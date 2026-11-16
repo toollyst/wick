@@ -27,7 +27,7 @@ use super::idregs;
 use super::pvtime;
 use super::regs::{self, Reg, reg_size};
 use super::trng;
-use super::vm::VmInner;
+use super::vm::{HostFault, VmInner};
 use super::wait::{Ended, Waiter};
 use super::{Error, Handle, Result, VcpuExit, err};
 
@@ -179,6 +179,11 @@ pub(crate) struct VcpuShared {
     /// The `VmInner::vtimer_gen` whose offset the vCPU has (`u64::MAX`: none yet).
     vtimer_gen: AtomicU64,
     in_run: AtomicBool,
+    /// Tests: the vCPU's returns from `hv_vcpu_run`, all of them and those
+    /// that were not an exception (a cancel, a virtual timer), so that a test
+    /// can tell that no exit it did not cause came between two points.
+    #[cfg(test)]
+    run_returns: [AtomicU64; 2],
     power: Mutex<Power>,
     /// What a powered-off vCPU waits on ([`VcpuFd::wait_powered_on`]).
     cv: Condvar,
@@ -225,6 +230,8 @@ impl VcpuShared {
             os_lock: AtomicBool::new(false),
             vtimer_gen: AtomicU64::new(u64::MAX),
             in_run: AtomicBool::new(false),
+            #[cfg(test)]
+            run_returns: [AtomicU64::new(0), AtomicU64::new(0)],
             power: Mutex::new(Power::default()),
             cv: Condvar::new(),
             waiter: Waiter::new().map_err(|e| Error::new(e.raw_os_error().unwrap_or(libc::EIO)))?,
@@ -1621,7 +1628,7 @@ impl VcpuFd {
         steal.start(wall_ns(), ticks_to_ns(pvtime::wfi_ticks(hv)));
         drop(steal);
         // SAFETY: STRUCT_SIZE bytes at the host address write_guest gives.
-        self.vm.write_guest(ipa, pvtime::STRUCT_SIZE, |p| unsafe { std::ptr::write_bytes(p, 0, pvtime::STRUCT_SIZE) });
+        self.vm.write_guest(ipa, pvtime::STRUCT_SIZE, false, |p| unsafe { std::ptr::write_bytes(p, 0, pvtime::STRUCT_SIZE) });
         ipa
     }
 
@@ -1644,7 +1651,7 @@ impl VcpuFd {
             // `stolen_time`, le64 at offset 8 (8-byte aligned: the IPA is
             // 64-byte aligned, and so is its host address), read and written
             // with one access each, as kvm_get_guest/kvm_put_guest.
-            self.vm.write_guest(ipa + 8, 8, |p| {
+            self.vm.write_guest(ipa + 8, 8, true, |p| {
                 // SAFETY: an aligned u64 in guest RAM, mapped while this runs.
                 let word = unsafe { AtomicU64::from_ptr(p.cast::<u64>()) };
                 let v = u64::from_le(word.load(Ordering::Relaxed)).wrapping_add(add);
@@ -1786,6 +1793,14 @@ impl VcpuFd {
         }
     }
 
+    /// Reads the vCPU's returns from `hv_vcpu_run` from any thread: (all of
+    /// them, those that were not an exception).
+    #[cfg(test)]
+    pub(crate) fn run_returns_for_test(&self) -> impl Fn() -> (u64, u64) + Send + 'static {
+        let shared = self.shared.clone();
+        move || (shared.run_returns[0].load(Ordering::SeqCst), shared.run_returns[1].load(Ordering::SeqCst))
+    }
+
     /// The framework's vCPU, for tests that read its counters on the owner thread.
     #[cfg(test)]
     pub(crate) fn hv_for_test(&self) -> Option<hv_vcpu_t> {
@@ -1839,6 +1854,13 @@ impl VcpuFd {
             check(ret)?;
             // SAFETY: Hypervisor.framework keeps the exit record valid for the vCPU's lifetime.
             let exit = unsafe { *self.exit.0 };
+            #[cfg(test)]
+            {
+                self.shared.run_returns[0].fetch_add(1, Ordering::SeqCst);
+                if exit.reason != HV_EXIT_REASON_EXCEPTION {
+                    self.shared.run_returns[1].fetch_add(1, Ordering::SeqCst);
+                }
+            }
 
             match exit.reason {
                 HV_EXIT_REASON_CANCELED => continue,
@@ -1868,6 +1890,14 @@ impl VcpuFd {
                     if vm.wait_mapped(ipa) {
                         continue;
                     }
+                    // The host protection, before the page is faulted in
+                    // (`VmInner::host_fault`): KVM_RUN's EFAULT, the PC at
+                    // the instruction.
+                    match vm.host_fault(ipa, write, instruction)? {
+                        HostFault::Refused => return Err(Error::new(libc::EFAULT)),
+                        HostFault::Retry => continue,
+                        HostFault::Pass => {}
+                    }
                     // A page a userfaultfd has not filled: wait for it, as KVM
                     // does when it faults the host page in (get_user_pages).
                     if let Some(host) = vm.ram_host_addr(ipa)
@@ -1876,10 +1906,10 @@ impl VcpuFd {
                         continue;
                     }
                     // A write to dirty-tracked memory: retry the instruction.
-                    if write && vm.dirty_fault(ipa) {
+                    if write && vm.dirty_fault(ipa)? {
                         continue;
                     }
-                    if vm.stale_fault(ipa, write) {
+                    if vm.stale_fault(ipa, write)? {
                         continue;
                     }
                     if instruction {

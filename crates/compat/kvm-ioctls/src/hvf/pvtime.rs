@@ -708,6 +708,36 @@ pub(super) mod tests {
         assert_eq!(mmio_values(without, 5), [0, NOT_SUPPORTED, NOT_SUPPORTED, NOT_SUPPORTED, NOT_SUPPORTED]);
     }
 
+    /// A stolen-time write the host protection refuses is skipped and the
+    /// vCPU goes on, as KVM's: `kvm_init_stolen_time` ignores its write's
+    /// result (arch/arm64/kvm/pvtime.c, v6.12, :65) and the guest still gets
+    /// the IPA, and `kvm_update_stolen_time` skips the update when its read
+    /// fails (:26) and ignores its write's (:30). Here the write would take
+    /// the host's fault and end the VMM: the page the structure lies in (the
+    /// code's) is made `PROT_READ`, PV_TIME_ST answers with the IPA and the
+    /// structure keeps its bytes.
+    #[test]
+    fn test_a_stolen_time_write_to_a_host_read_only_page_is_skipped() {
+        if !offered_or_refused() {
+            return;
+        }
+        //   x0 = 0xc5000021; hvc #0; str x0, [x9]; b .
+        let code = [0xd280_0420, 0xf2b8_a000, 0xd400_0002, 0xf900_0120, 0x1400_0000];
+        let (vm, mem) = vm_with_code(&code, 0);
+        // SAFETY: plain call.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        // SAFETY: the test's page.
+        assert_eq!(unsafe { libc::mprotect(mem.cast(), page, libc::PROT_READ) }, 0);
+        let vcpu = new_vcpu(&vm, 0);
+        vcpu.set_device_attr(&attr(PVTIME_CTRL, PVTIME_IPA, &ST)).unwrap();
+        assert_eq!(mmio_values(vcpu, 1), [ST]);
+        // SAFETY: the structure lies in the test's page.
+        let st = unsafe { std::slice::from_raw_parts(mem.add((ST - RAM) as usize), 64) };
+        assert_eq!(st, [0xaau8; 64], "the structure was written through a read-only page");
+        // SAFETY: the test's page.
+        assert_eq!(unsafe { libc::mprotect(mem.cast(), page, libc::PROT_READ | libc::PROT_WRITE) }, 0);
+    }
+
     #[test]
     fn test_pv_time_is_not_offered_without_the_wfi_figure() {
         // Before macOS 27 (forced here: the switch takes the path of a

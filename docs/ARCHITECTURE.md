@@ -180,18 +180,25 @@ the range is unregistered (`test_part_of_a_mapping_is_registered`,
 | Interrupt controller | KVM vGIC / LAPIC | `hv_gic_*` GICv3 (GICv2m MSI frame instead of an ITS) | WHP LAPIC + user-space IOAPIC, 8259 PIC, 8254 PIT |
 | Process hardening | seccomp-BPF, jailer | Seatbelt, upstream's jailer on macOS backends (`overlay/jailer/platform`) | a process mitigation profile, upstream's jailer on Windows backends: a jail drive, a restricted token, a Job Object |
 
-Guest memory and the host's protection on macOS: not as Linux yet. KVM takes each stage-2 page through the host's
-vma (mm/gup.c, v6.12, `check_vma_flags`), so a guest access follows the host's `mprotect`, `munmap` and `mmap` of
-slot memory, and an `mprotect` or `munmap` invalidates stage 2 before it returns. Hypervisor.framework maps the
-physical pages behind a host range at `hv_vm_map`, with the slot's permissions, and the backend does not yet follow
-a later change of the range's protection or mapping (pages the host replaces, by `MADV_DONTNEED` or `MAP_FIXED`, it
-follows already). Firecracker makes no such change to memory in a live slot, as read from the code; the cases, what
-each measured and why, are in SECURITY.md, "Not at parity yet". Their tests, ignored until it is done:
-`test_a_guest_reaches_new_memory_mapped_where_slot_memory_was_unmapped`,
-`test_a_guest_access_the_host_protection_refuses_is_efault`, `test_no_guest_store_lands_after_a_host_mprotect_returned`,
-`test_a_slot_over_memory_mapped_read_only_starts_read_only`, `test_a_guest_executes_from_a_host_read_only_page`,
-`test_a_refused_access_to_a_missing_page_posts_no_event`, `test_a_write_only_host_page_is_readable_by_the_guest_after_its_write`;
-what is as Linux already: `test_a_store_to_a_read_only_slot_is_still_mmio`.
+Guest memory and the host's protection on macOS: KVM takes each stage-2 page through the host's vma (mm/gup.c,
+v6.12, `check_vma_flags`), so a guest access follows the host's `mprotect`, `munmap` and `mmap` of slot memory, and
+an `mprotect` or `munmap` invalidates stage 2 before it returns. Hypervisor.framework maps the physical pages behind
+a host range at `hv_vm_map`, with the permissions given then, so the backend follows the host instead: every
+`mprotect`, `munmap` and `mmap` of the compatibility libc calls the `protected` hook after it returned
+(`crates/compat/libc/src/wick_guest.rs`), saying whether the range's mappings were replaced (`munmap`, a new
+mapping: every slot page of it in stage 2 is then unmapped first, as a protection cannot tell a page from its
+replacement), which reads the range's protection, with the userfaultfd's registrations,
+under the VM's memory lock (`wick_uffd::host_protections`), brings each slot page to it (unmapped where the mapping
+went, mapped with the new pages where one was made, the permissions changed otherwise; each run mapped with its final
+permissions), with no vCPU made to leave its run, as arm64 KVM makes none leave (its stage-2 change ends in a
+broadcast TLB invalidation; relied on here is that `hv_vm_protect` and `hv_vm_unmap` have invalidated a running
+vCPU's translations when they return, which hv_vm.h does not say and two tests measure: docs/PORTING.md); a guest abort is
+checked against the page's host protection before a userfaultfd is asked (`VmInner::host_fault`). A stage-2
+protect that takes a permission away and fails ends the process; one that gives a permission and fails is
+`KVM_RUN`'s error (`protect_stage2`). Pages the libc
+replaces (`MADV_DONTNEED`, `MAP_FIXED`) are unmapped for the change and mapped again after (`replace`). A call of the
+system's own library on guest memory is not seen. The tests and what was measured before: SECURITY.md, "Fixed
+defects".
 
 PV steal time on macOS 27 (`crates/compat/kvm-ioctls/src/hvf/pvtime.rs`): KVM adds a vCPU thread's run delay to the
 guest's stolen-time structure at the next entry after the scheduler runs the thread again. Hypervisor.framework

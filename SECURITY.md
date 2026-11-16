@@ -197,6 +197,91 @@ has the per-control details and results.
 
 ## Fixed defects
 
+- **macOS: stage 2 did not follow the host's protection of guest memory** (from the macOS backend's start; its tests
+  and this entry, then under "Not at parity yet", in 2e942d5a; fixed in the commit that moved it here). On Linux each
+  stage-2 page of a memslot is taken through the host's vma, so a guest access is allowed only as the host's
+  protection allows, and an `mprotect` or `munmap` of slot memory invalidates stage 2 before it returns (mm/gup.c,
+  v6.12, `check_vma_flags` :1285 to :1287 and :1303 to :1305, no vma :1464 to :1466; mm/mprotect.c :455 to :458;
+  mm/vma.c `unmap_vmas` :1095; arch/arm64/kvm/mmu.c :1579 to :1580). Hypervisor.framework maps the physical pages
+  behind a host range at `hv_vm_map`, with the slot's permissions, and the backend followed no later change of the
+  range's protection or mapping. Measured before the fix (2e942d5a's tests, ignored then), worst first:
+  - the guest reached slot memory the host unmapped, and kept the old pages where the host mapped new memory at the
+    same address by a hint (`test_a_guest_reaches_new_memory_mapped_where_slot_memory_was_unmapped`: "unmapped:
+    Ok(Some(1229782938247303441)), not Err(14)");
+  - guest stores landed on memory the host made read-only: after the `mprotect`
+    (`test_a_guest_access_the_host_protection_refuses_is_efault`: `Ok(Some(8))` where Linux gives `Err(14)`), while
+    a vCPU ran (`test_no_guest_store_lands_after_a_host_mprotect_returned`: "the word was 91141332, then 178463532
+    50 ms later"), and in a slot made over read-only memory, whose host page took the store
+    (`test_a_slot_over_memory_mapped_read_only_starts_read_only`: "the host's page holds 0x7");
+  - the guest executed from a page the host made `PROT_NONE` (`test_a_guest_executes_from_a_host_read_only_page`);
+  - a guest access the host refuses, to a page a userfaultfd has not filled, posted an event
+    (`test_a_refused_access_to_a_missing_page_posts_no_event`);
+  - the guest read a page the host made `PROT_WRITE` alone before it wrote it
+    (`test_a_write_only_host_page_is_readable_by_the_guest_after_its_write`).
+
+  Now every `mprotect`, `munmap` and `mmap` of the compatibility libc tells the backend after it returned
+  (`wick_guest::Hooks::protected`), and the backend reads the range's protection, with the userfaultfd's
+  registrations, under the VM's memory lock and brings stage 2 to it: a page whose mapping went is unmapped, one
+  mapped anew is mapped with the new pages, the others get their permissions; each run of pages is mapped with its
+  final permissions, none at all included, never more for a moment. A protection value cannot tell a page from the
+  page that replaced it, so each call also says whether the range's mappings were replaced (`munmap`, and a new
+  mapping not placed by `MAP_FIXED`, which can only be where nothing was; a `MAP_FIXED` one is followed as a
+  replacement): then every slot page of it that was in stage 2 is unmapped first, whatever its protection reads now,
+  and the read decides whether the pages there now are mapped. Memory unmapped and mapped again by another thread
+  before the `munmap`'s hook ran is so reached anew, in either order of the two hooks
+  (`test_memory_mapped_where_slot_memory_was_unmapped_before_its_hook_reaches_the_guest`). The bound that lets an
+  `mprotect` outside every slot skip the lock is stored only under the memory lock, so a slot made while another is
+  removed still takes a protection changed meanwhile
+  (`test_a_slot_made_while_another_is_removed_takes_a_protection_changed_meanwhile`). A stage-2 protect that takes a
+  permission away and fails ends the process with a line naming the range, the flags and the return, as a failed
+  unmap does; one that gives a permission and fails is `KVM_RUN`'s error, never retried silently. No test can make
+  Hypervisor.framework fail a protect, so this rule is not shown failing. No running vCPU is made to leave its run, as
+  none is on Linux on arm64: KVM's stage-2 unmap ends in a broadcast TLB invalidation that is complete on every CPU
+  when it returns (arch/arm64/kvm/hyp/pgtable.c, v6.12, `stage2_unmap_put_pte` :846 to :867; hyp/vhe/tlb.c
+  `__kvm_tlb_flush_vmid_ipa` :92 to :120, `tlbi ipas2e1is` then `dsb ish`), and arm64's
+  `kvm_arch_flush_remote_tlbs` (mmu.c :169 to :173) returns 0, so virt/kvm/kvm_main.c :349 to :350 sends no
+  `KVM_REQ_TLB_FLUSH` and kicks no vCPU. What is relied on here is that `hv_vm_protect` and `hv_vm_unmap` have
+  invalidated the running vCPUs' stage-2 translations when they return; hv_vm.h does not say so. It rests on the
+  same broadcast invalidation as Linux's, and on the host's own safety: macOS takes pages from a running guest
+  (pageout, a page freed by a host `munmap` and reused) through the same stage-2 removal, and one that reached a
+  running vCPU late would let a guest write a page the host had given to someone else. Measured on macOS 27.2, M1
+  Pro, with the vCPU in a loop that makes no exit of its own, so that a change taken up only at the next entry
+  would never have stopped the stores: no store landed after the `mprotect` returned, and the run left
+  `hv_vcpu_run` once only, for the refused store, in the 50 ms round and 300 rounds more
+  (`test_no_guest_store_lands_after_a_host_mprotect_returned`); none landed on the old page after a discard
+  returned, the run leaving `hv_vcpu_run` for nothing but faults until the test's own kick
+  (`test_no_guest_store_lands_on_old_pages_after_a_discard_returned`). Not measured on another macOS version or
+  chip: CI's runners have no Hypervisor.framework, so these runs are this Mac's alone; both tests are on
+  docs/PORTING.md's list of what to measure again on a new macOS major. A guest abort is checked against the page's host protection before a userfaultfd is asked, so a refused
+  access is `EFAULT` from `KVM_RUN` and posts no event. A write or execute protection without read, which XNU widens
+  with read (bsd/kern/kern_mman.c, `mmap` :349 to :351, `mprotect` :1251 to :1253), is read as it was asked, as a
+  vma keeps it (`test_a_protection_xnu_widens_reads_as_asked`). Every test above passes, the mprotect one over its
+  50 ms round and 300 rounds more; also `test_the_protection_stored_last_is_the_one_the_host_has` and
+  `test_a_slot_made_while_an_mprotect_runs_takes_its_protection` (each fails when the protection is read before the
+  memory lock), `test_a_page_mapped_with_no_permission_faults_and_takes_its_permissions_later`,
+  `test_no_guest_store_lands_on_old_pages_after_a_discard_returned` and
+  `test_an_mprotect_of_memory_in_no_slot_takes_no_vm_lock` (an mprotect outside the slots costs two atomic loads).
+  What stays different:
+  - Only the compatibility libc's calls are followed; a call of the system's own library on guest memory (Rust
+    std's, a framework's) is not, and Firecracker makes its calls on guest memory through the compatibility libc
+    (docs/PORTING.md, the `libc` row).
+  - The backend's own store to guest memory (the stolen-time record, `write_guest`) checks the page's protection and
+    then stores, not in one step: a host `mprotect` or `munmap` of that page on another thread can land between the
+    two, and the store then takes the host's fault and ends the VMM, where Linux's `put_user` returns `EFAULT`. It is
+    never a refused store that lands. Reaching it needs the VMM to `mprotect` or `munmap` guest RAM in a live slot while a vCPU runs, which
+    Firecracker does not (below; its `MAP_FIXED` replacement is waited for, as a guest fault waits for it).
+  As Linux already before: a guest store to a read-only memory slot exits as MMIO, also with the slot's memory
+  `PROT_READ` (`test_a_store_to_a_read_only_slot_is_still_mmio`). Firecracker reached none of the cases above, as read from the
+  code: it changes the protection of guest memory only outside a live slot (virtio-mem's `update_slot`,
+  lib/firecracker/src/vmm/src/vstate/memory.rs :701, makes a slot readable and writable before it adds it and
+  `PROT_NONE` after it removes it; `register_memory_region`, vstate/vm.rs :497, protects only the slots it does not
+  add); it maps a read-only pmem's memory `PROT_READ` in a read-only slot (devices/virtio/pmem/device.rs :192 to
+  :195 and :335 to :339); it replaces hotplugged memory's pages by `MAP_FIXED` (memory.rs :797 to :808), which is
+  followed; and it unmaps guest memory at teardown, after `Vmm`'s drop has ended the vCPU threads (lib.rs :794 to
+  :798) and the VM's descriptor is dropped (`VmCommon`, vstate/vm.rs :81, before the guest memory at :84). No other
+  process can make these changes to the VMM's memory, and a compromised VMM can read and write guest memory
+  directly, so it gains nothing by them. The compatibility layer is held to Linux's behaviour all the same, so that
+  code which relies on the host's protection of guest memory behaves here as it does on Linux.
 - **Windows: `munmap` and `mmap(MAP_FIXED)` of userfaultfd-registered memory left the registration** (from the
   Windows userfaultfd backend's start; its tests and this entry, then under "Not at parity yet", in 5859a449; fixed
   in the commit that moved it here). On Linux the registration belongs to the vma and goes with it (mm/vma.c, v6.12,
@@ -446,46 +531,6 @@ upstream Firecracker and its jailer.
   as two halves, swapped one at a time, so that the other half keeps the region's page table.
 - **Without the jailer, the VMM runs as the user who started it** on macOS and Windows: an escape from the VM and
   then the VMM lands as that user (files are then not limited, as on Linux without the jailer).
-- **macOS: stage 2 does not follow the host's protection of guest memory yet.** On Linux each stage-2 page of a
-  memslot is taken through the host's vma, so a guest access is allowed only as the host's protection allows, and an
-  `mprotect` or `munmap` of slot memory invalidates stage 2 before it returns (mm/gup.c, v6.12, `check_vma_flags`
-  :1285 to :1287 and :1303 to :1305, no vma :1464 to :1466; mm/mprotect.c :455 to :458; mm/vma.c `unmap_vmas` :1095;
-  arch/arm64/kvm/mmu.c :1579 to :1580). Hypervisor.framework maps the physical pages behind a host range at
-  `hv_vm_map`, with the slot's permissions, and the backend does not yet follow a later change of the range's
-  protection or mapping; pages the host replaces (`MADV_DONTNEED`, `MAP_FIXED`) it follows already. Each case below
-  has a test in crates/compat/kvm-ioctls/src/hvf/vm.rs, ignored until this is done, and what it measured, worst
-  first:
-  - The guest reaches slot memory the host unmapped: it read the old pages where Linux's access is `EFAULT`, and
-    kept them where the host mapped new memory at the same address by a hint
-    (`test_a_guest_reaches_new_memory_mapped_where_slot_memory_was_unmapped`: "unmapped:
-    Ok(Some(1229782938247303441)), not Err(14)", "the hint: Ok(Some(1229782938247303441)), not
-    Ok(Some(3689348814741910323))"; its `MAP_FIXED` case passes).
-  - Guest stores land on memory the host made read-only: after the `mprotect`
-    (`test_a_guest_access_the_host_protection_refuses_is_efault`: "a store to a read-only page", `Ok(Some(8))` where
-    Linux gives `Err(14)`), while a vCPU runs (`test_no_guest_store_lands_after_a_host_mprotect_returned`: "the word
-    was 91141332, then 178463532 50 ms later"), and in a slot made over read-only memory, whose host page took the
-    store (`test_a_slot_over_memory_mapped_read_only_starts_read_only`: "the store: Ok(Some(7))", "the host's page
-    holds 0x7").
-  - The guest executes from a page the host made `PROT_NONE` (`test_a_guest_executes_from_a_host_read_only_page`:
-    "code page 0: Ok(Some(2)), not Err(14)").
-  - A guest access the host refuses, to a page a userfaultfd has not filled, posts an event, which Linux does not
-    (`test_a_refused_access_to_a_missing_page_posts_no_event`: "an event posted: true; the load: Ok(Some(0))").
-  - The guest reads a page the host made `PROT_WRITE` alone before it writes it
-    (`test_a_write_only_host_page_is_readable_by_the_guest_after_its_write`: "the first load: Ok(Some(0)), not
-    Err(14)", "the load after PROT_WRITE again: Ok(Some(5))").
-
-  As Linux already: a guest store to a read-only memory slot exits as MMIO, also with the slot's memory `PROT_READ`
-  (`test_a_store_to_a_read_only_slot_is_still_mmio`). Firecracker reaches none of the cases above, as read from the
-  code: it changes the protection of guest memory only outside a live slot (virtio-mem's `update_slot`,
-  lib/firecracker/src/vmm/src/vstate/memory.rs :701, makes a slot readable and writable before it adds it and
-  `PROT_NONE` after it removes it; `register_memory_region`, vstate/vm.rs :497, protects only the slots it does not
-  add); it maps a read-only pmem's memory `PROT_READ` in a read-only slot (devices/virtio/pmem/device.rs :192 to
-  :195 and :335 to :339); it replaces hotplugged memory's pages by `MAP_FIXED` (memory.rs :797 to :808), which is
-  followed; and it unmaps guest memory at teardown, after `Vmm`'s drop has ended the vCPU threads (lib.rs :794 to
-  :798) and the VM's descriptor is dropped (`VmCommon`, vstate/vm.rs :81, before the guest memory at :84). No other
-  process can make these changes to the VMM's memory, and a compromised VMM can read and write guest memory
-  directly, so it gains nothing by them. The compatibility layer is held to Linux's behaviour all the same, so that
-  code which relies on the host's protection of guest memory behaves here as it does on Linux.
 - **macOS jailer: no namespaces in the kernel.** macOS has no network or PID namespaces (XNU's system calls,
   bsd/kern/syscalls.master, have no `unshare`, `setns` or `clone`): IP networking is denied by the sandbox; a
   jailed VMM uses Unix socket endpoints in the jail or in the directory `--netns` names, the jail's network.

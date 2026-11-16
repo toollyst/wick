@@ -92,10 +92,73 @@ struct Slot {
     /// with `KVM_MEM_LOG_DIRTY_PAGES`. Pages are mapped read-only until the
     /// guest writes them; the write fault marks the page and makes it writable.
     dirty: Option<Vec<std::sync::atomic::AtomicU64>>,
+    /// The protection a Linux vma would give each host page of the slot's
+    /// memory (`PROT_*` bits; -1: no mapping there, so not mapped in stage 2
+    /// either), as last read ([`guest_protected`],
+    /// `libc::wick_uffd::host_protections`). A page's stage-2 permissions
+    /// are the slot's intersected with what this allows ([`Slot::flags`]),
+    /// as KVM's stage-2 fault takes the page through the vma (mm/gup.c,
+    /// v6.12, `check_vma_flags`).
+    prot: Vec<i8>,
+    /// Pages whose protection allows a write but not a read that the guest
+    /// has written since their protection was last read: KVM's write fault
+    /// maps such a page readable too (arch/arm64/kvm/mmu.c, v6.12, :1441
+    /// `KVM_PGTABLE_PROT_R` always, :1659 to :1660 W), until the next
+    /// invalidation (an mprotect). One bit per host page.
+    wrote: Vec<u64>,
 }
 
 const RX: hv_memory_flags_t = HV_MEMORY_READ | HV_MEMORY_EXEC;
 const RWX: hv_memory_flags_t = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
+
+/// `hv_vm_protect` of `[ipa, ipa + size)` to `flags`, the one place where a
+/// protect's failure is decided. One that takes a permission away
+/// (`reducing`: the host's protection was lowered, a page became missing, a
+/// dirty-tracked page is write-protected) and fails would leave the guest a
+/// permission the host withdrew, silently: the process ends with a line
+/// naming the range, the flags and the return, as a failed `hv_vm_unmap`
+/// ends it. One that only gives permissions returns the error, which a
+/// fault's caller returns from `KVM_RUN`, as a failed stage-2 map's error is
+/// `KVM_RUN`'s on KVM; it is never retried silently. No test can make
+/// Hypervisor.framework fail a protect of a page it mapped, so neither
+/// branch is shown failing.
+fn protect_stage2(ipa: u64, size: u64, flags: hv_memory_flags_t, reducing: bool) -> Result<()> {
+    // SAFETY: changes the permissions of a range of a slot we mapped (the
+    // callers' contract: every page of it is in stage 2).
+    let ret = unsafe { hv_vm_protect(ipa, size as usize, flags) };
+    if ret == HV_SUCCESS {
+        return Ok(());
+    }
+    if reducing {
+        eprintln!(
+            "wick: guest memory at {ipa:#x}+{size:#x} cannot be protected to {flags:#x} \
+             (hv_vm_protect: {ret:#x}): the guest would keep a permission the host withdrew"
+        );
+        std::process::abort();
+    }
+    check(ret)
+}
+
+/// The stage-2 permissions a page's host protection allows (`prot` as in
+/// [`Slot::prot`]): `PROT_READ` gives read and execute (KVM grants stage-2
+/// exec on an instruction fault once the read that takes the page passed,
+/// arch/arm64/kvm/mmu.c, v6.12, :1662 to :1663, and an instruction fetch is
+/// a read to GUP), `PROT_WRITE` gives write. A page that allows a write but
+/// not a read gives nothing until the guest wrote it (`wrote`), and then
+/// read and write, as KVM's write fault maps it (see [`Slot::wrote`]): so
+/// the guest's first access to it faults, and a read first is refused.
+fn host_flags(prot: i8, wrote: bool) -> hv_memory_flags_t {
+    if prot < 0 {
+        return 0;
+    }
+    let (read, write) = (c_int::from(prot) & libc::PROT_READ != 0, c_int::from(prot) & libc::PROT_WRITE != 0);
+    match (read, write) {
+        (true, true) => RWX,
+        (true, false) => RX,
+        (false, true) if wrote => HV_MEMORY_READ | HV_MEMORY_WRITE,
+        _ => 0,
+    }
+}
 
 /// Part of a slot unmapped from stage 2 while the libc replaces the pages
 /// behind it (see [`guest_replace`]).
@@ -117,6 +180,12 @@ impl Memory {
     fn slot_at(&self, ipa: u64) -> Option<&Slot> {
         self.slots
             .values()
+            .find(|s| ipa >= s.ipa && ipa < s.ipa + s.size)
+    }
+
+    fn slot_at_mut(&mut self, ipa: u64) -> Option<&mut Slot> {
+        self.slots
+            .values_mut()
             .find(|s| ipa >= s.ipa && ipa < s.ipa + s.size)
     }
 
@@ -266,11 +335,14 @@ fn uffd_stage2(host: u64, len: u64, present: bool) {
         while addr < end {
             let ipa = slot.ipa + (addr - slot.host);
             // A page being replaced is mapped again with its permissions
-            // when the replacement ends (`Slot::map`).
-            if !memory.replacing(ipa) {
+            // when the replacement ends (`Slot::map`); a page with no
+            // mapping is not in stage 2 at all.
+            if !memory.replacing(ipa) && slot.mapped(slot.page_index(ipa)) {
                 let flags = if present { slot.flags(ipa) } else { 0 };
-                // SAFETY: changes the permissions of one page of a slot we mapped.
-                unsafe { hv_vm_protect(ipa, page as usize, flags) };
+                // Made missing: a reduction. Made present: a failure leaves
+                // the page without permissions, and the guest's next fault
+                // there (`stale_fault`) returns the error from `KVM_RUN`.
+                let _ = protect_stage2(ipa, page, flags, !present);
             }
             addr += page;
         }
@@ -291,7 +363,7 @@ fn uffd_stage2(host: u64, len: u64, present: bool) {
 /// ([`VmInner::wait_mapped`]), as a KVM guest's access waits while the host
 /// zaps the page. Returns, before, whether any guest memory was unmapped,
 /// and after, whether all of it was mapped again.
-fn guest_replace(host: u64, len: u64, before: bool) -> bool {
+fn guest_replace(host: u64, len: u64, before: bool, anew: bool) -> bool {
     let Some(vm) = CURRENT.lock().unwrap().upgrade() else {
         return false;
     };
@@ -321,9 +393,8 @@ fn guest_replace(host: u64, len: u64, before: bool) -> bool {
             })
             .collect();
         for w in &windows {
-            // SAFETY: unmapping part of a slot we mapped.
-            let ret = unsafe { hv_vm_unmap(w.ipa, w.size as usize) };
-            if ret != HV_SUCCESS {
+            let slot = memory.slot_at(w.ipa).expect("a window is in a slot");
+            if let Err(ret) = slot.unmap_range(w.ipa, w.size) {
                 // The guest would keep the old pages while the host uses
                 // the new ones: silent corruption.
                 eprintln!(
@@ -347,7 +418,19 @@ fn guest_replace(host: u64, len: u64, before: bool) -> bool {
         for w in mine {
             // The slot is still there: `set_user_memory_region` waits for
             // open windows.
-            if let Some(slot) = memory.slot_at(w.ipa) {
+            if let Some(slot) = memory.slot_at_mut(w.ipa) {
+                if anew {
+                    // A new mapping (`MAP_FIXED`): its pages have its
+                    // protection from now on, as the new vma's on Linux; the
+                    // protection hook that follows the call reads it again
+                    // with the registrations.
+                    let first = slot.page_index(w.ipa);
+                    let prot = libc::wick_uffd::mapped_protections(w.host, w.host + w.size);
+                    for (i, p) in prot.into_iter().enumerate() {
+                        slot.prot[first + i] = p;
+                        slot.wrote[(first + i) / 64] &= !(1 << ((first + i) % 64));
+                    }
+                }
                 // SAFETY: the slot's host range, valid while the slot exists.
                 ok &= unsafe { slot.map(w.host, w.ipa, w.size) }.is_ok();
             }
@@ -357,54 +440,368 @@ fn guest_replace(host: u64, len: u64, before: bool) -> bool {
     }
 }
 
-impl Slot {
-    /// Maps `[host, host + size)`, part of the slot's memory, at `ipa` with
-    /// the permissions its pages have: the slot's, read-only until written
-    /// for a dirty-tracked page not written yet, none for a page a
-    /// userfaultfd has not filled.
-    ///
-    /// # Safety
-    /// The host range must stay mapped while the slot exists.
-    unsafe fn map(&self, host: u64, ipa: u64, size: u64) -> Result<()> {
-        let base = if self.readonly || self.dirty.is_some() { RX } else { RWX };
-        // SAFETY: the caller's contract.
-        check(unsafe { hv_vm_map(host as *mut _, ipa, size as usize, base) })?;
-        let page = host_page_size();
-        // Runs of pages whose permissions differ from the slot's.
-        let mut run: Option<(u64, hv_memory_flags_t)> = None;
-        let mut off = 0;
-        while off <= size {
-            let flags = if off == size {
-                base
-            } else if libc::wick_uffd::is_missing(host + off) {
-                0
-            } else {
-                self.flags(ipa + off)
-            };
-            if run.is_some_and(|(_, f)| f != flags) || (run.is_none() && flags != base) {
-                if let Some((start, f)) = run.take() {
-                    // SAFETY: changes the permissions of pages mapped above.
-                    check(unsafe { hv_vm_protect(ipa + start, (off - start) as usize, f) })?;
+/// The host range the slots' memory spans: the lowest start and the highest
+/// end of any slot's (0 and 0 with no slot). One interval for all slots:
+/// memory between two slots' ranges takes the protection hook's lock and
+/// finds no slot, which is correct, only slower, and Firecracker's guest
+/// memory is one reservation a region.
+///
+/// Every store of the span is made under the memory lock: [`widen_bound`]
+/// by [`VmFd::set_user_memory_region`] after it takes the lock and before
+/// it reads the new slot's protection, [`set_bound`] after a slot is
+/// inserted or removed. [`guest_protected`] loads it with `SeqCst` after its
+/// caller's system call, before any lock. So either the hook's load sees
+/// the widened span, and the hook then waits for the memory lock, which the
+/// slot's maker holds from the widening through the read to the insert, and
+/// finds the slot; or the load came before the widening (`SeqCst`'s one
+/// order), so the system call came before the slot's read, which sees the
+/// change. No one narrows the span between the widening and the insert: a
+/// narrowing is a store, made only under the lock the maker holds. Widened
+/// before the lock, a removal's `set_bound` could narrow it again before the
+/// read, and the hook of an mprotect made between the read and the insert
+/// missed the new slot
+/// (`test_a_slot_made_while_another_is_removed_takes_a_protection_changed_meanwhile`).
+static BOUND_LOW: AtomicU64 = AtomicU64::new(0);
+static BOUND_HIGH: AtomicU64 = AtomicU64::new(0);
+
+/// Tests: the protection hook's calls that got past the bound check.
+#[cfg(test)]
+static PROTECTED_PAST_BOUND: AtomicUsize = AtomicUsize::new(0);
+
+/// Tests: run once by the next protection read (the protection hook's or a
+/// new slot's), after `wick_uffd`'s lock or count and before the memory
+/// lock, so that a test can make a whole other change there.
+#[cfg(test)]
+static BEFORE_PROTECTION_READ: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+/// Tests: run once by the next protection hook for a range starting at the
+/// address given, first thing (its caller's system call has returned, the
+/// hook has done nothing yet), so that a test can make another change there.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static BEFORE_PROTECTED: Mutex<Option<(u64, Box<dyn FnOnce() + Send>)>> = Mutex::new(None);
+
+#[cfg(test)]
+fn before_protected(host: u64) {
+    let mut hook = BEFORE_PROTECTED.lock().unwrap();
+    if hook.as_ref().is_some_and(|&(at, _)| at == host) {
+        let (_, f) = hook.take().unwrap();
+        drop(hook);
+        f();
+    }
+}
+
+/// Tests: run once by the next new slot's protection read, after the read
+/// and before the slot is inserted (the memory lock held).
+#[cfg(test)]
+static AFTER_SLOT_READ: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+#[cfg(test)]
+fn after_slot_read() {
+    let hook = AFTER_SLOT_READ.lock().unwrap().take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn before_protection_read() {
+    let hook = BEFORE_PROTECTION_READ.lock().unwrap().take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// `libc::wick_guest` protection hook: the protection of the host range
+/// `[host, host + len)` may have changed, or it was unmapped or mapped anew
+/// (an `mprotect`, `munmap` or `mmap` of the compatibility libc, after it
+/// returned). Stage 2 follows, as KVM's follows the vmas through the MMU
+/// notifier (mm/mprotect.c, v6.12, :455 to :458; mm/vma.c `unmap_vmas`
+/// :1095): each slot page of the range gets its host protection again
+/// ([`Slot::prot`], read with the registrations by
+/// `libc::wick_uffd::host_protections`); a page whose mapping went is
+/// unmapped from stage 2, so the guest reaches no page of the old mapping
+/// (Hypervisor.framework maps the physical pages, not the address); a page
+/// with a mapping again is mapped with the new pages; the others get their
+/// permissions. No vCPU is made to leave its run, as none is on Linux on
+/// arm64 (KVM's stage-2 unmap ends in a broadcast TLB invalidation,
+/// arch/arm64/kvm/hyp/pgtable.c, v6.12, `stage2_unmap_put_pte` :846 to
+/// :867; hyp/vhe/tlb.c `__kvm_tlb_flush_vmid_ipa` :92 to :120, `tlbi
+/// ipas2e1is` and `dsb ish`; arm64's `kvm_arch_flush_remote_tlbs`, mmu.c
+/// :169 to :173, returns 0, so virt/kvm/kvm_main.c :349 to :350 sends no
+/// `KVM_REQ_TLB_FLUSH`): what is relied on is that `hv_vm_protect` and
+/// `hv_vm_unmap` have invalidated the running vCPUs' stage-2 translations
+/// when they return, which hv_vm.h does not say, and which
+/// `test_no_guest_store_lands_after_a_host_mprotect_returned` and
+/// `test_no_guest_store_lands_on_old_pages_after_a_discard_returned` measure
+/// with a vCPU in a loop that makes no exit (docs/PORTING.md, what to measure
+/// again on a new macOS).
+///
+/// `replaced` (an `munmap`, a new mapping that is not `MAP_FIXED`): every
+/// slot page of the range that is in stage 2 is unmapped first, whatever
+/// its protection reads now, and then the read decides (no mapping: it stays
+/// out; a mapping: mapped with the pages there now). A protection cannot
+/// tell a page from the page that replaced it: an `munmap` whose address
+/// another thread maps again (by a hint) before the munmap's hook runs reads
+/// read and write in both hooks, the same as before, and without this the
+/// guest kept the old pages for good
+/// (`test_memory_mapped_where_slot_memory_was_unmapped_before_its_hook_reaches_the_guest`).
+/// Both orders of the two hooks end with the new pages, each hook whole
+/// under the memory lock, so no vCPU sees the middle: the mapping's hook
+/// first unmaps the old pages and maps the new, then the munmap's unmaps
+/// those, reads a mapping and maps them again; the munmap's first unmaps
+/// the old pages and reads no mapping (it stays out) or the new one (mapped),
+/// then the mapping's unmaps what is there and maps the new pages.
+///
+/// A range outside the slots' span costs two atomic loads ([`BOUND_LOW`]).
+/// Not from a signal handler (no compatibility `mmap`, `munmap` or
+/// `mprotect` is called from one), and never with the VM's memory lock
+/// held: no holder of it calls them (the lock order is `wick_uffd`'s lock,
+/// then the memory lock).
+fn guest_protected(host: u64, len: u64, replaced: bool) {
+    #[cfg(test)]
+    before_protected(host);
+    let end = host.saturating_add(len);
+    let (low, high) = (BOUND_LOW.load(Ordering::SeqCst), BOUND_HIGH.load(Ordering::SeqCst));
+    if end <= low || host >= high {
+        return;
+    }
+    #[cfg(test)]
+    PROTECTED_PAST_BOUND.fetch_add(1, Ordering::SeqCst);
+    let Some(vm) = CURRENT.lock().unwrap().upgrade() else {
+        return;
+    };
+    let page = host_page_size();
+    let start = (host - host % page).max(low);
+    let end = end.next_multiple_of(page).min(high);
+    libc::wick_uffd::host_protections(start, end, |read| {
+        #[cfg(test)]
+        before_protection_read();
+        let mut guard = vm.memory.lock().unwrap();
+        // Read under the memory lock (`host_protections`): the last of two
+        // hooks for the same pages to store also read last.
+        let prot = read();
+        let memory = &mut *guard;
+        for slot in memory.slots.values_mut() {
+            let (s, e) = (start.max(slot.host), end.min(slot.host + slot.size));
+            let mut at = s;
+            while at < e {
+                let ipa = slot.ipa + (at - slot.host);
+                let index = slot.page_index(ipa);
+                let missing = libc::wick_uffd::is_missing(at);
+                let mut before = if slot.mapped(index) && !missing { slot.flags(ipa) } else { 0 };
+                let mut was_mapped = slot.mapped(index);
+                // A page being replaced gets its protection only: the
+                // window's end maps it with it (`Slot::map`).
+                let in_window = memory.replacing.iter().any(|w| ipa >= w.ipa && ipa < w.ipa + w.size);
+                if replaced && was_mapped && !in_window {
+                    // SAFETY: unmapping one page of a slot we mapped.
+                    let ret = unsafe { hv_vm_unmap(ipa, page as usize) };
+                    if ret != HV_SUCCESS {
+                        // The guest would keep pages the host may have given up.
+                        eprintln!(
+                            "wick: guest memory at {ipa:#x} cannot be unmapped after its host memory was replaced \
+                             (hv_vm_unmap: {ret:#x})"
+                        );
+                        std::process::abort();
+                    }
+                    (was_mapped, before) = (false, 0);
                 }
-                if flags != base {
-                    run = Some((off, flags));
+                slot.prot[index] = prot[((at - start) / page) as usize];
+                slot.wrote[index / 64] &= !(1 << (index % 64));
+                if !in_window {
+                    slot.follow(at, ipa, was_mapped, before, missing);
                 }
+                at += page;
             }
-            off += page;
+        }
+    });
+}
+
+/// Widens the slots' span ([`BOUND_LOW`]) to `[start, end)`. Under the
+/// memory lock, as every store of the span.
+fn widen_bound(start: u64, end: u64) {
+    let low = BOUND_LOW.load(Ordering::SeqCst);
+    if low == 0 || start < low {
+        BOUND_LOW.store(start, Ordering::SeqCst);
+    }
+    if end > BOUND_HIGH.load(Ordering::SeqCst) {
+        BOUND_HIGH.store(end, Ordering::SeqCst);
+    }
+}
+
+/// Sets the slots' span to the slots `memory` has, under the memory lock
+/// (a span wider than the slots only costs a hook its lock).
+fn set_bound(memory: &Memory) {
+    let low = memory.slots.values().map(|s| s.host).min().unwrap_or(0);
+    let high = memory.slots.values().map(|s| s.host + s.size).max().unwrap_or(0);
+    BOUND_LOW.store(low, Ordering::SeqCst);
+    BOUND_HIGH.store(high, Ordering::SeqCst);
+}
+
+impl Slot {
+    /// Unmaps the slot's mapped pages from stage 2.
+    fn unmap(&self) -> Result<()> {
+        self.unmap_range(self.ipa, self.size).map_err(|ret| check(ret).unwrap_err())
+    }
+
+    /// Unmaps the mapped pages of `[ipa, ipa + size)`, part of the slot,
+    /// from stage 2, by runs (a page with no mapping is not in stage 2).
+    /// The error is Hypervisor.framework's.
+    fn unmap_range(&self, ipa: u64, size: u64) -> std::result::Result<(), hv_return_t> {
+        let page = host_page_size();
+        let end = ipa + size;
+        let mut at = ipa;
+        while at < end {
+            if !self.mapped(self.page_index(at)) {
+                at += page;
+                continue;
+            }
+            let run = at;
+            while at < end && self.mapped(self.page_index(at)) {
+                at += page;
+            }
+            // SAFETY: unmapping a run of a slot we mapped.
+            let ret = unsafe { hv_vm_unmap(run, (at.min(end) - run) as usize) };
+            if ret != HV_SUCCESS {
+                return Err(ret);
+            }
         }
         Ok(())
     }
 
-    /// The stage-2 permissions page `ipa` should have while present.
+    /// Brings stage 2 at the host page `host` (`ipa`) to the page's
+    /// protection just stored ([`Slot::prot`]): `was_mapped` and `before`
+    /// are what it had.
+    fn follow(&self, host: u64, ipa: u64, was_mapped: bool, before: hv_memory_flags_t, missing: bool) {
+        let page = host_page_size();
+        let index = self.page_index(ipa);
+        match (was_mapped, self.mapped(index)) {
+            (true, false) => {
+                // SAFETY: unmapping one page of a slot we mapped.
+                let ret = unsafe { hv_vm_unmap(ipa, page as usize) };
+                if ret != HV_SUCCESS {
+                    // The guest would keep a page the host no longer has.
+                    eprintln!("wick: guest memory at {ipa:#x} cannot be unmapped after its host memory went (hv_vm_unmap: {ret:#x})");
+                    std::process::abort();
+                }
+            }
+            (false, true) => {
+                // SAFETY: the page's new mapping, which the hook unmaps
+                // again when it goes.
+                if let Err(e) = unsafe { self.map_run(host, ipa, page) } {
+                    eprintln!("wick: guest memory at {ipa:#x} cannot be mapped to its new host memory: {e}");
+                    std::process::abort();
+                }
+            }
+            (true, true) => {
+                let after = if missing { 0 } else { self.flags(ipa) };
+                if after != before {
+                    // A permission taken that fails ends the process; one
+                    // given that fails is the guest's next fault's error
+                    // (`stale_fault`).
+                    let _ = protect_stage2(ipa, page, after, before & !after != 0);
+                }
+            }
+            (false, false) => {}
+        }
+    }
+
+    /// The index of the host page holding `ipa`, which the slot holds.
+    fn page_index(&self, ipa: u64) -> usize {
+        ((ipa - self.ipa) / host_page_size()) as usize
+    }
+
+    /// Whether the host page at `index` is mapped in stage 2: its memory
+    /// has a mapping ([`Slot::prot`]).
+    fn mapped(&self, index: usize) -> bool {
+        self.prot[index] >= 0
+    }
+
+    /// Maps `[host, host + size)`, part of the slot's memory, at `ipa` with
+    /// the permissions its pages have ([`Slot::flags`]; none for a page a
+    /// userfaultfd has not filled). Pages with no mapping
+    /// ([`Slot::prot`] -1) are left unmapped: Hypervisor.framework maps
+    /// the physical pages behind a host range, and there are none.
+    ///
+    /// # Safety
+    /// The mapped pages of the host range must stay mapped while the slot
+    /// exists, or until [`guest_protected`] unmaps them.
+    unsafe fn map(&self, host: u64, ipa: u64, size: u64) -> Result<()> {
+        let page = host_page_size();
+        let mut off = 0;
+        while off < size {
+            if !self.mapped(self.page_index(ipa + off)) {
+                off += page;
+                continue;
+            }
+            let run = off;
+            while off < size && self.mapped(self.page_index(ipa + off)) {
+                off += page;
+            }
+            // SAFETY: the caller's contract, for a run of mapped pages.
+            unsafe { self.map_run(host + run, ipa + run, off.min(size) - run) }?;
+        }
+        Ok(())
+    }
+
+    /// [`Slot::map`] of a run of pages that all have a mapping: each run of
+    /// pages with the same permissions is mapped with them
+    /// ([`Slot::flags`], none for a page a userfaultfd has not filled), so
+    /// no page is ever mapped with more than it is to have, not even for
+    /// the time between a map and a protect (a running vCPU could store to
+    /// a page the host made read-only, or reach a page not filled, in
+    /// between). Hypervisor.framework maps a range with no permission at all
+    /// too: a guest access to it is a stage-2 fault
+    /// (`test_a_page_mapped_with_no_permission_faults_and_takes_its_permissions_later`).
+    ///
+    /// # Safety
+    /// As [`Slot::map`].
+    unsafe fn map_run(&self, host: u64, ipa: u64, size: u64) -> Result<()> {
+        let page = host_page_size();
+        let flags_at = |off: u64| {
+            if libc::wick_uffd::is_missing(host + off) {
+                0
+            } else {
+                self.flags(ipa + off)
+            }
+        };
+        let mut off = 0;
+        while off < size {
+            let (run, flags) = (off, flags_at(off));
+            off += page;
+            while off < size && flags_at(off) == flags {
+                off += page;
+            }
+            // SAFETY: the caller's contract, for a run of the range.
+            check(unsafe { hv_vm_map((host + run) as *mut _, ipa + run, (off.min(size) - run) as usize, flags) })?;
+        }
+        Ok(())
+    }
+
+    /// The stage-2 permissions page `ipa` should have while present: the
+    /// slot's (read-only for a read-only slot, and until written for a
+    /// dirty-tracked page) and no more than its host protection allows
+    /// ([`host_flags`]).
     fn flags(&self, ipa: u64) -> hv_memory_flags_t {
+        let index = self.page_index(ipa);
+        host_flags(self.prot[index], self.wrote(index)) & self.slot_flags(index)
+    }
+
+    /// Whether the guest wrote the host page at `index` since its
+    /// protection was last read ([`Slot::wrote`]).
+    fn wrote(&self, index: usize) -> bool {
+        self.wrote[index / 64] & (1 << (index % 64)) != 0
+    }
+
+    /// The slot's own permissions for the host page at `index`.
+    fn slot_flags(&self, index: usize) -> hv_memory_flags_t {
         if self.readonly {
             return RX;
         }
         match &self.dirty {
             Some(bitmap) => {
-                let index = (ipa - self.ipa) / host_page_size();
-                if bitmap[(index / 64) as usize].load(Ordering::Acquire) & (1 << (index % 64)) != 0
-                {
+                if bitmap[index / 64].load(Ordering::Acquire) & (1 << (index % 64)) != 0 {
                     RWX
                 } else {
                     RX
@@ -415,7 +812,67 @@ impl Slot {
     }
 }
 
+/// What a guest abort at a slot's page is to its host protection
+/// ([`VmInner::host_fault`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HostFault {
+    /// Not the host protection's: the userfaultfd's, dirty tracking's, MMIO.
+    Pass,
+    /// The page was mapped for the access: run the instruction again.
+    Retry,
+    /// The host protection refuses the access: `KVM_RUN` ends with `EFAULT`.
+    Refused,
+}
+
 impl VmInner {
+    /// A guest abort at `ipa` (`write`, `instruction`) checked against the
+    /// host protection of the page, as KVM's stage-2 fault takes the page
+    /// through the vma (arch/arm64/kvm/mmu.c, v6.12, `user_mem_abort`
+    /// :1573 to :1580; mm/gup.c `check_vma_flags`: a write with no
+    /// `VM_WRITE` :1285 to :1287, a read with no `VM_READ` :1303 to :1305; a
+    /// page with no vma :1464 to :1466), in KVM's order: a write to a
+    /// read-only slot is MMIO first (mmu.c :1839), and the refusal comes
+    /// before the page is faulted in (`handle_mm_fault`), so a refused access
+    /// to a page a userfaultfd has not filled posts no event. A permitted
+    /// write to a page the host made write-only maps it readable too, as
+    /// KVM's write fault does (mmu.c :1441, :1659 to :1660), until the next
+    /// mprotect ([`Slot::wrote`]); an instruction fetch from it is still a
+    /// read GUP refuses.
+    pub(crate) fn host_fault(&self, ipa: u64, write: bool, instruction: bool) -> Result<HostFault> {
+        let mut memory = self.memory_mapped(ipa);
+        let Some(slot) = memory.slot_at_mut(ipa) else {
+            return Ok(HostFault::Pass);
+        };
+        if write && slot.readonly {
+            return Ok(HostFault::Pass);
+        }
+        let index = slot.page_index(ipa);
+        let prot = c_int::from(slot.prot[index]);
+        if prot < 0 {
+            return Ok(HostFault::Refused);
+        }
+        let wrote = slot.wrote(index);
+        let allowed = if write {
+            prot & libc::PROT_WRITE != 0
+        } else {
+            prot & libc::PROT_READ != 0 || (wrote && !instruction && prot & libc::PROT_WRITE != 0)
+        };
+        if !allowed {
+            return Ok(HostFault::Refused);
+        }
+        if write && prot & libc::PROT_READ == 0 && !wrote {
+            slot.wrote[index / 64] |= 1 << (index % 64);
+            let page = host_page_size();
+            let ipa = ipa - (ipa - slot.ipa) % page;
+            if !libc::wick_uffd::is_missing(slot.host + (ipa - slot.ipa)) {
+                // Gives read and write: a failure is `KVM_RUN`'s error.
+                protect_stage2(ipa, page, slot.flags(ipa), false)?;
+            }
+            return Ok(HostFault::Retry);
+        }
+        Ok(HostFault::Pass)
+    }
+
     /// The host address of guest RAM at `ipa`.
     pub(crate) fn ram_host_addr(&self, ipa: u64) -> Option<u64> {
         let memory = self.memory.lock().unwrap();
@@ -454,28 +911,30 @@ impl VmInner {
     /// A guest fault on RAM whose page allows the access (a permission change
     /// raced with the fault): restores the page's permissions. Returns false
     /// if `ipa` is not RAM or the access is not allowed (e.g. a write to a
-    /// read-only slot, which is MMIO as on KVM).
-    pub(crate) fn stale_fault(&self, ipa: u64, write: bool) -> bool {
+    /// read-only slot, which is MMIO as on KVM). A protect that fails is the
+    /// error, which `KVM_RUN` returns, not a fault retried for good.
+    pub(crate) fn stale_fault(&self, ipa: u64, write: bool) -> Result<bool> {
         let memory = self.memory_mapped(ipa);
         let Some(slot) = memory.slot_at(ipa) else {
-            return false;
+            return Ok(false);
         };
         let page = host_page_size();
         let ipa = ipa - (ipa - slot.ipa) % page;
         if libc::wick_uffd::is_missing(slot.host + (ipa - slot.ipa)) {
-            return false;
+            return Ok(false);
         }
         let flags = slot.flags(ipa);
         if write && flags & HV_MEMORY_WRITE == 0 {
-            return false;
+            return Ok(false);
         }
-        // SAFETY: restores the permissions of one page of a slot we mapped.
-        unsafe { hv_vm_protect(ipa, page as usize, flags) == HV_SUCCESS }
+        protect_stage2(ipa, page, flags, false)?;
+        Ok(true)
     }
 
     /// Handles a guest write fault on dirty-tracked memory: marks the page
-    /// dirty and makes it writable. Returns false if `ipa` is not tracked memory.
-    pub(crate) fn dirty_fault(&self, ipa: u64) -> bool {
+    /// dirty and makes it writable. Returns false if `ipa` is not tracked
+    /// memory; a protect that fails is the error, which `KVM_RUN` returns.
+    pub(crate) fn dirty_fault(&self, ipa: u64) -> Result<bool> {
         let memory = self.memory_mapped(ipa);
         let page = host_page_size();
         for slot in memory.slots.values() {
@@ -486,14 +945,17 @@ impl VmInner {
             let index = (ipa - slot.ipa) / page;
             if libc::wick_uffd::is_missing(slot.host + index * page) {
                 // Not filled yet: the userfaultfd resolves the fault first.
-                return false;
+                return Ok(false);
             }
             bitmap[(index / 64) as usize].fetch_or(1 << (index % 64), Ordering::AcqRel);
-            // SAFETY: re-protecting one page of a range we mapped.
-            return unsafe { hv_vm_protect(slot.ipa + index * page, page as usize, RWX) }
-                == HV_SUCCESS;
+            // The page's permissions now: written, so the slot's are RWX,
+            // and no more than the host protection allows (checked before,
+            // `host_fault`).
+            let flags = slot.flags(slot.ipa + index * page);
+            protect_stage2(slot.ipa + index * page, page, flags, false)?;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 
     /// Writes guest RAM at `ipa` from the hypervisor's side, as KVM's
@@ -502,13 +964,33 @@ impl VmInner {
     /// page a userfaultfd has not filled is waited for (KVM's copy_to_user
     /// faults it in), and a dirty-tracked page is marked dirty
     /// (mark_page_dirty). `None` if `ipa` is not writable RAM (a read-only
-    /// slot: KVM_HVA_ERR_RO_BAD).
-    pub(crate) fn write_guest<R>(&self, ipa: u64, len: usize, f: impl FnOnce(*mut u8) -> R) -> Option<R> {
+    /// slot: KVM_HVA_ERR_RO_BAD), or if the host protection refuses the
+    /// access (a store, and a load first when `read`), which KVM's
+    /// `kvm_put_guest` and `kvm_get_guest` fail with `EFAULT` and the
+    /// stolen-time update then skips (arch/arm64/kvm/pvtime.c, v6.12, :26
+    /// and :30; `kvm_init_stolen_time` ignores its write's result, :65):
+    /// here the store would take the host's fault and end the VMM.
+    ///
+    /// Not as Linux: the check and the store are not one step against a host
+    /// `mprotect` or `munmap` of the page on another thread. Its system call
+    /// can land between them (the hook that updates [`Slot::prot`] waits for
+    /// the memory lock this holds), and the store then takes the host's fault
+    /// and ends the VMM, where Linux's `put_user` returns `EFAULT`. It is
+    /// never a store the host refused that lands. Reaching it needs the VMM
+    /// itself to `mprotect` or `munmap` guest RAM in a live slot while a vCPU
+    /// runs, which Firecracker does not (SECURITY.md, the host protection
+    /// entry; a `MAP_FIXED` replacement is waited for above); closing it
+    /// needs a store that can be refused (a fault-catching copy).
+    pub(crate) fn write_guest<R>(&self, ipa: u64, len: usize, read: bool, f: impl FnOnce(*mut u8) -> R) -> Option<R> {
         let page = host_page_size();
         debug_assert!(ipa % page + len as u64 <= page);
         loop {
             let memory = self.memory_mapped(ipa);
             let slot = memory.slot_at(ipa).filter(|s| !s.readonly)?;
+            let prot = c_int::from(slot.prot[slot.page_index(ipa)]);
+            if prot < 0 || prot & libc::PROT_WRITE == 0 || (read && prot & libc::PROT_READ == 0) {
+                return None;
+            }
             let host = slot.host + (ipa - slot.ipa);
             if libc::wick_uffd::is_missing(host) {
                 drop(memory);
@@ -762,10 +1244,12 @@ impl VmInner {
         if let Some(kicker) = self.pvtime_kicker.get() {
             kicker.stop();
         }
-        for (_, slot) in self.memory.lock().unwrap().slots.drain() {
-            // SAFETY: unmapping a range we mapped.
-            unsafe { hv_vm_unmap(slot.ipa, slot.size as usize) };
+        let mut memory = self.memory.lock().unwrap();
+        for (_, slot) in memory.slots.drain() {
+            let _ = slot.unmap();
         }
+        set_bound(&memory);
+        drop(memory);
         // SAFETY: destroys the process VM; fails if vCPUs are still alive.
         if unsafe { hv_vm_destroy() } != HV_SUCCESS {
             PENDING_DESTROY.store(true, Ordering::Release);
@@ -897,6 +1381,7 @@ impl VmFd {
         libc::wick_guest::set_hooks(libc::wick_guest::Hooks {
             stage2: uffd_stage2,
             replace: guest_replace,
+            protected: guest_protected,
         });
         let mut vm = VmFd {
             inner,
@@ -935,14 +1420,41 @@ impl VmFd {
         if region.flags & !(KVM_MEM_READONLY | KVM_MEM_LOG_DIRTY_PAGES) != 0 {
             return err(libc::EINVAL);
         }
-        let mut memory = self.inner.memory_settled();
-        if let Some(slot) = memory.slots.remove(&region.slot) {
-            // SAFETY: unmapping a range we mapped.
-            check(unsafe { hv_vm_unmap(slot.ipa, slot.size as usize) })?;
-        }
         if region.memory_size == 0 {
+            let mut memory = self.inner.memory_settled();
+            if let Some(slot) = memory.slots.remove(&region.slot) {
+                slot.unmap()?;
+            }
+            set_bound(&memory);
             return Ok(());
         }
+        let page = host_page_size();
+        let host_end = (region.userspace_addr + region.memory_size).next_multiple_of(page);
+        libc::wick_uffd::host_protections(region.userspace_addr, host_end, |read| {
+            #[cfg(test)]
+            before_protection_read();
+            let mut memory = self.inner.memory_settled();
+            // The span under the lock that the read and the insert hold, then
+            // the read (`BOUND_LOW`): an mprotect whose hook missed the new
+            // span made its system call before this read.
+            widen_bound(region.userspace_addr, region.userspace_addr + region.memory_size);
+            // Read under the lock that inserts the slot: a protection hook
+            // that ran before found no slot and changed nothing, so its
+            // change is what this reads (`host_protections`).
+            let prot = read();
+            #[cfg(test)]
+            after_slot_read();
+            if let Some(slot) = memory.slots.remove(&region.slot) {
+                slot.unmap()?;
+            }
+            let result = self.add_slot(&mut memory, region, prot);
+            set_bound(&memory);
+            result
+        })
+    }
+
+    /// Makes slot `region.slot` with `prot`, its pages' host protection.
+    fn add_slot(&self, memory: &mut Memory, region: kvm_userspace_memory_region, prot: Vec<i8>) -> Result<()> {
         let readonly = region.flags & KVM_MEM_READONLY != 0;
         // Dirty tracking only concerns writable memory (writes to read-only
         // slots exit as MMIO, as on KVM).
@@ -953,12 +1465,15 @@ impl VmFd {
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect()
         });
+        let pages = prot.len();
         let slot = Slot {
             ipa: region.guest_phys_addr,
             size: region.memory_size,
             host: region.userspace_addr,
             readonly,
             dirty,
+            prot,
+            wrote: vec![0; pages.div_ceil(64)],
         };
         // SAFETY: the caller guarantees the host range is valid for the slot's lifetime.
         unsafe { slot.map(region.userspace_addr, region.guest_phys_addr, region.memory_size) }?;
@@ -1048,14 +1563,23 @@ impl VmFd {
                 let j = b.trailing_zeros() as u64;
                 b &= b - 1;
                 let offset = (i as u64 * 64 + j) * page;
-                // A page a userfaultfd no longer has (released since) stays inaccessible.
+                // A page a userfaultfd no longer has (released since) stays
+                // inaccessible; one with no mapping is not in stage 2.
+                if !s.mapped((offset / page) as usize) {
+                    continue;
+                }
                 let flags = if libc::wick_uffd::is_missing(s.host + offset) {
                     0
                 } else {
-                    RX
+                    // The page's flags with its dirty bit clear: the slot's
+                    // read and execute, within its host protection (a
+                    // write-only page the guest wrote stays readable, as
+                    // `Slot::flags` has it).
+                    let index = (offset / page) as usize;
+                    RX & host_flags(s.prot[index], s.wrote(index))
                 };
-                // SAFETY: write-protecting one page of a range we mapped.
-                check(unsafe { hv_vm_protect(s.ipa + offset, page as usize, flags) })?;
+                // Write-protecting: a reduction.
+                protect_stage2(s.ipa + offset, page, flags, true)?;
             }
             bits = word.fetch_and(!bits, Ordering::AcqRel) & bits;
             out[i] = bits;
@@ -2035,7 +2559,6 @@ mod tests {
     /// vma now allows. The control: the same store before the host protects
     /// the page.
     #[test]
-    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
     fn test_a_guest_access_the_host_protection_refuses_is_efault() {
         let (_vm, mut vcpu, mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
         let page = host_page_size();
@@ -2108,7 +2631,6 @@ mod tests {
     /// refused and `KVM_RUN` ends with `EFAULT` (:1303 to :1305 refuse, mmu.c
     /// :1579 to :1580); after an mprotect back the code runs again.
     #[test]
-    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
     fn test_a_guest_executes_from_a_host_read_only_page() {
         let (_vm, mut vcpu, mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
         let page = host_page_size();
@@ -2141,12 +2663,21 @@ mod tests {
     /// stage 2 and flushes its TLB entries) and the next fault's write is
     /// refused (mm/gup.c `check_vma_flags` :1285 to :1287): a vCPU running a
     /// loop that increments a word, the host makes the word's page
-    /// `PROT_READ`; after that returned the word does not change over 50 ms,
-    /// and `KVM_RUN` ends with `EFAULT`. The control: the word changes over
-    /// 50 ms before the mprotect. A run that has not ended after 10 s is
-    /// kicked, and so reports `EINTR`.
+    /// `PROT_READ`; after that returned the word does not change, and
+    /// `KVM_RUN` ends with `EFAULT`. The first round reads the word again
+    /// 50 ms after the call, the control being that it changed over 50 ms
+    /// before it; then [`MPROTECT_ROUNDS`] more rounds (the page made
+    /// writable again, the run started again from the refused store, the
+    /// word seen to move, the page made `PROT_READ`, the word read when the
+    /// call returned and again once the run has ended); the line gives the
+    /// rounds made. Each run must leave `hv_vcpu_run` once only, for the
+    /// refused store: no cancel, no timer exit and no other fault, so that
+    /// the change reached the running vCPU and was not taken up at an entry
+    /// the test did not cause (the loop makes no exit of its own, so a change
+    /// applied only at the next entry would never stop the stores). Bounded
+    /// by rounds, not time: a wait has a 10 s bound only so that a hang fails
+    /// (a run not ended by then is kicked, and so reports `EINTR`).
     #[test]
-    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
     fn test_no_guest_store_lands_after_a_host_mprotect_returned() {
         extern "C" fn nothing(_: libc::c_int) {}
         // SAFETY: a handler that does nothing.
@@ -2160,6 +2691,156 @@ mod tests {
         let mut kicker = unsafe {
             vm.create_vcpu_from_rawfd(libc::dup(std::os::unix::io::AsRawFd::as_raw_fd(&vcpu))).unwrap()
         };
+        let returns = vcpu.run_returns_for_test();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            // SAFETY: plain call.
+            tid_tx.send(unsafe { libc::pthread_self() } as usize).unwrap();
+            while go_rx.recv().is_ok() {
+                vcpu.set_kvm_immediate_exit(0);
+                let (all, other) = returns();
+                let ran = match vcpu.run() {
+                    Ok(exit) => Ok(format!("{exit:?}")),
+                    Err(e) => Err(e.errno()),
+                };
+                let (all_after, other_after) = returns();
+                // The run's returns from hv_vcpu_run: all, not an exception.
+                done_tx.send((ran, all_after - all, other_after - other)).unwrap();
+            }
+        });
+        let thread = tid_rx.recv().unwrap() as libc::pthread_t;
+        let at = mem as u64 + page;
+        // SAFETY: the counter's page, not the code's.
+        let counter = unsafe { mem.add(page as usize) };
+        let mut end_run = || {
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| loop {
+                kicker.set_kvm_immediate_exit(1);
+                // SAFETY: a live thread of this process.
+                unsafe { libc::pthread_kill(thread, libc::SIGUSR2) };
+                if let Ok(ran) = done_rx.recv_timeout(Duration::from_millis(1)) {
+                    break ran;
+                }
+            })
+        };
+        // The refused store's return alone.
+        let once = |ran: &(std::result::Result<String, i32>, u64, u64)| ran.0 == Err(libc::EFAULT) && ran.1 == 1 && ran.2 == 0;
+        let moved_from = |from: u64| {
+            let started = Instant::now();
+            while word(at) == from && started.elapsed() < Duration::from_secs(10) {
+                std::hint::spin_loop();
+            }
+            word(at) != from
+        };
+        go_tx.send(()).unwrap();
+        assert!(moved_from(0), "the guest did not start incrementing within 10 s");
+        let before = word(at);
+        std::thread::sleep(Duration::from_millis(50));
+        let control = word(at);
+        protect(counter, page, libc::PROT_READ);
+        let after = word(at);
+        std::thread::sleep(Duration::from_millis(50));
+        let later = word(at);
+        let ran = end_run();
+        assert!(before != 0 && control != before, "the control: the word was {before}, then {control} 50 ms later");
+        assert!(
+            after == later && once(&ran),
+            "after the mprotect returned the word was {after}, then {later} 50 ms later; the run (its result, \
+             its returns from hv_vcpu_run, those not an exception): {ran:?}"
+        );
+        let mut rounds = 0;
+        for round in 1..=MPROTECT_ROUNDS {
+            protect(counter, page, libc::PROT_READ | libc::PROT_WRITE);
+            let from = word(at);
+            go_tx.send(()).unwrap();
+            assert!(moved_from(from), "round {round}: the guest did not go on within 10 s");
+            protect(counter, page, libc::PROT_READ);
+            let after = word(at);
+            let ran = end_run();
+            let later = word(at);
+            assert!(
+                after == later && once(&ran),
+                "round {round}: after the mprotect returned the word was {after}, then {later} once the run \
+                 ended; the run (its result, its returns from hv_vcpu_run, those not an exception): {ran:?}"
+            );
+            rounds = round;
+        }
+        drop(go_tx);
+        runner.join().unwrap();
+        println!(
+            "no guest store after the mprotect returned: the 50 ms round and {rounds} rounds more, each run left \
+             hv_vcpu_run once, for the refused store"
+        );
+    }
+
+    /// The rounds [`test_no_guest_store_lands_after_a_host_mprotect_returned`]
+    /// makes after its first.
+    const MPROTECT_ROUNDS: u32 = 300;
+
+    /// A second mapping of the physical page behind `at` (one host page),
+    /// shared with it: it keeps the page after `at` is given another.
+    fn second_mapping(at: u64) -> u64 {
+        unsafe extern "C" {
+            fn mach_vm_remap(
+                target: u32,
+                address: *mut u64,
+                size: u64,
+                mask: u64,
+                flags: c_int,
+                src: u32,
+                src_address: u64,
+                copy: c_int,
+                cur: *mut c_int,
+                max: *mut c_int,
+                inheritance: u32,
+            ) -> c_int;
+            static mach_task_self_: u32;
+        }
+        let (mut alias, mut cur, mut max) = (0u64, 0, 0);
+        // SAFETY: maps one page of the test's memory again, anywhere
+        // (VM_FLAGS_ANYWHERE), shared (copy 0).
+        let kr = unsafe {
+            mach_vm_remap(mach_task_self_, &mut alias, host_page_size(), 0, 1, mach_task_self_, at, 0, &mut cur, &mut max, 1)
+        };
+        assert_eq!(kr, 0, "mach_vm_remap");
+        alias
+    }
+
+    /// No guest store lands on the old pages after a discard returned, as on
+    /// Linux, where `MADV_DONTNEED` zaps the pages and the MMU notifier
+    /// invalidates the secondary mappings before it returns (mm/madvise.c,
+    /// v6.12, `madvise_dontneed_single_vma`; mm/memory.c `zap_page_range_single`
+    /// brackets the zap with `mmu_notifier_invalidate_range_start`/`_end`): a
+    /// vCPU increments a word, the host discards its page; after that
+    /// returned, the old page, read through a second mapping of it, does not
+    /// change over 50 ms, and the new page does (the guest goes on there).
+    /// The control: the old page changes over 50 ms before the discard. The
+    /// run leaves `hv_vcpu_run` for nothing before the discard, and after it
+    /// only for faults (the discard's window) until the test's kick at the
+    /// end: no cancel and no timer exit, so the change reached the running
+    /// vCPU and was not taken up at an entry the test did not cause (the loop
+    /// makes no exit of its own).
+    #[test]
+    fn test_no_guest_store_lands_on_old_pages_after_a_discard_returned() {
+        extern "C" fn nothing(_: libc::c_int) {}
+        // SAFETY: a handler that does nothing.
+        unsafe { libc::signal(libc::SIGUSR2, nothing as *const () as libc::sighandler_t) };
+        let (vm, mut vcpu, mem, _len) = vm_with_memory(1, &INCREMENT);
+        let page = host_page_size();
+        for (id, v) in [(PC, GUEST_BASE), (PSTATE, 0x3c5), (x_reg(1), GUEST_BASE + page)] {
+            vcpu.set_one_reg(id, &v.to_le_bytes()).unwrap();
+        }
+        let at = mem as u64 + page;
+        // SAFETY: the counter's page, written so that it has a page to remap.
+        unsafe { std::ptr::write_volatile(at as *mut u64, 0) };
+        let old = second_mapping(at);
+        // SAFETY: dup of the vCPU's descriptor, owned by the new handle.
+        let mut kicker = unsafe {
+            vm.create_vcpu_from_rawfd(libc::dup(std::os::unix::io::AsRawFd::as_raw_fd(&vcpu))).unwrap()
+        };
+        let returns = vcpu.run_returns_for_test();
+        let r0 = returns();
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let runner = std::thread::spawn(move || {
@@ -2167,39 +2848,48 @@ mod tests {
             tid_tx.send(unsafe { libc::pthread_self() } as usize).unwrap();
             vcpu.set_kvm_immediate_exit(0);
             let ran = match vcpu.run() {
-                Ok(exit) => Ok(format!("{exit:?}")),
-                Err(e) => Err(e.errno()),
+                // The test's kick at the end (a discard's window only holds
+                // the access until the new pages are mapped).
+                Err(e) if e.errno() == libc::EINTR => Ok(()),
+                Ok(exit) => Err(format!("{exit:?}")),
+                Err(e) => Err(format!("error {e}")),
             };
             done_tx.send(ran).unwrap();
         });
         let thread = tid_rx.recv().unwrap() as libc::pthread_t;
-        let at = mem as u64 + page;
         let started = Instant::now();
-        while word(at) == 0 && started.elapsed() < Duration::from_secs(10) {
+        while word(old) == 0 && started.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(1));
         }
-        let before = word(at);
+        let c0 = word(old);
         std::thread::sleep(Duration::from_millis(50));
-        let control = word(at);
-        // SAFETY: the counter's page, not the code's.
-        protect(unsafe { mem.add(page as usize) }, page, libc::PROT_READ);
-        let after = word(at);
+        let c1 = word(old);
+        let r1 = returns();
+        // SAFETY: the counter's page.
+        assert_eq!(unsafe { libc::madvise(at as *mut _, page as usize, libc::MADV_DONTNEED) }, 0);
+        let o0 = word(old);
+        let n0 = word(at);
         std::thread::sleep(Duration::from_millis(50));
-        let later = word(at);
-        let ran = done_rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| loop {
+        let (o1, n1) = (word(old), word(at));
+        let r2 = returns();
+        let ran = loop {
             kicker.set_kvm_immediate_exit(1);
             // SAFETY: a live thread of this process.
             unsafe { libc::pthread_kill(thread, libc::SIGUSR2) };
             if let Ok(ran) = done_rx.recv_timeout(Duration::from_millis(1)) {
                 break ran;
             }
-        });
+        };
         runner.join().unwrap();
-        assert!(before != 0 && control != before, "the control: the word was {before}, then {control} 50 ms later");
-        assert!(
-            after == later && ran == Err(libc::EFAULT),
-            "after the mprotect returned the word was {after}, then {later} 50 ms later; the run: {ran:?}"
-        );
+        // SAFETY: the second mapping, the test's.
+        unsafe { libc::munmap(old as *mut _, page as usize) };
+        assert!(c0 != 0 && c1 != c0, "the control: the old page was {c0}, then {c1} 50 ms later");
+        assert_eq!(ran, Ok(()), "the run");
+        assert_eq!(o0, o1, "a guest store landed on the old page after the discard returned");
+        assert!(n1 != n0, "the guest did not go on on the new page: {n0}, then {n1}");
+        assert_eq!(r1, r0, "the run left hv_vcpu_run before the discard (its returns, those not an exception)");
+        assert_eq!(r2.1, r0.1, "the run left hv_vcpu_run other than for a fault before the test's kick");
+        println!("the run left hv_vcpu_run {} times for a fault after the discard, for nothing else", r2.0 - r1.0);
     }
 
     /// A memory slot made over host memory that is `PROT_READ` gives the
@@ -2209,7 +2899,6 @@ mod tests {
     /// to :1287) and `KVM_RUN` ends with `EFAULT` (arch/arm64/kvm/mmu.c :1579
     /// to :1580). The host's page keeps its contents.
     #[test]
-    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
     fn test_a_slot_over_memory_mapped_read_only_starts_read_only() {
         let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
         let extra = extra_slot(&vm, 1, 0x5a, libc::PROT_READ, 0);
@@ -2264,7 +2953,6 @@ mod tests {
     /// to read. Bounded: an event posted is answered by a fill after the
     /// mprotect back, which lets the guest go on.
     #[test]
-    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
     fn test_a_refused_access_to_a_missing_page_posts_no_event() {
         let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
         let page = host_page_size();
@@ -2328,7 +3016,6 @@ mod tests {
     /// placed") and the result line counts the attempts placed. The
     /// control: the slot's page that stays.
     #[test]
-    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
     fn test_a_guest_reaches_new_memory_mapped_where_slot_memory_was_unmapped() {
         let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
         let page = host_page_size();
@@ -2390,11 +3077,18 @@ mod tests {
     /// the write fault maps the page readable as well as writable
     /// (arch/arm64/kvm/mmu.c :1441 `KVM_PGTABLE_PROT_R` always, :1659 to
     /// :1660 W); an mprotect to `PROT_WRITE` again invalidates that mapping,
-    /// and a load is `EFAULT` again.
+    /// and a load is `EFAULT` again. The host's own access to such a page is
+    /// read and write (arm64's page tables have no write-only permission, so
+    /// the host's load reads it); the rule the test holds the guest to is
+    /// the vma's, which has no `VM_READ`. With dirty tracking the same: a
+    /// written page's flags with its dirty bit clear, which
+    /// `get_dirty_log` gives it, keep it readable (`Slot::flags`, one rule),
+    /// so the guest's load after a dirty-log read gets the value (a page
+    /// given less would only cost a fault, which `stale_fault` heals; no
+    /// guest result shows that difference).
     #[test]
-    #[ignore = "fails until stage 2 follows the host's protection of guest memory (SECURITY.md, Not at parity yet: \"macOS: stage 2 does not follow the host's protection of guest memory yet\")"]
     fn test_a_write_only_host_page_is_readable_by_the_guest_after_its_write() {
-        let (_vm, mut vcpu, mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let (vm, mut vcpu, mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
         let page = host_page_size();
         // SAFETY: a page of the test's mapping, not the code's.
         let one = unsafe { mem.add(page as usize) };
@@ -2416,7 +3110,325 @@ mod tests {
         if got != Err(libc::EFAULT) {
             wrong.push(format!("the load after PROT_WRITE again: {got:?}"));
         }
+        let extra = extra_slot(&vm, 1, 0, libc::PROT_WRITE, KVM_MEM_LOG_DIRTY_PAGES);
+        for (what, pc, value, expected) in [
+            ("dirty-tracked: the first load", load, 0, Err(libc::EFAULT)),
+            ("dirty-tracked: the store", store, 6, Ok(Some(6))),
+        ] {
+            let got = access(&mut vcpu, pc, EXTRA, value);
+            if got != expected {
+                wrong.push(format!("{what}: {got:?}, not {expected:?}"));
+            }
+        }
+        let log = vm.get_dirty_log(1, page as usize).unwrap();
+        if log.first() != Some(&1) {
+            wrong.push(format!("dirty-tracked: the log {log:?}, not the page written"));
+        }
+        let got = access(&mut vcpu, load, EXTRA, 0);
+        if got != Ok(Some(6)) {
+            wrong.push(format!("dirty-tracked: the load after the dirty-log read: {got:?}"));
+        }
+        // SAFETY: the test's mapping.
+        unsafe { libc::munmap(extra as *mut _, page as usize) };
         assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// Two `mprotect`s of the same slot page, each of whose hooks runs after
+    /// its own call returned, leave stage 2 with the protection the host
+    /// has: one making the page read and write, whose hook is held after
+    /// `wick_uffd`'s count and before the memory lock (the test hook
+    /// `BEFORE_PROTECTION_READ`), and inside that hold a whole second one
+    /// making it read-only, hook included. The first hook then reads the
+    /// protection under the memory lock and stores read-only, as Linux's
+    /// mprotect does both the change and the invalidation under the mmap
+    /// write lock (mm/mprotect.c, v6.12): a guest store is `EFAULT` and the
+    /// host's page keeps its word. Read before the lock, the first hook
+    /// would store read and write last, after the read-only call returned.
+    #[test]
+    fn test_the_protection_stored_last_is_the_one_the_host_has() {
+        let (_vm, mut vcpu, mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        // SAFETY: a page of the test's mapping, not the code's.
+        let one = unsafe { mem.add(page as usize) } as usize;
+        protect(one as *mut _, page, libc::PROT_READ);
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        *BEFORE_PROTECTION_READ.lock().unwrap() = Some(Box::new(move || {
+            protect(one as *mut _, page, libc::PROT_READ);
+            r.store(true, Ordering::SeqCst);
+        }));
+        protect(one as *mut _, page, libc::PROT_READ | libc::PROT_WRITE);
+        // The page read and write, as the first call made it, then read-only
+        // by the second, inside the first's hook.
+        assert!(ran.load(Ordering::SeqCst), "the second mprotect did not run inside the first's hook");
+        let store = access(&mut vcpu, GUEST_BASE, GUEST_BASE + page, 7);
+        assert_eq!(store, Err(libc::EFAULT), "a guest store after both mprotects returned, the host read-only");
+        assert_eq!(word(one as u64), 0, "the host's page");
+    }
+
+    /// A memory slot made while an `mprotect` of its memory runs takes the
+    /// protection that call left: the slot's protection is read under the
+    /// lock that inserts it, after the hook of an `mprotect` that ran first
+    /// (and found no slot, so changed nothing) returned. Here the slot's
+    /// read is held after `wick_uffd`'s count and before the memory lock
+    /// (`BEFORE_PROTECTION_READ`) while a whole `mprotect` makes the memory
+    /// read-only: a guest store to the new slot is `EFAULT` and the host's
+    /// page keeps its contents. Read before the lock, the slot would be
+    /// made writable over read-only memory.
+    #[test]
+    fn test_a_slot_made_while_an_mprotect_runs_takes_its_protection() {
+        let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        // SAFETY: a fresh anonymous mapping, kept for the test.
+        let extra = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        } as usize;
+        assert_ne!(extra as *mut libc::c_void, libc::MAP_FAILED);
+        // SAFETY: the mapping just made.
+        unsafe { std::ptr::write_bytes(extra as *mut u8, 0x5a, page as usize) };
+        *BEFORE_PROTECTION_READ.lock().unwrap() = Some(Box::new(move || protect(extra as *mut _, page, libc::PROT_READ)));
+        let region = kvm_userspace_memory_region {
+            slot: 1,
+            guest_phys_addr: EXTRA,
+            memory_size: page,
+            userspace_addr: extra as u64,
+            flags: 0,
+        };
+        // SAFETY: the mapping stays for the test.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+        assert!(BEFORE_PROTECTION_READ.lock().unwrap().is_none(), "the mprotect did not run inside the slot's read");
+        let store = access(&mut vcpu, GUEST_BASE, EXTRA, 7);
+        assert_eq!(store, Err(libc::EFAULT), "a guest store to the new slot over memory made read-only");
+        assert_eq!(word(extra as u64), 0x5a5a_5a5a_5a5a_5a5a, "the host's page");
+        // SAFETY: the test's mapping.
+        unsafe { libc::munmap(extra as *mut _, page as usize) };
+    }
+
+    /// Memory mapped where slot memory was unmapped, before the unmap's
+    /// protection hook ran, reaches the guest: the host unmaps a page of a
+    /// slot, and between that munmap's system call and its hook another
+    /// thread maps a new page by a hint at the same address (its own hook
+    /// runs whole there); once both calls returned the guest reads the new
+    /// page, as on Linux, where munmap zaps the old pages before it returns
+    /// (mm/vma.c, v6.12, `unmap_vmas` :1095) and the guest's next fault
+    /// takes the new vma's page. A protection read cannot tell the new
+    /// mapping from the old one (both read and write), so the hook is told
+    /// that the pages may have been replaced. The hint may be given another
+    /// address (retried; the line says how often it was placed).
+    #[test]
+    fn test_memory_mapped_where_slot_memory_was_unmapped_before_its_hook_reaches_the_guest() {
+        let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        let extra = extra_slot(&vm, 2, 0x11, libc::PROT_READ | libc::PROT_WRITE, 0);
+        let load = GUEST_BASE + 16;
+        let at = extra + page;
+        assert_eq!(access(&mut vcpu, load, EXTRA + page, 0), Ok(Some(0x1111_1111_1111_1111)), "the control");
+        let map = move |fixed: bool, fill: u8| -> u64 {
+            let flags = libc::MAP_ANON | libc::MAP_PRIVATE | if fixed { libc::MAP_FIXED } else { 0 };
+            // SAFETY: at a hole of the test's mapping, or anywhere the kernel puts it.
+            let p = unsafe {
+                libc::mmap(at as *mut _, page as usize, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0)
+            };
+            assert_ne!(p, libc::MAP_FAILED);
+            // SAFETY: the page just mapped.
+            unsafe { std::ptr::write_bytes(p.cast::<u8>(), fill, page as usize) };
+            p as u64
+        };
+        let (mut placed, mut elsewhere) = (false, Vec::new());
+        for _ in 0..8 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            *BEFORE_PROTECTED.lock().unwrap() = Some((
+                at,
+                Box::new(move || {
+                    let p = std::thread::spawn(move || map(false, 0x33)).join().unwrap();
+                    tx.send(p).unwrap();
+                }),
+            ));
+            // SAFETY: a page of the test's slot memory.
+            assert_eq!(unsafe { libc::munmap(at as *mut _, page as usize) }, 0);
+            let p = rx.recv_timeout(Duration::from_secs(10)).expect("the hook did not run");
+            if p == at {
+                placed = true;
+                break;
+            }
+            println!("not placed: the hint {at:#x} gave {p:#x}");
+            elsewhere.push(p);
+            // The slot's page again, for the next attempt.
+            assert_eq!(map(true, 0x11), at);
+        }
+        println!("the hint: {} of {} attempts placed", u32::from(placed), u32::from(placed) + elsewhere.len() as u32);
+        let got = placed.then(|| access(&mut vcpu, load, EXTRA + page, 0));
+        for p in elsewhere {
+            // SAFETY: the test's mappings.
+            unsafe { libc::munmap(p as *mut _, page as usize) };
+        }
+        // SAFETY: the test's mapping.
+        unsafe { libc::munmap(extra as *mut _, (2 * page) as usize) };
+        assert!(placed, "the hint was never placed");
+        assert_eq!(got, Some(Ok(Some(0x3333_3333_3333_3333))), "the guest's load from the page mapped again");
+    }
+
+    /// A slot made while another slot is removed and the new slot's memory
+    /// is protected takes the protection: the slot's span is widened, then
+    /// (before its protection read) another slot is removed, which sets the
+    /// span to the slots there are; after the read and before the insert,
+    /// another thread makes the new slot's memory `PROT_READ`. Its hook must
+    /// see the new slot's span and wait for the insert, so the guest's store
+    /// to the new slot is `EFAULT`. Widened outside the memory lock, the span
+    /// is narrowed again by the removal, the hook misses, and the slot keeps
+    /// the read and write the host no longer has.
+    #[test]
+    fn test_a_slot_made_while_another_is_removed_takes_a_protection_changed_meanwhile() {
+        let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        let fresh = || {
+            // SAFETY: a fresh anonymous mapping, kept for the test.
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    page as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(p, libc::MAP_FAILED);
+            p as u64
+        };
+        let (other, new) = (fresh(), fresh());
+        let region = |slot: u32, ipa: u64, at: u64, size: u64| kvm_userspace_memory_region {
+            slot,
+            guest_phys_addr: ipa,
+            memory_size: size,
+            userspace_addr: at,
+            flags: 0,
+        };
+        // SAFETY: the mapping stays for the test.
+        unsafe { vm.set_user_memory_region(region(2, EXTRA + (1 << 20), other, page)).unwrap() };
+        let vm = std::sync::Arc::new(vm);
+        let remover = vm.clone();
+        *BEFORE_PROTECTION_READ.lock().unwrap() = Some(Box::new(move || {
+            // SAFETY: removes slot 2.
+            unsafe { remover.set_user_memory_region(region(2, EXTRA + (1 << 20), other, 0)).unwrap() };
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        *AFTER_SLOT_READ.lock().unwrap() = Some(Box::new(move || {
+            std::thread::spawn(move || {
+                protect(new as *mut _, page, libc::PROT_READ);
+                tx.send(()).unwrap();
+            });
+            // Time for the mprotect's hook to end, if it does not wait.
+            std::thread::sleep(Duration::from_millis(200));
+        }));
+        // SAFETY: the mapping stays for the test.
+        unsafe { vm.set_user_memory_region(region(1, EXTRA, new, page)).unwrap() };
+        rx.recv_timeout(Duration::from_secs(10)).expect("the mprotect did not return");
+        assert!(AFTER_SLOT_READ.lock().unwrap().is_none(), "the hook did not run");
+        let store = access(&mut vcpu, GUEST_BASE, EXTRA, 7);
+        // SAFETY: the test's mappings.
+        unsafe {
+            libc::munmap(other as *mut _, page as usize);
+            libc::munmap(new as *mut _, page as usize);
+        }
+        assert_eq!(store, Err(libc::EFAULT), "a guest store to the new slot, whose memory was made read-only");
+    }
+
+    /// Hypervisor.framework maps a range with no permission at all, as
+    /// [`Slot::map`] maps a page whose host protection allows nothing: the
+    /// slot is made (`hv_vm_map` with flags 0 succeeds), a guest load from
+    /// the page is a stage-2 fault, refused by the host protection
+    /// (`EFAULT`), and once the host makes the page readable and writable
+    /// the protection hook gives it its permissions (`hv_vm_protect` of a
+    /// page mapped with none) and the guest reads it.
+    #[test]
+    fn test_a_page_mapped_with_no_permission_faults_and_takes_its_permissions_later() {
+        let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let extra = extra_slot(&vm, 1, 0x5a, libc::PROT_NONE, 0);
+        let load = GUEST_BASE + 16;
+        assert_eq!(access(&mut vcpu, load, EXTRA, 0), Err(libc::EFAULT), "a load from a page mapped with no permission");
+        protect(extra as *mut _, host_page_size(), libc::PROT_READ | libc::PROT_WRITE);
+        assert_eq!(access(&mut vcpu, load, EXTRA, 0), Ok(Some(0x5a5a_5a5a_5a5a_5a5a)), "after the host made it readable");
+        // SAFETY: the test's mapping.
+        unsafe { libc::munmap(extra as *mut _, host_page_size() as usize) };
+    }
+
+    /// An mprotect of memory outside every slot's host range costs the
+    /// protection hook two atomic loads: it takes no lock and reads nothing.
+    /// So do the process's other mappings: a thread started and joined, a
+    /// large allocation made and freed (std's own calls, the system
+    /// library's), and a 64 MiB mapping of the compatibility libc made,
+    /// protected and unmapped outside the slots (its calls are the hooked
+    /// ones). The control: an mprotect of slot memory gets past the check.
+    #[test]
+    fn test_an_mprotect_of_memory_in_no_slot_takes_no_vm_lock() {
+        let (_vm, _vcpu, mem, len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        // SAFETY: a fresh anonymous mapping, kept for the test.
+        let other = unsafe {
+            libc::mmap(std::ptr::null_mut(), page as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+        };
+        assert_ne!(other, libc::MAP_FAILED);
+        let o = other as u64;
+        assert!(o + page <= mem as u64 || o >= mem as u64 + len as u64, "the mapping is inside the slot's range");
+        let before = PROTECTED_PAST_BOUND.load(Ordering::SeqCst);
+        protect(other, page, libc::PROT_READ);
+        assert_eq!(PROTECTED_PAST_BOUND.load(Ordering::SeqCst), before, "an mprotect outside the slots");
+        std::thread::spawn(|| std::hint::black_box(1)).join().unwrap();
+        drop(std::hint::black_box(vec![1u8; 64 << 20]));
+        let big = 64usize << 20;
+        // SAFETY: a fresh anonymous mapping, unmapped below.
+        let m = unsafe {
+            libc::mmap(std::ptr::null_mut(), big, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+        };
+        assert_ne!(m, libc::MAP_FAILED);
+        protect(m, big as u64, libc::PROT_READ);
+        // SAFETY: the mapping just made.
+        assert_eq!(unsafe { libc::munmap(m, big) }, 0);
+        assert_eq!(
+            PROTECTED_PAST_BOUND.load(Ordering::SeqCst),
+            before,
+            "a thread, a large allocation, a 64 MiB mapping's mmap, mprotect and munmap outside the slots"
+        );
+        // SAFETY: a page of the slot's memory, not the code's.
+        protect(unsafe { mem.add(page as usize) }, page, libc::PROT_READ);
+        assert_eq!(PROTECTED_PAST_BOUND.load(Ordering::SeqCst), before + 1, "the control: an mprotect of slot memory");
+        // SAFETY: the test's mapping.
+        unsafe { libc::munmap(other, page as usize) };
+    }
+
+    /// The protection hook does not wait for a vCPU that waits for pages
+    /// being replaced (`VmInner::wait_mapped`, which waits with the memory
+    /// lock released): another thread's mprotect of other slot memory
+    /// returns within 10 s; the vCPU's access then lands once the pages are
+    /// mapped again.
+    #[test]
+    fn test_an_mprotect_does_not_wait_for_a_vcpu_waiting_for_replaced_pages() {
+        let (_vm, mut vcpu, mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        let replaced = mem as u64 + page;
+        assert!(guest_replace(replaced, page, true, false), "the window");
+        let runner = std::thread::spawn(move || access(&mut vcpu, GUEST_BASE, GUEST_BASE + page, 5));
+        // The vCPU reaches the window and waits in it.
+        std::thread::sleep(Duration::from_millis(200));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = mem as u64 + 2 * page;
+        let protecting = std::thread::spawn(move || {
+            protect(other as *mut libc::c_void, page, libc::PROT_READ);
+            tx.send(()).unwrap();
+        });
+        let returned = rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        assert!(guest_replace(replaced, page, false, false), "mapped again");
+        protecting.join().unwrap();
+        assert!(returned, "the mprotect did not return within 10 s while a vCPU waited for replaced pages");
+        assert_eq!(runner.join().unwrap(), Ok(Some(5)));
     }
 
     /// Guest program: writes X3 to every page from X5 to X2, adds 1 to X3,

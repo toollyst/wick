@@ -140,10 +140,30 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
     if wick_mm::exec_denied(prot) {
         return -1;
     }
-    crate::wick_uffd::protecting(addr as u64, len as u64, prot, |at, n| {
-        // SAFETY: the caller's contract, for a part of its range.
-        unsafe { libc::mprotect(at as *mut c_void, n as usize, prot) }
-    })
+    let rc = crate::wick_uffd::protecting(addr as u64, len as u64, prot, |at, n| {
+        crate::wick_uffd::protection_change(
+            // SAFETY: the caller's contract, for a part of its range.
+            || unsafe { libc::mprotect(at as *mut c_void, n as usize, prot) },
+            |rc| (*rc == 0).then_some((at, n, prot)),
+        )
+    });
+    // Failed or not: a failure part way leaves the pieces before it changed.
+    tell_guest(addr as u64, len as u64, false);
+    rc
+}
+
+/// Tells the hypervisor backend that the protection or the mapping of
+/// `[start, start + len)` may have changed ([`crate::wick_guest::protected`]),
+/// so that stage 2 follows it, as KVM's stage 2 follows the vmas through
+/// the MMU notifier; `replaced` when the call may have put other pages
+/// there ([`crate::wick_guest::Hooks::protected`]). After the change
+/// returned, with `errno` kept.
+fn tell_guest(start: u64, len: u64, replaced: bool) {
+    // SAFETY: this thread's errno.
+    let saved = unsafe { *libc::__error() };
+    crate::wick_guest::protected(start, len, replaced);
+    // SAFETY: as above.
+    unsafe { *libc::__error() = saved };
 }
 
 /// `mmap` with the Linux flags above.
@@ -178,11 +198,11 @@ pub unsafe fn mmap(
     if flags & libc::MAP_ANON != 0 {
         if flags & MAP_HUGETLB != 0 {
             // SAFETY: the caller's contract.
-            return unsafe { mmap_huge(addr, len, prot, flags, -1, 0) };
+            return mapped(addr, len, prot, flags, unsafe { mmap_huge(addr, len, prot, flags, -1, 0) });
         }
     } else if hugetlb_file(fd) {
         // SAFETY: the caller's contract.
-        return unsafe { mmap_huge(addr, len, prot, flags, fd, offset) };
+        return mapped(addr, len, prot, flags, unsafe { mmap_huge(addr, len, prot, flags, fd, offset) });
     } else if flags & MAP_HUGETLB != 0 {
         set_errno(libc::EINVAL);
         return libc::MAP_FAILED;
@@ -209,6 +229,35 @@ pub unsafe fn mmap(
                 off += page;
             }
         }
+    }
+    mapped(addr, len, prot, flags, ptr)
+}
+
+/// What [`mmap`] returns, once the hypervisor backend was told
+/// ([`tell_guest`]): of the new mapping, and with `MAP_FIXED` of the range
+/// asked for also when the call failed (a fixed mapping that fails may have
+/// released what was there). A huge page mapping's length is rounded up to
+/// whole huge pages here, as [`mmap_huge`] maps it.
+fn mapped(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, ptr: *mut c_void) -> *mut c_void {
+    let huge = flags & MAP_HUGETLB != 0
+        || (ptr != libc::MAP_FAILED && crate::wick_uffd::touches_huge(ptr as u64, ptr as u64 + 1));
+    // A length past the address space (an mmap refused for it) is told as
+    // it is: the hook clamps its range.
+    let len = if huge { (len as u64).checked_next_multiple_of(HUGE_PAGE).unwrap_or(len as u64) } else { len as u64 };
+    if ptr != libc::MAP_FAILED {
+        // A fixed mapping's was recorded with its system call
+        // ([`mmap_replacing`]).
+        // A new mapping is where nothing was, or where something was
+        // unmapped since: its pages may not be the ones stage 2 holds. A
+        // fixed mapping's were put there by the replace hook.
+        let fixed = flags & libc::MAP_FIXED != 0;
+        if !fixed {
+            crate::wick_uffd::note_protection(ptr as u64, len, prot);
+        }
+        tell_guest(ptr as u64, len, !fixed);
+    } else if flags & libc::MAP_FIXED != 0 {
+        // A fixed mapping that failed may have released what was there.
+        tell_guest(addr as u64, len, true);
     }
     ptr
 }
@@ -342,7 +391,7 @@ unsafe fn mmap_fixed_aware(
         len as u64,
         true,
         // SAFETY: the caller's contract.
-        || unsafe { mmap_replacing(addr, len, prot, flags, fd, offset) },
+        || unsafe { mmap_replacing(true, addr, len, prot, flags, fd, offset) },
         |p| *p != libc::MAP_FAILED,
     )
 }
@@ -359,11 +408,14 @@ fn huge_cut_allowed(start: u64, len: u64) -> bool {
 }
 
 /// The host's `mmap`; with `MAP_FIXED`, the guest's view of `[addr, addr +
-/// len)` is replaced with it ([`crate::wick_guest::replacing`]).
+/// len)` is replaced with it ([`crate::wick_guest::replacing`]): a new
+/// mapping's pages with its protection when `anew`, a discard's fresh pages
+/// with the protection the range had otherwise.
 ///
 /// # Safety
 /// Same contract as `mmap(2)`.
 unsafe fn mmap_replacing(
+    anew: bool,
     addr: *mut c_void,
     len: size_t,
     prot: c_int,
@@ -375,9 +427,14 @@ unsafe fn mmap_replacing(
         // SAFETY: the caller's contract.
         return unsafe { libc::mmap(addr, len, prot, flags, fd, offset) };
     }
-    crate::wick_guest::replacing(addr as u64, len as u64, || {
-        // SAFETY: the caller's contract.
-        unsafe { libc::mmap(addr, len, prot, flags, fd, offset) }
+    crate::wick_guest::replacing(addr as u64, len as u64, anew, || {
+        // A new mapping's protection is recorded with its system call; a
+        // discard keeps the range's.
+        crate::wick_uffd::protection_change(
+            // SAFETY: the caller's contract.
+            || unsafe { libc::mmap(addr, len, prot, flags, fd, offset) },
+            |p| (anew && *p != libc::MAP_FAILED).then_some((addr as u64, len as u64, prot)),
+        )
     })
 }
 
@@ -426,11 +483,19 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
         set_errno(libc::EINVAL);
         return -1;
     }
-    // SAFETY: the caller's contract; the registration of what it unmaps
-    // goes in the same step, as Linux's goes with the vma.
-    let rc = crate::wick_uffd::unmapping(start, len as u64, false, || unsafe { libc::munmap(addr, len) }, |rc| *rc == 0);
+    // The registration of what it unmaps goes in the same step, as Linux's
+    // goes with the vma.
+    let unmap = || {
+        crate::wick_uffd::protection_change(
+            // SAFETY: the caller's contract.
+            || unsafe { libc::munmap(addr, len) },
+            |rc| (*rc == 0).then_some((start, len as u64, -1)),
+        )
+    };
+    let rc = crate::wick_uffd::unmapping(start, len as u64, false, unmap, |rc| *rc == 0);
     if rc == 0 {
         crate::wick_uffd::note_mapping(start, len as u64, false);
+        tell_guest(start, len as u64, true);
     }
     rc
 }
@@ -765,6 +830,7 @@ unsafe fn discard_piece(ptr: *mut c_void, len: size_t, backing: Backing, prot: c
             // held them.
             let new = unsafe {
                 mmap_replacing(
+                    false,
                     ptr,
                     len,
                     prot,
@@ -2236,8 +2302,10 @@ mod tests {
 
     /// A replacement of the pages of a range (a `MADV_DONTNEED` of private
     /// anonymous memory, a `MAP_FIXED` mapping) is reported to the
-    /// hypervisor backend's hooks before and after, with the range; other
-    /// mappings are not.
+    /// hypervisor backend's hooks before and after, with the range, as a new
+    /// mapping or not; other mappings are not. Every mapping, `MAP_FIXED` or
+    /// not, `munmap` and `mprotect` is reported to the protection hook after
+    /// it returned, and a discard, which changes no vma on Linux, is not.
     #[test]
     fn test_replaced_pages_are_reported_to_the_guest_hooks() {
         use std::sync::Mutex;
@@ -2245,13 +2313,19 @@ mod tests {
         // The hooks are the process's: other tests' replacements come here
         // too, some of them earlier at the addresses this mapping now has, so
         // each call is kept with the thread that made it.
-        static CALLS: Mutex<std::vec::Vec<(ThreadId, u64, u64, bool)>> = Mutex::new(std::vec::Vec::new());
+        /// A replace hook's call: the thread, the range, before, anew.
+        type Call = (ThreadId, u64, u64, bool, bool);
+        static CALLS: Mutex<std::vec::Vec<Call>> = Mutex::new(std::vec::Vec::new());
+        static PROTECTED: Mutex<std::vec::Vec<(ThreadId, u64, u64, bool)>> = Mutex::new(std::vec::Vec::new());
         fn stage2(_: u64, _: u64, _: bool) {}
-        fn replace(start: u64, len: u64, before: bool) -> bool {
-            CALLS.lock().unwrap().push((std::thread::current().id(), start, len, before));
+        fn replace(start: u64, len: u64, before: bool, anew: bool) -> bool {
+            CALLS.lock().unwrap().push((std::thread::current().id(), start, len, before, anew));
             true
         }
-        crate::wick_guest::set_hooks(crate::wick_guest::Hooks { stage2, replace });
+        fn protected(start: u64, len: u64, replaced: bool) {
+            PROTECTED.lock().unwrap().push((std::thread::current().id(), start, len, replaced));
+        }
+        crate::wick_guest::set_hooks(crate::wick_guest::Hooks { stage2, replace, protected });
         assert!(crate::wick_guest::hooked());
         const LEN: usize = 1 << 20;
         // SAFETY: a fresh mapping; not fixed, so not a replacement.
@@ -2268,21 +2342,32 @@ mod tests {
         assert_ne!(p, libc::MAP_FAILED);
         let (start, half) = (p as u64, (LEN / 2) as u64);
         let me = std::thread::current().id();
-        let calls = || -> std::vec::Vec<(u64, u64, bool)> {
+        let calls = || -> std::vec::Vec<(u64, u64, bool, bool)> {
             CALLS
                 .lock()
                 .unwrap()
                 .iter()
+                .filter(|&&(t, s, _, _, _)| t == me && s >= start && s < start + LEN as u64)
+                .map(|&(_, s, l, b, n)| (s, l, b, n))
+                .collect()
+        };
+        let protected = || -> std::vec::Vec<(u64, u64, bool)> {
+            PROTECTED
+                .lock()
+                .unwrap()
+                .iter()
                 .filter(|&&(t, s, _, _)| t == me && s >= start && s < start + LEN as u64)
-                .map(|&(_, s, l, b)| (s, l, b))
+                .map(|&(_, s, l, r)| (s, l, r))
                 .collect()
         };
         assert!(calls().is_empty());
+        assert_eq!(protected(), [(start, LEN as u64, true)], "the new mapping");
         // SAFETY: inside the mapping.
         unsafe { core::ptr::write_bytes(p.cast::<u8>(), 0x5a, LEN) };
         // SAFETY: half of the mapping.
         assert_eq!(unsafe { madvise(p, LEN / 2, libc::MADV_DONTNEED) }, 0);
-        assert_eq!(calls(), [(start, half, true), (start, half, false)]);
+        assert_eq!(calls(), [(start, half, true, false), (start, half, false, false)]);
+        assert_eq!(protected().len(), 1, "a discard");
         // SAFETY: over the other half.
         let q = unsafe {
             mmap(
@@ -2297,12 +2382,25 @@ mod tests {
         assert_eq!(q as u64, start + half);
         assert_eq!(
             calls(),
-            [(start, half, true), (start, half, false), (start + half, half, true), (start + half, half, false)]
+            [
+                (start, half, true, false),
+                (start, half, false, false),
+                (start + half, half, true, true),
+                (start + half, half, false, true)
+            ]
         );
+        assert_eq!(protected(), [(start, LEN as u64, true), (start + half, half, false)], "MAP_FIXED");
         // SAFETY: the mapping, now all zeros.
         assert_eq!(unsafe { *p.cast::<u8>().add(LEN - 1) }, 0);
+        // SAFETY: half of our own mapping.
+        assert_eq!(unsafe { mprotect(p, LEN / 2, libc::PROT_READ) }, 0);
         // SAFETY: unmapping our own mapping.
-        unsafe { libc::munmap(p, LEN) };
+        assert_eq!(unsafe { munmap(p, LEN) }, 0);
+        assert_eq!(
+            protected(),
+            [(start, LEN as u64, true), (start + half, half, false), (start, half, false), (start, LEN as u64, true)],
+            "mprotect, then munmap"
+        );
     }
 
     fn memfd_file() -> std::os::fd::OwnedFd {

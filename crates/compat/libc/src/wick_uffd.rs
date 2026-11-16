@@ -355,6 +355,111 @@ fn page_size() -> u64 {
     PAGE.load(Ordering::Relaxed)
 }
 
+/// Ranges whose protection, as asked of this libc's `mmap` or `mprotect`,
+/// XNU widened: a write or execute protection is given read too (xnu
+/// bsd/kern/kern_mman.c, `mmap` :349 to :351, `mprotect` :1251 to :1253;
+/// "the hardware currently does not support writing without
+/// read-before-write"), where a Linux vma keeps what was asked (no
+/// `VM_READ`). The hypervisor backend holds the guest to the vma's rule
+/// ([`mapped_protections`]). Sorted, disjoint.
+///
+/// Its lock is a leaf: held only around a system call and its record
+/// ([`protection_change`]) or a read ([`mapped_protections`]), never while
+/// another lock is taken. The compatibility `mprotect`, `munmap` and
+/// `MAP_FIXED` `mmap` make their system call and its record under it, so
+/// for overlapping ranges the records come in the kernel's order; a new
+/// mapping's range is no one else's until `mmap` returned, so it is recorded
+/// after ([`note_protection`]). Only ranges asked with a write or execute
+/// protection and no read are kept, which Firecracker never asks (its
+/// guest memory is `PROT_READ | PROT_WRITE`, `PROT_READ` or `PROT_NONE`), so
+/// in a Firecracker run the list stays empty; an entry goes when its range is
+/// protected again or unmapped through this libc.
+///
+/// The one stale case: a range unmapped and mapped again by the system's own
+/// calls, not this libc's, keeps its record, and a later mapping there whose
+/// protection is exactly what XNU made of the recorded ask (the ask with
+/// read) reads as that ask, write or execute without read. That is a read
+/// refused that the host allows, never a permission the host does not give;
+/// a mapping there with any other protection reads as it is
+/// ([`mapped_protections`]).
+static WIDENED: Mutex<Vec<(u64, u64, i8)>> = Mutex::new(Vec::new());
+
+/// Records the protection `prot` asked of `[start, start + len)` by a
+/// `mmap` that succeeded and made a new mapping there: kept when XNU widened
+/// it (a write or execute protection without read), forgotten otherwise.
+pub fn note_protection(start: u64, len: u64, prot: c_int) {
+    note_locked(&mut WIDENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner), start, len, prot);
+}
+
+/// Makes a change of protection or mapping with `call` and records what
+/// `noted` says it did (`start`, `len`, the protection asked, -1 for a range
+/// unmapped), in one step under [`WIDENED`]'s lock. A call that failed
+/// records nothing: XNU's `mprotect` checks the whole range before it
+/// changes any of it (osfmk/vm/vm_map.c, xnu-12377.1.9, `vm_map_protect`:
+/// the first pass :5945, the changes from :6063).
+pub fn protection_change<T>(call: impl FnOnce() -> T, noted: impl FnOnce(&T) -> Option<(u64, u64, c_int)>) -> T {
+    let mut all = WIDENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let done = call();
+    if let Some((start, len, prot)) = noted(&done) {
+        #[cfg(test)]
+        between_call_and_record(start);
+        note_locked(&mut all, start, len, prot);
+    }
+    done
+}
+
+/// Tests: run once by the next [`protection_change`] of a range starting at
+/// the address given, between its system call and its record, so that a
+/// test can start another change of the same range there.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static BETWEEN_CALL_AND_RECORD: Mutex<Option<(u64, Box<dyn FnOnce() + Send>)>> = Mutex::new(None);
+
+#[cfg(test)]
+fn between_call_and_record(start: u64) {
+    let mut hook = BETWEEN_CALL_AND_RECORD.lock().unwrap();
+    if hook.as_ref().is_some_and(|&(at, _)| at == start) {
+        let (_, f) = hook.take().unwrap();
+        drop(hook);
+        f();
+    }
+}
+
+fn note_locked(all: &mut Vec<(u64, u64, i8)>, start: u64, len: u64, prot: c_int) {
+    let rw_x = libc::PROT_WRITE | libc::PROT_EXEC;
+    let kept_ask = prot >= 0 && prot & libc::PROT_READ == 0 && prot & rw_x != 0;
+    if all.is_empty() && !kept_ask {
+        // Nothing to cut and nothing to keep: every change of a Firecracker
+        // run, which asks no protection XNU widens.
+        return;
+    }
+    let end = start.saturating_add(len);
+    let mut kept = Vec::with_capacity(all.len() + 2);
+    for &(s, e, p) in all.iter() {
+        if e <= start || s >= end {
+            kept.push((s, e, p));
+            continue;
+        }
+        if s < start {
+            kept.push((s, start, p));
+        }
+        if e > end {
+            kept.push((end, e, p));
+        }
+    }
+    if kept_ask {
+        kept.push((start, end, prot as i8));
+    }
+    kept.sort_unstable_by_key(|&(s, _, _)| s);
+    *all = kept;
+}
+
+/// Tests: whether [`WIDENED`] has an entry over `[start, end)`.
+#[cfg(test)]
+fn widened_over(start: u64, end: u64) -> bool {
+    WIDENED.lock().unwrap().iter().any(|&(s, e, _)| s < end && start < e)
+}
+
 /// Records a mapping `[start, start + len)` the compatibility `mmap` made,
 /// with or without `MAP_HUGETLB`.
 pub fn note_mapping(start: u64, len: u64, huge: bool) {
@@ -792,6 +897,12 @@ pub fn protecting(start: u64, len: u64, prot: c_int, apply: impl Fn(u64, u64) ->
             record(at, a);
         }
         record(a, b);
+        // A missing run keeps its protection until it is filled, and
+        // takes the one asked then (`protect_as_asked`): recorded as asked,
+        // under `LOCK` as every change of a registered range is.
+        if b > a {
+            note_protection(a, b - a, prot);
+        }
         at = b;
     }
     0
@@ -939,6 +1050,90 @@ fn mapped_entries(start: u64, end: u64) -> Vec<(u64, u64, c_int)> {
         at = addr + size;
     }
     entries
+}
+
+/// The protection a Linux vma would give each host page of `[start, end)`
+/// (both page aligned), for the hypervisor backend's stage 2
+/// ([`crate::wick_guest::Hooks::protected`]): `PROT_*` bits, or -1 for a
+/// page in no mapping. A page a userfaultfd registered has the protection
+/// asked of it ([`protecting`]; its host protection is `PROT_NONE` while it
+/// is missing), any other page its mapping's own.
+///
+/// `f` is given the reader of them, and is called while no register or
+/// unregister can be half-way: under [`LOCK`] when the range touches a
+/// registration or a register is under way, otherwise counted as a change
+/// running without it ([`unlocked_change`]), which a register that starts
+/// meanwhile waits for before it reads the mappings. So a register (asked
+/// published, then the host made `PROT_NONE`) is seen whole or not at all.
+/// `f` takes the backend's memory lock and reads under it, then stores what
+/// it read before it lets the lock go: the order is [`LOCK`] (or the
+/// count), then that lock, then the read. Two callers for the same pages,
+/// each after its own `mprotect` returned, are ordered by the memory lock,
+/// and the one that stores last read last, after both calls, so stage 2
+/// ends with the protection the host has; a read before the memory lock
+/// could be stored after a later caller's (mm/mprotect.c, v6.12, does both
+/// the change and the invalidation under the mmap write lock). Not from a
+/// signal handler.
+pub fn host_protections<T>(start: u64, end: u64, f: impl FnOnce(&dyn Fn() -> Vec<i8>) -> T) -> T {
+    let unlocked = unlocked_change(|| slots(start, end).next().is_some());
+    let guard = unlocked.is_none().then(lock);
+    let locked = guard.is_some();
+    let read = || {
+        let host = host_page();
+        let mut prot = mapped_protections(start, end);
+        if locked {
+            for r in slots(start, end) {
+                let (s, e) = (r.start.load(Ordering::Acquire), r.end.load(Ordering::Acquire));
+                let mut at = s.max(start);
+                while at < e.min(end) {
+                    let page = (at - s) / r.page_size();
+                    if Range::test(&r.tracked, page) {
+                        prot[((at - start) / host) as usize] = r.asked(page) as i8;
+                    }
+                    at += host;
+                }
+            }
+        }
+        prot
+    };
+    f(&read)
+}
+
+/// The host's page size, also before the first userfaultfd set
+/// [`page_size`]: the hypervisor backend reads protections in a process
+/// that may never make one.
+fn host_page() -> u64 {
+    // SAFETY: plain call.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+}
+
+/// The protection of each host page of `[start, end)` (both page aligned)
+/// as its mapping has it now (`PROT_*` bits, -1 for a page in no mapping),
+/// registrations not looked at: for a new mapping, which none has
+/// registered yet (the hypervisor backend's `replace` hook after a
+/// `MAP_FIXED`). Takes no lock.
+pub fn mapped_protections(start: u64, end: u64) -> Vec<i8> {
+    let host = host_page();
+    let mut prot = std::vec![-1i8; ((end - start) / host) as usize];
+    // The mappings and the records read in one step: a compatibility
+    // change makes its system call and its record under this lock.
+    let widened = WIDENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (a, b, p) in mapped_entries(start, end) {
+        let (a, b) = ((a - start) / host, (b - start).div_ceil(host));
+        prot[a as usize..b as usize].fill(p as i8);
+    }
+    // What was asked where XNU widened it, as a vma keeps it; only where the
+    // page has what XNU made of that ask, so a change made since by other
+    // means (the system's own `mprotect`) reads as it is.
+    for &(s, e, p) in widened.iter().filter(|&&(s, e, _)| s < end && start < e) {
+        let (a, b) = ((s.max(start) - start) / host, (e.min(end) - start).div_ceil(host));
+        for page in &mut prot[a as usize..b as usize] {
+            if *page >= 0 && c_int::from(*page) == c_int::from(p) | libc::PROT_READ {
+                *page = p;
+            }
+        }
+    }
+    prot
 }
 
 /// The protection of the entry of `entries` ([`mapped_entries`]) that
@@ -2813,6 +3008,156 @@ mod tests {
         *CHANGE_HOOK.lock().unwrap() = None;
         let thread = RACE_THREAD.lock().unwrap().take().expect("the change did not run without the lock");
         thread.join().unwrap()
+    }
+
+    /// A protection XNU widens is read as it was asked
+    /// ([`mapped_protections`]), as a Linux vma keeps it: `PROT_WRITE` alone
+    /// through the compatibility `mprotect` reads as asked where macOS's
+    /// entry has read added (xnu bsd/kern/kern_mman.c :1251 to :1253); read
+    /// and write again reads read and write; an `munmap` leaves nothing; a
+    /// new `mmap` with `PROT_WRITE` alone reads as asked (:349 to :351). The
+    /// control: macOS's own entry has read in each widened case. (`PROT_EXEC`
+    /// alone is widened the same way; this libc refuses executable memory
+    /// where the sandbox would, so it is not asked here.)
+    #[test]
+    fn test_a_protection_xnu_widens_reads_as_asked() {
+        let ps = host_page();
+        let (w, rw) = (libc::PROT_WRITE as i8, (libc::PROT_READ | libc::PROT_WRITE) as i8);
+        let mem = map(2);
+        let at = |m: u64| mapped_protections(m, m + 2 * ps);
+        let entry = |m: u64| mapped_entries(m, m + ps)[0].2;
+        // SAFETY: the test's mapping.
+        assert_eq!(unsafe { crate::linux_items::mprotect(mem as *mut _, ps as usize, libc::PROT_WRITE) }, 0);
+        assert_eq!(at(mem), [w, rw], "PROT_WRITE alone");
+        assert_ne!(entry(mem) & libc::PROT_READ, 0, "the control: macOS's entry has read");
+        // SAFETY: as above.
+        assert_eq!(unsafe { crate::linux_items::mprotect(mem as *mut _, 2 * ps as usize, libc::PROT_READ | libc::PROT_WRITE) }, 0);
+        assert_eq!(at(mem), [rw, rw], "read and write again");
+        // SAFETY: as above.
+        assert_eq!(unsafe { crate::linux_items::munmap(mem as *mut _, 2 * ps as usize) }, 0);
+        assert_eq!(at(mem), [-1, -1], "unmapped");
+        // SAFETY: a new mapping, unmapped below.
+        let m = unsafe {
+            crate::linux_items::mmap(core::ptr::null_mut(), ps as usize, libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+        };
+        assert_ne!(m, libc::MAP_FAILED);
+        assert_eq!(mapped_protections(m as u64, m as u64 + ps), [w], "a new mapping with PROT_WRITE alone");
+        assert_ne!(entry(m as u64) & libc::PROT_READ, 0, "the control: macOS's entry has read");
+        // SAFETY: the mapping just made.
+        assert_eq!(unsafe { crate::linux_items::munmap(m, ps as usize) }, 0);
+        assert!(!widened_over(m as u64, m as u64 + ps), "an munmap drops the record");
+    }
+
+    /// The record of a widened protection follows the later changes of its
+    /// range as a vma would: a discard (`MADV_DONTNEED`, new zero pages)
+    /// keeps it; a `MAP_FIXED` mapping over it with read and write drops it;
+    /// a change by the system's own `mprotect` (not this libc's) reads as
+    /// the system made it, not as the record says; an `munmap` drops it.
+    #[test]
+    fn test_a_widened_protection_follows_later_changes_of_its_range() {
+        let ps = host_page();
+        let (w, r, rw) = (libc::PROT_WRITE as i8, libc::PROT_READ as i8, (libc::PROT_READ | libc::PROT_WRITE) as i8);
+        let mem = map(1);
+        let at = || mapped_protections(mem, mem + ps)[0];
+        let p = mem as *mut core::ffi::c_void;
+        // SAFETY: the test's mapping, here and below.
+        assert_eq!(unsafe { crate::linux_items::mprotect(p, ps as usize, libc::PROT_WRITE) }, 0);
+        assert_eq!(at(), w, "PROT_WRITE alone");
+        // SAFETY: as above.
+        assert_eq!(unsafe { crate::linux_items::madvise(p, ps as usize, libc::MADV_DONTNEED) }, 0);
+        assert_eq!(at(), w, "after a discard");
+        // SAFETY: as above.
+        let fixed = unsafe {
+            crate::linux_items::mmap(
+                p,
+                ps as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(fixed, p);
+        assert_eq!(at(), rw, "a MAP_FIXED mapping with read and write over it");
+        // SAFETY: as above.
+        assert_eq!(unsafe { crate::linux_items::mprotect(p, ps as usize, libc::PROT_WRITE) }, 0);
+        assert_eq!(at(), w, "PROT_WRITE alone again");
+        // SAFETY: as above; the system's own call.
+        assert_eq!(unsafe { libc::mprotect(p, ps as usize, libc::PROT_READ) }, 0);
+        assert_eq!(at(), r, "after the system's own mprotect to PROT_READ");
+        // SAFETY: as above.
+        assert_eq!(unsafe { crate::linux_items::munmap(p, ps as usize) }, 0);
+        assert!(!widened_over(mem, mem + ps), "an munmap drops the record");
+    }
+
+    /// Two compatibility `mprotect`s of the same page are recorded in the
+    /// order of their system calls: one asks `PROT_WRITE` alone, and between
+    /// its system call and its record another thread asks read and write;
+    /// that one's system call waits until the first is recorded, so the page
+    /// reads read and write, the protection asked last. Recorded apart from
+    /// the system call, the first's record would come last and the page would
+    /// read `PROT_WRITE` alone, a read refused that the host allows.
+    #[test]
+    fn test_protection_records_come_in_the_order_of_their_calls() {
+        let ps = host_page();
+        let mem = map(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        *BETWEEN_CALL_AND_RECORD.lock().unwrap() = Some((
+            mem,
+            Box::new(move || {
+                let second = std::thread::spawn(move || {
+                    // SAFETY: the test's mapping.
+                    let rc = unsafe {
+                        crate::linux_items::mprotect(mem as *mut core::ffi::c_void, ps as usize, libc::PROT_READ | libc::PROT_WRITE)
+                    };
+                    tx.send(rc).unwrap();
+                });
+                // The second's system call waits; give it the time to be done
+                // if it did not.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                drop(second);
+            }),
+        ));
+        // SAFETY: the test's mapping.
+        assert_eq!(unsafe { crate::linux_items::mprotect(mem as *mut core::ffi::c_void, ps as usize, libc::PROT_WRITE) }, 0);
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)), Ok(0), "the second mprotect");
+        assert_eq!(
+            mapped_protections(mem, mem + ps),
+            [(libc::PROT_READ | libc::PROT_WRITE) as i8],
+            "the protection asked last"
+        );
+        // SAFETY: the test's mapping.
+        assert_eq!(unsafe { crate::linux_items::munmap(mem as *mut core::ffi::c_void, ps as usize) }, 0);
+    }
+
+    /// The hypervisor backend's read of the host protection
+    /// ([`host_protections`]) racing a register of the same memory: a
+    /// register started between the read's lock-free check and its read
+    /// waits for the read, which sees the memory as before the register (its
+    /// own protection, read and write), never half-way (asked published and
+    /// the missing pages made `PROT_NONE`, which would store "nothing" for
+    /// pages the guest may use). Then a read after the register gets the
+    /// asked protection of its missing pages. Without the count the register
+    /// does not wait, and the hook's wait for it fails.
+    #[test]
+    fn test_a_protection_read_racing_a_register_is_the_asked_one() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(2);
+        let rw = (libc::PROT_READ | libc::PROT_WRITE) as i8;
+        let mut during = std::vec::Vec::new();
+        let waits = REGISTER_WAITS.load(Ordering::SeqCst);
+        let registered = register_racing(a, mem, 2 * ps, || {
+            during = host_protections(mem, mem + 2 * ps, |read| read());
+        });
+        assert!(registered.is_ok(), "{registered:?}");
+        assert!(REGISTER_WAITS.load(Ordering::SeqCst) > waits, "the register did not wait for the read");
+        assert_eq!(during, [rw, rw], "the read racing the register");
+        assert!(is_missing(mem) && is_missing(mem + ps));
+        let after = host_protections(mem, mem + 2 * ps, |read| read());
+        assert_eq!(after, [rw, rw], "the read after the register: the asked protection of missing pages");
+        assert_eq!(unregister(a, mem, 2 * ps), Ok(()));
+        close(&[ua]);
     }
 
     /// A register that starts while an `munmap` of the memory runs without

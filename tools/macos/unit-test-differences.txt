@@ -68,9 +68,9 @@
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
 #   cpu-template-helper: 30 tests; 25 pass, 5 fail (no-hvf).
-#   compat-kvm-ioctls: 99 tests; 34 pass, 58 fail, 7 ignored (counted again
+#   compat-kvm-ioctls: 108 tests; 34 pass, 74 fail, 0 ignored (counted again
 #   on 2026-11-17 by check-unit-tests.py --crate compat-kvm-ioctls), all
-#   no-hvf: 57 with Error(1) at hv_vm_create, and the vCPU thread's latency
+#   no-hvf: 73 with Error(1) at hv_vm_create, and the vCPU thread's latency
 #   tier's test_a_wfi_ends_when_its_timer_is_due, which fails on a runner
 #   before it makes its VM, at its own requirement of a foreground process,
 #   since the runners' processes are coalesced as background ones
@@ -108,6 +108,7 @@ no-hvf compat-kvm-ioctls hvf::debug::tests::test_set_guest_debug_rejects_unknown
 no-hvf compat-kvm-ioctls hvf::debug::tests::test_single_step_exits_after_one_instruction
 no-hvf compat-kvm-ioctls hvf::debug::tests::test_the_guests_os_lock_blocks_its_own_breakpoints
 no-hvf compat-kvm-ioctls hvf::debug::tests::test_watchpoint_exit_gives_the_address
+no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_a_stolen_time_write_to_a_host_read_only_page_is_skipped
 no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_a_vcpu_kept_off_its_cpu_has_its_steal_updated_while_it_runs
 no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_pv_time_calls_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::pvtime::tests::test_pv_time_is_not_offered_without_the_wfi_figure
@@ -127,12 +128,23 @@ no-hvf compat-kvm-ioctls hvf::smccc_tests::test_the_arch_workarounds_answer_as_k
 no-hvf compat-kvm-ioctls hvf::smccc_tests::test_trng_calls_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::vcpu::tests::test_kvm_ptp_counters
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_fill_in_a_removed_slots_page_maps_nothing_for_the_guest
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_guest_access_the_host_protection_refuses_is_efault
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_guest_executes_from_a_host_read_only_page
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_guest_reaches_new_memory_mapped_where_slot_memory_was_unmapped
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_new_vcpu_has_kvms_reset_values
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_page_mapped_with_no_permission_faults_and_takes_its_permissions_later
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_refused_access_to_a_missing_page_posts_no_event
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_slot_made_while_an_mprotect_runs_takes_its_protection
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_slot_made_while_another_is_removed_takes_a_protection_changed_meanwhile
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_slot_over_memory_mapped_read_only_starts_read_only
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_store_to_a_read_only_slot_is_still_mmio
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_wfi_ends_when_its_timer_is_due
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_write_only_host_page_is_readable_by_the_guest_after_its_write
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_an_eventfd_is_one_irqfd_of_a_vm
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_an_irqfd_write_of_another_process_is_raised_by_the_irqfd_thread
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_an_irqfd_write_raises_its_spi_before_it_returns
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_an_mprotect_does_not_wait_for_a_vcpu_waiting_for_replaced_pages
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_an_mprotect_of_memory_in_no_slot_takes_no_vm_lock
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_an_unregistered_irqfd_raises_nothing
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_clocks_do_not_go_back_on_a_vcpu_thread
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_guest_writes_during_a_discard_wait_for_the_new_pages
@@ -140,7 +152,10 @@ no-hvf compat-kvm-ioctls hvf::vm::tests::test_id_register_writes_reach_the_guest
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_irqfd_writes_registrations_and_the_irqfd_thread_do_not_wait_for_each_other
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_madvise_dontneed_replaces_guest_pages
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_map_fixed_replaces_guest_pages
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_memory_mapped_where_slot_memory_was_unmapped_before_its_hook_reaches_the_guest
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_msi_data_names_no_spi
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_no_guest_store_lands_after_a_host_mprotect_returned
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_no_guest_store_lands_on_old_pages_after_a_discard_returned
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_os_lock_is_a_register_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_psci_version_is_the_vms
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_ptrauth_is_a_vcpu_feature
@@ -149,6 +164,7 @@ no-hvf compat-kvm-ioctls hvf::vm::tests::test_scattered_discards_keep_the_guest_
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_signals_interrupt_run_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_spi_active_restored_before_its_vcpu_exists
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_spi_raised_before_its_vcpu_exists
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_the_protection_stored_last_is_the_one_the_host_has
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_the_vtimer_thread_runs_only_while_a_timer_is_masked
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_vcpu_init_reads_what_the_run_phase_needs
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_virtual_count_is_the_vms
