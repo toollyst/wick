@@ -2469,7 +2469,11 @@ impl VcpuFd {
         });
         match done {
             None => Ok(false),
-            Some(r) => r.map(|()| true),
+            Some(r) => r.map(|()| {
+                #[cfg(feature = "whp-x2apic-record")]
+                count_held_write(vp, value);
+                true
+            }),
         }
     }
 
@@ -3311,6 +3315,21 @@ fn unkept_line(seen: &mut Vec<(u32, bool)>, index: u32, write: bool) -> Unkept {
             Unkept::Past
         }
         _ => Unkept::Said,
+    }
+}
+
+/// The record build's count of held LVT timer writes, the process's
+/// (X2HOLDCOUNT): `boot-test.ps1 x2apic` reads how many a guest makes at its
+/// boot, idle, under a timer load, at a CPU's offline and online, and after a
+/// restore, which bounds option E-ii's cost (each write holds every vCPU of
+/// the VM, X2HOLDREC e) by event. A `whp:` line with the running count for
+/// each of the first 64 writes and each 1000th after.
+#[cfg(feature = "whp-x2apic-record")]
+fn count_held_write(vp: u32, value: u32) {
+    static HELD: AtomicU64 = AtomicU64::new(0);
+    let n = HELD.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 64 || n.is_multiple_of(1000) {
+        super::ffi::report(log::Level::Info, &format!("whp: X2HOLDCOUNT {n} held LVT timer writes so far (vCPU {vp}'s of {value:#x})"));
     }
 }
 

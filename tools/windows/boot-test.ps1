@@ -82,7 +82,9 @@
 #          partition on an AMD host: the guest in x2APIC mode with its local
 #          timers in TSC-deadline mode, through the backend's held LVT timer
 #          write, then the smp stage on it (CPU 1 offline and online, after
-#          boot and after a snapshot restore); on a host that is not AMD,
+#          boot and after a snapshot restore); X2HOLDCOUNT, the held writes
+#          the guest makes at its boot, idle, under a timer load, at CPU 1's
+#          offline and online and after a restore; on a host that is not AMD,
 #          where option E makes no x2APIC partition, N/A (exit code 3)
 #   gdb    (not in `all`: needs a Firecracker built with the gdb feature and
 #          a gdb) upstream's debug kernel under gdb: a hardware breakpoint at
@@ -4072,12 +4074,6 @@ function Stage-X2Apic {
     try {
         $vm = Start-Vm 'x2apic' (Base-Config 2) -Api
         Wait-Shell $vm
-        $routing = $vm.Sh("dmesg | grep -o 'Switched APIC routing to [^.]*'; true")
-        $deadline = $vm.Sh('grep -c "Clock Event Device: lapic-deadline" /proc/timer_list; true')
-        $vm.Healthy()
-        Save-Dmesg $vm 'x2apic'
-        $vm.Reboot()
-        $vm.Drain(2000)
         $said = $vm.Output + "`n" + (Get-Content -Raw $vm.LogPath -ErrorAction SilentlyContinue)
         $build = [regex]::Match($said, 'whp: a whp-x2apic-record build[^\r\n]*').Value
         # Option E makes x2APIC partitions on AMD hosts only
@@ -4088,11 +4084,66 @@ function Stage-X2Apic {
             Not-Applicable "not applicable on this host ($($cpu.Manufacturer), $($cpu.Name.Trim())): option E makes x2APIC partitions on AMD hosts only; the build's line: '$build'"
         }
         Check ($build -match 'emulate an x2APIC') "not an x2APIC partition (this host is $($cpu.Manufacturer), or $fc is not the record build): '$build'"
+        $routing = $vm.Sh("dmesg | grep -o 'Switched APIC routing to [^.]*'; true")
+        $deadline = $vm.Sh('grep -c "Clock Event Device: lapic-deadline" /proc/timer_list; true')
         Check ($routing -match 'x2apic') "the guest's APIC routing: '$routing' (no x2APIC mode)"
         Check ($deadline -eq '2') "local timers in TSC-deadline mode (/proc/timer_list): '$deadline' of 2 vCPUs"
+        # X2HOLDCOUNT: the held LVT timer writes (option E-ii, each holding
+        # every vCPU) the guest makes at its boot, idle, under a timer
+        # load, at CPU 1's offline and online, and after a restore. Record
+        # only.
+        $boot = Get-HeldWrites $vm
+        Start-Sleep -Seconds 10
+        $idle = Get-HeldWrites $vm
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $out = $vm.Sh("for c in 0 1; do taskset -c `$c sh -c 'i=0; while [ `$i -lt 2000 ]; do sleep 0.001; i=`$((i+1)); done' & done; wait; echo slept", 120000, $true)
+        $loadSeconds = $sw.Elapsed.TotalSeconds
+        Check ($out.EndsWith('slept')) "the timer load: '$out'"
+        $load = Get-HeldWrites $vm
+        $out = $vm.Sh('echo 0 > /sys/devices/system/cpu/cpu1/online; echo 1 > /sys/devices/system/cpu/cpu1/online; cat /sys/devices/system/cpu/online')
+        Check ($out -eq '0-1') "CPU 1 offline and online: '$out'"
+        Start-Sleep -Seconds 1
+        $hotplug = Get-HeldWrites $vm
+        $vm.Healthy()
+        Save-Dmesg $vm 'x2apic'
+        $dir = Join-Path $Scratch 'x2apic'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $state = Join-Path $dir 'vm.state'
+        $mem = Join-Path $dir 'vm.mem'
+        Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+        Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = $state; mem_file_path = $mem }) | Out-Null
+        $vm.Kill()
+        $vm = Start-Vm 'x2apic-restored' $null -Api
+        Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
+            snapshot_path = $state
+            mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = $mem }
+            resume_vm     = $true
+        }) | Out-Null
+        $out = $vm.Sh('cat /sys/devices/system/cpu/online')
+        Check ($out -eq '0-1') "online CPUs after the restore: '$out'"
+        $restored = Get-HeldWrites $vm
+        Start-Sleep -Seconds 10
+        $restoredIdle = Get-HeldWrites $vm
+        $vm.Healthy()
+        $vm.Reboot()
+        Remove-Item -Force $mem -ErrorAction SilentlyContinue
+        $held = "X2HOLDCOUNT held LVT timer writes: $boot at the boot, +$($idle - $boot) over 10 s idle, +$($load - $idle) over a timer load " +
+            ("({0:N1} s of sleep 0.001 on both vCPUs), +{1} over CPU 1 offline and online; after a restore (a new process): {2} at its resume, +{3} over 10 s idle" -f $loadSeconds, ($hotplug - $load), $restored, ($restoredIdle - $restored))
+        Write-Step $held
         $smp = Stage-Smp 'x2apic-smp'
     } finally { $script:Fc = $saved }
-    return "x2APIC partition ($build): $routing, local timers in TSC-deadline mode on 2 vCPUs; smp on it: $smp"
+    return "x2APIC partition ($build): $routing, local timers in TSC-deadline mode on 2 vCPUs; $held; smp on it: $smp"
+}
+
+# The backend's count of held LVT timer writes so far in `$vm`'s process
+# (X2HOLDCOUNT lines of the x2APIC record build: one with the running count
+# for each of the first 64 writes and each 1000th after, so past 64 it is
+# the count at the last such line), 0 with none.
+function Get-HeldWrites($vm) {
+    $said = $vm.Output + "`n" + (Get-Content -Raw $vm.LogPath -ErrorAction SilentlyContinue)
+    $counts = @([regex]::Matches($said, 'whp: X2HOLDCOUNT (\d+) ') | ForEach-Object { [int]$_.Groups[1].Value })
+    if ($counts.Count -eq 0) { return 0 }
+    return ($counts | Measure-Object -Maximum).Maximum
 }
 
 function Stage-Gdb {
