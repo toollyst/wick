@@ -22,6 +22,12 @@
 //!   half filled.
 //! - `madvise(MADV_DONTNEED)` on registered pages makes them missing again and
 //!   queues a remove event ([`discarding`]).
+//! - `mprotect` of registered memory ([`protecting`]) changes the present
+//!   pages and records the protection for every page; missing pages stay
+//!   `PROT_NONE` and take it once filled or no longer registered, as Linux's
+//!   mprotect changes the vma and leaves its registration as it is. An access
+//!   the asked protection refuses is the process's own fault, with no event
+//!   ([`asked_allows`]), as Linux checks the vma before the userfaultfd.
 //!
 //! A userfaultfd is one end of a socket pair. Events are [`RECORD`]-byte
 //! records read from it ([`proto`]). Another process holding the descriptor
@@ -30,7 +36,7 @@
 
 use core::ffi::c_int;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::boxed::Box;
 use std::io;
 use std::sync::{Mutex, Once};
@@ -78,6 +84,8 @@ const VM_FLAGS_ANYWHERE: c_int = 1;
 const VM_FLAGS_FIXED_OVERWRITE: c_int = 0x4000;
 const MAX_CTX: usize = 16;
 const MAX_WAITERS: usize = 256;
+/// The protection bits a page's asked protection keeps.
+const PROT_RWX: c_int = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
 
 /// A registered range. Its bitmaps are never freed: the signal handler may be
 /// reading them.
@@ -96,6 +104,10 @@ struct Range {
     missing: AtomicPtr<AtomicU64>,
     /// One bit per page: the page is registered (cleared by unregister).
     tracked: AtomicPtr<AtomicU64>,
+    /// One byte per page: the protection asked of the page (`PROT_*` bits),
+    /// which a missing page gets once it is filled or no longer registered
+    /// ([`protecting`]).
+    asked: AtomicPtr<AtomicU8>,
 }
 
 impl Range {
@@ -108,6 +120,7 @@ impl Range {
             alias: AtomicU64::new(0),
             missing: AtomicPtr::new(ptr::null_mut()),
             tracked: AtomicPtr::new(ptr::null_mut()),
+            asked: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -132,6 +145,20 @@ impl Range {
         } else {
             Self::bit(map, page).fetch_and(!mask, Ordering::SeqCst);
         }
+    }
+
+    fn asked_byte(&self, page: u64) -> &AtomicU8 {
+        // SAFETY: one byte per page of the range, never freed.
+        unsafe { &*self.asked.load(Ordering::Acquire).add(page as usize) }
+    }
+
+    /// The protection asked of `page`.
+    fn asked(&self, page: u64) -> c_int {
+        c_int::from(self.asked_byte(page).load(Ordering::Acquire))
+    }
+
+    fn set_asked(&self, page: u64, prot: c_int) {
+        self.asked_byte(page).store((prot & PROT_RWX) as u8, Ordering::Release);
     }
 }
 
@@ -342,6 +369,36 @@ pub fn is_missing(addr: u64) -> bool {
     }
 }
 
+/// The kinds of host access a fault can be, as Linux's arm64 fault handler
+/// tells them apart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    Write,
+    Exec,
+}
+
+/// Whether the protection asked of the registered page holding `addr`
+/// ([`protecting`]) allows a host access of kind `access`. Linux checks the
+/// vma's flags before it handles a fault (arch/arm64/mm/fault.c, v6.12,
+/// `do_page_fault` :590 to :595: `if (!(vma->vm_flags & vm_flags))` is
+/// `bad_area` with `SEGV_ACCERR`), so an access they refuse never reaches
+/// the userfaultfd. The flags it needs (:553 to :568): an instruction fetch
+/// `VM_EXEC`; a write `VM_WRITE`; a read any of `VM_READ`, `VM_WRITE`
+/// ("Write implies read") and `VM_EXEC`, which Linux takes for a read when
+/// the processor has no EPAN (`FEAT_PAN3`, Armv8.7). It is taken as on a
+/// processor without it: macOS's `hw.optional.arm` lists no PAN feature, so
+/// a newer Apple processor that has it is not told apart; an execute-only
+/// page is not one Firecracker asks for. Async-signal-safe.
+fn asked_allows(addr: u64, access: Access) -> bool {
+    let need = match access {
+        Access::Exec => libc::PROT_EXEC,
+        Access::Write => libc::PROT_WRITE,
+        Access::Read => libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+    };
+    find(addr).is_some_and(|(r, page)| r.asked(page) & need != 0)
+}
+
 fn post(ctx: usize, record: [u64; 4]) {
     let fd = CTXS[ctx].fd.load(Ordering::Acquire);
     if fd < 0 {
@@ -438,7 +495,15 @@ extern "C" fn on_signal(sig: c_int, info: *mut libc::siginfo_t, uctx: *mut libc:
         };
         let ec = esr >> 26;
         let write = (ec == 0x24 || ec == 0x25) && esr & (1 << 6) != 0;
-        if fault(addr, write) {
+        // An instruction abort (EC 0x20 from EL0, 0x21 from EL1).
+        let access = match (ec, write) {
+            (0x20 | 0x21, _) => Access::Exec,
+            (_, true) => Access::Write,
+            (_, false) => Access::Read,
+        };
+        // An access the asked protection refuses is the process's own
+        // fault, as on Linux: on to the previous handler.
+        if asked_allows(addr, access) && fault(addr, write) {
             // Retry the access.
             return;
         }
@@ -532,6 +597,90 @@ fn protect(addr: u64, len: u64, prot: c_int) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Gives the pages of range `r` in `[a, b)` (whole pages of it) the
+/// protection asked of each ([`protecting`]), in runs of one protection.
+fn protect_as_asked(r: &Range, a: u64, b: u64) -> io::Result<()> {
+    let base = r.start.load(Ordering::Acquire);
+    let ps = r.page_size();
+    let mut at = a;
+    while at < b {
+        let prot = r.asked((at - base) / ps);
+        let mut to = at + ps;
+        while to < b && r.asked((to - base) / ps) == prot {
+            to += ps;
+        }
+        protect(at, to - at, prot)?;
+        at = to;
+    }
+    Ok(())
+}
+
+/// Wraps an `mprotect(start, len, prot)`, which `apply` makes, of memory
+/// that may be registered. Linux's mprotect changes a vma's protection and
+/// leaves its userfaultfd registration as it is (mm/mprotect.c, v6.12,
+/// `mprotect_fixup` :603: `vma_modify_flags` :664 and `vm_flags_reset` :677,
+/// nothing of `vm_userfaultfd_ctx`), and an access the protection allows to
+/// a missing page faults to the userfaultfd; here a missing page is
+/// `PROT_NONE` so that it faults, which a plain mprotect
+/// would undo, letting the process read zeros and write to a page a later
+/// fill overwrites. So registered missing pages keep `PROT_NONE`, `apply`
+/// changes the rest, piece by piece in order (an error ends the call, as
+/// Linux's walk of the vmas ends at one, with what came before changed),
+/// and every registered page has `prot` recorded as asked: a missing page
+/// gets it once filled ([`copy`], [`zeropage`]) or no longer registered
+/// ([`unregister`], the userfaultfd closed), and keeps it across a discard
+/// that makes it missing again. A range that touches no registered range,
+/// or a start off a host page (which `apply` refuses, `EINVAL`), goes to
+/// `apply` as it is. The pages of a huge page range are whole: a range that
+/// cuts one is `EINVAL`, as Linux's hugetlb refuses to split a vma off a
+/// huge page boundary (mm/hugetlb.c `hugetlb_vm_op_split`).
+pub fn protecting(start: u64, len: u64, prot: c_int, apply: impl Fn(u64, u64) -> c_int) -> c_int {
+    let host = page_size();
+    let end = start.checked_add(len).and_then(|e| e.checked_next_multiple_of(host.max(1)));
+    let Some(end) = end.filter(|_| host != 0 && len != 0 && start.is_multiple_of(host)) else {
+        return apply(start, len);
+    };
+    if slots(start, end).next().is_none() {
+        return apply(start, len);
+    }
+    let _guard = LOCK.lock().unwrap();
+    for r in slots(start, end) {
+        let (s, e, ps) = (r.start.load(Ordering::Acquire), r.end.load(Ordering::Acquire), r.page_size());
+        if !(start.max(s) - s).is_multiple_of(ps) || !(end.min(e) - s).is_multiple_of(ps) {
+            crate::linux_items::set_errno(libc::EINVAL);
+            return -1;
+        }
+    }
+    let mut missing = Vec::new();
+    for_each_missing(start, end - start, |a, l| missing.push((a.max(start), (a + l).min(end))));
+    // The pieces between the missing runs go to `apply`; the asked
+    // protection is recorded as the walk passes each page.
+    let record = |a: u64, b: u64| {
+        for r in slots(a, b) {
+            let (s, ps) = (r.start.load(Ordering::Acquire), r.page_size());
+            let (from, to) = (a.max(s), b.min(r.end.load(Ordering::Acquire)));
+            for page in (from - s) / ps..(to - s) / ps {
+                if Range::test(&r.tracked, page) {
+                    r.set_asked(page, prot);
+                }
+            }
+        }
+    };
+    let mut at = start;
+    for (a, b) in missing.into_iter().chain(core::iter::once((end, end))) {
+        if a > at {
+            let rc = apply(at, a - at);
+            if rc != 0 {
+                return rc;
+            }
+            record(at, a);
+        }
+        record(a, b);
+        at = b;
+    }
+    0
 }
 
 /// Creates a userfaultfd. Returns its index and the user's descriptor (the
@@ -643,11 +792,10 @@ fn validate_range(start: u64, len: u64) -> Result<u64, c_int> {
 }
 
 /// The VM map entries in `[start, end)`, cut to it, in order: Linux's vmas
-/// of the range, holes left out. Each with whether all of it is readable
-/// and writable.
-fn mapped_entries(start: u64, end: u64) -> Vec<(u64, u64, bool)> {
+/// of the range, holes left out. Each with its current protection
+/// (`PROT_*` bits).
+fn mapped_entries(start: u64, end: u64) -> Vec<(u64, u64, c_int)> {
     const VM_REGION_BASIC_INFO_64: c_int = 9;
-    let rw = libc::PROT_READ | libc::PROT_WRITE;
     let mut entries = Vec::new();
     let mut at = start;
     while at < end {
@@ -673,10 +821,16 @@ fn mapped_entries(start: u64, end: u64) -> Vec<(u64, u64, bool)> {
         }
         // vm_region_basic_info_64 starts with the current protection
         // (VM_PROT_* bits are PROT_* bits).
-        entries.push((addr.max(at), (addr + size).min(end), info[0] & rw == rw));
+        entries.push((addr.max(at), (addr + size).min(end), info[0] & PROT_RWX));
         at = addr + size;
     }
     entries
+}
+
+/// The protection of the entry of `entries` ([`mapped_entries`]) that
+/// holds `addr`, which one does.
+fn protection_in(entries: &[(u64, u64, c_int)], addr: u64) -> c_int {
+    entries.iter().find(|&&(s, e, _)| s <= addr && addr < e).map_or(0, |&(_, _, prot)| prot)
 }
 
 /// The occupied range slots that overlap `[start, end)`.
@@ -773,11 +927,12 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     // The parts to register: the entries, cut where huge page mappings
     // begin and end, adjacent ones of one page size joined.
     let mut parts: Vec<(u64, u64, u64)> = Vec::new();
-    for &(s, e, rw) in &entries {
+    let rw = libc::PROT_READ | libc::PROT_WRITE;
+    for &(s, e, prot) in &entries {
         if overlaps_an_alias(s, e) {
             return Err(errno_err(libc::EINVAL));
         }
-        if !rw && !all_registered(s, e) {
+        if prot & rw != rw && !all_registered(s, e) {
             return Err(errno_err(libc::EPERM));
         }
         let mut at = s;
@@ -817,7 +972,8 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         }
     }
     // Pages of this userfaultfd's ranges that were unregistered, with
-    // whether they are missing now.
+    // whether they are missing now and their protection, which is what was
+    // asked of them: unregistered, they are ordinary memory.
     let mut again = Vec::new();
     for &(s, e, _) in &parts {
         for r in slots(s, e) {
@@ -827,7 +983,7 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
             for page in (a - base) / ps..(b - base) / ps {
                 if !Range::test(&r.tracked, page) {
                     let at = base + page * ps;
-                    again.push((r, page, missing_pages(at, ps, ps)?[0]));
+                    again.push((r, page, missing_pages(at, ps, ps)?[0], protection_in(&entries, at)));
                 }
             }
         }
@@ -893,6 +1049,10 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         range.missing.store(alloc_bitmap(pages, false), Ordering::Release);
         // Trailing bits of the last word stay set; they are past `end`.
         range.tracked.store(alloc_bitmap(pages, true), Ordering::Release);
+        let asked: Vec<AtomicU8> = (0..pages)
+            .map(|page| AtomicU8::new((protection_in(&entries, s + page * ps) & PROT_RWX) as u8))
+            .collect();
+        range.asked.store(Box::into_raw(asked.into_boxed_slice()).cast(), Ordering::Release);
         for (page, &m) in missing.iter().enumerate() {
             if m {
                 Range::set(&range.missing, page as u64, true);
@@ -902,7 +1062,8 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         REGISTERED.fetch_add(1, Ordering::AcqRel);
     }
     let mut runs = Vec::new();
-    for (r, page, missing) in again {
+    for (r, page, missing, prot) in again {
+        r.set_asked(page, prot);
         Range::set(&r.missing, page, missing);
         Range::set(&r.tracked, page, true);
         if missing {
@@ -977,14 +1138,13 @@ pub fn unregister(_ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
             let base = r.start.load(Ordering::Acquire);
             let ps = r.page_size();
             let (a, b) = (s.max(base), e.min(r.end.load(Ordering::Acquire)));
-            // Accessible first, then not missing: a thread that faulted on
-            // a page before it was accessible finds it missing and waits for
+            // Given what was asked of them first, then not missing: a thread
+            // that faulted on a page before finds it missing and waits for
             // the wake below.
             let mut runs = Vec::new();
             for_each_missing(a, b - a, |x, l| runs.push((x, l)));
             for (x, l) in runs {
-                protect(x, l, libc::PROT_READ | libc::PROT_WRITE)
-                    .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+                protect_as_asked(r, x, x + l).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
                 stage2(x, l, true);
             }
             for page in (a - base) / ps..(b - base) / ps {
@@ -1029,8 +1189,7 @@ fn fill(
     }
     let bytes = n * ps;
     fill((alias + (dst - base)) as *mut u8, bytes as usize, 0);
-    protect(dst, bytes, libc::PROT_READ | libc::PROT_WRITE)
-        .map_err(|e| (e.raw_os_error().unwrap_or(libc::EIO), 0))?;
+    protect_as_asked(range, dst, dst + bytes).map_err(|e| (e.raw_os_error().unwrap_or(libc::EIO), 0))?;
     stage2(dst, bytes, true);
     for page in first..first + n {
         Range::set(&range.missing, page, false);
@@ -1152,6 +1311,16 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
                 );
                 std::process::abort();
             }
+            // The remap gives the alias the new pages' protection, the one
+            // asked of them ([`protecting`]), which may not be writable; the
+            // alias is written by every fill.
+            if let Err(e) = protect(alias + (a - s), b - a, libc::PROT_READ | libc::PROT_WRITE) {
+                std::eprintln!(
+                    "wick: userfaultfd alias of {a:#x}+{:#x} cannot be made writable after a discard ({e})",
+                    b - a
+                );
+                std::process::abort();
+            }
             // The range's whole pages inside the piece.
             let (first, last) = ((a - s).div_ceil(ps), (b - s) / ps);
             for page in first..last {
@@ -1191,7 +1360,7 @@ fn destroy(ctx: usize) {
         for_each_missing(s, e - s, |a, l| runs.push((a, l)));
         let ps = r.page_size();
         for (a, l) in runs {
-            let _ = protect(a, l, libc::PROT_READ | libc::PROT_WRITE);
+            let _ = protect_as_asked(r, a, a + l);
             stage2(a, l, true);
             for page in (a - s) / ps..(a + l - s) / ps {
                 Range::set(&r.missing, page, false);
@@ -1449,7 +1618,11 @@ pub fn prefault(addr: u64, len: u64, write: bool) -> bool {
     while page < end {
         // The first byte of the buffer in this page.
         let at = page.max(addr);
-        if is_missing(at) && fault(at, write) {
+        // A page whose asked protection refuses the access is left to the
+        // call, which fails with EFAULT, as Linux's copy fails on it with no
+        // fault reaching the userfaultfd.
+        let access = if write { Access::Write } else { Access::Read };
+        if is_missing(at) && asked_allows(at, access) && fault(at, write) {
             any = true;
         }
         page += ps;
@@ -2298,7 +2471,6 @@ mod tests {
     /// the host, so the VMM's own access faults to the handler, where before
     /// it read zeros and a later copy overwrote what it wrote.
     #[test]
-    #[ignore = "fails until mprotect of registered memory keeps missing pages missing"]
     fn test_mprotect_of_registered_missing_pages_keeps_them_missing() {
         let (a, ua) = create(0, false, true).unwrap();
         let ps = page_size();
@@ -2344,7 +2516,6 @@ mod tests {
     /// page must be missing and inaccessible, so a page a call opened fails
     /// here rather than reading zeros with no event to serve.
     #[test]
-    #[ignore = "fails until mprotect of registered memory keeps missing pages missing"]
     fn test_plug_after_a_uffd_restore() {
         let (ctx, user) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
         let ps = page_size();
@@ -2408,7 +2579,6 @@ mod tests {
     /// by a copy, by a zero page, and after a discard made it missing again
     /// and a copy filled it, as Linux's pages take their vma's protection.
     #[test]
-    #[ignore = "fails until mprotect of registered memory keeps missing pages missing"]
     fn test_a_filled_page_takes_the_protection_asked_while_it_was_missing() {
         let (a, ua) = create(0, false, true).unwrap();
         let ps = page_size();
@@ -2434,10 +2604,39 @@ mod tests {
         close(&[ua]);
     }
 
+    /// A virtio-mem slot unplugged and plugged again after a restore through
+    /// a userfaultfd, as Firecracker does it: the slot made `PROT_NONE`, then
+    /// discarded (devices/virtio/mem/device.rs: `update_slot` before
+    /// `discard_range`), then made read-write; the handler's next fill there
+    /// lands, as on Linux, where the discard leaves the pages missing in their
+    /// vma. The discard's remap of the alias must leave it writable.
+    #[test]
+    fn test_a_slot_unplugged_and_plugged_again_is_filled_through_its_alias() {
+        let (a, ua) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(2);
+        let data = std::vec![0x5au8; ps as usize];
+        register(a, mem, 2 * ps).unwrap();
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        mprotect(mem, 2 * ps, libc::PROT_NONE);
+        // SAFETY: the test's mapping.
+        let r = unsafe { crate::linux_items::madvise(mem as *mut _, (2 * ps) as usize, libc::MADV_DONTNEED) };
+        assert_eq!(r, 0);
+        assert!(is_missing(mem) && is_missing(mem + ps));
+        mprotect(mem, 2 * ps, RW);
+        // SAFETY: `data` holds a page; the alias must be writable.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        // SAFETY: filled just now.
+        assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0x5a);
+        assert_eq!(prot_of(mem) & RW, RW);
+        assert_eq!(unregister(a, mem, 2 * ps), Ok(()));
+        close(&[ua]);
+    }
+
     /// Unregistered, a missing page gets the protection asked of it, as a
     /// Linux page has its vma's once no userfaultfd has it.
     #[test]
-    #[ignore = "fails until mprotect of registered memory keeps missing pages missing"]
     fn test_an_unregistered_page_takes_the_protection_asked_while_it_was_missing() {
         let (a, ua) = create(0, false, true).unwrap();
         let ps = page_size();
@@ -2447,6 +2646,105 @@ mod tests {
         assert_eq!(unregister(a, mem, ps), Ok(()));
         assert_eq!(prot_of(mem) & RW, libc::PROT_READ);
         close(&[ua]);
+    }
+
+    /// Released with its userfaultfd, a missing page gets the protection
+    /// asked of it, as a Linux page has its vma's once the userfaultfd is
+    /// gone: its release (fs/userfaultfd.c, v6.12, `userfaultfd_release`
+    /// :856) clears each vma with mm/userfaultfd.c `userfaultfd_clear_vma`
+    /// :1797, whose new flags drop only `__VM_UFFD_FLAGS` (:1810).
+    #[test]
+    fn test_a_released_page_takes_the_protection_asked_while_it_was_missing() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(1);
+        register(a, mem, ps).unwrap();
+        mprotect(mem, ps, libc::PROT_READ);
+        assert_eq!(prot_of(mem) & RW, 0, "a missing page is not accessible");
+        close(&[ua]);
+        // The release is the serving thread's, once it sees the close.
+        let until = Instant::now() + Duration::from_secs(10);
+        while slots(mem, mem + ps).next().is_some() {
+            assert!(Instant::now() < until, "the userfaultfd was not released in 10 s");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(prot_of(mem) & RW, libc::PROT_READ);
+    }
+
+    /// A host access to a missing page that the protection asked of it
+    /// refuses is the process's own fault, with no event, as on Linux, whose
+    /// fault handler refuses it before the userfaultfd is asked
+    /// ([`asked_allows`]); one it allows faults to the
+    /// userfaultfd (the control). Each case in a child, which a refused
+    /// access ends by its signal.
+    #[test]
+    fn test_a_registered_page_its_protection_denies_is_no_userfault() {
+        const CASE: &str = "WICK_UFFD_ASKED_CASE";
+        // (case, protection asked, the access writes, refused)
+        const CASES: [(&str, c_int, bool, bool); 3] = [
+            ("none", libc::PROT_NONE, false, true),
+            ("read-only", libc::PROT_READ, true, true),
+            ("allowed", libc::PROT_READ, false, false),
+        ];
+        let Some(case) = std::env::var_os(CASE) else {
+            for (name, _, _, refused) in CASES {
+                let out = {
+                    let _spawning = crate::timerfd::spawning();
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "wick_uffd::tests::test_a_registered_page_its_protection_denies_is_no_userfault",
+                            "--exact",
+                            "--test-threads=1",
+                            "--nocapture",
+                        ])
+                        .env(CASE, name)
+                        .output()
+                        .unwrap()
+                };
+                let text = std::format!(
+                    "{name}: {:?}\n{}{}",
+                    out.status,
+                    std::string::String::from_utf8_lossy(&out.stdout),
+                    std::string::String::from_utf8_lossy(&out.stderr)
+                );
+                use std::os::unix::process::ExitStatusExt;
+                if refused {
+                    let sig = out.status.signal();
+                    assert!(sig == Some(libc::SIGSEGV) || sig == Some(libc::SIGBUS), "{text}");
+                    assert!(!text.contains("EVENT"), "{text}");
+                } else {
+                    assert!(out.status.success() && text.contains("EVENT"), "{text}");
+                }
+            }
+            return;
+        };
+        let (_, prot, write, _) = CASES.iter().find(|c| case == c.0).copied().unwrap();
+        // An access that waits for an event that never comes would hang:
+        // the alarm's default action ends the child, which the parent sees.
+        // SAFETY: plain alarm.
+        unsafe { libc::alarm(10) };
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = page_size();
+        let mem = map(1);
+        register(a, mem, ps).unwrap();
+        mprotect(mem, ps, prot);
+        let handler = std::thread::spawn(move || {
+            let mut event = [0u8; proto::RECORD];
+            if read_full(ua, &mut event) {
+                std::eprintln!("EVENT {:x?}", words(&event));
+                assert_eq!(zeropage(a, mem, ps, true), Ok(ps));
+            }
+        });
+        // SAFETY: a page of the test's mapping; a refused access ends the
+        // process here.
+        unsafe {
+            if write {
+                ptr::write_volatile(mem as *mut u8, 1);
+            } else {
+                ptr::read_volatile(mem as *const u8);
+            }
+        }
+        handler.join().unwrap();
     }
 
     /// `MADV_FREE` of registered pages makes them missing, as Linux's does once

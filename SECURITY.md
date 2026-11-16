@@ -241,6 +241,33 @@ has the per-control details and results.
   accepted, which was not checked before; no such connection was seen. The behaviour this relies on is measured on
   the host (`test_af_unix_paths_and_abstract_addresses_on_record`): a connection queued on the listener is accepted
   after its path is deleted, and both ends report this process's pid.
+- **macOS: a virtio-mem slot plugged after a restore from a userfaultfd let the VMM read memory the handler had not
+  filled.** On `main` from 6c4320c5 (the compatibility `libc`, with its userfaultfd) to the commit that brought
+  `libc::wick_uffd::protecting`. Path: a microVM restored with `mem_backend` `Uffd` registers every guest region
+  with the userfaultfd, the hotplug region too (persist.rs `guest_memory_from_uffd`); an unplugged slot is made
+  `PROT_NONE` and a plugged one `PROT_READ | PROT_WRITE` (vstate/memory.rs `GuestMemorySlot::protect`). That
+  `mprotect` went to macOS as it was, and a missing page, kept `PROT_NONE` so that a host access faults to the
+  handler, became readable and writable: the VMM's own accesses there (its device emulation) read zeros with no
+  fault, and a later fill of the page, still missing to the userfaultfd, overwrote what the VMM had written. The
+  guest's own accesses still went to the handler, as a fill alone maps a page into stage 2 (`libc::wick_guest`).
+  Effect: the integrity of the guest's data in plugged memory, not the host's isolation. Fixed: `mprotect` of
+  registered memory keeps missing pages inaccessible and gives each the protection asked once it is filled or no
+  longer registered, as Linux's mprotect leaves the registration as it is (docs/ARCHITECTURE.md, "Memory calls on
+  registered memory"; `test_plug_after_a_uffd_restore`,
+  `test_a_slot_plugged_after_a_uffd_restore_still_faults_host_accesses`).
+- **macOS: a fill after a discard of a registered page that was not writable ended the process by SIGBUS** (from
+  fc1d7a42, which made a discard remap the userfaultfd's alias over the new pages, to the commit that brought
+  `libc::wick_uffd::protecting`). The remap gives the alias the new pages' protection, and every fill writes through
+  the alias: after `mprotect` to `PROT_READ` of filled registered pages and a `MADV_DONTNEED` of them, the handler's
+  next fill there ended the process by SIGBUS (measured, before the fix:
+  `test_a_filled_page_takes_the_protection_asked_while_it_was_missing`, "signal: 10, SIGBUS"). Firecracker reaches it:
+  after a restore through a userfaultfd, a virtio-mem unplug of a whole slot makes it `PROT_NONE` and then discards it
+  (devices/virtio/mem/device.rs: `update_slot` before `discard_range`), so the alias of its filled pages became
+  `PROT_NONE`; once the slot was plugged again, the handler's fill of a page the guest touched ended Firecracker by
+  SIGBUS. Those calls in that order are measured at the libc's level
+  (`test_a_slot_unplugged_and_plugged_again_is_filled_through_its_alias`, SIGBUS with the alias left as the remap made
+  it), not in a VM. Now the alias is made read-write after the remap (`discarding`), and a fill gives the page the
+  protection asked.
 
 ## Not at parity yet
 
@@ -570,22 +597,18 @@ upstream Firecracker and its jailer.
   user wrote meanwhile (up to 64 KiB), if it knows the name. Run each jail's pipes under names the others cannot
   guess, or run tenants under different accounts.
 - **macOS: userfaultfd memory calls not yet as Linux's; fix in progress.** On memory a userfaultfd has registered
-  (`mem_backend` `Uffd`), `mprotect` makes missing pages accessible: a virtio-mem slot plugged after such a restore
-  lets the VMM's own accesses (its device emulation) read zeros the handler never filled, and a later fill overwrite
-  what the VMM wrote; the guest's own accesses still go to the handler, as only a fill maps a page into stage 2
-  (`libc::wick_guest`). The effect is on the integrity of guest data in plugged memory, not on the host's isolation.
-  `MADV_FREE` of registered pages posts no remove event, and memory mapped over registered memory stays in its
-  registration. Firecracker uses no `MADV_FREE` and maps nothing over registered memory; it unmaps registered guest
-  memory only when the VM is torn down, while the VM's userfaultfd is still open (the guest regions' drop,
-  lib/firecracker/src/vmm/src/vstate/memory.rs:308, `guest_memory` dropped before `uffd`, vstate/vm.rs:84 and :95);
-  the guest's paths (`libc::wick_guest`, the HVF backend) reach neither; as read from the code. Until that userfaultfd
-  is released the unmapped range stays registered, and its release then makes the range's old missing pages read-write
-  on whatever is mapped there by then in the same process, such as another thread's new stack guard or a `PROT_NONE`
-  reservation (measured: a `PROT_NONE` mapping made in the hole was read-write after the release,
+  (`mem_backend` `Uffd`), `MADV_FREE` of registered pages posts no remove event, and memory mapped over registered
+  memory stays in its registration. Firecracker uses no `MADV_FREE` and maps nothing over registered memory; it unmaps
+  registered guest memory only when the VM is torn down, while the VM's userfaultfd is still open (the guest regions'
+  drop, lib/firecracker/src/vmm/src/vstate/memory.rs:308, `guest_memory` dropped before `uffd`, vstate/vm.rs:84 and
+  :95); the guest's paths (`libc::wick_guest`, the HVF backend) reach neither; as read from the code. Until that
+  userfaultfd is released the unmapped range stays registered, and its release then makes the range's old missing
+  pages read-write on whatever is mapped there by then in the same process, such as another thread's new stack guard
+  or a `PROT_NONE` reservation (measured: a `PROT_NONE` mapping made in the hole was read-write after the release,
   `test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is`, ignored until the munmap fix); the
   window is from `guest_memory`'s drop to `uffd`'s (vstate/vm.rs:84 to :95), or longer while something else holds the
   userfaultfd, such as the handler. Each has its test, ignored until its fix (docs/ARCHITECTURE.md, "Memory calls on
-  registered memory": `test_plug_after_a_uffd_restore`, `test_madv_free_of_registered_pages_makes_them_missing`,
+  registered memory": `test_madv_free_of_registered_pages_makes_them_missing`,
   `test_memory_replaced_while_registered_is_in_no_registration`,
   `test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is`).
 - **macOS: a call Firecracker's own sandbox denies ends it by SIGKILL, not exit 148.** On Linux the seccomp trap's

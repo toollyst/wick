@@ -130,7 +130,9 @@ pub mod wick_mm {
     }
 }
 
-/// `mprotect`, with the [`wick_mm`] check.
+/// `mprotect`, with the [`wick_mm`] check, and Linux's meaning on memory a
+/// userfaultfd has registered: the registration stays and its missing pages
+/// keep faulting to the userfaultfd ([`crate::wick_uffd::protecting`]).
 ///
 /// # Safety
 /// Same contract as `mprotect(2)`.
@@ -138,8 +140,10 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
     if wick_mm::exec_denied(prot) {
         return -1;
     }
-    // SAFETY: forwarded.
-    unsafe { libc::mprotect(addr, len, prot) }
+    crate::wick_uffd::protecting(addr as u64, len as u64, prot, |at, n| {
+        // SAFETY: the caller's contract, for a part of its range.
+        unsafe { libc::mprotect(at as *mut c_void, n as usize, prot) }
+    })
 }
 
 /// `mmap` with the Linux flags above.

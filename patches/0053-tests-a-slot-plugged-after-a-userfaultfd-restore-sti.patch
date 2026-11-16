@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Mon, 16 Nov 2026 19:40:00 +0900
+Subject: [PATCH] tests: a slot plugged after a userfaultfd restore still
+ faults host accesses
+
+Why: upstream's restore from a userfaultfd registers every guest region,
+the hotplug one too (persist.rs guest_memory_from_uffd), and virtio-mem
+protects an unplugged slot and plugs it with mprotect
+(vm.rs register_memory_region, GuestRegionMmapExt::update_slot). On Linux
+mprotect leaves the registration as it is (v6.12 mm/mprotect.c
+mprotect_fixup), so the VMM's own access to a page the handler has not
+filled faults to the handler; no upstream test covers that path, and
+wick's compatibility mprotect on macOS once made such pages readable
+zeros.
+
+What: a unit test in vstate/memory.rs that makes those calls on a
+hotpluggable region (register, protect every slot, plug one) and reads a
+page of the plugged slot from another thread: the read must wait for the
+handler's fill and see its bytes. user_mode_only(true): the access is a
+user-mode one, so it runs unprivileged on Linux (v6.12 fs/userfaultfd.c
+userfaultfd_syscall_allowed).
+
+Test: cargo test -p vmm --lib -- \
+  vstate::memory::tests::test_a_slot_plugged_after_a_uffd_restore_still_faults_host_accesses
+---
+ src/vmm/src/vstate/memory.rs | 78 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 78 insertions(+)
+
+diff --git a/src/vmm/src/vstate/memory.rs b/src/vmm/src/vstate/memory.rs
+index 54dfbd7fb41d64638d78c4b3aca136972c53f879..29d61c839af5ac83079aff14609bba80a4527395 100644
+--- a/src/vmm/src/vstate/memory.rs
++++ b/src/vmm/src/vstate/memory.rs
+@@ -2370,6 +2370,84 @@ mod tests {
+             .unwrap();
+     }
+ 
++    // wick: a virtio-mem slot plugged after a restore from a userfaultfd
++    // keeps its missing pages faulting to the handler on the VMM's own
++    // access, on every host: Linux's mprotect leaves a registration as it is
++    // (v6.12 mm/mprotect.c `mprotect_fixup`), and wick's compatibility
++    // mprotect on macOS must too (`libc::wick_uffd::protecting`). The calls
++    // are the restore's: every region registered (persist.rs
++    // `guest_memory_from_uffd`), an unplugged slot protected (vm.rs
++    // `register_memory_region`), then plugged (`update_slot`'s
++    // `protect(false)`). `user_mode_only(true)`: the access is a user-mode
++    // one, and so the test runs unprivileged on Linux (v6.12 fs/userfaultfd.c
++    // :2138 `userfaultfd_syscall_allowed`).
++    #[test]
++    fn test_a_slot_plugged_after_a_uffd_restore_still_faults_host_accesses() {
++        use std::sync::mpsc;
++        use std::time::Duration;
++
++        use userfaultfd::{Event, UffdBuilder};
++
++        const FILL: u8 = 0x5a;
++        let page = host_page_size();
++        let slot_size = 4 * page;
++        let region = anonymous(
++            vec![(GuestAddress(0x10_0000), 2 * slot_size)].into_iter(),
++            false,
++            HugePageConfig::None,
++        )
++        .unwrap()
++        .into_iter()
++        .next()
++        .unwrap();
++        let ext = GuestRegionMmapExt::hotpluggable_from_mmap_region(region, 0, slot_size);
++        let uffd = UffdBuilder::new()
++            .close_on_exec(true)
++            .non_blocking(false)
++            .user_mode_only(true)
++            .create()
++            .unwrap();
++        uffd.register(ext.as_ptr().cast(), ext.size()).unwrap();
++        for (slot, plugged) in ext.slots() {
++            assert!(!plugged);
++            slot.protect(true).unwrap();
++        }
++        let (slot, _) = ext.slots().nth(1).unwrap();
++        slot.protect(false).unwrap();
++        // A page of the plugged slot, never filled.
++        let at = ext.as_ptr() as usize + slot_size + page;
++
++        // The handler: the first event, its page filled.
++        let (tx, rx) = mpsc::channel();
++        let handler = std::thread::spawn(move || {
++            let event = uffd.read_event();
++            let addr = match event {
++                Ok(Some(Event::Pagefault { addr, .. })) => addr as usize,
++                other => panic!("{other:?}"),
++            };
++            tx.send(addr).unwrap();
++            let src = vec![FILL; page];
++            let to = addr - addr % page;
++            // SAFETY: a page of the registered region.
++            unsafe { uffd.copy(src.as_ptr().cast(), to as *mut c_void, page, true) }.unwrap();
++        });
++        // The VMM's own read.
++        let reader = std::thread::spawn(move || {
++            // SAFETY: a page of the region; the read waits for the fill.
++            unsafe { std::ptr::read_volatile(at as *const u8) }
++        });
++        match rx.recv_timeout(Duration::from_secs(60)) {
++            Ok(addr) => assert_eq!(addr - addr % page, at - at % page),
++            Err(err) if reader.is_finished() => panic!(
++                "the read returned {:#x} with no fault ({err}): the plug made a missing page accessible",
++                reader.join().unwrap()
++            ),
++            Err(err) => panic!("no fault in 60 s ({err}), and the read still waits"),
++        }
++        assert_eq!(reader.join().unwrap(), FILL);
++        handler.join().unwrap();
++    }
++
+     /// Returns the (start, end) of the VMA containing `addr` in `/proc/self/maps`, if any.
+     // wick: Linux; the macOS version follows.
+     #[cfg(target_os = "linux")]
