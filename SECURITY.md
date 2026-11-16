@@ -651,6 +651,28 @@ has the per-control details and results.
   often: a slot holds less than twice its largest arrays, which have room for the next power of two of its largest
   range's pages (64 at least), so less than four times what that range needs past that floor (136 KiB for 1 GiB of 16 KiB pages, a power of two:
   under 272 KiB with any arrays it outgrew) (`test_register_and_release_in_a_loop_keeps_the_array_count_flat`).
+- **Windows: a reader of a userfaultfd range without the lock could read one range's bounds with another's arrays,
+  and every registration leaked its arrays** (from b0dfb35b, the Windows userfaultfd's start, to the commit that
+  brought `Range::gen` there; found by reading, not observed; the macOS entry above). The process's exception
+  handler (`resolve_access`: `is_missing`, `fault`), the WHP run loop's `fault` at a guest's access to a missing page,
+  and the system calls' prefault read a slot's start, end and per-page arrays without `LOCK`. A slot freed (its
+  memory unmapped or mapped over) and taken by another range between those loads gave the old bounds with the new
+  arrays: an index past the end of a smaller array, an out-of-bounds read inside the exception handler, or a page of
+  the other range read as missing, its fault posted to a userfaultfd that never registered the address, the access
+  waiting for a fill that would not come. It needs an unmapping and a register, under `LOCK` on another thread, to
+  land between one reader's few loads; Firecracker registers its guest memory once and unmaps it at its exit, as
+  read from the code. Now each slot has a sequence count, odd while a writer changes its bounds (stores only: no
+  allocation, lock or system call in the window, so no exception can be raised inside it, and a lookup that finds
+  its own thread's window open ends the process with a line,
+  `test_a_lookup_inside_its_own_writers_window_ends_the_process`); a reader reads it before and after and starts
+  over on a change (`test_a_reader_between_its_generation_reads_starts_over`), `fault` validates it once its waiter
+  is registered, read after the page's bits (`test_fault_validates_after_its_waiter_is_registered`,
+  `test_fault_reads_the_generation_after_the_page`), and every index is checked against the capacity the array
+  holds (`test_an_index_past_an_arrays_capacity_reads_nothing`). The arrays (a byte for the owner and three bits a
+  page: missing, no read, no write) belong to their slot and only grow, with the peak of what is registered at
+  once, not with how often (`test_register_and_unmap_in_a_loop_keeps_the_array_count_flat`): 352 KiB for 1 GiB of
+  4 KiB pages, a power of two, under 704 KiB with any arrays its slot outgrew. Windows Server 2022 20348 and 2025
+  26100; each test ran on the code with its check taken out and failed there (the commit names each).
 - **Windows: a guest access to guest RAM that the host refuses ended the VMM with an access violation, and a store to
   a read-only memory slot waited a million runs again or for ever** (found by reading, review of the WHP run loop's
   memory access exit; failing first in the decision's own shape: `test_a_ram_access_is_decided_in_kvms_order`, 11
