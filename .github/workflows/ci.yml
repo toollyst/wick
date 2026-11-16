@@ -2363,6 +2363,30 @@ jobs:
           }
           Write-Host "::error::bindlink without bindlink.dll: expected only the stage's no-DLL failure and no drive left; got: $($lines -join ' | ')"
           exit 1
+      # Option E-ii's isolation (X2STORM lines): on the kit's x2APIC record
+      # build, a jailed 4-vCPU guest loops 10 s on the held LVT timer write
+      # (its own value back to MSR 0x832 through /dev/cpu/1/msr) and, as the
+      # control, on port 0x80 writes; recorded each time: the writes and the
+      # time a write, the held count, A's API latency (GET every 50 ms),
+      # A's CPU with no cpu.max and under cpu.max of one CPU, and a second
+      # jailed VM's 1 kHz loop rate; five runs, X2STORMSUM the medians. It
+      # fails on an unanswered request, a loop that did not run, writes that
+      # were not held, or A past its cpu.max. Not applicable (exit code 3)
+      # where the build makes xAPIC partitions, which this step accepts only
+      # on a runner whose processor is not AMD, as the x2apic step does.
+      - name: jailer-test.ps1 x2storm
+        if: (success() || failure()) && steps.kit.outcome == 'success'
+        run: |
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          Write-Host "the runner's processor: $($cpu.Manufacturer), $($cpu.Name.Trim())"
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir "$env:WJT-x2storm" -Assets $env:WBT -Stage x2storm
+          $code = $LASTEXITCODE
+          Get-Content "$env:WJT-x2storm\summary.txt" -ErrorAction SilentlyContinue
+          if ($code -eq 3 -and $cpu.Manufacturer -ne 'AuthenticAMD') {
+            Write-Host "::notice::jailer-test.ps1 x2storm is not applicable on this $($cpu.Manufacturer) runner: option E makes x2APIC partitions on AMD hosts only (the stage's line above)"
+            exit 0
+          }
+          exit $code
       # Large pages need "Lock pages in memory" in the token, and a right
       # given to an account reaches only a logon made after it. So: the right
       # is given to this account (secedit), the account gets a password of

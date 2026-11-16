@@ -6,7 +6,7 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user] [-Bin <dir>]
+#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user|x2storm] [-Bin <dir>] [-X2ApicFirecracker <exe>]
 #
 # `refuse`, `freeze`, `cpuset`, `parent`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
@@ -14,7 +14,11 @@
 # its own, as CI's step runs it (<WorkDir>-pidns); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
 # Platform filters). `hugepages` needs the account to hold "Lock pages in memory" (it
 # fails, saying so, without it). `bindlink` needs an elevated PowerShell and Windows 11
-# 24H2 or later (bindlink.dll; it fails, saying so, without it).
+# 24H2 or later (bindlink.dll; it fails, saying so, without it). `x2storm`
+# (not in the default list, about 10 minutes) needs the x2APIC record build
+# (-X2ApicFirecracker, default the build's x2apic\release\firecracker.exe,
+# which CI's kit has) and an AMD host; on another it is not applicable, and
+# the script's exit code is 3 if no stage failed.
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build),
 # `examples\uffd_on_demand_handler.exe` for `uffd` and, for `vhost-user`,
@@ -30,7 +34,8 @@ param(
     [string[]]$Stage = @('refuse', 'freeze', 'cpuset', 'parent', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'bindlink', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
-    [string]$Probe = ''
+    [string]$Probe = '',
+    [string]$X2ApicFirecracker = ''
 )
 $ErrorActionPreference = 'Stop'
 # Firecracker, the jailer and the probes write UTF-8 (Rust's strings,
@@ -48,6 +53,10 @@ $WorkDir = (Resolve-Path $WorkDir).Path
 $Results = [ordered]@{}
 
 class Failure : Exception { Failure([string]$m) : base($m) {} }
+# A stage that cannot run on this host, by design (x2storm on a host whose
+# partitions are xAPICs): its line says so, and the script's exit code is 3
+# when no stage failed.
+class NotApplicable : Exception { NotApplicable([string]$m) : base($m) {} }
 function Check([bool]$ok, [string]$what) { if (-not $ok) { throw [Failure]::new($what) } }
 
 # An AF_UNIX socket's path holds at most 107 bytes (sun_path[108] with its
@@ -181,7 +190,8 @@ class JailedVm {
 # -Api keeps the API socket (/run/firecracker.socket in the jail) and sets
 # `Sock` and `Root` on the VM; -NoConfig starts Firecracker with nothing
 # configured (the API configures it); `drives` are added to the root drive.
-function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(), [int]$memMib = 256, [switch]$Api, [switch]$NoConfig, [object[]]$drives = @(), [string]$hugePages = '') {
+function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(), [int]$memMib = 256, [switch]$Api, [switch]$NoConfig, [object[]]$drives = @(), [string]$hugePages = '', [int]$vcpus = 2, [string]$exec = '') {
+    if (-not $exec) { $exec = $Fc }
     $root = Join-Path $base "firecracker.exe\$id\root"
     New-Item -ItemType Directory -Force -Path $root | Out-Null
     Copy-Item (Join-Path $Assets 'vmlinux-6.1.188') (Join-Path $root 'vmlinux')
@@ -189,14 +199,14 @@ function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(),
     $cfg = [ordered]@{
         'boot-source'    = [ordered]@{ kernel_image_path = '/vmlinux'; boot_args = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd root=/dev/vda ro rootfstype=squashfs init=/bin/sh' }
         'drives'         = @([ordered]@{ drive_id = 'rootfs'; path_on_host = '/rootfs'; is_root_device = $true; is_read_only = $true }) + $drives
-        'machine-config' = [ordered]@{ vcpu_count = 2; mem_size_mib = $memMib }
+        'machine-config' = [ordered]@{ vcpu_count = $vcpus; mem_size_mib = $memMib }
     }
     if ($hugePages) { $cfg['machine-config']['huge_pages'] = $hugePages }
     Set-Content -Encoding ASCII (Join-Path $root 'vm.json') ($cfg | ConvertTo-Json -Depth 5)
     $fcArgs = @('--')
     if (-not $Api) { $fcArgs += '--no-api' }
     if (-not $NoConfig) { $fcArgs += @('--config-file', '/vm.json') }
-    $line = (@('--id', $id, '--exec-file', "`"$Fc`"", '--uid', '0', '--gid', '0', '--chroot-base-dir', "`"$base`"") + ($jailerArgs | ForEach-Object { if ($_ -match ' ') { "`"$_`"" } else { $_ } }) + $fcArgs) -join ' '
+    $line = (@('--id', $id, '--exec-file', "`"$exec`"", '--uid', '0', '--gid', '0', '--chroot-base-dir', "`"$base`"") + ($jailerArgs | ForEach-Object { if ($_ -match ' ') { "`"$_`"" } else { $_ } }) + $fcArgs) -join ' '
     $vm = [JailedVm]::new($Jailer, $line, (Join-Path $base "$id-console.txt"))
     $vm | Add-Member -NotePropertyName Root -NotePropertyValue $root
     $sock = Join-Path $root 'run\firecracker.socket'
@@ -1880,6 +1890,178 @@ function Stage-Cpu([int]$Boots = 12) {
     "cpu.max=25000 100000 from the start: $Boots boots, held to $($booting -join '%, ')% of a CPU up to init and $($used -join '%, ')% in a spin, local timers in TSC-deadline mode"
 }
 
+# Option E-ii's isolation, a record (X2STORM lines): a guest that loops on
+# the held LVT timer write, each write holding every vCPU of its VM while
+# the backend sets the APIC page (SECURITY.md, option E-ii), against a
+# control that loops on an exit with no hold. The x2APIC record build
+# (-X2ApicFirecracker) on an AMD host, as boot-test.ps1 x2apic. Each run
+# boots, jailed, A (4 vCPUs) and B (2 vCPUs, the release build) side by
+# side, first with no cpu.max and then with cpu.max=100000 100000 (one CPU)
+# on A, and for each of the two loops, 10 s on A's vCPU 1:
+# - storm: the guest's own LVT timer value written back to MSR 0x832
+#   through /dev/cpu/1/msr, one WRMSR a pwrite (Linux v6.1
+#   arch/x86/kernel/msr.c msr_write: wrmsr_safe_on_cpu, writes allowed by
+#   default with a rate-limited warning, filter_write);
+# - control: a byte written to port 0x80 through /dev/port (an exit to the
+#   VMM, no hold);
+# and records: the loop's writes and the time a write; A's held writes over
+# the window (X2HOLDCOUNT, whose lines past 64 come every 1000th: a count to
+# the thousand); A's API, GET /machine-config every 50 ms (curl's own
+# time_total, its process start not in it): median, p99, max; A's CPU (its
+# Firecracker's processor time over the wall time, in CPUs); B's 1 kHz loop
+# (sleep 1 ms) in iterations a second. Asserted: every request answered
+# 200, both loops ran, the storm's writes were held (the count rose by the
+# writes, to the thousand), and A under cpu.max used no more than its CPU
+# (1.15 with the sampling's slack). Whether the storm is no worse than the
+# control is read from the lines (X2STORMSUM: the median over the runs).
+# On a host whose partitions the build makes xAPICs (not AMD) it is not
+# applicable, exit code 3.
+$StormGuest = @'
+import os, sys, time
+mode, cpu, secs, tag = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+os.sched_setaffinity(0, {cpu})
+n = 0
+t0 = time.monotonic()
+end = t0 + secs
+if mode == 'tick':
+    while time.monotonic() < end:
+        time.sleep(0.001)
+        n += 1
+    v = b''
+else:
+    if mode == 'storm':
+        f = os.open('/dev/cpu/%d/msr' % cpu, os.O_RDWR)
+        at = 0x832
+        v = os.pread(f, 8, at)
+    else:
+        f = os.open('/dev/port', os.O_WRONLY)
+        at = 0x80
+        v = b'\0'
+    while time.monotonic() < end:
+        os.pwrite(f, v, at)
+        n += 1
+print('DONE', tag, mode, n, '%.3f' % (time.monotonic() - t0), v.hex() or '-', flush=True)
+'@
+
+function Get-StormCommand([string]$mode, [int]$cpu, [int]$secs, [string]$tag) {
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(($StormGuest -replace "`r", '')))
+    "python3 -c `"import base64,sys;exec(base64.b64decode('$b64'))`" $mode $cpu $secs $tag"
+}
+
+# The record build's count of held LVT timer writes so far in a VM's output
+# (its X2HOLDCOUNT lines), 0 with none.
+function Get-HeldWrites([string]$text) {
+    $counts = @([regex]::Matches($text, 'whp: X2HOLDCOUNT (\d+) ') | ForEach-Object { [long]$_.Groups[1].Value })
+    if ($counts.Count -eq 0) { return 0 }
+    return ($counts | Measure-Object -Maximum).Maximum
+}
+
+# GET /machine-config on `sock` every 50 ms for `secs`: the latencies of the
+# answered requests (curl's time_total, in ms) and the others' answers.
+function Measure-ApiGets([string]$sock, [double]$secs) {
+    Assert-SockPath $sock
+    $lat = New-Object Collections.Generic.List[double]
+    $bad = @()
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $next = 0.0
+    while ($sw.Elapsed.TotalSeconds -lt $secs) {
+        $r = (& curl.exe -s -o NUL -w '%{http_code} %{time_total}' --max-time 10 --unix-socket $sock 'http://localhost/machine-config') -join ''
+        $f = @($r -split ' ')
+        if ($f.Count -eq 2 -and $f[0] -eq '200') { $lat.Add([double]::Parse($f[1], [Globalization.CultureInfo]::InvariantCulture) * 1000) } else { $bad += $r }
+        $next += 0.05
+        $wait = $next - $sw.Elapsed.TotalSeconds
+        if ($wait -gt 0) { Start-Sleep -Milliseconds ([int][math]::Ceiling($wait * 1000)) } else { $next = $sw.Elapsed.TotalSeconds }
+    }
+    $s = @($lat | Sort-Object)
+    $q = { param($p) if ($s.Count) { $s[[math]::Max(0, [int][math]::Ceiling($p * $s.Count) - 1)] } else { [double]::NaN } }
+    [pscustomobject]@{ N = $s.Count; Bad = $bad; Median = (& $q 0.5); P99 = (& $q 0.99); Max = (& $q 1.0) }
+}
+
+function Get-JailedFirecracker([string]$base, [string]$id) {
+    $p = Get-Process firecracker -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$base\firecracker.exe\$id\*" } | Select-Object -First 1
+    Check ($null -ne $p) "no jailed Firecracker for $id under $base"
+    $null = $p.Handle
+    $p
+}
+
+function Get-Median([double[]]$v) {
+    $s = @($v | Sort-Object)
+    if (-not $s.Count) { return [double]::NaN }
+    $s[[int][math]::Floor(($s.Count - 1) / 2)]
+}
+
+function Stage-X2storm([int]$Runs = 5, [int]$Secs = 10) {
+    $x2 = if ($X2ApicFirecracker) { $X2ApicFirecracker } else { Join-Path (Split-Path -Parent (Split-Path -Parent $Here)) 'lib\firecracker\build\x2apic\release\firecracker.exe' }
+    Check (Test-Path $x2) "no x2APIC record build at $x2 (cargo build --release -p firecracker -p <kvm-ioctls' package id> --features kvm-ioctls/whp-x2apic-record, or pass -X2ApicFirecracker)"
+    $x2 = (Resolve-Path $x2).Path
+    $base = New-Base 'x2storm'
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $rows = @()
+    for ($run = 1; $run -le $Runs; $run++) {
+        foreach ($cap in @('', '100000 100000')) {
+            $capName = if ($cap) { 'cpu.max one CPU' } else { 'no cpu.max' }
+            $ida = "a$run$(if ($cap) { 'c' } else { 'u' })"
+            $idb = "b$run$(if ($cap) { 'c' } else { 'u' })"
+            $capArgs = if ($cap) { @('--cgroup-version', '2', '--cgroup', "cpu.max=$cap") } else { @() }
+            try {
+                $a = Start-JailedVm $base $ida $capArgs 256 -Api -vcpus 4 -exec $x2
+                $b = Start-JailedVm $base $idb @() 256 -vcpus 2
+                Wait-Shell $a
+                Wait-Shell $b
+                $build = [regex]::Match($a.Text(), 'whp: a whp-x2apic-record build[^\r\n]*').Value
+                $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+                if ($build -match 'emulate an xAPIC' -and $cpu.Manufacturer -ne 'AuthenticAMD') {
+                    throw [NotApplicable]::new("not applicable on this host ($($cpu.Manufacturer), $($cpu.Name.Trim())): option E makes x2APIC partitions on AMD hosts only; the build's line: '$build'")
+                }
+                Check ($build -match 'emulate an x2APIC') "A is not an x2APIC partition (this host is $($cpu.Manufacturer), or $x2 is not the record build): '$build'"
+                $deadline = $a.Sh('grep -c "Clock Event Device: lapic-deadline" /proc/timer_list', 10)
+                Check ($deadline -eq '4') "A's local timers in TSC-deadline mode (/proc/timer_list): '$deadline' of 4 vCPUs"
+                $dev = $a.Sh('test -c /dev/cpu/1/msr && test -c /dev/port && echo both', 10)
+                Check ($dev -eq 'both') "A has no /dev/cpu/1/msr or /dev/port: '$dev'"
+                $fcA = Get-JailedFirecracker $base $ida
+                foreach ($mode in @('control', 'storm')) {
+                    $tag = "$ida$mode"
+                    $held0 = Get-HeldWrites $a.Text()
+                    $b.Send((Get-StormCommand 'tick' 0 $Secs "B$tag"))
+                    $a.Send((Get-StormCommand $mode 1 $Secs "A$tag"))
+                    # Inside both loops: they start once python3 has.
+                    Start-Sleep -Milliseconds 1500
+                    $fcA.Refresh(); $c0 = $fcA.TotalProcessorTime; $w0 = [Diagnostics.Stopwatch]::StartNew()
+                    $api = Measure-ApiGets $a.Sock ($Secs - 3)
+                    $fcA.Refresh(); $used = ($fcA.TotalProcessorTime - $c0).TotalSeconds / $w0.Elapsed.TotalSeconds
+                    Check ($a.WaitFor("(?m)^DONE A$tag ", $Secs + 60)) "${capName}, ${mode}: A's loop did not end: $(($a.Text() -split "`n" | Select-Object -Last 3) -join ' | ')"
+                    Check ($b.WaitFor("(?m)^DONE B$tag ", $Secs + 60)) "${capName}, ${mode}: B's loop did not end: $(($b.Text() -split "`n" | Select-Object -Last 3) -join ' | ')"
+                    $held = (Get-HeldWrites $a.Text()) - $held0
+                    $da = [regex]::Match($a.Text(), "(?m)^DONE A$tag \S+ (\d+) ([\d.]+) (\S+)")
+                    $db = [regex]::Match($b.Text(), "(?m)^DONE B$tag \S+ (\d+) ([\d.]+)")
+                    $writes = [long]$da.Groups[1].Value
+                    $took = [double]::Parse($da.Groups[2].Value, $inv)
+                    $tick = [long]$db.Groups[1].Value / [double]::Parse($db.Groups[2].Value, $inv)
+                    $us = if ($writes) { $took * 1e6 / $writes } else { [double]::NaN }
+                    $line = "X2STORM run $run, $capName, ${mode}: $writes writes in $($da.Groups[2].Value) s ($('{0:N1}' -f $us) us a write, value $($da.Groups[3].Value)), held +$held; A's API GET median $('{0:N2}' -f $api.Median) ms, p99 $('{0:N2}' -f $api.P99), max $('{0:N2}' -f $api.Max) ($($api.N) answered, $($api.Bad.Count) not); A's CPU $('{0:N2}' -f $used); B's 1 kHz loop $('{0:N0}' -f $tick)/s"
+                    Write-Host "     $line"
+                    Check ($api.Bad.Count -eq 0 -and $api.N -gt 0) "${capName}, ${mode}: A's API: $($api.Bad.Count) requests not answered 200: $($api.Bad -join ' | ')"
+                    Check ($writes -gt 0) "${capName}, ${mode}: A's loop wrote nothing"
+                    if ($mode -eq 'storm') { Check ($held + 2000 -ge $writes -and $held -le $writes + 2000) "${capName}: $writes writes, $held held: the storm's writes were not the held write" }
+                    if ($cap) { Check ($used -le 1.15) "${capName}, ${mode}: A used $('{0:N2}' -f $used) CPUs" }
+                    $rows += [pscustomobject]@{ Cap = $capName; Mode = $mode; Us = $us; Median = $api.Median; P99 = $api.P99; Max = $api.Max; Cpu = $used; Tick = $tick }
+                }
+                $a.Send('reboot -ff'); $b.Send('reboot -ff')
+                [void]$a.P.WaitForExit(15000); [void]$b.P.WaitForExit(15000)
+            } finally { Stop-Jailed }
+        }
+    }
+    $sum = foreach ($capName in @('no cpu.max', 'cpu.max one CPU')) {
+        $by = { param($m, $f) Get-Median @($rows | Where-Object { $_.Cap -eq $capName -and $_.Mode -eq $m } | ForEach-Object { $_.$f }) }
+        $c = [ordered]@{}; $s = [ordered]@{}
+        foreach ($f in 'Us', 'Median', 'P99', 'Max', 'Cpu', 'Tick') { $c[$f] = & $by 'control' $f; $s[$f] = & $by 'storm' $f }
+        $l = "X2STORMSUM $capName, medians of $Runs runs, storm against control: a write $('{0:N1}' -f $s.Us) us against $('{0:N1}' -f $c.Us); API GET median $('{0:N2}' -f $s.Median) ms against $('{0:N2}' -f $c.Median), p99 $('{0:N2}' -f $s.P99) against $('{0:N2}' -f $c.P99), max $('{0:N2}' -f $s.Max) against $('{0:N2}' -f $c.Max); A's CPU $('{0:N2}' -f $s.Cpu) against $('{0:N2}' -f $c.Cpu); B's 1 kHz loop $('{0:N0}' -f $s.Tick)/s against $('{0:N0}' -f $c.Tick)/s"
+        Write-Host "     $l"
+        $l
+    }
+    $sum -join '; '
+}
+
 # Row 8 of docs/PORTING.md, the freezer (overlay/jailer/platform/windows/freezer.rs):
 # upstream's cgroup freezer files in <chroot-base>\<exec>\<id>\, kept by the
 # jailer, which freezes and thaws the jail's Job Object. The jailed binary is
@@ -2144,7 +2326,7 @@ foreach ($s in $Stage) {
         $dir = Join-Path $WorkDir $s
         if (Test-Path $dir) { Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue }
     } catch {
-        $Results[$s] = "FAIL  ${s}: $($_.Exception.Message)"
+        $Results[$s] = if ($_.Exception -is [NotApplicable]) { "N/A   ${s}: $($_.Exception.Message)" } else { "FAIL  ${s}: $($_.Exception.Message)" }
         Stop-Jailed
         # The processes this stage's cleanup, or the stage, killed while they
         # ran: their output ends where the kill came.
@@ -2162,8 +2344,11 @@ $left = foreach ($c in [char[]](68..90)) {
 }
 $Results['drives'] = if ($left) { "FAIL  drives: left mapped: $($left -join ', ')" } else { 'PASS  drives: every jail drive was removed' }
 $failed = @($Results.Values | Where-Object { $_.StartsWith('FAIL') }).Count
-$summary = @($Results.Values) + @('', "$($Results.Count - $failed) passed, $failed failed")
+$na = @($Results.Values | Where-Object { $_.StartsWith('N/A') }).Count
+$summary = @($Results.Values) + @('', "$($Results.Count - $failed - $na) passed, $failed failed$(if ($na) { ", $na not applicable" })")
 $summary | Set-Content -Encoding UTF8 (Join-Path $WorkDir 'summary.txt')
 ''
 $summary
-exit [int]($failed -ne 0)
+if ($failed) { exit 1 }
+if ($na) { exit 3 }
+exit 0

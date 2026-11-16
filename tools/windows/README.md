@@ -67,8 +67,18 @@
   privilege but traversal and gets its 2 MiB pages from the jailer, bounded
   by `hugetlb.2MB.max`; needs "Lock pages in memory", as the boot test's
   stage does), `uffd` and `vhost-user` (a jailed guest's memory handed to a
-  handler or a backend of the operator); and a check that every jail's drive
-  letter was removed. It needs the boot test's guest files (`-Assets`,
+  handler or a backend of the operator), and, not in the default list,
+  `x2storm` (option E-ii's isolation, a record, X2STORM lines: on the x2APIC
+  record build, `-X2ApicFirecracker` as `boot-test.ps1 x2apic` takes it, a
+  jailed 4 vCPU guest loops 10 s on its held LVT timer write, its own value
+  back to MSR 0x832 through `/dev/cpu/1/msr`, and as the control on port
+  0x80 writes through `/dev/port`, while the stage reads its API latency
+  (GET every 50 ms), its CPU with no `cpu.max` and under one CPU's, and a
+  second jailed VM's 1 kHz loop rate; five runs, X2STORMSUM the medians; it
+  fails on an unanswered request, a loop that did not run, writes not held,
+  or the VM past its `cpu.max`; N/A on a host whose partitions are xAPICs,
+  exit code 3 if no stage failed; not run yet); and a check that every
+  jail's drive letter was removed. It needs the boot test's guest files (`-Assets`,
   default `C:\wbt`) and the probe (`jail-probe.exe` from the kit, or
   `rustc` to build it):
 
@@ -240,7 +250,9 @@ crate tests to the kit's upload run whatever failed before them, where runs
   its own too, with its own result: pagefile-backed sections past
   `memory.max` end the jail with 137 at the jailer's next count, and
   temporary-file sections (page cache) are allowed (docs/COMPATIBILITY.md,
-  the `memory.max` row). The job's summary lists `bindlink`'s step, so that
+  the `memory.max` row). `x2storm` in a step of its own, which accepts its
+  N/A (exit code 3) only on a runner whose processor is not AMD, as the
+  `x2apic` step does. The job's summary lists `bindlink`'s step, so that
   a green job does not read as every stage passing.
 
 A failed stage fails the job, the stages after it still run, and the logs

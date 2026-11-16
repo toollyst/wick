@@ -939,8 +939,11 @@ upstream Firecracker and its jailer.
   of them costs that vCPU's thread, which runs under the jail's CPU limit like any guest work, as a guest's busy loop
   does. KVM intercepts every #GP the same way when `enable_vmware_backdoor` is set (Linux v6.1
   arch/x86/kvm/vmx/vmx.c 791, 5091-5103). The decode and the merge are unit-tested on every host (fuzz crate
-  `whp_gp`); the storm's isolation (another vCPU's rate, the API's latency, the job's CPU accounting) is not
-  measured yet. The exit path itself has run on Windows, in record builds only: GPEXITREC
+  `whp_gp`); the storm's isolation is measured for its costliest #GP, the held LVT timer write below, by
+  `jailer-test.ps1 x2storm` (X2STORM lines: a jailed 4-vCPU guest looping 10 s on that write against a port-write
+  control, five runs, with the VM's API latency, its CPU with no `cpu.max` and under one CPU's, and a second jailed
+  VM's 1 kHz loop rate), which has not run yet: it needs the x2APIC record build on an AMD host, and its first run is
+  CI's. The exit path itself has run on Windows, in record builds only: GPEXITREC
   (`test_gp_exits_on_an_x2apic_partition_on_record`, a guest's #GP exits on an x2APIC partition) and
   `boot-test.ps1 x2apic` (a Linux guest booted on such a partition) passed on CI's AMD runners in CI runs 43680983973
   and 43688550565. Its LVT timer write in TSC-deadline mode is the one #GP that
