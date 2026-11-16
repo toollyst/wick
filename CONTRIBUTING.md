@@ -125,7 +125,11 @@ and the main checkout use; they never set the variable.
   must exist (here or in upstream's tree), and a table row's code span writes
   a `|` with a backslash before it; in every document and source comment, a
   heading cited as `SECURITY.md, "Heap"` must be one of that document's
-  headings, bold labels or table rows. A probe that once showed something is
+  headings, bold labels or table rows. A number a document derives from the
+  tree is checked too: the patch and file counts by `tools/patches.sh check`,
+  COMPATIBILITY's counts by `tools/compat-counts.py`, README's line count and
+  PORTING row 1's sandbox counts by `tools/check-derived.py` (a new derived
+  number gets its extractor there). A probe that once showed something is
   not a test; the claim waits until the product does it and a test in the
   repository shows it.
 - A number in a doc says how it was measured. On a loaded machine, measure
