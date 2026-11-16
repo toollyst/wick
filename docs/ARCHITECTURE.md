@@ -372,6 +372,35 @@ semantics on Win32. The details are in the comments of each
   discards private pages. File offsets not aligned to 64 KiB, shared mappings
   past EOF, `MAP_FIXED` over part of a view and `MAP_HUGETLB` fail with the
   Linux errno.
+- **Released userfaultfd ranges = a fixed table of records (`windows_mm::RELEASED`).** A registered range's pages
+  that leave the registration while missing (its userfaultfd released, `wick_uffd::destroy`, or an unregister of
+  them) are pending: one never filled is not committed, and is committed at its first access with the protection
+  `mprotect` gave it; one discarded is committed, closed and still charged, and is zeroed through the range's alias
+  at its first access and opened, as Linux gives a zapped page as zeros at its next touch. Linux's release clears
+  each vma's flags in place and the pages stay in its page tables (v6.1 fs/userfaultfd.c `userfaultfd_release`,
+  885-899), so it needs no memory; here the release runs at the job's limit too, so it may allocate nothing:
+  - **One record per registration, taken at the register** (`released_reserve`) with its bitmaps (`pending`,
+    `noread`, `nowrite`, one bit a page), from a table as large as the slots (64). With none free the register is
+    `ENOMEM` and nothing is done, as Linux's register past `vm.max_map_count` (mm/mmap.c `split_vma`). The release
+    then only sets bits and stores fields (`test_a_userfaultfd_released_at_the_limit_allocates_nothing`).
+  - **A record is freed when its registration is released and its views are all gone** (each chunk's view counted
+    at the register and counted out when it is unmapped or mapped over), not when its last pending page is
+    resolved: two threads faulting on the last pending page must both find the record, the second to see the page
+    resolved and run its access again (`test_released_records_reused_under_touching_threads`). So a register is
+    refused while 64 registrations' memory is still mapped, registered or released
+    (`test_released_records_past_the_table_refuse_a_register`, `test_release_then_munmap_frees_the_record`).
+  - **Readers: every decision about a record is taken under `RELEASED`'s lock.** The access path finds the record
+    holding the page, tests its bits, resolves the page and clears its bit in one critical section, so no reader
+    holds a record across its reuse; taking, freeing, the release's flips, `munmap`'s and `mprotect`'s changes are
+    made under the lock too. Only `RELEASED_LIVE`, the count of records in use, is read without it, a hint that
+    lets an access that cannot concern a record skip the lock. It gives no false "none" for a page that matters:
+    the release publishes its record before `destroy` wakes the threads waiting on the range's missing pages, which
+    run their access again and find it.
+  - **Lock order:** the userfaultfd's `LOCK`, the region table, `RELEASED`, `CHARGES`. The release does not take the
+    region table: `mprotect` and `munmap` ask `released_overlaps` for a view a record holds.
+  - A released chunk is not a candidate of the reclaim at the memory limit, so its discarded pages keep their charge
+    until each is touched or unmapped, where Linux freed them at the discard (the `memory.max` row of
+    docs/COMPATIBILITY.md).
 - **memfd = unnamed temporary file**, unlinked at once with
   `FILE_FLAG_DELETE_ON_CLOSE` and POSIX delete. Size seals (`SealShrink`,
   `SealGrow`) attach a section of that size to the fd, so the OS refuses to

@@ -8,12 +8,18 @@
 //! `alloc_fd` fails the call that would take a number at or past
 //! `rlimit(RLIMIT_NOFILE)` with `EMFILE`, and the process goes on (linux
 //! v6.12 fs/file.c). Windows has no descriptor table and no settable
-//! per-process handle limit (agent-state/win1/nofile-windows.md §1, §2, §9b,
-//! measured; Microsoft, "Kernel Objects": a fixed 2^24). Here the number
+//! per-process handle limit (Microsoft, "Kernel Objects": a fixed 2^24).
+//! Measured once on Windows Server 2022 20348, by probes not kept in the
+//! tree: a process's pool quota grows with its use (300,000 events made
+//! under a 1 MiB limit set on itself) unless a host-wide registry value
+//! fixes it, and then one quota block is shared by the whole logon session;
+//! no job object limit or notification counts handles (all information
+//! classes 1 to 51 read, 1,000,000 events made under the UI limits); an
+//! account's LSA pool quotas are accepted and read back as 0. Here the number
 //! bounds the process's **handles**, as Windows counts them
 //! (`GetProcessHandleCount`), read at each call: Windows' own handles count
-//! too, where Linux counts only descriptors. Measured on Windows Server 2022
-//! (nofile-windows.md §10): Firecracker has 94 handles 3 s after its start
+//! too, where Linux counts only descriptors. Measured once by hand on
+//! Windows Server 2022 20348: Firecracker has 94 handles 3 s after its start
 //! with the API, and 117 after an `InstanceStart`, where Linux has about 10
 //! descriptors; upstream's default 2048 leaves about 1930 of them, the same
 //! order of headroom. Nothing is added to or taken from the number given: a
@@ -81,7 +87,8 @@
 //!
 //! **Cost.** Without a limit, a call reads a cached `None`. With one, each
 //! call above makes one `GetProcessHandleCount` (0.15 µs at 1,000,082
-//! handles, measured, nofile-windows.md §8). At run time that is per
+//! handles, measured once on Windows Server 2022 20348 by a probe not kept
+//! in the tree). At run time that is per
 //! connection accepted (the API process, the vsock muxer), per device
 //! activation and setup (eventfds, timerfds, epoll), per snapshot or file
 //! opened; never per I/O.
@@ -96,7 +103,9 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleC
 pub const ENV: &str = "WICK_NO_FILE";
 
 /// Windows' own maximum of handles per process, 2^24 (Microsoft, "Kernel
-/// Objects"; 16,711,680 measured, nofile-windows.md §7): `getrlimit` without
+/// Objects"; measured once on Windows Server 2022 20348, outside a job:
+/// 16,711,680 duplicates made, the next refused with
+/// `ERROR_NO_SYSTEM_RESOURCES`): `getrlimit` without
 /// a limit.
 pub const MAX: u64 = 1 << 24;
 

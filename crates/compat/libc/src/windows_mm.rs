@@ -3871,8 +3871,8 @@ pub(crate) fn uffd_commit(s: usize, len: usize) -> bool {
 }
 
 
-/// A userfaultfd range's record of its released pages (design in
-/// agent-state, design-released-ranges.md): the pages that were missing when
+/// A userfaultfd range's record of its released pages (docs/ARCHITECTURE.md,
+/// "Released userfaultfd ranges"): the pages that were missing when
 /// they left the registration (at its release, `wick_uffd::destroy`, or an
 /// unregister of them) and are still to be resolved at their first access:
 /// one never filled is not committed and is committed then, with the

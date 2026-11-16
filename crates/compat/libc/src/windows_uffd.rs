@@ -5515,7 +5515,7 @@ mod tests {
     /// filled reads zeros and takes a write; a filled page keeps its data;
     /// as Linux's released range, whose zapped and never-faulted pages are
     /// anonymous memory's zero-filled pages (a control for the released
-    /// ranges' records, design-released-ranges.md).
+    /// ranges' records, docs/ARCHITECTURE.md, "Released userfaultfd ranges").
     #[test]
     fn test_a_stale_page_read_after_release_reads_zeros() {
         let mem = released_with_pending_pages(0x5a);
@@ -5701,7 +5701,8 @@ mod tests {
 
     /// Ranges registered and released while other threads touch the pending
     /// pages of those released before: records freed and taken again under
-    /// touching threads (design-released-ranges.md, the reader protocol).
+    /// touching threads (docs/ARCHITECTURE.md, "Released userfaultfd ranges":
+    /// the readers).
     /// One thread makes 200 ranges of 4 pages (`released_with_pending_pages`,
     /// filled with the round's byte) and unmaps the one of two rounds
     /// before; four threads touch the pending pages of the ranges still
@@ -5774,7 +5775,8 @@ mod tests {
 
     /// The released ranges' records are as many as the slots, one taken at
     /// each register and held until the registration is released and its
-    /// memory unmapped (design-released-ranges.md): with 64 ranges released
+    /// memory unmapped (docs/ARCHITECTURE.md, "Released userfaultfd ranges"):
+    /// with 64 ranges released
     /// and still mapped, a 65th register is refused with `ENOMEM` and
     /// changes nothing, as Linux refuses a register whose vma
     /// split would pass `vm.max_map_count` (mm/mmap.c `split_vma`); their

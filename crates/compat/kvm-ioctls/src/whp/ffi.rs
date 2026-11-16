@@ -766,7 +766,12 @@ pub(crate) mod trace {
     /// a mutex: nothing is allocated where it is written, so the record
     /// runs at the memory limit too. Which exit grows a vCPU thread's stack
     /// inside WHP, and whether WHP's C++ exceptions are thrown in it, is
-    /// what it answers (design-stack-reclaim.md 13.3).
+    /// what it answers. What it is to confirm (CI run 43833851623, STACKCALL
+    /// lines, on fc_vcpu 0): the thread's first write to `MAP_NORESERVE`
+    /// guest RAM, a memory-access exit, grew its stack from 20 to 56 KiB
+    /// with two first-chance C++ exceptions (0xE06D7363) inside the call,
+    /// and the next such writes 0 KiB with two each; a port-I/O exit grew
+    /// it by 4 KiB and CPUID exits by none, with no exception.
     #[cfg(test)]
     pub(crate) mod runrec {
         use std::sync::Mutex;

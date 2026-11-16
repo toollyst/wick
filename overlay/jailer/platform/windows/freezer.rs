@@ -416,20 +416,27 @@ fn delete(path: &[u16]) -> io::Result<()> {
 // refused and reads a whole value. On Windows a handle that can write a
 // file, or delete it (as replacing it by a rename does), refuses every
 // opener that does not share that with it, and every way to change a
-// file's content takes such a handle. Measured on Windows Server 2022 build
-// 20348, four readers in tight loops, 2000 changes (agent-state/win2/
-// results-fzs.txt, results-fzs2.txt, results-fzt.txt):
+// file's content takes such a handle. Measured once, by a probe that is not
+// kept in the tree, on Windows Server 2022 build 20348 with Defender's
+// real-time protection on, readers in tight loops while a file's value
+// changed 2000 times each way:
 //
 // - written in place: a reader that shares reading and writing (`type`,
-//   Get-Content, C's fopen) is never refused; one that shares reading alone
-//   (.NET's File.ReadAllText) is, about ten times a change; a value changed
-//   in several bytes can be read half written ("THAWEN\n", twice);
+//   Get-Content, C's fopen) is never refused (two such readers, about 8000
+//   reads each, 0 refused); one that shares reading alone (.NET's
+//   File.ReadAllText) is, about ten times a change (two such readers,
+//   about 21000 refusals each); a value changed in several bytes can be
+//   read half written (twice "THAWEN\n" and once "TROZEN\n" in about
+//   32000 reads);
 // - replaced by a rename (MoveFileExW, or a POSIX-semantics rename) of a
 //   file written aside: every reader that does not share deleting, both of
-//   those, is refused about twice a change, whoever scans the files (the
-//   same with the files written 10 s before); a reader holding the file
-//   refuses the rename itself;
-// - a hard link made and removed: no reader refused.
+//   those, is refused about twice a change (four readers, about 4300
+//   refusals each over the 2000 changes), whoever scans the files (the same
+//   with the files written 10 s before); a reader holding the file refuses
+//   the rename itself (1975 of 2000 MoveFileExW refused, error 5, with four
+//   readers);
+// - a hard link made and removed: 2000 of 2000 changes made, and no reader
+//   refused (four readers, about 5600 reads each).
 //
 // So the jailer makes a file by writing it aside and linking the name to
 // it, where nothing is (a reader finds no file, then the whole file), and
@@ -526,7 +533,7 @@ impl Files {
         // named, which refused a reader sharing reading and writing that
         // opened it then (`test_readers_are_never_refused_v1`, 4 times in
         // a run); a link made and the other name removed refuse no reader
-        // (agent-state/win2/results-fzs.txt). Fails if the name is there.
+        // (the hard link's measurement above). Fails if the name is there.
         let linked = written.and_then(|()| {
             if unsafe { CreateHardLinkW(wide(&path).as_ptr(), tmp.as_ptr(), std::ptr::null()) } == 0 {
                 Err(last_error())
@@ -1451,9 +1458,9 @@ mod tests {
     //   refuses them while any handle can write the file (CreateFileW: "You
     //   cannot request a sharing mode that conflicts with the access mode
     //   that is specified in an existing request that has an open handle"),
-    //   and every way to change a file's content takes one (measured,
-    //   agent-state/win2/results-fzs.txt, results-fzs2.txt,
-    //   results-fzt.txt; the freeze stage's ReadAllText was refused so on
+    //   and every way to change a file's content takes one (measured: the
+    //   comment on how the files are read and written, at the head of this
+    //   file's writing; the freeze stage's ReadAllText was refused so on
     //   Windows 11 26300); what they do read is whole;
     // - every flip reaches the job, in order; once the readers stop, both
     //   files read the last state within the settle.
@@ -1563,8 +1570,7 @@ mod tests {
 
     // An operator's write that lands between the jailer's read of the
     // control file and its write-back is applied, never written over (the
-    // write-back undid it before: `test_readers_are_never_refused_v2` lost
-    // a flip so, agent-state/win2/results-fz-readers-before.txt). The
+    // write-back wrote over it before fc4191ed). The
     // jailer's steps of a read are run by hand here, the write put between.
     #[test]
     fn test_a_write_after_the_read_is_applied() {

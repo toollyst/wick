@@ -9522,8 +9522,8 @@ mod fpu_tests {
         }
     }
 
-    /// The records E0 of option E (agent-state's x2apic-e-plan.md), before
-    /// its code: an x2APIC partition whose #GPs leave the hypervisor
+    /// The records E0 of option E (whp/gp.rs's module doc), before its
+    /// code: an x2APIC partition whose #GPs leave the hypervisor
     /// (ExceptionExit, vector 13 in the exception exit bitmap), each case
     /// driven by `WHvRunVirtualProcessor` alone, so each exit's context is
     /// read as WHP gave it (X2E0REC lines). Printed:
