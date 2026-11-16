@@ -3198,11 +3198,23 @@ mod tests {
         const CHUNK: u64 = 2 << 20;
         let (ctx, user) = create(0, false, true).unwrap();
         let len = 2 * CHUNK + 16 * PAGE;
-        let at = fresh_gib(1) + (64 << 20);
-        // SAFETY: a new anonymous mapping at a free address.
-        let mem = unsafe { crate::mmap(at as *mut c_void, len as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0) };
-        assert_eq!(mem as usize, at, "the range's address");
-        let mem = mem as u64;
+        // At a 2 MiB boundary in address space found free; another test of
+        // the suite may map there between the look and the map, so a
+        // mapping placed elsewhere is given back and the look made again.
+        let mut tries = 0;
+        let mem = loop {
+            let at = fresh_gib(1) + (64 << 20);
+            // SAFETY: a new anonymous mapping, asked at a free address.
+            let p = unsafe { crate::mmap(at as *mut c_void, len as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0) };
+            assert_ne!(p, crate::MAP_FAILED);
+            if p as usize == at {
+                break p as u64;
+            }
+            // SAFETY: the mapping just made, ours.
+            assert_eq!(unsafe { crate::munmap(p, len as usize) }, 0);
+            tries += 1;
+            assert!(tries < 8, "no free 2 MiB boundary held for the range in 8 tries");
+        };
         register(ctx, mem, len).unwrap();
         assert!(range_of(ctx, mem, len).unwrap().reserved.load(Ordering::Acquire), "the section is not reserved");
         #[allow(clippy::cast_possible_truncation)]
@@ -3239,10 +3251,14 @@ mod tests {
         // SAFETY: a page of chunk 1 not discarded.
         assert_eq!(unsafe { *((mem + CHUNK + CHUNK / 2) as *const u8) }, 0x5a);
         // The last chunk, of 16 pages, discarded whole: at the range's edge.
-        let refused = crate::windows_mm::edge_refused_for_tests();
+        // Counted on this thread, where the discard's swap is refused: the
+        // process's count also takes the edge refusals of the suite's other
+        // tests running meanwhile (their 64 KiB ranges discarded whole),
+        // which once made it 2 here (Windows Server 2025 26100).
+        let refused = crate::windows_mm::edge_refused_on_this_thread_for_tests();
         // SAFETY: our mapping.
         assert_eq!(unsafe { crate::madvise((mem + 2 * CHUNK) as *mut c_void, 16 * PAGE as usize, crate::MADV_DONTNEED) }, 0);
-        assert_eq!(crate::windows_mm::edge_refused_for_tests(), refused + 1, "the last chunk's swap, at the range's edge");
+        assert_eq!(crate::windows_mm::edge_refused_on_this_thread_for_tests(), refused + 1, "the last chunk's swap, at the range's edge");
         assert!((0..16).all(|p| is_missing(mem + 2 * CHUNK + p * PAGE)), "the last chunk's pages");
         assert_eq!(committed(mem + 2 * CHUNK, 16 * PAGE), 16 * PAGE, "the last chunk discarded in place");
         assert_eq!(charged(), CHUNK + PAGE + 16 * PAGE);
@@ -4290,6 +4306,8 @@ mod tests {
 
     static MOVE_HELD: AtomicBool = AtomicBool::new(false);
     static MOVE_GO: AtomicBool = AtomicBool::new(false);
+    static DEEP_STARTED: AtomicBool = AtomicBool::new(false);
+    static TOUCHER_GROWN: AtomicBool = AtomicBool::new(false);
     static DEEP_GO: AtomicBool = AtomicBool::new(false);
     static TOUCH_GO: AtomicBool = AtomicBool::new(false);
 
@@ -4350,10 +4368,15 @@ mod tests {
         if mode == DuringMove::Late {
             crate::windows_mm::STACK_HANDLER_HOOK.store(let_the_reclaim_end as fn() as usize, Ordering::SeqCst);
         }
-        // Both threads made before the limit, the toucher's stack grown.
+        // Both threads made, started and the toucher's stack grown before
+        // the limit: waited for, as a thread still starting or growing at
+        // the limit is itself refused a stack page with no reclaim under
+        // way and ends the process with 137 (CI run 43947438431: the
+        // toucher, still in its `deep(16)`, on a 4-processor runner).
         let deep_one = std::thread::Builder::new()
             .name("wick-stack-wait".into())
             .spawn(move || {
+                DEEP_STARTED.store(true, Ordering::SeqCst);
                 while !DEEP_GO.load(Ordering::SeqCst) {
                     std::thread::yield_now();
                 }
@@ -4362,11 +4385,14 @@ mod tests {
             .unwrap();
         let toucher = std::thread::spawn(|| {
             core::hint::black_box(deep(16));
+            TOUCHER_GROWN.store(true, Ordering::SeqCst);
             while !TOUCH_GO.load(Ordering::SeqCst) {
                 std::thread::yield_now();
             }
             reclaim_at_touch(PAGE as usize)
         });
+        wait_for(&DEEP_STARTED, "the deep thread's start");
+        wait_for(&TOUCHER_GROWN, "the toucher's stack grown");
         let mut held = no_room_left();
         TOUCH_GO.store(true, Ordering::SeqCst);
         wait_for(&MOVE_HELD, "the move");
@@ -4409,6 +4435,11 @@ mod tests {
     /// as Linux's memory cgroup reclaims and charges the page (where before
     /// the process ended with 137). STACKWAIT: the stack the wait and the
     /// retry used under the handler's frame, of what was left there.
+    /// The main thread takes the job's room ([`no_room_left`]) only once
+    /// the deep thread has started and the toucher's stack is grown
+    /// (`DEEP_STARTED`, `TOUCHER_GROWN`): a thread still starting or growing
+    /// at the limit is refused its own stack page with no reclaim under way
+    /// and ends the child with 137 (CI run 43947438431).
     #[test]
     fn test_a_stack_page_refused_during_a_move_is_had_once_it_ends() {
         let (code, text) = run_child("stack_during_a_move_ends_child", Some(96 << 20));
@@ -4432,6 +4463,11 @@ mod tests {
     /// more, with no wait, whenever the commit was refused, so the room the
     /// move gave back is found; before, it found no reclaim under way and
     /// the process ended with 137.
+    /// The main thread takes the job's room ([`no_room_left`]) only once
+    /// the deep thread has started and the toucher's stack is grown
+    /// (`DEEP_STARTED`, `TOUCHER_GROWN`): a thread still starting or growing
+    /// at the limit is refused its own stack page with no reclaim under way
+    /// and ends the child with 137 (CI run 43947438431).
     #[test]
     fn test_a_stack_page_refused_as_the_reclaim_ends_is_had() {
         let (code, text) = run_child("stack_during_a_move_late_child", Some(96 << 20));
@@ -4453,6 +4489,11 @@ mod tests {
     /// stack page is refused during a move does not wait: the move may need
     /// that lock, so the wait could be for itself. It ends as before, with
     /// 137, at once, its line saying why it did not wait.
+    /// The main thread takes the job's room ([`no_room_left`]) only once
+    /// the deep thread has started and the toucher's stack is grown
+    /// (`DEEP_STARTED`, `TOUCHER_GROWN`): a thread still starting or growing
+    /// at the limit is refused its own stack page with no reclaim under way
+    /// and ends the child with 137 (CI run 43947438431).
     #[test]
     fn test_a_stack_page_refused_with_a_lock_held_is_not_waited_for() {
         let (code, text) = run_child("stack_during_a_move_held_child", Some(96 << 20));
@@ -4473,6 +4514,11 @@ mod tests {
     /// (`windows_mm::STACK_WAIT_BOUND`, 1 s): the page is asked for once
     /// more, refused, and the process ends with 137, its line saying it
     /// waited to the bound.
+    /// The main thread takes the job's room ([`no_room_left`]) only once
+    /// the deep thread has started and the toucher's stack is grown
+    /// (`DEEP_STARTED`, `TOUCHER_GROWN`): a thread still starting or growing
+    /// at the limit is refused its own stack page with no reclaim under way
+    /// and ends the child with 137 (CI run 43947438431).
     #[test]
     fn test_a_stack_page_waits_for_a_move_that_does_not_end_to_its_bound() {
         let (code, text) = run_child("stack_during_a_move_never_child", Some(96 << 20));
@@ -4495,6 +4541,11 @@ mod tests {
     /// process with 137, its line saying it waited for the reclaim's step
     /// and the page was still refused, which tells it from the end without
     /// a wait.
+    /// The main thread takes the job's room ([`no_room_left`]) only once
+    /// the deep thread has started and the toucher's stack is grown
+    /// (`DEEP_STARTED`, `TOUCHER_GROWN`): a thread still starting or growing
+    /// at the limit is refused its own stack page with no reclaim under way
+    /// and ends the child with 137 (CI run 43947438431).
     #[test]
     fn test_a_stack_page_refused_again_after_the_wait_ends_with_137() {
         let (code, text) = run_child("stack_during_a_move_again_child", Some(96 << 20));
@@ -4515,6 +4566,11 @@ mod tests {
     /// (`RECLAIMER_STACK`, `test_the_reclaimers_stack_on_record`); made to
     /// go past it in a move's middle at the limit, it ends the process with
     /// 137 at once, its line naming it.
+    /// The main thread takes the job's room ([`no_room_left`]) only once
+    /// the deep thread has started and the toucher's stack is grown
+    /// (`DEEP_STARTED`, `TOUCHER_GROWN`): a thread still starting or growing
+    /// at the limit is refused its own stack page with no reclaim under way
+    /// and ends the child with 137 (CI run 43947438431).
     #[test]
     fn test_the_reclaimers_own_stack_page_is_not_waited_for() {
         let (code, text) = run_child("stack_during_a_move_reclaimer_child", Some(96 << 20));
@@ -8228,9 +8284,16 @@ mod tests {
         let (ctx, user, mem, done) = fill_to_the_limit_and_discard_in_part();
         let before = counts();
         let stop = std::sync::Arc::new(AtomicBool::new(false));
+        // The reader started and its stack grown before the room is taken,
+        // waited for: a thread still starting at the limit is refused its
+        // own stack page (CI run 43947438431, the stack-wait tests).
+        let grown = std::sync::Arc::new(AtomicBool::new(false));
         let reader = {
             let stop = stop.clone();
+            let grown = grown.clone();
             std::thread::spawn(move || {
+                core::hint::black_box(deep(16));
+                grown.store(true, Ordering::SeqCst);
                 let mut reads = 0u64;
                 while !stop.load(Ordering::Acquire) {
                     for p in (PAGE..8 * CHUNK).step_by(2 * PAGE as usize) {
@@ -8243,6 +8306,7 @@ mod tests {
             })
         };
         let page = std::vec![0x5au8; PAGE as usize];
+        wait_for(&grown, "the reader's stack grown");
         let held = no_room_left();
         let mut more = 0;
         while more < 8 << 20 {

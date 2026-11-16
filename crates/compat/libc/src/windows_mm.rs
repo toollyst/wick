@@ -4914,6 +4914,8 @@ pub(crate) fn at_a_ranges_edge(view: usize, len: usize, alias: usize, start: usi
 /// `what`, and what follows (`then`); counted ([`EDGE_REFUSED`]).
 fn edge_refused(view: usize, what: &str, then: &str) {
     let n = EDGE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    EDGE_REFUSED_HERE.set(EDGE_REFUSED_HERE.get() + 1);
     if n < 16 || n.is_multiple_of(1024) {
         say_at_the_limit(format_args!(
             "wick: reclaim: the chunk at {view:#x} has a view alone in a 2 MiB region at its range's edge, whose swap would \
@@ -4927,6 +4929,21 @@ fn edge_refused(view: usize, what: &str, then: &str) {
 #[cfg(test)]
 pub(crate) fn edge_refused_for_tests() -> u64 {
     EDGE_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// [`EDGE_REFUSED`]'s refusals made on this thread: a discard's swap
+    /// is refused on the discarding thread, so a test reads its own there,
+    /// whatever the suite's other tests refuse meanwhile.
+    static EDGE_REFUSED_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Moves and swaps refused at a range's edge on this thread
+/// ([`EDGE_REFUSED_HERE`]), for tests.
+#[cfg(test)]
+pub(crate) fn edge_refused_on_this_thread_for_tests() -> u64 {
+    EDGE_REFUSED_HERE.get()
 }
 
 /// How many moves were not made ([`MOVE_MAPS_REFUSED`]): the tests', and
