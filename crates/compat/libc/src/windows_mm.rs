@@ -3809,6 +3809,8 @@ fn released_resolve(addr: usize, write: bool, grain: usize) -> Option<(Access, c
         // chunk is committed (`uffd_unalias`; `released_forget` before it
         // goes).
         unsafe { std::ptr::write_bytes((r.alias + (page - r.start)) as *mut u8, 0, PAGE) };
+        #[cfg(test)]
+        resolve_pause();
         if !protect(page, PAGE, prot) {
             return Some((Access::NotLazy, 0..0));
         }
@@ -3838,6 +3840,52 @@ fn released_resolve(addr: usize, write: bool, grain: usize) -> Option<(Access, c
         r.resolved(at);
     }
     Some((Access::Committed, from..to))
+}
+
+/// Tests: a resolve of a discarded page parks after zeroing it, holding the
+/// records' lock, while [`RESOLVE_PAUSE`] is armed: 0 off, 1 armed, 2
+/// parked, 3 let go.
+#[cfg(test)]
+static RESOLVE_PAUSE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+fn resolve_pause() {
+    use std::sync::atomic::Ordering::SeqCst;
+    if RESOLVE_PAUSE.compare_exchange(1, 2, SeqCst, SeqCst).is_ok() {
+        while RESOLVE_PAUSE.load(SeqCst) != 3 {
+            std::thread::yield_now();
+        }
+        RESOLVE_PAUSE.store(0, SeqCst);
+    }
+}
+
+/// Tests: the next resolve of a discarded page parks ([`RESOLVE_PAUSE`]).
+#[cfg(test)]
+pub(crate) fn resolve_pause_arm() {
+    RESOLVE_PAUSE.store(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Tests: whether a resolve is parked.
+#[cfg(test)]
+pub(crate) fn resolve_parked() -> bool {
+    RESOLVE_PAUSE.load(std::sync::atomic::Ordering::SeqCst) == 2
+}
+
+/// Tests: lets the parked resolve go on.
+#[cfg(test)]
+pub(crate) fn resolve_go() {
+    RESOLVE_PAUSE.store(3, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Tests: poisons the released ranges' records' lock, a thread panicking
+/// while it holds it, as a bug would.
+#[cfg(test)]
+pub(crate) fn poison_released() {
+    let _ = std::thread::spawn(|| {
+        let _g = RELEASED.lock().unwrap();
+        panic!("poisoning RELEASED on purpose");
+    })
+    .join();
 }
 
 /// [`released_resolve`] with the reclaim asked once when refused, as a

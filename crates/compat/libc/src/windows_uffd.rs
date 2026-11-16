@@ -4649,6 +4649,96 @@ mod tests {
         assert_eq!(unsafe { crate::munmap(mem as *mut c_void, 4 * PAGE as usize) }, 0);
     }
 
+    /// A fixed mapping over a released range while a first access resolves
+    /// its discarded page waits for the resolve: the view stays until the
+    /// page is zeroed and given its protection (the resolve holds the
+    /// records' lock from its check that the page is committed, and a view
+    /// leaves the records before it goes), so the resolve's protection
+    /// change cannot be refused for a view gone under it, which left the
+    /// page charged, zeroed and still pending; the new mapping reads zeros,
+    /// as Linux's fault and `mmap` serialise on the mm's lock. The resolve
+    /// is parked after zeroing the page, for the mapping to come while it
+    /// is (`windows_mm::resolve_pause_arm`). In a process of its own (the
+    /// park is the process's).
+    #[test]
+    #[ignore = "until a view leaves the released ranges' records before it goes"]
+    fn test_a_fixed_mapping_over_a_page_being_resolved_waits_for_it() {
+        let (code, text) = run_child("resolve_under_a_fixed_mapping_child", None);
+        assert!(text.contains("RESOLVE the view while parked: committed"), "{text}");
+        assert!(text.contains("RESOLVE access: Committed"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_fixed_mapping_over_a_page_being_resolved_waits_for_it in a process of its own"]
+    fn resolve_under_a_fixed_mapping_child() {
+        let mem = released_with_pending_pages(0x5a);
+        let page = (mem + PAGE) as usize;
+        crate::windows_mm::resolve_pause_arm();
+        let resolver = std::thread::spawn(move || crate::windows_mm::wick_mm::commit_on_access(page, false));
+        let t = std::time::Instant::now();
+        while !crate::windows_mm::resolve_parked() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the resolve did not park");
+            std::thread::yield_now();
+        }
+        let mapper = std::thread::spawn(move || {
+            // SAFETY: a fixed anonymous mapping over our released range.
+            let p = unsafe {
+                crate::mmap(
+                    mem as *mut c_void,
+                    4 * PAGE as usize,
+                    crate::PROT_READ | crate::PROT_WRITE,
+                    crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            p as u64
+        });
+        // The mapping's time to unmap the view, were it not to wait.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        unsafe { windows_sys::Win32::System::Memory::VirtualQuery(page as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) };
+        let view = if mbi.State == windows_sys::Win32::System::Memory::MEM_COMMIT { "committed" } else { "gone" };
+        std::println!("RESOLVE the view while parked: {view} (state {:#x})", mbi.State);
+        crate::windows_mm::resolve_go();
+        let access = resolver.join().unwrap();
+        std::println!("RESOLVE access: {access:?}");
+        assert_eq!(mapper.join().unwrap(), mem, "the fixed mapping");
+        // SAFETY: the new mapping, ours.
+        assert!(unsafe { std::slice::from_raw_parts(page as *const u8, PAGE as usize) }.iter().all(|&b| b == 0));
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::munmap(mem as *mut c_void, 4 * PAGE as usize) }, 0);
+    }
+
+    /// A poisoned lock on the path of a first access (here the released
+    /// ranges' records', poisoned by a thread that panicked holding it) ends
+    /// the process with a line naming it and an abort (0xC0000409), never a
+    /// panic inside the exception's dispatch: the access is resolved in the
+    /// vectored handler, which cannot unwind. A bug's end, named. In a
+    /// process of its own.
+    #[test]
+    #[ignore = "until a poisoned lock ends the process, named"]
+    fn test_a_poisoned_lock_on_the_access_path_aborts_named() {
+        let (code, text) = run_child("poisoned_access_child", None);
+        assert!(text.contains("wick: the lock RELEASED was poisoned"), "{text}");
+        assert!(!text.contains("reached the page"), "{text}");
+        assert_eq!(code, Some(0xC000_0409_u32.cast_signed()), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_poisoned_lock_on_the_access_path_aborts_named in a process of its own"]
+    fn poisoned_access_child() {
+        let mem = released_with_pending_pages(0x5a);
+        crate::windows_mm::poison_released();
+        // SAFETY: our mapping, released: its discarded page is resolved at
+        // this first read.
+        let b = unsafe { core::ptr::read_volatile((mem + PAGE) as *const u8) };
+        std::println!("reached the page: {b}");
+    }
+
     /// Two threads touching one page of a released range at once, each
     /// writing at its own offset, both keep their writes: the page is
     /// resolved once (a discarded page zeroed once, a page never filled
