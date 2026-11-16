@@ -1852,6 +1852,183 @@ mod tests {
         unsafe { ws::closesocket(sock(user)) };
     }
 
+    /// Anonymous private memory committed at first touch, as Firecracker
+    /// maps guest memory (`MAP_NORESERVE`).
+    fn map_noreserve(len: usize) -> u64 {
+        // SAFETY: a new anonymous mapping.
+        let p = unsafe {
+            crate::mmap(
+                ptr::null_mut(),
+                len,
+                crate::PROT_READ | crate::PROT_WRITE,
+                crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, crate::MAP_FAILED);
+        p as u64
+    }
+
+    fn mprotect_of(addr: u64, len: u64, prot: c_int) -> Result<(), io::Error> {
+        // SAFETY: registered memory of the test's.
+        if unsafe { crate::mprotect(addr as *mut c_void, len as usize, prot) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    }
+
+    /// `mprotect` of registered memory whose pages are missing changes their
+    /// protection and leaves them missing, as Linux's `mprotect` changes the
+    /// vma's protection and leaves its pages unpopulated: made accessible
+    /// again, a page's first access is a userfault, filled by the handler;
+    /// a page filled while `PROT_NONE` is filled, and keeps its protection
+    /// until it is changed; a `PROT_READ` page's read is a userfault too.
+    /// Today Windows refuses the call with `EACCES`, as `VirtualProtect`
+    /// changes committed pages only (Learn: "If the state of any page in the
+    /// specified region is not committed, the function fails").
+    #[test]
+    #[ignore = "until the next commit"]
+    fn test_mprotect_of_registered_missing_pages_keeps_them_missing() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 4 << 20;
+        let mem = map_noreserve(len as usize);
+        register(ctx, mem, len).unwrap();
+        let slot = mem + (2 << 20);
+        mprotect_of(slot, 2 << 20, crate::PROT_NONE).expect("PROT_NONE over missing registered pages");
+        assert!(is_missing(slot) && is_missing(slot + PAGE));
+        mprotect_of(slot, 2 << 20, crate::PROT_READ | crate::PROT_WRITE).expect("read-write again");
+        assert!(is_missing(slot) && is_missing(slot + PAGE));
+        let reader = std::thread::spawn(move || {
+            // SAFETY: registered memory; the read waits for the fill.
+            unsafe { core::ptr::read_volatile((slot + 5) as *const u8) }
+        });
+        let event = serve_one(user, ctx, 0x33);
+        assert_eq!((event[0], event[1]), (proto::EVENT_PAGEFAULT, slot + 5));
+        assert_eq!(reader.join().unwrap(), 0x33);
+        // Filled while PROT_NONE: filled, and closed until made accessible.
+        mprotect_of(slot + PAGE, PAGE, crate::PROT_NONE).unwrap();
+        let page = std::vec![0x44u8; PAGE as usize];
+        // SAFETY: `page` holds a page.
+        assert_eq!(unsafe { copy(ctx, page.as_ptr(), slot + PAGE, PAGE, true) }, Ok(PAGE));
+        assert!(!is_missing(slot + PAGE));
+        mprotect_of(slot + PAGE, PAGE, crate::PROT_READ | crate::PROT_WRITE).unwrap();
+        // SAFETY: filled and accessible.
+        assert_eq!(unsafe { core::ptr::read_volatile((slot + PAGE) as *const u8) }, 0x44);
+        // A read-only missing page: its read is a userfault.
+        mprotect_of(slot + 2 * PAGE, PAGE, crate::PROT_READ).unwrap();
+        let reader = std::thread::spawn(move || {
+            // SAFETY: registered memory; the read waits for the fill.
+            unsafe { core::ptr::read_volatile((slot + 2 * PAGE) as *const u8) }
+        });
+        let event = serve_one(user, ctx, 0x55);
+        assert_eq!((event[0], event[1] & proto::FLAG_WRITE), (proto::EVENT_PAGEFAULT, 0));
+        assert_eq!(reader.join().unwrap(), 0x55);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// Firecracker's memory hotplug after a restore from a userfaultfd: the
+    /// whole region registered (`persist.rs`, `guest_memory_from_uffd`), an
+    /// unplugged slot made `PROT_NONE` (`vm.rs`, `register_memory_region` →
+    /// `slot.protect(true)`), a plugged one read through the handler, the
+    /// slot plugged (`protect(false)`) and read through the handler, then
+    /// unplugged again (discarded, `MADV_DONTNEED`, and `PROT_NONE`), its
+    /// pages missing again. Today the first `protect(true)` fails with
+    /// `EACCES`, so such a restore fails where Linux's succeeds.
+    #[test]
+    #[ignore = "until the next commit"]
+    fn test_plug_after_a_uffd_restore() {
+        let (ctx, user) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let slot_len: u64 = 2 << 20;
+        let mem = map_noreserve(2 * slot_len as usize);
+        register(ctx, mem, 2 * slot_len).unwrap();
+        let unplugged = mem + slot_len;
+        mprotect_of(unplugged, slot_len, crate::PROT_NONE).expect("protect(true) of an unplugged slot");
+        let read_through_the_handler = |addr: u64, fill: u8| {
+            let reader = std::thread::spawn(move || {
+                // SAFETY: registered memory; the read waits for the fill.
+                unsafe { core::ptr::read_volatile(addr as *const u8) }
+            });
+            let event = serve_one(user, ctx, fill);
+            assert_eq!((event[0], event[1]), (proto::EVENT_PAGEFAULT, addr));
+            assert_eq!(reader.join().unwrap(), fill);
+        };
+        read_through_the_handler(mem + 3 * PAGE, 0x61);
+        mprotect_of(unplugged, slot_len, crate::PROT_READ | crate::PROT_WRITE).expect("protect(false) at plug");
+        read_through_the_handler(unplugged + 7 * PAGE, 0x62);
+        // Unplug: discarded, then closed; its pages missing again.
+        // SAFETY: registered memory of ours.
+        assert_eq!(unsafe { crate::madvise(unplugged as *mut c_void, slot_len as usize, crate::MADV_DONTNEED) }, 0);
+        let mut removed = [0u8; proto::RECORD];
+        assert!(recv_all(user, &mut removed));
+        assert_eq!(words(&removed)[0], proto::EVENT_REMOVE);
+        mprotect_of(unplugged, slot_len, crate::PROT_NONE).expect("protect(true) at unplug");
+        assert!(is_missing(unplugged + 7 * PAGE));
+        // Plugged again: a userfault again.
+        mprotect_of(unplugged, slot_len, crate::PROT_READ | crate::PROT_WRITE).unwrap();
+        read_through_the_handler(unplugged + 7 * PAGE, 0x63);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// An access its protection denies to a missing page of registered
+    /// memory is the access fault (SIGSEGV on Linux; here the process ends
+    /// with `STATUS_ACCESS_VIOLATION`), not a userfault: Linux checks the
+    /// vma's protection before it faults the page in (v6.1
+    /// arch/x86/mm/fault.c, `do_user_addr_fault`: `access_error` and
+    /// `bad_area_access_error` at :1410 and :1411, before `handle_mm_fault`
+    /// at :1428, where `do_anonymous_page` hands a missing page to
+    /// userfaultfd). A read of a `PROT_NONE` page, and a write of a
+    /// `PROT_READ` one, each in a child whose handler would say any event.
+    #[test]
+    #[ignore = "until the next commit"]
+    fn test_a_registered_page_its_protection_denies_is_no_userfault() {
+        for child in ["denied_read_child", "denied_write_child"] {
+            let (code, text) = run_child(child, None);
+            assert!(text.contains("UFFDDENIED accessing"), "{child}: {text}");
+            assert!(!text.contains("UFFDDENIED event"), "{child}: a userfault for an access its protection denies: {text}");
+            assert_eq!(code, Some(0xC000_0005_u32.cast_signed()), "{child}: {text}");
+        }
+    }
+
+    fn denied_access(prot: c_int, write: bool) {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let mem = map_noreserve(64 << 10);
+        register(ctx, mem, 64 << 10).unwrap();
+        mprotect_of(mem, 64 << 10, prot).unwrap();
+        std::thread::spawn(move || loop {
+            let mut buf = [0u8; proto::RECORD];
+            if !recv_all(user, &mut buf) {
+                return;
+            }
+            let event = words(&buf);
+            std::println!("UFFDDENIED event {:#x} at {:#x}", event[0], event[1]);
+            let page = std::vec![0u8; PAGE as usize];
+            // SAFETY: `page` holds a page.
+            let _ = unsafe { copy(ctx, page.as_ptr(), event[1] - event[1] % PAGE, PAGE, true) };
+        });
+        std::println!("UFFDDENIED accessing");
+        if write {
+            // SAFETY: registered memory, which the access is to fault on.
+            unsafe { core::ptr::write_volatile((mem + PAGE) as *mut u8, 1) };
+        } else {
+            // SAFETY: as above.
+            core::hint::black_box(unsafe { core::ptr::read_volatile((mem + PAGE) as *const u8) });
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::println!("UFFDDENIED the access went on");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_registered_page_its_protection_denies_is_no_userfault"]
+    fn denied_read_child() {
+        denied_access(crate::PROT_NONE, false);
+    }
+
+    #[test]
+    #[ignore = "run by test_a_registered_page_its_protection_denies_is_no_userfault"]
+    fn denied_write_child() {
+        denied_access(crate::PROT_READ, true);
+    }
+
     #[test]
     fn test_host_fault_copy_zeropage() {
         let (ctx, user) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
