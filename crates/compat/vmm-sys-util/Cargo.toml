@@ -48,3 +48,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The unhandled-exception tests run children in a job of the jailer's limits.
+windows-sys = { version = "0.61.2", features = ["Win32_System_JobObjects"] }

@@ -3536,53 +3536,34 @@ mod tests {
     }
 
     /// An unbounded recursion on a new thread of `kind`, waited for by the
-    /// thread's own structure, with no timeout: the overflow either ends the
-    /// process or this returns and says how the process went on. A Rust or
-    /// `CreateThread` thread is waited for to its end (its handle); a pool
-    /// thread is the only thread of a pool of its own (at most and at least
-    /// one, Learn: SetThreadpoolThreadMaximum, SetThreadpoolThreadMinimum),
-    /// with a second callback queued behind the recursion's, which runs only
-    /// once that thread is back in its pool (or a new one replaced it): as
-    /// Windows Server 2025 26100.33674's pool took the overflow and went on
-    /// waiting for work (CI run 43823078930's windows job: the child's
-    /// process alive after 60 s, its overflowed thread back in
-    /// `ntdll!TppWorkerThread`). A child run in a job (WICK_TEST_JOB, its
-    /// name) waits until it is in that job first, and says its error mode.
+    /// thread's own structure ([`on_a_thread_and_wait`]): the overflow either
+    /// ends the process or this returns and says how the process went on. A
+    /// child run in a job waits until it is in that job first
+    /// ([`in_the_job_if_asked`]).
     fn stack_overflow(kind: Kind) {
-        use windows_sys::Win32::System::Threading::{
-            CloseThreadpool, CreateThread, CreateThreadpool, INFINITE, PTP_CALLBACK_INSTANCE, SetThreadpoolThreadMaximum,
-            SetThreadpoolThreadMinimum, TP_CALLBACK_ENVIRON_V3, TP_CALLBACK_PRIORITY_NORMAL, TrySubmitThreadpoolCallback,
-            WaitForSingleObject,
-        };
-        fn said_then_deep(kind: Kind) -> u8 {
+        fn said_then_deep(kind: Kind) {
             let (base, limit, reserve, guarantee) = stack_of_this_thread();
             std::println!(
                 "the {kind:?} thread's stack: {} KiB committed of a {} KiB reserve, a guarantee of {guarantee} bytes",
                 (base - limit) >> 10,
                 (base - reserve) >> 10
             );
-            deep(usize::MAX)
+            core::hint::black_box(deep(usize::MAX));
         }
-        unsafe extern "system" fn recurse(_: *mut c_void) -> u32 {
-            u32::from(core::hint::black_box(said_then_deep(Kind::CreateThread)))
-        }
-        unsafe extern "system" fn recurse_pooled(_: PTP_CALLBACK_INSTANCE, started: *mut c_void) {
-            // SAFETY: the sender boxed below, given to this callback alone.
-            let started = unsafe { std::boxed::Box::from_raw(started.cast::<std::sync::mpsc::Sender<()>>()) };
-            started.send(()).unwrap();
-            drop(started);
-            core::hint::black_box(said_then_deep(Kind::Pool));
-        }
-        unsafe extern "system" fn next(_: PTP_CALLBACK_INSTANCE, tx: *mut c_void) {
-            // SAFETY: the sender boxed below, given to this callback alone.
-            let tx = unsafe { std::boxed::Box::from_raw(tx.cast::<std::sync::mpsc::Sender<()>>()) };
-            let _ = tx.send(());
-        }
+        in_the_job_if_asked();
+        lazy_memory_is_mapped();
+        let how = on_a_thread_and_wait(kind, said_then_deep);
+        std::println!("the {kind:?} thread's unbounded recursion: {how}, and the process went on");
+    }
+
+    /// A child run in a job (WICK_TEST_JOB, its name) waits until it is in
+    /// that job, and says its error mode.
+    fn in_the_job_if_asked() {
         if let Ok(name) = std::env::var("WICK_TEST_JOB") {
             use windows_sys::Win32::System::JobObjects::{IsProcessInJob, OpenJobObjectW};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
             /// winnt.h's (windows-sys has it under System_SystemServices).
             const JOB_OBJECT_QUERY: u32 = 4;
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
             let wide: std::vec::Vec<u16> = name.encode_utf16().chain([0]).collect();
             // SAFETY: a NUL-terminated name.
             let job = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, wide.as_ptr()) };
@@ -3602,19 +3583,52 @@ mod tests {
         }
         // SAFETY: plain call.
         std::println!("the child's error mode: {:#x}", unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode() });
-        lazy_memory_is_mapped();
-        let how = match kind {
+    }
+
+    /// Runs `body` on a new thread of `kind` and waits for it by the
+    /// thread's own structure, with no timeout; says how it went on if the
+    /// process did. A Rust or `CreateThread` thread is waited for to its
+    /// end (its handle); a pool thread is the only thread of a pool of its
+    /// own (at most and at least one, Learn: SetThreadpoolThreadMaximum,
+    /// SetThreadpoolThreadMinimum), and a second callback is queued once the
+    /// first has started `body`, so it runs only once that thread is back in
+    /// its pool (or a new one replaced it): as Windows Server 2025
+    /// 26100.33674's pool took a stack overflow and went on waiting for work
+    /// (CI run 43823078930's windows job: the child's process alive after
+    /// 60 s, its overflowed thread back in `ntdll!TppWorkerThread`).
+    fn on_a_thread_and_wait(kind: Kind, body: fn(Kind)) -> std::string::String {
+        use windows_sys::Win32::System::Threading::{
+            CloseThreadpool, CreateThread, CreateThreadpool, INFINITE, PTP_CALLBACK_INSTANCE, SetThreadpoolThreadMaximum,
+            SetThreadpoolThreadMinimum, TP_CALLBACK_ENVIRON_V3, TP_CALLBACK_PRIORITY_NORMAL, TrySubmitThreadpoolCallback,
+            WaitForSingleObject,
+        };
+        type Started = (std::sync::mpsc::Sender<()>, fn(Kind));
+        unsafe extern "system" fn started(raw: *mut c_void) -> u32 {
+            // SAFETY: the function pointer passed below.
+            let body: fn(Kind) = unsafe { core::mem::transmute::<*mut c_void, fn(Kind)>(raw) };
+            body(Kind::CreateThread);
+            0
+        }
+        unsafe extern "system" fn pooled(_: PTP_CALLBACK_INSTANCE, raw: *mut c_void) {
+            // SAFETY: the pair boxed below, given to this callback alone.
+            let (said, body) = *unsafe { std::boxed::Box::from_raw(raw.cast::<Started>()) };
+            said.send(()).unwrap();
+            drop(said);
+            body(Kind::Pool);
+        }
+        unsafe extern "system" fn next(_: PTP_CALLBACK_INSTANCE, tx: *mut c_void) {
+            // SAFETY: the sender boxed below, given to this callback alone.
+            let tx = unsafe { std::boxed::Box::from_raw(tx.cast::<std::sync::mpsc::Sender<()>>()) };
+            let _ = tx.send(());
+        }
+        match kind {
             Kind::Rust => {
-                let ended = std::thread::Builder::new()
-                    .name("wick-stack-test".into())
-                    .spawn(|| core::hint::black_box(said_then_deep(Kind::Rust)))
-                    .unwrap()
-                    .join();
+                let ended = std::thread::Builder::new().name("wick-stack-test".into()).spawn(move || body(Kind::Rust)).unwrap().join();
                 std::format!("the thread ended ({})", if ended.is_ok() { "returned" } else { "panicked" })
             }
             Kind::CreateThread => {
                 // SAFETY: a thread of ours with the default stack.
-                let t = unsafe { CreateThread(ptr::null(), 0, Some(recurse), ptr::null(), 0, ptr::null_mut()) };
+                let t = unsafe { CreateThread(ptr::null(), 0, Some(started), body as *mut c_void, 0, ptr::null_mut()) };
                 assert!(!t.is_null());
                 // SAFETY: our thread's handle.
                 unsafe { WaitForSingleObject(t, INFINITE) };
@@ -3639,12 +3653,12 @@ mod tests {
                     Size: core::mem::size_of::<TP_CALLBACK_ENVIRON_V3>() as u32,
                     ..Default::default()
                 };
-                let (started, has_started) = std::sync::mpsc::channel::<()>();
-                let started = std::boxed::Box::into_raw(std::boxed::Box::new(started)).cast::<c_void>();
+                let (said, has_started) = std::sync::mpsc::channel::<()>();
+                let raw = std::boxed::Box::into_raw(std::boxed::Box::new((said, body))).cast::<c_void>();
                 // SAFETY: a callback of this module, on our pool.
-                assert_ne!(unsafe { TrySubmitThreadpoolCallback(Some(recurse_pooled), started, &env) }, 0);
-                // The next callback is queued once the pool's one thread is
-                // in the recursion, so it runs only once that thread is back.
+                assert_ne!(unsafe { TrySubmitThreadpoolCallback(Some(pooled), raw, &env) }, 0);
+                // The next callback is queued once the pool's one thread has
+                // started `body`, so it runs only once that thread is back.
                 has_started.recv().unwrap();
                 let (tx, rx) = std::sync::mpsc::channel::<()>();
                 let tx = std::boxed::Box::into_raw(std::boxed::Box::new(tx)).cast::<c_void>();
@@ -3655,8 +3669,93 @@ mod tests {
                 unsafe { CloseThreadpool(pool) };
                 "its pool ran the next callback".into()
             }
-        };
-        std::println!("the {kind:?} thread's unbounded recursion: {how}, and the process went on");
+        }
+    }
+
+    /// The exceptions [`test_an_unhandled_exception_ends_the_process_with_its_code`]
+    /// raises, and their codes: an access violation (a write to address 8),
+    /// an illegal instruction (`ud2`) and software exceptions no signal
+    /// stands for, one raised non-continuable and one continuable.
+    const UNHANDLED: [(&str, u32); 4] = [("av", 0xC000_0005), ("ud2", 0xC000_001D), ("raise", 0xE057_1C4B), ("raise-continuable", 0xE057_1C4D)];
+
+    /// An exception that nothing handles gets a line that names it, its
+    /// address and its thread (the last unhandled-exception filter,
+    /// `windows_mm::last_filter`), and ends the process with its code, on
+    /// every kind of thread ([`Kind`]), alone and in a job of the jailer's
+    /// limits, with lazy memory mapped (the stack filter above it, as in a
+    /// VMM) and, for the access violation, without (as in the API process
+    /// or the jailer): in the job the filter ends the process itself, where
+    /// the end is left to the filters' caller, which for a pool thread's
+    /// stack overflow was its pool, going on
+    /// ([`test_a_stack_overflow_at_the_reserves_end_is_still_one`]); alone,
+    /// Windows Error Reporting ends it, with its dump, as Linux's default
+    /// action for a fault signal no handler is registered for ends a
+    /// process with a core. No time is asserted.
+    #[test]
+    #[ignore = "fails until the last unhandled-exception filter names the exception"]
+    fn test_an_unhandled_exception_ends_the_process_with_its_code() {
+        let mut not_ended = std::vec::Vec::new();
+        for (fault, code) in UNHANDLED {
+            for lazy in ["1", "0"] {
+                if lazy == "0" && fault != "av" {
+                    continue;
+                }
+                for child in ["unhandled_rust_child", "unhandled_createthread_child", "unhandled_pool_child"] {
+                    for jailed in [false, true] {
+                        let (got, text, ended) = run_child_watched(child, &[("WICK_TEST_FAULT", fault), ("WICK_TEST_LAZY", lazy)], jailed);
+                        let how = if jailed { "in a job as the jailer's" } else { "alone" };
+                        std::eprintln!("UNHANDLED {child} {fault} lazy {lazy} {how}: {got:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
+                        if !text.contains(&std::format!("wick: an unhandled exception {code:#x}")) || got != Some(code.cast_signed()) {
+                            not_ended.push(std::format!("{child} {fault} lazy {lazy} {how} ({got:?}): {text}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(not_ended.is_empty(), "not ended by the last filter with its line and the exception's code: {not_ended:#?}");
+    }
+
+    fn unhandled_fault(kind: Kind) {
+        let fault = std::env::var("WICK_TEST_FAULT").unwrap();
+        std::println!("the {kind:?} thread raises {fault}");
+        match fault.as_str() {
+            // SAFETY: a write that faults, on purpose.
+            "av" => unsafe { core::ptr::write_volatile(core::hint::black_box(8usize) as *mut u8, 1) },
+            // SAFETY: an instruction that faults, on purpose.
+            "ud2" => unsafe { core::arch::asm!("ud2", options(nomem, nostack)) },
+            // SAFETY: a software exception with no arguments.
+            "raise" => unsafe { windows_sys::Win32::System::Diagnostics::Debug::RaiseException(UNHANDLED[2].1, 1 /* EXCEPTION_NONCONTINUABLE */, 0, ptr::null()) },
+            // SAFETY: as above.
+            "raise-continuable" => unsafe { windows_sys::Win32::System::Diagnostics::Debug::RaiseException(UNHANDLED[3].1, 0, 0, ptr::null()) },
+            other => panic!("no fault {other}"),
+        }
+    }
+
+    fn unhandled(kind: Kind) {
+        in_the_job_if_asked();
+        if std::env::var("WICK_TEST_LAZY").as_deref() == Ok("1") {
+            lazy_memory_is_mapped();
+        }
+        let how = on_a_thread_and_wait(kind, unhandled_fault);
+        std::println!("the {kind:?} thread's exception: {how}, and the process went on");
+    }
+
+    #[test]
+    #[ignore = "run by test_an_unhandled_exception_ends_the_process_with_its_code"]
+    fn unhandled_rust_child() {
+        unhandled(Kind::Rust);
+    }
+
+    #[test]
+    #[ignore = "run by test_an_unhandled_exception_ends_the_process_with_its_code"]
+    fn unhandled_createthread_child() {
+        unhandled(Kind::CreateThread);
+    }
+
+    #[test]
+    #[ignore = "run by test_an_unhandled_exception_ends_the_process_with_its_code"]
+    fn unhandled_pool_child() {
+        unhandled(Kind::Pool);
     }
 
     /// STACKENDHOST's host part: this process's error mode, which its

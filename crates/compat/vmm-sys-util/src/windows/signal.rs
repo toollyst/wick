@@ -691,6 +691,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
     use super::*;
 
     static CALLED: AtomicUsize = AtomicUsize::new(0);
@@ -962,5 +964,156 @@ mod tests {
         let p = page.cast::<u8>();
         unsafe { p.add(8).write_volatile(42) };
         assert_eq!(unsafe { p.add(8).read_volatile() }, 42);
+    }
+
+    /// A fault on a pool thread goes to the handler registered for its
+    /// signal, as Firecracker's SIGSEGV handler on Linux, which ends the
+    /// process as it says (here: its line, then exit 150, Firecracker's
+    /// `FcExitCode::SIGSEGV`); and one whose signal has no handler ends the
+    /// process with its code and the line of the last unhandled-exception
+    /// filter (libc's `windows_mm::last_filter`), below this module's
+    /// (`unhandled`), as a fault signal's default action does on Linux.
+    /// Each alone and in a job of the jailer's limits, where Windows Error
+    /// Reporting is not called and a pool takes an exception the filters
+    /// pass on. The pool is the child's own, of one thread, and a second
+    /// callback is queued once the first is at the fault, so it runs only
+    /// if that thread went back to its pool.
+    #[test]
+    #[ignore = "fails until the last unhandled-exception filter names the exception"]
+    fn test_a_pool_threads_fault_goes_to_its_handler_or_ends_the_process() {
+        let mut wrong = Vec::new();
+        for handler in ["segv", "ill"] {
+            for jailed in [false, true] {
+                let (code, text) = run_fault_child(handler, jailed);
+                eprintln!("POOLFAULT {handler} jailed {jailed}: {code:?}; {}", text.trim().replace('\n', " | "));
+                let right = if handler == "segv" {
+                    text.contains("the SIGSEGV handler ran") && code == Some(150)
+                } else {
+                    text.contains("wick: an unhandled exception 0xc0000005") && code == Some(0xC000_0005_u32 as i32)
+                };
+                if !right {
+                    wrong.push(format!("{handler} jailed {jailed} ({code:?}): {text}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    extern "C" fn segv_ends_150(_: c_int, _: *mut siginfo_t, _: *mut c_void) {
+        eprintln!("the SIGSEGV handler ran");
+        // SAFETY: ends this process, as Firecracker's handler does.
+        unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), 150) };
+    }
+
+    /// Runs [`pool_fault_child`] with `handler` (WICK_TEST_HANDLER), in a
+    /// job of the jailer's limits (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+    /// JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`, named to the child) if
+    /// `jailed`.
+    fn run_fault_child(handler: &str, jailed: bool) -> (Option<i32>, String) {
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+        let name = format!("Local\\wick-test-fault-{}-{handler}-{jailed}", std::process::id());
+        let test = format!("{}::pool_fault_child", module_path!().split_once("::").unwrap().1);
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test.as_str(), "--ignored", "--nocapture"])
+            .env("WICK_TEST_HANDLER", handler);
+        let mut job = std::ptr::null_mut();
+        if jailed {
+            let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            job = unsafe { CreateJobObjectW(std::ptr::null(), wide.as_ptr()) };
+            assert!(!job.is_null());
+            let mut l: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            l.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+            let size = std::mem::size_of_val(&l) as u32;
+            assert_ne!(
+                unsafe { SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const l).cast(), size) },
+                0
+            );
+            command.env("WICK_TEST_JOB", &name);
+        }
+        let child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        if jailed {
+            assert_ne!(unsafe { AssignProcessToJobObject(job, child.as_raw_handle()) }, 0);
+        }
+        let out = child.wait_with_output().unwrap();
+        if !job.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+        }
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("running 1 test"), "the child ran no test: {text}");
+        (out.status.code(), text)
+    }
+
+    #[test]
+    #[ignore = "run by test_a_pool_threads_fault_goes_to_its_handler_or_ends_the_process"]
+    fn pool_fault_child() {
+        use windows_sys::Win32::System::Threading::{
+            CreateThreadpool, PTP_CALLBACK_INSTANCE, SetThreadpoolThreadMaximum, SetThreadpoolThreadMinimum,
+            TP_CALLBACK_ENVIRON_V3, TP_CALLBACK_PRIORITY_NORMAL, TrySubmitThreadpoolCallback,
+        };
+        if let Ok(name) = std::env::var("WICK_TEST_JOB") {
+            use windows_sys::Win32::System::JobObjects::{IsProcessInJob, OpenJobObjectW};
+            /// winnt.h's.
+            const JOB_OBJECT_QUERY: u32 = 4;
+            let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            let job = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, wide.as_ptr()) };
+            assert!(!job.is_null());
+            loop {
+                let mut is = 0;
+                assert_ne!(unsafe { IsProcessInJob(GetCurrentProcess(), job, &mut is) }, 0);
+                if is != 0 {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+        }
+        match std::env::var("WICK_TEST_HANDLER").unwrap().as_str() {
+            "segv" => register_signal_handler(SIGSEGV, segv_ends_150).unwrap(),
+            // A handler for another fault signal: this module's filter is in
+            // place, and passes SIGSEGV on.
+            _ => register_signal_handler(SIGILL, count).unwrap(),
+        }
+        unsafe extern "system" fn fault(_: PTP_CALLBACK_INSTANCE, said: *mut c_void) {
+            let said = unsafe { Box::from_raw(said.cast::<mpsc::Sender<()>>()) };
+            said.send(()).unwrap();
+            drop(said);
+            unsafe { std::ptr::write_volatile(std::hint::black_box(8usize) as *mut u8, 1) };
+        }
+        unsafe extern "system" fn next(_: PTP_CALLBACK_INSTANCE, tx: *mut c_void) {
+            let tx = unsafe { Box::from_raw(tx.cast::<mpsc::Sender<()>>()) };
+            let _ = tx.send(());
+        }
+        let pool = unsafe { CreateThreadpool(std::ptr::null()) };
+        assert_ne!(pool, 0);
+        unsafe {
+            SetThreadpoolThreadMaximum(pool, 1);
+            assert_ne!(SetThreadpoolThreadMinimum(pool, 1), 0);
+        }
+        let env = TP_CALLBACK_ENVIRON_V3 {
+            Version: 3,
+            Pool: pool,
+            CallbackPriority: TP_CALLBACK_PRIORITY_NORMAL,
+            Size: std::mem::size_of::<TP_CALLBACK_ENVIRON_V3>() as u32,
+            ..Default::default()
+        };
+        let (said, at_the_fault) = mpsc::channel::<()>();
+        let said = Box::into_raw(Box::new(said)).cast::<c_void>();
+        assert_ne!(unsafe { TrySubmitThreadpoolCallback(Some(fault), said, &env) }, 0);
+        at_the_fault.recv().unwrap();
+        let (tx, rx) = mpsc::channel::<()>();
+        let tx = Box::into_raw(Box::new(tx)).cast::<c_void>();
+        assert_ne!(unsafe { TrySubmitThreadpoolCallback(Some(next), tx, &env) }, 0);
+        rx.recv().unwrap();
+        println!("the pool thread's fault: its pool ran the next callback, and the process went on");
     }
 }
