@@ -550,6 +550,34 @@ has the per-control details and results.
   where before, and on Linux, it ended at once. Not as Linux either: an address in no registered range whose
   protection came to allow the access between the fault and the handler's read (an `mprotect` on another thread)
   is retried, where Linux delivers the signal; the handler cannot tell it from a page an unregister freed.
+- **Windows: a guest access to guest RAM that the host refuses ended the VMM with an access violation, and a store to
+  a read-only memory slot waited a million runs again or for ever** (found by reading, review of the WHP run loop's
+  memory access exit; failing first in the decision's own shape: `test_a_ram_access_is_decided_in_kvms_order`, 11
+  of its 15 rows against the old order written in that shape, the module run alone on macOS). KVM gives a write to
+  a `KVM_MEM_READONLY` slot to the VMM as MMIO before it looks at the page (v6.1 virt/kvm/kvm_main.c `__gfn_to_hva_many` :2405 to :2406, `__gfn_to_pfn_memslot` :2705 to
+  :2709; arch/x86/kvm/mmu/mmu.c `kvm_handle_bad_page` :3159 to :3160), and fails `KVM_RUN` with `EFAULT` for a host
+  page it cannot fault in (`hva_to_pfn` :2679 to :2690, `kvm_handle_bad_page` :3167). The WHP run loop asked the
+  commit and, with a userfaultfd registered, `wick_uffd::fault`, then ran the access again up to a million times
+  (60ae1f52) before emulating it, and without a userfaultfd emulated it at once; the emulation copies a RAM operand
+  through the host (c56eb138; before it the access read zeros). So, as read from the code:
+  - a store to a read-only slot with a userfaultfd registered (Firecracker's read-only pmem after a restore from
+    one) ran again a million times and logged "guest RAM ... stays inaccessible", which was false, before its MMIO
+    exit; over lazy writable memory (`MAP_NORESERVE` under a read-only slot) it ran again without end, the commit
+    answering each time;
+  - a guest access to a page whose host protection refuses it (or under which nothing is mapped) was emulated, and
+    the host's copy ended the VMM with 0xC0000005, where KVM fails the run with `EFAULT` and Firecracker's vCPU
+    ends the VMM with its error.
+  Now the exit is decided in KVM's order (`exit::ram_access`): a write to a read-only slot is MMIO at once; then the
+  commit and the userfaultfd; then one look at the page under the locks every change of it takes
+  (`wick_mm::settled_access`: the userfaultfd's lock, the region table's, the released records', the lazy ranges'),
+  so that a fill, discard, move or release between the looks is seen whole: a page they would resolve is asked of
+  them again, one the host allows runs again, one it refuses fails the run with `EFAULT` and a line naming the
+  address and the access (`test_a_page_changed_between_a_vcpus_looks_is_settled_as_it_is_now`, Windows Server 2022
+  20348 and 2025 26100). A page the host allows that keeps exiting fails the run so after a million runs again in a
+  row, said as such. `test_a_guest_ram_access_exit_is_decided_as_kvms` asserts each case and the runs again it
+  took on WHP (not run here: its first run is CI's). What stays: an emulated instruction's other operand in RAM is
+  still copied by the host on the vCPU thread, and a page the host refuses there ends the VMM with 0xC0000005
+  (docs/COMPATIBILITY.md, `mem_size_mib`).
 
 ## Not at parity yet
 

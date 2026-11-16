@@ -2174,27 +2174,85 @@ impl VcpuFd {
                 whv::WHvRunVpExitReasonMemoryAccess => {
                     // SAFETY: the union arm matches the exit reason.
                     let mem = unsafe { ctx.Anonymous.MemoryAccess };
-                    // Guest RAM not committed yet (anonymous `MAP_NORESERVE`
-                    // memory gets its pages at the first access, as on
-                    // Linux): WHP exits at the access to such a page, which
-                    // re-runs once it is committed (measured), as KVM resolves
-                    // the stage-2 fault through the host page.
-                    // A write's first access commits its block (a 4 KiB
-                    // page, or all of a transparent huge page: memory
-                    // advised `MADV_HUGEPAGE`) and has WHP map it before
-                    // the re-run, as Linux's fault maps what it charged
-                    // (`VmInner::populate_committed`); a read commits its
-                    // page only and leaves it to WHP's fault (`wick_mm`:
-                    // Linux's huge zero page).
+                    // Guest RAM (an address a memory slot holds), decided in
+                    // KVM's order for the stage-2 fault
+                    // (`super::exit::ram_access`):
+                    // - a write to a read-only slot is MMIO at once, the page
+                    //   not looked at (KVM_PFN_ERR_RO_FAULT, RET_PF_EMULATE);
+                    // - lazy memory not committed yet (anonymous
+                    //   `MAP_NORESERVE` memory gets its pages at the first
+                    //   access, as on Linux), and a released userfaultfd
+                    //   range's pending page: committed, and the access
+                    //   re-runs, as KVM resolves the stage-2 fault through
+                    //   the host page. WHP exits at the access to such a
+                    //   page (measured). A write's first access commits its
+                    //   block (a 4 KiB page, or all of a transparent huge
+                    //   page: memory advised `MADV_HUGEPAGE`) and has WHP map
+                    //   it before the re-run, as Linux's fault maps what it
+                    //   charged (`VmInner::populate_committed`); a read
+                    //   commits its page only and leaves it to WHP's fault
+                    //   (`wick_mm`: Linux's huge zero page);
+                    // - a missing userfaultfd page: WHP honours its host
+                    //   PAGE_NOACCESS and exits at the access, which re-runs
+                    //   once the handler filled it (`wick_uffd::fault`), as
+                    //   KVM's fault reaches `handle_userfault`;
+                    // - what is left is looked at once more as a whole
+                    //   (`wick_mm::settled_access`, under the locks every
+                    //   change of the page takes): a page changed meanwhile
+                    //   into one the steps above resolve is asked of them
+                    //   again before the guest runs; one the host allows now
+                    //   (filled, moved or committed between the exit and the
+                    //   looks) re-runs, never as MMIO; one the host refuses
+                    //   (its protection, or nothing mapped) fails the run
+                    //   with EFAULT, as KVM's for a host page it cannot fault
+                    //   in, and Firecracker's vCPU ends the VMM. A page the
+                    //   host allows that keeps exiting fails the run so
+                    //   after `RAM_RETRY_BOUND` runs again in a row.
                     #[cfg(test)]
                     let looked_up = std::time::Instant::now();
-                    if let Some(host) = self.shared.inner.host_addr(mem.Gpa) {
+                    if let Some((host, readonly)) = self.shared.inner.ram_slot(mem.Gpa) {
                         #[cfg(test)]
                         let committing = std::time::Instant::now();
-                        #[allow(clippy::cast_possible_truncation)]
-                        let write = super::exit::memory_write(unsafe { mem.AccessInfo.AsUINT32 });
-                        match libc::wick_mm::commit_block_on_access(host as usize, write) {
-                            (libc::wick_mm::Access::Committed, block) => {
+                        // SAFETY: the access-info bitfield overlaps the u32.
+                        let info = unsafe { mem.AccessInfo.AsUINT32 };
+                        let write = super::exit::memory_write(info);
+                        #[cfg(test)]
+                        let came = exit_ring::stamp();
+                        let mut block = 0..0;
+                        let next = loop {
+                            let next = super::exit::ram_access(
+                                readonly,
+                                write,
+                                libc::wick_uffd::active(),
+                                ram_retries,
+                                || {
+                                    let answer = match libc::wick_mm::commit_block_on_access(host as usize, write) {
+                                        (libc::wick_mm::Access::Committed, b) => {
+                                            block = b;
+                                            super::exit::RamCommit::Committed
+                                        }
+                                        (libc::wick_mm::Access::Exhausted(err), _) => super::exit::RamCommit::Exhausted(err),
+                                        (libc::wick_mm::Access::NotLazy, _) => super::exit::RamCommit::NotLazy,
+                                    };
+                                    #[cfg(test)]
+                                    ram_hook_after_the_commit();
+                                    answer
+                                },
+                                || libc::wick_uffd::fault(host, write),
+                                || ram_settled(host, write),
+                            );
+                            if next != super::exit::RamExit::AnotherPass {
+                                break next;
+                            }
+                            #[cfg(test)]
+                            exit_ring::note(came, mem.Gpa, exit_ring::PASS, ram_retries);
+                            #[cfg(test)]
+                            RAM_RERUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            ram_retries += 1;
+                        };
+                        match next {
+                            super::exit::RamExit::Mmio => {}
+                            super::exit::RamExit::Committed => {
                                 #[cfg(test)]
                                 let populating = std::time::Instant::now();
                                 #[cfg(test)]
@@ -2206,43 +2264,55 @@ impl VcpuFd {
                                 }
                                 #[cfg(test)]
                                 super::ffi::trace::split_lazy(looked_up, committing, populating);
+                                ram_retries = 0;
                                 continue;
                             }
-                            (libc::wick_mm::Access::Exhausted(err), _) => libc::wick_mm::out_of_memory(host as usize, err),
-                            (libc::wick_mm::Access::NotLazy, _) => {}
+                            super::exit::RamExit::OutOfMemory(err) => libc::wick_mm::out_of_memory(host as usize, err),
+                            super::exit::RamExit::Faulted => {
+                                #[cfg(test)]
+                                exit_ring::note(came, mem.Gpa, exit_ring::FAULTED, ram_retries);
+                                ram_retries = 0;
+                                continue;
+                            }
+                            super::exit::RamExit::RunAgain => {
+                                #[cfg(test)]
+                                exit_ring::note(came, mem.Gpa, exit_ring::RERUN, ram_retries);
+                                #[cfg(test)]
+                                RAM_RERUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                ram_retries += 1;
+                                std::thread::yield_now();
+                                continue;
+                            }
+                            super::exit::RamExit::AnotherPass => unreachable!("taken by the loop above"),
+                            super::exit::RamExit::Refused => {
+                                #[cfg(test)]
+                                exit_ring::note(came, mem.Gpa, exit_ring::REFUSED, ram_retries);
+                                let line = format!(
+                                    "whp: the guest's {} of RAM at {:#x} (host {host:#x}): the host refuses it, \
+                                     and the run fails with EFAULT, as KVM's for a host page it cannot fault in",
+                                    super::exit::memory_access_kind(info),
+                                    mem.Gpa
+                                );
+                                super::ffi::report(log::Level::Error, &line);
+                                #[cfg(test)]
+                                RAM_LINE.lock().unwrap().clone_from(&line);
+                                return err(libc::EFAULT);
+                            }
+                            super::exit::RamExit::KeptExiting => {
+                                #[cfg(test)]
+                                exit_ring::note(came, mem.Gpa, exit_ring::REFUSED, ram_retries);
+                                let line = format!(
+                                    "whp: the guest's {} of RAM at {:#x} (host {host:#x}): a page the host allows kept \
+                                     exiting ({ram_retries} runs again in a row), and the run fails with EFAULT",
+                                    super::exit::memory_access_kind(info),
+                                    mem.Gpa
+                                );
+                                super::ffi::report(log::Level::Error, &line);
+                                #[cfg(test)]
+                                RAM_LINE.lock().unwrap().clone_from(&line);
+                                return err(libc::EFAULT);
+                            }
                         }
-                    }
-                    // Guest RAM that is a missing userfaultfd page: WHP
-                    // honours its host PAGE_NOACCESS and exits at the
-                    // access, which re-runs once the handler filled it, as
-                    // KVM resolves the stage-2 fault through the host page.
-                    // A page filled between the exit and the check (by the
-                    // handler, or for another vCPU) is not reported: the
-                    // access re-runs, never as MMIO, which would read zeros.
-                    if libc::wick_uffd::active()
-                        && let Some(host) = self.shared.inner.host_addr(mem.Gpa)
-                    {
-                        #[cfg(test)]
-                        let came = exit_ring::stamp();
-                        // SAFETY: the access-info bitfield overlaps the u32.
-                        let write = super::exit::memory_write(unsafe { mem.AccessInfo.AsUINT32 });
-                        if libc::wick_uffd::fault(host, write) {
-                            #[cfg(test)]
-                            exit_ring::note(came, mem.Gpa, exit_ring::FAULTED, ram_retries);
-                            ram_retries = 0;
-                            continue;
-                        }
-                        #[cfg(test)]
-                        exit_ring::note(came, mem.Gpa, exit_ring::RERUN, ram_retries);
-                        ram_retries += 1;
-                        if ram_retries < 1_000_000 {
-                            std::thread::yield_now();
-                            continue;
-                        }
-                        super::ffi::report(
-                            log::Level::Error,
-                            &format!("whp: guest RAM at {:#x} stays inaccessible", mem.Gpa),
-                        );
                     }
                     if let Some(exit) = self.emulate_mmio(&ctx.VpContext, &mem, Vec::new(), scratch)? {
                         return Ok(exit);
@@ -3508,6 +3578,52 @@ impl Drop for Watchdog {
 /// ([`FAULTED`]), or not missing at the check, the access run again
 /// ([`RERUN`]). Nothing is kept while [`CLOCK`] is 0: two relaxed atomic
 /// loads an exit.
+/// [`libc::wick_mm::settled_access`]'s answer for the run loop; in tests,
+/// [`FORCE_SETTLED`]'s instead when it is set.
+fn ram_settled(host: u64, write: bool) -> super::exit::RamSettled {
+    #[cfg(test)]
+    match FORCE_SETTLED.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => return super::exit::RamSettled::Allowed,
+        2 => return super::exit::RamSettled::Resolvable,
+        _ => {}
+    }
+    match libc::wick_mm::settled_access(host as usize, write) {
+        libc::wick_mm::Settled::Resolvable => super::exit::RamSettled::Resolvable,
+        libc::wick_mm::Settled::Allowed => super::exit::RamSettled::Allowed,
+        libc::wick_mm::Settled::Refused => super::exit::RamSettled::Refused,
+    }
+}
+
+/// Tests: the runs again and passes of guest RAM accesses
+/// ([`super::exit::RamExit::RunAgain`], [`super::exit::RamExit::AnotherPass`]).
+#[cfg(test)]
+pub(crate) static RAM_RERUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tests: the last line a guest RAM access's `EFAULT` logged.
+#[cfg(test)]
+pub(crate) static RAM_LINE: Mutex<String> = Mutex::new(String::new());
+
+/// Tests: an `fn()` as a `usize` (0 for none), called once on the vCPU
+/// thread after a guest RAM access's commit answered and before
+/// `wick_uffd::fault` looks: a change between the looks.
+#[cfg(test)]
+pub(crate) static RAM_HOOK_AFTER_THE_COMMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn ram_hook_after_the_commit() {
+    let hook = RAM_HOOK_AFTER_THE_COMMIT.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if hook != 0 {
+        // SAFETY: only `fn()` values are stored.
+        unsafe { core::mem::transmute::<usize, fn()>(hook)() };
+    }
+}
+
+/// Tests: 1 makes every settled look [`super::exit::RamSettled::Allowed`]
+/// and 2 [`super::exit::RamSettled::Resolvable`], whatever the page is, so
+/// that a page WHP keeps exiting on reaches the bound; 0, the look's own.
+#[cfg(test)]
+pub(crate) static FORCE_SETTLED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 #[cfg(test)]
 pub(crate) mod exit_ring {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -3521,6 +3637,12 @@ pub(crate) mod exit_ring {
     /// check, so the access runs again (a fill between the exit and the
     /// check).
     pub(crate) const RERUN: u64 = 2;
+    /// The page had changed into one the commit or the userfaultfd
+    /// resolves: asked of them again before the guest ran.
+    pub(crate) const PASS: u64 = 3;
+    /// The run failed with `EFAULT` (the host refused the access, or a page
+    /// it allows kept exiting).
+    pub(crate) const REFUSED: u64 = 4;
     /// The address of the test's clock, 0 for no record.
     pub(crate) static CLOCK: AtomicUsize = AtomicUsize::new(0);
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -12640,6 +12762,186 @@ mod fpu_tests {
             }
         }
         lines
+    }
+
+    /// A guest RAM access's memory access exit decided in KVM's order
+    /// (`super::exit::ram_access`), each case asserting the outcome and the
+    /// runs again it took (`RAM_RERUNS`). RAMEXIT lines. First with no
+    /// userfaultfd registered, then with one:
+    /// - a guest write to a page the host made `PROT_READ` in a writable
+    ///   slot: the run fails with `EFAULT` (KVM: `hva_to_pfn`'s
+    ///   `KVM_PFN_ERR_FAULT`, `-EFAULT`), its line logged, nothing emulated
+    ///   (no MMIO exit, RIP still at the store, the page's byte unchanged),
+    ///   0 runs again; the process goes on; the same with a userfaultfd;
+    /// - a store to a `KVM_MEM_READONLY` slot with a userfaultfd registered:
+    ///   an MMIO write exit, 0 runs again (before: a million, then MMIO);
+    /// - the same slot over lazy writable memory (`MAP_NORESERVE`): an MMIO
+    ///   write exit, 0 runs again (before: re-run without end);
+    /// - a missing userfaultfd page filled between the exit and
+    ///   `wick_uffd::fault`'s look (`RAM_HOOK_AFTER_THE_COMMIT`): read with
+    ///   its filled byte, 1 run again;
+    /// - a page the host refuses that the look is made to call allowed
+    ///   (`FORCE_SETTLED`): `EFAULT` after `RAM_RETRY_BOUND` runs again, the
+    ///   "kept exiting" line, and the wall time of the million (RAMEXIT
+    ///   kept exiting).
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_guest_ram_access_exit_is_decided_as_kvms() {
+        use std::sync::atomic::Ordering::SeqCst;
+        const PROGRAM: u64 = 0xB000;
+        // In the 2 MiB page at 2 MiB, which the tables map below.
+        const READ_ONLY_PAGE: u64 = 0x28_0000;
+        const RO_SLOT: u64 = 0x34_0000;
+        const RO_LAZY_SLOT: u64 = 0x36_0000;
+        const UFFD_SLOT: u64 = 0x38_0000;
+        static FILL_AT: AtomicU64 = AtomicU64::new(0);
+        static FILL_CTX: AtomicU64 = AtomicU64::new(0);
+        let say = |l: String| eprintln!("RAMEXIT {l}");
+        let store = |at: u64| {
+            let mut b = vec![0xC6, 0x04, 0x25];
+            b.extend_from_slice(&u32::try_from(at).unwrap().to_le_bytes());
+            b.extend_from_slice(&[0x01, 0xE6, PORT as u8, 0xF4, 0xEB, 0xFD]);
+            b
+        };
+        let load = |at: u64| {
+            let mut b = vec![0x8A, 0x04, 0x25];
+            b.extend_from_slice(&u32::try_from(at).unwrap().to_le_bytes());
+            b.extend_from_slice(&[0xE6, PORT as u8, 0xF4, 0xEB, 0xFD]);
+            b
+        };
+        let reruns = || RAM_RERUNS.swap(0, SeqCst);
+        // A VM over `m`'s first 3 MiB, with the page at READ_ONLY_PAGE made
+        // PROT_READ, the vCPU at PROGRAM.
+        let vm_over = |m: *mut u8| {
+            put(m, 0x3008, &(0x20_0000u64 | 0x83).to_le_bytes());
+            let vm = super::super::VmFd::create().unwrap();
+            // SAFETY: the memory stays mapped while the VM has it.
+            unsafe {
+                vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                    slot: 0,
+                    flags: 0,
+                    guest_phys_addr: 0,
+                    memory_size: 0x30_0000,
+                    userspace_addr: m as u64,
+                })
+            }
+            .unwrap();
+            // SAFETY: the test's page, in the slot.
+            assert_eq!(unsafe { libc::mprotect(m.add(READ_ONLY_PAGE as usize).cast(), 4096, libc::PROT_READ) }, 0);
+            vm
+        };
+        // Runs `program` from PROGRAM: the run's result, and RIP after it.
+        let run = |vcpu: &mut VcpuFd, m: *mut u8, program: &[u8]| {
+            put(m, PROGRAM, program);
+            vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+            let got = match vcpu.run() {
+                Ok(VcpuExit::IoOut(port, _)) => format!("IoOut {port:#x}"),
+                Ok(VcpuExit::MmioWrite(address, data)) => format!("MmioWrite {address:#x} {data:?}"),
+                Ok(VcpuExit::MmioRead(address, _)) => format!("MmioRead {address:#x}"),
+                Ok(other) => format!("{other:?}"),
+                Err(e) => format!("errno {}", e.errno()),
+            };
+            (got, vcpu.get_regs().unwrap())
+        };
+        let efault = format!("errno {}", libc::EFAULT);
+        let refused = |vcpu: &mut VcpuFd, m: *mut u8, with: &str| {
+            reruns();
+            RAM_LINE.lock().unwrap().clear();
+            let (got, regs) = run(vcpu, m, &store(READ_ONLY_PAGE));
+            let line = RAM_LINE.lock().unwrap().clone();
+            // SAFETY: the test's page, readable.
+            let byte = unsafe { *m.add(READ_ONLY_PAGE as usize) };
+            let n = reruns();
+            say(format!("{with}: a write to a PROT_READ page in a writable slot: {got}, RIP {:#x}, the page's byte {byte}, {n} runs again; the line: {line}", regs.rip));
+            assert_eq!(got, efault, "{with}");
+            assert_eq!(regs.rip, PROGRAM, "{with}: RIP still at the store");
+            assert_eq!((byte, n), (0, 0), "{with}");
+            assert!(line.contains("the guest's write of RAM at 0x280000") && line.contains("the host refuses it"), "{with}: {line}");
+        };
+
+        // No userfaultfd.
+        let m = guest();
+        let vm = vm_over(m);
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        assert!(!libc::wick_uffd::active(), "a userfaultfd is registered before the test");
+        refused(&mut vcpu, m, "no userfaultfd");
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's memory, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+
+        // With a userfaultfd: its range (64 KiB) is the UFFD_SLOT slot,
+        // registered before the slot is made.
+        let m = guest();
+        let mapping = |flags: i32| {
+            // SAFETY: a new anonymous mapping.
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), 0x1_0000, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | flags, -1, 0) };
+            assert_ne!(p, libc::MAP_FAILED);
+            p as u64
+        };
+        let registered = mapping(0);
+        let lazy = mapping(libc::MAP_NORESERVE);
+        let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+        libc::wick_uffd::register(ctx, registered, 0x1_0000).unwrap();
+        let vm = vm_over(m);
+        for (slot, gpa, host, size) in [(1, RO_SLOT, m as u64 + RO_SLOT, 4096), (2, RO_LAZY_SLOT, lazy, 0x1_0000), (3, UFFD_SLOT, registered, 0x1_0000)] {
+            let flags = if slot == 3 { 0 } else { kvm_bindings::KVM_MEM_READONLY };
+            // SAFETY: the memory stays mapped while the VM has it.
+            unsafe {
+                vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region { slot, flags, guest_phys_addr: gpa, memory_size: size, userspace_addr: host })
+            }
+            .unwrap();
+        }
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        assert!(libc::wick_uffd::active());
+        refused(&mut vcpu, m, "a userfaultfd registered");
+        for (what, gpa) in [("a KVM_MEM_READONLY slot", RO_SLOT), ("a KVM_MEM_READONLY slot over lazy writable memory", RO_LAZY_SLOT)] {
+            reruns();
+            let (got, _) = run(&mut vcpu, m, &store(gpa));
+            let n = reruns();
+            say(format!("a userfaultfd registered: a store to {what}: {got}, {n} runs again"));
+            assert_eq!((got, n), (format!("MmioWrite {gpa:#x} [1]"), 0), "{what}");
+        }
+        // A missing page filled between the exit and fault()'s look.
+        fn fill() {
+            let page = [0x5au8; 4096];
+            // SAFETY: a page-sized buffer; the registered range's page.
+            let r = unsafe { libc::wick_uffd::copy(FILL_CTX.load(SeqCst) as usize, page.as_ptr(), FILL_AT.load(SeqCst), 4096, true) };
+            assert!(r.is_ok(), "the fill: {r:?}");
+        }
+        FILL_CTX.store(ctx as u64, SeqCst);
+        FILL_AT.store(registered + 0x2000, SeqCst);
+        assert!(libc::wick_uffd::is_missing(registered + 0x2000));
+        reruns();
+        RAM_HOOK_AFTER_THE_COMMIT.store(fill as fn() as usize, SeqCst);
+        let (got, regs) = run(&mut vcpu, m, &load(UFFD_SLOT + 0x2000));
+        let n = reruns();
+        say(format!("a userfaultfd registered: a missing page filled between the exit and fault()'s look: {got}, AL {:#x}, {n} runs again", regs.rax & 0xff));
+        assert_eq!((got, regs.rax & 0xff, n), (format!("IoOut {PORT:#x}"), 0x5a, 1));
+        // A page the host refuses, the look made to call it allowed: the bound.
+        FORCE_SETTLED.store(1, SeqCst);
+        RAM_LINE.lock().unwrap().clear();
+        let t = std::time::Instant::now();
+        let (got, regs) = run(&mut vcpu, m, &store(READ_ONLY_PAGE));
+        let took = t.elapsed();
+        FORCE_SETTLED.store(0, SeqCst);
+        let n = reruns();
+        let line = RAM_LINE.lock().unwrap().clone();
+        say(format!("kept exiting: {got}, {n} runs again in {} ms, RIP {:#x}; the line: {line}", took.as_millis(), regs.rip));
+        assert_eq!((got, regs.rip), (efault, PROGRAM));
+        assert_eq!(n, u64::from(super::super::exit::RAM_RETRY_BOUND));
+        assert!(line.contains("a page the host allows kept exiting"), "{line}");
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: closes the user end; the test's memory, no VM left using it.
+        unsafe {
+            libc::close(user);
+            assert_eq!(libc::munmap(m.cast(), MEM), 0);
+            assert_eq!(libc::munmap(registered as *mut _, 0x1_0000), 0);
+            assert_eq!(libc::munmap(lazy as *mut _, 0x1_0000), 0);
+        }
     }
 
     // String port I/O and device memory with a second operand in RAM, as

@@ -217,6 +217,15 @@ pub mod wick_mm {
         super::out_of_memory(addr, err)
     }
 
+    pub use super::Settled;
+
+    /// A guest access that the commit ([`commit_block_on_access`]) and the
+    /// userfaultfd (`wick_uffd::fault`) both left, looked at once more under
+    /// the locks every change of it takes: [`Settled`].
+    pub fn settled_access(addr: usize, write: bool) -> Settled {
+        super::settled_access(addr, write)
+    }
+
     /// This thread's own accesses to lazy memory that the exception
     /// handler committed (each an access violation the system dispatched
     /// on the thread's stack), and the most of the thread's stack that was
@@ -1342,6 +1351,64 @@ fn commit_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize
     } else {
         (Access::Exhausted(err), 0..0)
     }
+}
+
+/// What a look at a guest access's page, made whole, finds
+/// ([`settled_access`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    /// A page the commit or the userfaultfd resolves: a registered page
+    /// missing or being moved, a released range's pending page, lazy memory;
+    /// each with a protection that allows the access. Ask them again.
+    Resolvable,
+    /// The page allows the access now: committed, not a guard page, with a
+    /// protection that allows it. Run it again.
+    Allowed,
+    /// None of these: the host refuses the access, as Linux's page fault
+    /// for KVM finds no page it may map (v6.1 virt/kvm/kvm_main.c
+    /// `hva_to_pfn`, `KVM_PFN_ERR_FAULT`).
+    Refused,
+}
+
+/// A guest access to `addr` that the commit and the userfaultfd left,
+/// decided on one view of the page: under the userfaultfd's lock
+/// (`wick_uffd::with_registrations_still`), then the region table's, then
+/// [`RELEASED`]'s and [`LAZY`]'s, the order every other path takes them in,
+/// so that no fill, discard, move, release, `mprotect`, unmapping or mapping
+/// of it runs between the looks. A page any of them would make resolvable
+/// is [`Settled::Resolvable`], whatever it is now; one whose protection
+/// allows the access [`Settled::Allowed`]; else [`Settled::Refused`]. An
+/// execution is taken as a read, as KVM maps a host page for a guest
+/// execution where it may read it. Called by a vCPU thread between run
+/// calls, holding none of wick's locks; the waits are a fill's or a move's
+/// (a move holds the userfaultfd's lock, about 4 ms on record: RECLAIMREC).
+pub(crate) fn settled_access(addr: usize, write: bool) -> Settled {
+    crate::wick_uffd::with_registrations_still(addr as u64, write, |resolvable| {
+        if resolvable {
+            return Settled::Resolvable;
+        }
+        let _t = table().lock().unwrap();
+        let page = addr - addr % PAGE;
+        if RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) != 0
+            && RELEASED.lock().unwrap().iter().any(|r| {
+                r.holds(page) && r.get(PENDING, page) && {
+                    let prot = r.prot(page);
+                    prot != PAGE_NOACCESS && (!write || matches!(prot, PAGE_READWRITE | PAGE_EXECUTE_READWRITE))
+                }
+            })
+        {
+            return Settled::Resolvable;
+        }
+        let lazy = {
+            let l = LAZY.lock().unwrap();
+            let i = l.partition_point(|&(s, _, _)| s <= addr);
+            i.checked_sub(1).map(|i| l[i]).filter(|&(s, n, _)| addr < s + n)
+        };
+        if lazy.is_some_and(|(_, _, prot)| prot != PAGE_NOACCESS && (!write || matches!(prot, PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+            return Settled::Resolvable;
+        }
+        if accessible(addr, 1, write) { Settled::Allowed } else { Settled::Refused }
+    })
 }
 
 /// Commits the lazy pages of `[addr, addr + len)` that are not committed: a

@@ -296,6 +296,16 @@ impl VmInner {
             .map(|s| s.host + (gpa - s.guest_phys))
     }
 
+    /// The host address behind guest RAM at `gpa` and whether its slot is
+    /// read-only (`KVM_MEM_READONLY`); `None` where no slot is.
+    pub(crate) fn ram_slot(&self, gpa: u64) -> Option<(u64, bool)> {
+        let memory = self.memory.lock().unwrap();
+        memory
+            .values()
+            .find(|s| gpa >= s.guest_phys && gpa < s.guest_phys + s.size)
+            .map(|s| (s.host + (gpa - s.guest_phys), s.readonly))
+    }
+
     /// Has the hypervisor map the guest RAM whose host memory `block` is
     /// (what a guest write's first access just committed,
     /// `wick_mm::commit_block_on_access`: a transparent huge page, or a

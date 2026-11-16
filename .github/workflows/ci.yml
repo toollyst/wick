@@ -1518,6 +1518,18 @@ jobs:
           # reads back of an area written with the x87 and SSE header bits
           # cleared, then set.
           alone whp::vcpu::fpu_tests::test_set_fpu_on_record
+          # A guest RAM access's memory access exit decided in KVM's order
+          # (exit.rs ram_access), each with the runs again it took
+          # (RAMEXIT lines): a write to a page the host made PROT_READ in
+          # a writable slot fails the run with EFAULT, its line logged,
+          # nothing emulated, 0 runs again, with no userfaultfd and with
+          # one; with one, a store to a KVM_MEM_READONLY slot and to such
+          # a slot over lazy writable memory is an MMIO write exit with 0
+          # runs again (before: a million, and no end); a missing page
+          # filled between the exit and fault()'s look runs again once;
+          # and a page the look is made to call allowed fails the run after
+          # the bound, with the time the million took.
+          alone whp::vcpu::fpu_tests::test_a_guest_ram_access_exit_is_decided_as_kvms
           # Which WHP call it is that commits a vCPU thread's stack: every
           # call a thread makes, with the stack committed before and after
           # it (STACKCALL lines), for what a booting Linux guest does and

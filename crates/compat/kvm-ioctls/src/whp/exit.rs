@@ -48,6 +48,16 @@ pub fn memory_write(info: u32) -> bool {
     info & 0x3 == 1
 }
 
+/// A memory access's kind for a line: `AccessType` 0 read, 1 write, 2
+/// execute.
+pub fn memory_access_kind(info: u32) -> &'static str {
+    match info & 0x3 {
+        0 => "read",
+        1 => "write",
+        _ => "execution",
+    }
+}
+
 /// An MSR access: whether it is a `WRMSR` (bit 0 of its information word)
 /// and the value it writes, `EDX:EAX` (the upper halves of `RAX` and `RDX`
 /// are not part of it).
@@ -489,9 +499,165 @@ pub fn loads_ss(bytes: &[u8], long_mode_code: bool) -> bool {
     }
 }
 
+/// What the commit of a guest RAM page at its first access answered
+/// (`wick_mm::commit_block_on_access`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RamCommit {
+    /// Committed (or resolved), now or by another thread: run again.
+    Committed,
+    /// Refused at the memory limit, even after a reclaim: the VMM ends.
+    Exhausted(u32),
+    /// Not lazy memory, nor a released range's pending page.
+    NotLazy,
+}
+
+/// The page, looked at once more as a whole (`wick_mm::settled_access`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RamSettled {
+    /// The commit or the userfaultfd would resolve it now.
+    Resolvable,
+    /// The host allows the access now.
+    Allowed,
+    /// The host refuses it.
+    Refused,
+}
+
+/// What the run loop does with a memory access exit at a guest RAM address
+/// (one a memory slot holds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RamExit {
+    /// A write to a read-only slot: emulated as MMIO, its data for the VMM.
+    Mmio,
+    /// The page was committed: run again (the counter starts again).
+    Committed,
+    /// The memory limit refused the page: the VMM ends, as at the OOM kill.
+    OutOfMemory(u32),
+    /// The userfaultfd resolved it (waited for a fill or a move): run again
+    /// (the counter starts again).
+    Faulted,
+    /// The page changed meanwhile and allows the access: run again
+    /// (counted).
+    RunAgain,
+    /// The page changed meanwhile into one the commit or the userfaultfd
+    /// resolves: ask them again before the guest runs (counted).
+    AnotherPass,
+    /// The host refuses the access: the run fails with `EFAULT`.
+    Refused,
+    /// [`RAM_RETRY_BOUND`] times in a row the page was allowed or
+    /// resolvable and the access exited again: the run fails with `EFAULT`.
+    KeptExiting,
+}
+
+/// How many times in a row an access may be run again or asked again for
+/// one exit's page that the host allows ([`RamExit::RunAgain`],
+/// [`RamExit::AnotherPass`]) before the run fails.
+pub const RAM_RETRY_BOUND: u32 = 1_000_000;
+
+/// Decides a memory access exit at a guest RAM address, in KVM's order for
+/// the stage-2 fault (v6.1 arch/x86/kvm/mmu/mmu.c `kvm_faultin_pfn` :4140
+/// to `handle_abnormal_pfn` :3170): `readonly` is the slot's
+/// `KVM_MEM_READONLY`, `write` the access, `userfaultfd` whether one is
+/// registered; `retries` the runs again so far for this access; `commit`,
+/// `fault` and `settled` are asked in that order, each only if the step
+/// before left the access:
+/// 1. a write to a read-only slot is MMIO before the page is looked at:
+///    KVM's `__gfn_to_hva_many` gives `KVM_HVA_ERR_RO_BAD` (virt/kvm/
+///    kvm_main.c :2405 to :2406), `__gfn_to_pfn_memslot`
+///    `KVM_PFN_ERR_RO_FAULT` (:2705 to :2709) and `kvm_handle_bad_page`
+///    `RET_PF_EMULATE` (mmu.c :3159 to :3160), an MMIO exit;
+/// 2. the commit of lazy memory or of a released page (KVM's
+///    `hva_to_pfn`, kvm_main.c :2649, faulting the host page in);
+/// 3. the userfaultfd's wait for a fill or a move (the same fault reaching
+///    `handle_userfault`);
+/// 4. the page as a whole: resolvable now, another pass; allowed, run
+///    again; refused, `EFAULT`, as `hva_to_pfn` gives `KVM_PFN_ERR_FAULT`
+///    for a host page it cannot fault in (:2679 to :2690) and
+///    `kvm_handle_bad_page` turns it into `-EFAULT` (mmu.c :3167). A
+///    hardware-poisoned page (`KVM_PFN_ERR_HWPOISON`, a `SIGBUS` to the
+///    VMM) has no counterpart here.
+pub fn ram_access(
+    readonly: bool,
+    write: bool,
+    userfaultfd: bool,
+    retries: u32,
+    commit: impl FnOnce() -> RamCommit,
+    fault: impl FnOnce() -> bool,
+    settled: impl FnOnce() -> RamSettled,
+) -> RamExit {
+    if readonly && write {
+        return RamExit::Mmio;
+    }
+    match commit() {
+        RamCommit::Committed => return RamExit::Committed,
+        RamCommit::Exhausted(err) => return RamExit::OutOfMemory(err),
+        RamCommit::NotLazy => {}
+    }
+    if userfaultfd && fault() {
+        return RamExit::Faulted;
+    }
+    match settled() {
+        RamSettled::Refused => RamExit::Refused,
+        _ if retries >= RAM_RETRY_BOUND => RamExit::KeptExiting,
+        RamSettled::Resolvable => RamExit::AnotherPass,
+        RamSettled::Allowed => RamExit::RunAgain,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`ram_access`] against KVM's answer for each case, and which steps
+    /// it asked (`c` commit, `f` fault, `s` the settled look).
+    #[test]
+    fn test_a_ram_access_is_decided_in_kvms_order() {
+        use RamCommit::{Committed, Exhausted, NotLazy};
+        use RamSettled::{Allowed, Refused, Resolvable};
+        /// KVM's answer, readonly, write, userfaultfd, retries, commit,
+        /// fault, settled, ours, the steps asked.
+        type Row = (&'static str, bool, bool, bool, u32, RamCommit, bool, RamSettled, RamExit, &'static str);
+        #[rustfmt::skip]
+        let rows: &[Row] = &[
+            // (KVM's answer, readonly, write, userfaultfd, retries, commit, fault, settled, ours, asked)
+            ("KVM_PFN_ERR_RO_FAULT, RET_PF_EMULATE: MMIO, the page not looked at", true, true, true, 0, Committed, true, Allowed, RamExit::Mmio, ""),
+            ("the same without a userfaultfd", true, true, false, 0, NotLazy, false, Refused, RamExit::Mmio, ""),
+            ("a read of a read-only slot is faulted in as any (hva_to_pfn)", true, false, false, 0, Committed, false, Refused, RamExit::Committed, "c"),
+            ("hva_to_pfn faults the lazy page in", false, true, true, 0, Committed, false, Refused, RamExit::Committed, "c"),
+            ("the memory cgroup's OOM kill at the charge", false, true, false, 0, Exhausted(1455), false, Refused, RamExit::OutOfMemory(1455), "c"),
+            ("handle_userfault waits for the fill", false, false, true, 0, NotLazy, true, Refused, RamExit::Faulted, "cf"),
+            ("no userfaultfd: fault() is not asked", false, false, false, 0, NotLazy, true, Allowed, RamExit::RunAgain, "cs"),
+            ("filled between the exit and the look: the fault finds it present, re-run", false, true, true, 0, NotLazy, false, Allowed, RamExit::RunAgain, "cfs"),
+            ("discarded between the looks: faults again, another pass", false, true, true, 0, NotLazy, false, Resolvable, RamExit::AnotherPass, "cfs"),
+            ("KVM_PFN_ERR_FAULT, -EFAULT: a write to a host page without write", false, true, true, 0, NotLazy, false, Refused, RamExit::Refused, "cfs"),
+            ("the same without a userfaultfd", false, true, false, 0, NotLazy, false, Refused, RamExit::Refused, "cs"),
+            ("the same at the bound: still EFAULT, for the host's refusal", false, true, true, RAM_RETRY_BOUND, NotLazy, false, Refused, RamExit::Refused, "cfs"),
+            ("allowed, yet exiting a million times: EFAULT, no counterpart in KVM", false, false, true, RAM_RETRY_BOUND, NotLazy, false, Allowed, RamExit::KeptExiting, "cfs"),
+            ("resolvable, yet exiting a million times: EFAULT", false, false, false, RAM_RETRY_BOUND, NotLazy, false, Resolvable, RamExit::KeptExiting, "cs"),
+            ("just below the bound: run again", false, false, false, RAM_RETRY_BOUND - 1, NotLazy, false, Allowed, RamExit::RunAgain, "cs"),
+        ];
+        for &(kvm, readonly, write, uffd, retries, commit, fault, settled, want, asked) in rows {
+            let seen = core::cell::RefCell::new(String::new());
+            let got = ram_access(
+                readonly,
+                write,
+                uffd,
+                retries,
+                || {
+                    seen.borrow_mut().push('c');
+                    commit
+                },
+                || {
+                    seen.borrow_mut().push('f');
+                    fault
+                },
+                || {
+                    seen.borrow_mut().push('s');
+                    settled
+                },
+            );
+            assert_eq!((got, seen.borrow().as_str()), (want, asked), "{kvm}");
+        }
+    }
 
     #[test]
     fn test_the_shadow_after_a_finished_instruction_is_kvms() {

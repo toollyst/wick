@@ -599,6 +599,23 @@ pub(crate) fn resolve_access(addr: u64, write: bool) -> bool {
     READY.load(Ordering::Acquire) && (is_moving(addr) || is_missing(addr)) && fault(addr, write)
 }
 
+/// For a look at a page that is to be decided on whole
+/// (`windows_mm::settled_access`): runs `f` with [`LOCK`] held, so that no
+/// fill, discard, move (the reclaim moves under its asker's [`LOCK`]),
+/// register, unregister, release, `mprotect` or unmapping of registered
+/// memory runs during it, and tells `f` whether [`fault`] would resolve an
+/// access to `addr` now: its chunk being moved, or a missing registered
+/// page whose protection allows the access. Takes no lock the caller may
+/// hold: called with none of wick's memory locks held, [`LOCK`] first.
+pub(crate) fn with_registrations_still<T>(addr: u64, write: bool, f: impl FnOnce(bool) -> T) -> T {
+    let _guard = lock();
+    let resolvable = is_moving(addr)
+        || find(addr).is_some_and(|(r, page)| {
+            Range::test(&r.tracked, page) && Range::test(&r.missing, page) && !r.denies(page, write)
+        });
+    f(resolvable)
+}
+
 /// Whether `addr` is in a registered range (the handler's last check:
 /// memory that is ours).
 pub(crate) fn registered(addr: u64) -> bool {
@@ -8619,6 +8636,92 @@ mod tests {
         EXCEPTION_HOOK.store(0, Ordering::SeqCst);
         std::println!("read back {got:#x}");
         assert_eq!(got, 0xab);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// The look a vCPU's memory access exit takes last
+    /// (`windows_mm::settled_access`, the run loop's step after the commit
+    /// and `fault`), with the page changed between the looks, as another
+    /// thread changes it while the vCPU thread is between them: a fill after
+    /// the commit's look leaves `fault` nothing and the page Allowed (the
+    /// access runs again); a discard after `fault`'s look makes it
+    /// Resolvable (asked of the commit and the userfaultfd again, never
+    /// `EFAULT`); a page the host refuses is Refused: a filled page made
+    /// `PROT_READ` to a write (KVM: `EFAULT`) and Allowed to a read, a
+    /// missing page `PROT_NONE` asked, lazy memory made `PROT_READ` to a
+    /// write (and Resolvable to a read, not committed yet), unmapped memory;
+    /// a released range's pending page is Resolvable. In a process of its
+    /// own.
+    #[test]
+    fn test_a_page_changed_between_a_vcpus_looks_is_settled_as_it_is_now() {
+        let (code, text) = run_child("settled_looks_child", None);
+        std::eprintln!("{}", text.lines().filter(|l| l.starts_with("SETTLED") || l.contains("panicked")).collect::<std::vec::Vec<_>>().join("\n"));
+        assert!(text.contains("SETTLED done"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_page_changed_between_a_vcpus_looks_is_settled_as_it_is_now in a process of its own"]
+    fn settled_looks_child() {
+        use crate::windows_mm::{settled_access as settled, Access, Settled};
+        let look = |what: &str, got: Settled, want: Settled| {
+            std::println!("SETTLED {what}: {got:?}");
+            assert_eq!(got, want, "{what}");
+        };
+        let commit = |at: u64, write: bool| crate::windows_mm::wick_mm::commit_on_access(at as usize, write);
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 64 * 1024;
+        let mem = map(len);
+        register(ctx, mem, len as u64).unwrap();
+        let data = std::vec![0x5au8; PAGE as usize];
+        let page = mem + PAGE;
+        // A fill between the commit's look and fault()'s.
+        assert_eq!(commit(page, true), Access::NotLazy);
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), page, PAGE, true) }.unwrap(), PAGE);
+        assert!(!fault(page, true), "a filled page is not fault()'s");
+        look("filled after the commit's look", settled(page as usize, true), Settled::Allowed);
+        // A discard between fault()'s look and the settled one.
+        assert!(!fault(page, true));
+        // SAFETY: registered memory of ours.
+        assert_eq!(unsafe { crate::madvise(page as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        assert!(is_missing(page));
+        look("discarded after fault()'s look", settled(page as usize, true), Settled::Resolvable);
+        // Filled again and made PROT_READ: a write refused, a read allowed.
+        // SAFETY: as above.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), page, PAGE, true) }.unwrap(), PAGE);
+        // SAFETY: as above.
+        assert_eq!(unsafe { crate::mprotect(page as *mut c_void, PAGE as usize, crate::PROT_READ) }, 0);
+        assert!(!fault(page, true));
+        look("a filled page PROT_READ, written", settled(page as usize, true), Settled::Refused);
+        look("the same page, read", settled(page as usize, false), Settled::Allowed);
+        // A missing page PROT_NONE asked: no userfault, refused.
+        let none = mem + 3 * PAGE;
+        // SAFETY: as above.
+        assert_eq!(unsafe { crate::mprotect(none as *mut c_void, PAGE as usize, crate::PROT_NONE) }, 0);
+        assert!(is_missing(none) && !fault(none, false));
+        look("a missing page PROT_NONE, read", settled(none as usize, false), Settled::Refused);
+        // A released range's pending page: resolvable.
+        let pending = mem + 5 * PAGE;
+        unregister(ctx, mem + 4 * PAGE, 4 * PAGE).unwrap();
+        assert!(!fault(pending, true));
+        look("a released range's pending page, written", settled(pending as usize, true), Settled::Resolvable);
+        // Lazy memory made PROT_READ: a write refused, a read resolvable.
+        // SAFETY: a new anonymous mapping, committed at first touch.
+        let lazy = unsafe {
+            crate::mmap(ptr::null_mut(), 1 << 20, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE, -1, 0)
+        } as u64;
+        // SAFETY: as above.
+        assert_eq!(unsafe { crate::mprotect(lazy as *mut c_void, 1 << 20, crate::PROT_READ) }, 0);
+        assert_eq!(commit(lazy, true), Access::NotLazy);
+        look("lazy memory PROT_READ, written", settled(lazy as usize, true), Settled::Refused);
+        look("lazy memory PROT_READ, read before its commit", settled(lazy as usize, false), Settled::Resolvable);
+        // Unmapped memory.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::munmap(lazy as *mut c_void, 1 << 20) }, 0);
+        look("unmapped memory, read", settled(lazy as usize, false), Settled::Refused);
+        std::println!("SETTLED done");
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
