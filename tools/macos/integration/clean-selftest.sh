@@ -21,7 +21,10 @@
 # --remove then runs clean.sh for real and checks that both are gone, if its
 # dry run lists nothing but this test's (another run's leftovers would go
 # too). CLEAN_SH (default tools/clean.sh) is the script under test.
-set -euo pipefail
+set -Eeuo pipefail
+# A command that ends the script (set -e), in a function or a trap too (-E),
+# says so: a failure after "all passed" was once silent (CI run 43790310601).
+trap 'echo "clean-selftest: line $LINENO: \"$BASH_COMMAND\" exited $?" >&2' ERR
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 remove=0
 [[ "${1:-}" == --remove ]] && { remove=1; shift; }
@@ -58,13 +61,23 @@ owner_pid=""
 screen_pid=""
 window_pid=""
 loop_pid=""
+# Kills what is still alive of `pid`s: one already gone (clean.sh --remove
+# killed it) is not a failure.
+kill_if_alive() {
+    local pid
+    for pid in "$@"; do
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+}
 finish() {
-    [[ -n "$loop_pid" ]] && kill "$loop_pid" 2>/dev/null
-    [[ -n "$screen_pid" ]] && kill "$screen_pid" 2>/dev/null
-    [[ -n "$window_pid" ]] && kill "$window_pid" 2>/dev/null
-    [[ -n "$owner_pid" ]] && kill "$owner_pid" 2>/dev/null
+    local rc=$?
+    kill_if_alive "$loop_pid" "$screen_pid" "$window_pid" "$owner_pid"
     "$SCREEN" -wipe >/dev/null 2>&1 || true
     rm -rf "$session"
+    ((rc == 0)) || echo "clean-selftest: exit $rc" >&2
+    exit "$rc"
 }
 trap finish EXIT
 
@@ -74,7 +87,7 @@ trap finish EXIT
 # screen daemon, its parent then pid 1: it is killed with it, here and after
 # clean.sh's run, or each run would leave its windows behind for 600 s.
 stop_window() {
-    [[ -n "$window_pid" ]] && kill "$window_pid" 2>/dev/null
+    kill_if_alive "$window_pid"
     window_pid=""
 }
 stop_screen() {
