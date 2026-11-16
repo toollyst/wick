@@ -1420,11 +1420,17 @@ jobs:
         run: |
           k=../../crates/compat/kvm-ioctls/Cargo.toml
           failed=0
+          # Each run's whole output is kept too, for the next step to name
+          # the frames of a stack that could not grow (STACK137FRAMES).
+          mkdir -p "$RUNNER_TEMP/whp-logs"
+          runs=0
           alone() {
             local out
             out=$(cargo test --locked --manifest-path "$k" "${@:2}" -- \
               --include-ignored --exact --nocapture --test-threads=1 "$1" 2>&1) || true
             printf '%s\n' "$out"
+            runs=$((runs + 1))
+            printf '%s\n' "$out" > "$RUNNER_TEMP/whp-logs/$runs.log"
             if ! grep -q "test result: ok. 1 passed" <<<"$out"; then
               echo "::error::$1 did not pass alone"
               failed=1
@@ -1993,6 +1999,43 @@ jobs:
             failed=1
           fi
           exit $failed
+      # A process the stack filter ended with 137 (its stack could not grow
+      # at the job's limit: MOVEUNDERVCPU's vCPU thread in runs 43800980377
+      # and 43808974288) printed its return addresses (STACK137FRAMES, as
+      # offsets in its executable): named here with cdb against the test
+      # executable the run's "Running" line names and its pdb, and both kept
+      # as an artifact for a debugger elsewhere. Only prints; it fails
+      # nothing.
+      - name: Name the frames of a stack that could not grow
+        if: (success() || failure()) && steps.setup.outcome == 'success'
+        working-directory: lib/firecracker
+        run: |
+          cdb="/c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe"
+          mkdir -p "$RUNNER_TEMP/whp-frames"
+          for f in "$RUNNER_TEMP"/whp-logs/*.log; do
+            [ -e "$f" ] && grep -q 'STACK137FRAMES' "$f" || continue
+            exe=$(sed -n 's/.*Running unittests [^(]*(\(.*\.exe\)).*/\1/p' "$f" | tail -1 | tr '\\' /)
+            echo "== $f: $(grep -m1 'stack could not grow' "$f")"
+            echo "executable: $exe"
+            [ -n "$exe" ] && [ -f "$exe" ] || { echo "::warning::$f: no test executable named"; continue; }
+            cp "$exe" "${exe%.exe}.pdb" "$RUNNER_TEMP/whp-frames/" 2>/dev/null || true
+            module=$(basename "$exe" .exe | tr - _)
+            cmds=$(grep -o 'STACK137FRAMES [0-9]* image+0x[0-9a-f]*' "$f" | awk -v m="$module" '{sub("image", m, $3); printf "ln %s; ", $3}')
+            if [ -x "$cdb" ]; then
+              "$cdb" -z "$exe" -y "$(dirname "$exe")" -c "${cmds}q" 2>&1 | grep '^(' || true
+            else
+              echo "no cdb on this runner: the executable and its pdb are in the whp-frames artifact"
+            fi
+            grep 'STACK137FRAMES [0-9]* 0x' "$f" || true
+          done
+      - name: Keep the executables of a stack that could not grow
+        if: (success() || failure()) && steps.setup.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: whp-frames
+          path: ${{ runner.temp }}/whp-frames/*
+          if-no-files-found: ignore
+          retention-days: 14
       # wick-os's standard input on a console (a hidden console of its own,
       # made for a child process): ignored in the crate step above so that a
       # runner without a console cannot cost the kit; run alone here, after

@@ -1575,13 +1575,17 @@ fn this_threads_description(out: &mut [u16]) -> usize {
     n
 }
 
-/// STACK137FRAMES (tests): the return addresses on the stack of a thread
-/// whose stack could not grow, from the filter down through the exception
-/// dispatcher into the frames that faulted (`RtlCaptureStackBackTrace`),
-/// each as an offset in this executable (`__ImageBase`) where it is one,
-/// for a debugger to name (`cdb -z <exe>`, `ln`); written without
-/// allocating, in 256 bytes of stack.
-#[cfg(test)]
+/// STACK137FRAMES: the return addresses on the stack of a thread whose
+/// stack could not grow, printed after the filter's line, from the filter
+/// down through the exception dispatcher into the frames that faulted
+/// (`RtlCaptureStackBackTrace`), each as an offset in this executable
+/// (`__ImageBase`) where it is one, for a debugger with the build's pdb to
+/// name (`cdb -z <exe> -y <pdb dir>`, `ln <module>+<offset>`; CI's WHP
+/// step names them so). A VMM's last lines then say where its stack had
+/// to grow at the limit (the stack reclaim's step 3 and the stack
+/// pre-commit are decided from them), where Linux's OOM kill prints the
+/// task's memory, not its stack. Written without allocating, in 256 bytes
+/// of stack, on the 137 path only.
 #[inline(never)]
 fn stack_137_frames() {
     unsafe extern "C" {
@@ -1661,7 +1665,6 @@ unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::
                 unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
                 Utf16(&name[..len])
             ));
-            #[cfg(test)]
             stack_137_frames();
             // SAFETY: ends this process at once, as SIGKILL does.
             unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), OOM_EXIT) };
