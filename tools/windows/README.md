@@ -217,7 +217,10 @@ crate tests to the kit's upload run whatever failed before them, where runs
   of a PC's default run and `diff-nospace`; `hugepages`, `gdb` and
   `linux-snapshot` in steps of their own. `linux-snapshot` is given the
   snapshot the `linux-boot` job of the same run made (artifact
-  `linux-snapshot`). `hugepages` needs "Lock pages in memory" in a logon made after the
+  `linux-snapshot`); when `linux-boot` did not succeed, the step says
+  "not run: linux-boot ..., so it produced no snapshot" and passes, the
+  failed job keeping the run red, and a missing snapshot from a
+  `linux-boot` that succeeded fails it. `hugepages` needs "Lock pages in memory" in a logon made after the
   right was given: the job gives it to the runner's account and runs the
   stage (and `jailer-test.ps1 hugepages`) in a scheduled task as that
   account. `gdb` installs MSYS2's `gdb-multiarch` (one package, pinned by

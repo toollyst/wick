@@ -1,0 +1,48 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+name: Upstream's tag
+description: >-
+  lib/firecracker's git directory with upstream's tag at patches/base: from an
+  earlier run's cache, or fetched as tools/setup.sh fetches it and then cached.
+  Run after actions/checkout (submodules) and before tools/setup.sh.
+# Why: each job fetched upstream's tag from github.com, and an outage there
+# failed the job's setup before anything of wick ran (run 43783880314's
+# windows job, "The requested URL returned error: 503"; run 43790310601's
+# linux-boot). A hit needs no fetch. A miss fetches exactly as setup.sh does
+# (ensure_tag, no retry) and saves the directory as it is then: upstream's
+# commit and its tag, before setup.sh adds the series' branch, so a cached
+# directory never holds a branch `wick` of an older series.
+#
+# What a stale cache cannot cause: the key is patches/base's content, so a new
+# base is a new key; setup.sh still checks that the tag's commit is the one
+# lib/firecracker is recorded at, and patches.sh check (the patches job) still
+# compares the series with patches/ byte for byte, cache or not. Not checked on
+# a hit: whether upstream has moved the tag since it was cached (a hit keeps the
+# commit it was fetched at, the one lib/firecracker is recorded at); a miss (a
+# new base, or the cache evicted) fetches it and setup.sh checks it again.
+runs:
+  using: composite
+  steps:
+    - name: Upstream's git directory from an earlier run
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .git/modules/lib/firecracker
+        key: upstream-git-${{ runner.os }}-${{ hashFiles('patches/base') }}
+    - name: Upstream's tag (fetched on a miss)
+      shell: bash
+      run: |
+        source tools/common.sh
+        base="$(upstream_base)"
+        if up rev-parse -q --verify "refs/tags/$base^{commit}" >/dev/null; then
+            echo "upstream's $base: $(up rev-parse "refs/tags/$base^{commit}") (cache hit: ${{ steps.restore.outputs.cache-hit == 'true' }})"
+        elif ! (ensure_tag "$base"); then
+            echo "::error::upstream fetch failed: infrastructure, not a wick failure (the tag $base could not be fetched from $UPSTREAM_URL and no earlier run's cache has it; the steps that need it are skipped)"
+            exit 1
+        fi
+    - name: Upstream's git directory for later runs
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .git/modules/lib/firecracker
+        key: upstream-git-${{ runner.os }}-${{ hashFiles('patches/base') }}

@@ -40,6 +40,8 @@ jobs:
           submodules: true
           fetch-depth: 0
           persist-credentials: false
+      # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
+      - uses: ./.github/actions/upstream
       - name: Apply the patch series
         run: tools/setup.sh
       - name: Check the patch series
@@ -59,7 +61,8 @@ jobs:
           python3 -I -B tools/check-unit-graph.py --fetch
       - name: Actions are pinned by commit
         run: |
-          unpinned="$(grep -nE '^\s*(-\s+)?uses:' .github/workflows/*.yml | grep -vE 'uses:\s*[^@ ]+@[0-9a-f]{40}( |$)' || true)"
+          # This repository's own actions (uses: ./...) are its files; theirs are checked too.
+          unpinned="$(grep -nE '^\s*(-\s+)?uses:' .github/workflows/*.yml .github/actions/*/action.yml | grep -vE 'uses:\s*([^@ ]+@[0-9a-f]{40}( |$)|\./)' || true)"
           [[ -z "$unpinned" ]] || { echo "::error::actions not pinned by full commit SHA:"; echo "$unpinned"; exit 1; }
       # Every "in place", "verified" or "measured" in the docs' tables names
       # the test that checks it, Windows cells included; every commit a doc
@@ -94,6 +97,8 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
+      # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
+      - uses: ./.github/actions/upstream
       - run: tools/setup.sh
       - name: Install cargo-deny
         run: |
@@ -114,6 +119,8 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
+      # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
+      - uses: ./.github/actions/upstream
       - run: tools/setup.sh
       - name: Report KVM availability
         run: ls -l /dev/kvm || echo "no /dev/kvm on ${{ matrix.runner }}"
@@ -149,6 +156,8 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
+      # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
+      - uses: ./.github/actions/upstream
       - name: Set up upstream and the patch series
         id: setup
         run: tools/setup.sh
@@ -193,6 +202,8 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
+      # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
+      - uses: ./.github/actions/upstream
       - name: Set up upstream and the patch series
         id: setup
         run: tools/setup.sh
@@ -315,6 +326,8 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
+      # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
+      - uses: ./.github/actions/upstream
       - name: Set up upstream and the patch series
         id: setup
         run: tools/setup.sh
@@ -428,6 +441,8 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
+      # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
+      - uses: ./.github/actions/upstream
       - run: tools/setup.sh
       - name: Install clippy
         working-directory: lib/firecracker
@@ -668,6 +683,8 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
+      # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
+      - uses: ./.github/actions/upstream
       - run: tools/setup.sh
       - name: boot-test.sh's vmnet stage as root, before macOS 26
         run: |
@@ -747,6 +764,8 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
+      # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
+      - uses: ./.github/actions/upstream
       - run: tools/setup.sh
       # Run 43442912128's macos-15 job was cancelled by the job's timeout in
       # the step below, and GitHub kept no log of it. So the tests are built
@@ -930,19 +949,15 @@ jobs:
             "HypervisorPlatform: not read ($($_.Exception.Message))"
           }
           if (Test-Path "$env:SystemRoot\System32\WinHvPlatform.dll") { "WinHvPlatform.dll: present" } else { "WinHvPlatform.dll: absent" }
-      # A failed fetch of upstream is said as what it is in one line: an
-      # outage of github.com's upstream repository, not a wick failure (run
-      # 43783880314: "The requested URL returned error: 503"). No retry.
+      # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
+      - uses: ./.github/actions/upstream
+      # A failed fetch of upstream is said as what it is, in one line, by the
+      # step before (an outage of github.com's upstream repository, not a wick
+      # failure: run 43783880314, "The requested URL returned error: 503"),
+      # and this step does not run. No retry.
       - name: Set up upstream and the patch series
         id: setup
-        run: |
-          set +e
-          tools/setup.sh 2>&1 | tee "$RUNNER_TEMP/setup.log"
-          status=${PIPESTATUS[0]}
-          if ((status != 0)) && grep -q "cannot fetch tag" "$RUNNER_TEMP/setup.log"; then
-            echo "::error::upstream fetch failed: infrastructure, not a wick failure (tools/setup.sh could not fetch upstream's tag; the steps that need it are skipped)"
-          fi
-          exit "$status"
+        run: tools/setup.sh
       # Upstream tests put sockets and files under /tmp, which Windows
       # resolves to \tmp on the current drive.
       - name: Create \tmp on the working drive
@@ -1813,7 +1828,7 @@ jobs:
   # serial console someone types at stay with the PC (tools/windows/README.md).
   windows-guest:
     # linux-boot makes the snapshot of the linux-snapshot stage; without it
-    # that stage alone fails, saying what it lacks.
+    # (linux-boot failed) that stage alone is not run, saying why.
     needs: [windows, linux-boot]
     # Runs whenever the windows job uploaded the kit, also when a step after
     # the upload failed (the unit tests run after it): such a failure keeps
@@ -1870,9 +1885,17 @@ jobs:
       # build), loaded and resumed on WHP. A record: the stage's line says
       # RESTORED or REFUSED with Firecracker's error, and it fails only on
       # what is neither.
+      # Not run, said so, when linux-boot did not succeed and so made no
+      # snapshot (run 43790310601: its setup could not fetch upstream): that
+      # job's own failure is the cause, and it keeps the run red. A missing
+      # snapshot from a linux-boot that succeeded fails here.
       - name: boot-test.ps1 linux-snapshot
         if: (success() || failure()) && steps.kit.outcome == 'success'
         run: |
+          if ("${{ steps.snapshot.outcome }}" -ne 'success' -and "${{ needs.linux-boot.result }}" -ne 'success') {
+            "::warning::boot-test.ps1 linux-snapshot not run: linux-boot ${{ needs.linux-boot.result }}, so it produced no snapshot"
+            exit 0
+          }
           Get-Content "$env:RUNNER_TEMP\linux-snapshot\linux-x86_64.txt" -ErrorAction SilentlyContinue
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage linux-snapshot `
             -LinuxSnapshot "$env:RUNNER_TEMP\linux-snapshot"
