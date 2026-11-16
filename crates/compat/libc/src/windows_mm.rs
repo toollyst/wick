@@ -1762,9 +1762,21 @@ impl core::fmt::Display for Utf16<'_> {
 /// ([`RESCUE`]), so that the line and the exit have room. The process then
 /// ends with `TerminateProcess` at once, bypassing Windows Error Reporting
 /// on purpose: an end at the memory limit is not a crash (Linux's
-/// out-of-memory kill leaves no core either); a stack overflow at the
-/// reserve's end, and every other exception, go on to the filter this one
-/// replaced, or to Windows' own handling (a crash dump, `0xC00000FD`).
+/// out-of-memory kill leaves no core either).
+///
+/// A stack overflow at the reserve's end ends the process here too, with
+/// its line (the thread, the reserve left, its guarantee) and
+/// `STATUS_STACK_OVERFLOW` (0xC00000FD), on every kind of thread, as Linux
+/// ends a process whose stack overflows (SIGSEGV on its guard gap).
+/// Passed on, it was left to whoever called this filter: in a job of the
+/// jailer's limits (`JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`) Windows
+/// Error Reporting is not called and the caller handles it, and a thread
+/// pool's worker took it and went on running callbacks, the process alive
+/// with whatever the callback held
+/// (`test_a_stack_overflow_at_the_reserves_end_is_still_one`; CI run
+/// 43823078930's windows job). The filter this one replaced is not called
+/// for it. Every other exception goes on to that filter, or to Windows' own
+/// handling.
 unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
@@ -1794,12 +1806,19 @@ unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::
             unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), OOM_EXIT) };
             unreachable!("the process ended");
         }
-        #[cfg(test)]
+        let mut name = [0u16; 64];
+        let len = this_threads_description(&mut name);
         say_at_the_limit(format_args!(
-            "STACKFILTER a stack overflow at the reserve's end: {} KiB of the reserve left, the guarantee {guarantee} bytes; \
-             passed on",
-            left >> 10
+            "wick: a thread's stack overflowed at its reserve's end, {} KiB of it left (thread {} \"{}\", its guarantee \
+             {guarantee} bytes); the VMM ends with STATUS_STACK_OVERFLOW (0xC00000FD)",
+            left >> 10,
+            // SAFETY: plain call.
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+            Utf16(&name[..len])
         ));
+        // SAFETY: ends this process at once, as an unhandled stack overflow does.
+        unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), STACK_OVERFLOW.cast_unsigned()) };
+        unreachable!("the process ended");
     }
     match PREVIOUS_FILTER.load(std::sync::atomic::Ordering::SeqCst) {
         0 => windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH,

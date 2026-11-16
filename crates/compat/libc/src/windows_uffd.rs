@@ -3519,7 +3519,6 @@ mod tests {
     /// its start, the processes it started or that report its fault, and
     /// its threads' stacks (cdb, where the host has it).
     #[test]
-    #[ignore = "fails until the stack filter ends a stack overflow at the reserve's end itself"]
     fn test_a_stack_overflow_at_the_reserves_end_is_still_one() {
         stack_end_host_record();
         let mut not_ended = std::vec::Vec::new();
@@ -3822,12 +3821,13 @@ mod tests {
     /// meet the end inside it: the stack overflow then raised there must be
     /// dispatched as any other,
     /// Rust's "has overflowed its stack" line, the stack filter's
-    /// STACKFILTER line (the reserve's end, passed on) and 0xC00000FD. A
+    /// line (the reserve's end) and 0xC00000FD. A
     /// child per case: a thread recurses until 64, 63, ... 4 KiB are left
     /// above its reserve's low end (DeallocationStack), then reads a lazy
     /// page; a Rust thread (a 20 KiB guarantee) and a `CreateThread` thread
-    /// (none; a pool thread's stack is the same, and its overflow's end on
-    /// Windows Server 2025 is a question of its own). Asserted per case:
+    /// (none; a pool thread's stack is the same, and its overflow's end is
+    /// `test_a_stack_overflow_at_the_reserves_end_is_still_one`'s). Asserted
+    /// per case:
     /// the read served and the child ended 0, or the overflow said, as
     /// above; and for each kind, that some case met the reserve's end in
     /// the handler's commit (STACKASK says where the overflow was raised),
@@ -3844,7 +3844,7 @@ mod tests {
                 let served = code == Some(0) && text.contains("LAZYEND the read gave 0");
                 let loud = code == Some(0xC000_00FD_u32.cast_signed())
                     && text.contains("has overflowed its stack")
-                    && text.contains("STACKFILTER a stack overflow at the reserve's end");
+                    && text.contains("wick: a thread's stack overflowed at its reserve's end");
                 assert!(served || loud, "{kind} at {left} KiB left: neither served nor an overflow said as one ({code:?}): {text}");
                 in_the_handler[k] |= loud && text.contains("raised in the lazy handler's commit");
             }

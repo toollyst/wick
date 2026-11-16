@@ -412,8 +412,10 @@ upstream Firecracker and its jailer.
   reclaim first (`ENOMEM`, or the process ends: a thread whose stack must grow ends it with 137 and a line, its
   refused commit told from a stack used up by the thread's TEB in an unhandled-exception filter, which bypasses
   Windows Error Reporting on purpose, as an end at the limit is not a crash; a stack used up still reaches it,
-  `test_a_stack_that_must_grow_at_the_limit_ends_with_137`, `test_a_stack_overflow_at_the_reserves_end_is_still_one`,
-  on Windows Server 2022 20348; on Server 2025 26100 a thread-pool thread's overflow ended its child with 0, open),
+  `test_a_stack_that_must_grow_at_the_limit_ends_with_137`; a stack used up ends the VMM with 0xC00000FD and a
+  line from the same filter, on every kind of thread, in a job of the jailer's limits too, where a thread pool took
+  the overflow and went on when the filter passed it on: `test_a_stack_overflow_at_the_reserves_end_is_still_one`,
+  on Windows Server 2022 20348 and 2025 26100),
   not done yet for the reclaim; the limit holds either way. A move holds its live
   pages in two sections for its
   time; a 2 MiB move budget of private `PAGE_NOACCESS` commit, made at the first registration, is the cover the
