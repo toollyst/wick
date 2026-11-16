@@ -229,7 +229,7 @@ the uid it is for (`ip tuntap add ... user`), `install -m 0040 -g <group> /dev/n
 too) is anyone's. Make it anew when your switch makes the interface (a root Firecracker killed while it held a
 name it made can leave one there). `DIR` must be yours alone: the jailer refuses one the jail's uid owns or that your
 group, others or another uid's ACL entry may write. Keep nothing in `DIR` but
-your switch's sockets: the jailer lets the jails' uids send to (write) what is made directly there. Jails given one `DIR` are in one
+your switch's sockets and their lock files: the jailer lets the jails' uids send to (write) what is made directly there. Jails given one `DIR` are in one
 network and reach each other only through your switch; give each jail a uid of its own.
 [SECURITY.md](../SECURITY.md) has how each control is held.
 
