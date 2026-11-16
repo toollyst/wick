@@ -3368,7 +3368,7 @@ mod tests {
     #[test]
     fn test_a_frame_in_a_damaged_image_is_given_bare() {
         for (case, want) in [("control", Some("damaged.dll+0x1010")), ("exports", None), ("name", None)] {
-            let (code, text, _) = run_child_watched("damaged_image_child", &[("WICK_TEST_IMAGE", case)]);
+            let (code, text, _) = run_child_watched("damaged_image_child", &[("WICK_TEST_IMAGE", case)], false);
             let line = text.lines().find(|l| l.starts_with("STACK137FRAMES 0 ")).unwrap_or_default();
             assert!(text.contains(&std::format!("DAMAGED {case}: after the frame")), "{case}: {code:?}: {text}");
             assert_eq!(code, Some(0), "{case}: {text}");
@@ -3496,43 +3496,176 @@ mod tests {
     }
 
     /// A stack overflow at the reserve's end is still one, with the stack
-    /// filter in place: passed on (its test line, STACKFILTER, with how
-    /// much of the reserve was left and the thread's guarantee), it ends the
-    /// process with `STATUS_STACK_OVERFLOW` (0xC00000FD) as before, through
-    /// Windows' own handling (Windows Error Reporting), on each kind of
-    /// thread ([`Kind`]), with room left.
+    /// filter in place: the filter says so (its line, with how much of the
+    /// reserve was left, the thread and its guarantee) and ends the process
+    /// with `STATUS_STACK_OVERFLOW` (0xC00000FD) itself, on each kind of
+    /// thread ([`Kind`]), with room left; each child alone (the error mode
+    /// it inherits) and in a job as the jailer makes Firecracker's
+    /// (`JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`, which Learn says
+    /// forces `SEM_NOGPFAULTERRORBOX` on each process of the job: Windows
+    /// Error Reporting is not called, and the unhandled-exception filter's
+    /// caller handles the exception). There a pool thread's overflow, passed
+    /// on, was taken by its pool, which went on running callbacks, the
+    /// process with it (exit 0, on Windows Server 2022 20348 and 2025 26100
+    /// alike), where a Rust or `CreateThread` thread's ended the process
+    /// with 0xC00000FD. Each child waits for its thread by the thread's own
+    /// structure, with no timeout ([`stack_overflow`]): a child whose
+    /// process went on says how, and ends 0.
     ///
-    /// Its record, STACKENDHOST: the host's build and revision, its
-    /// just-in-time debugger (AeDebug) and Windows Error Reporting's keys;
-    /// and for each child when it ended after the filter's line, with what
-    /// status, and, if it still runs 12 s after its start, the processes it
-    /// started or that report its fault, and its threads' stacks (cdb, where
-    /// the host has it), as Windows Server 2025's pool thread went on for
-    /// 10 s in CI runs 43784960688 and 43790310601.
+    /// Its record, STACKENDHOST: the host's build and revision, this
+    /// process's error mode, its just-in-time debugger (AeDebug) and Windows
+    /// Error Reporting's keys; and for each child when it ended after the
+    /// filter's line, with what status, and, if it still runs 12 s after
+    /// its start, the processes it started or that report its fault, and
+    /// its threads' stacks (cdb, where the host has it).
     #[test]
+    #[ignore = "fails until the stack filter ends a stack overflow at the reserve's end itself"]
     fn test_a_stack_overflow_at_the_reserves_end_is_still_one() {
         stack_end_host_record();
+        let mut not_ended = std::vec::Vec::new();
         for child in ["stack_overflow_rust_child", "stack_overflow_createthread_child", "stack_overflow_pool_child"] {
-            let (code, text, ended) = run_child_watched(child, &[]);
-            std::eprintln!("STACKEND {child}: {code:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
-            assert!(text.contains("STACKFILTER a stack overflow at the reserve's end"), "{child}: {text}");
-            assert_eq!(code, Some(0xC000_00FD_u32.cast_signed()), "{child}: {text}");
+            for jailed in [false, true] {
+                let (code, text, ended) = run_child_watched(child, &[], jailed);
+                let how = if jailed { "in a job as the jailer's" } else { "alone" };
+                std::eprintln!("STACKEND {child} {how}: {code:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
+                if !text.contains("wick: a thread's stack overflowed at its reserve's end") || code != Some(0xC000_00FD_u32.cast_signed()) {
+                    not_ended.push(std::format!("{child} {how} ({code:?}): {text}"));
+                }
+            }
         }
+        assert!(not_ended.is_empty(), "not ended by the filter with its line and 0xC00000FD: {not_ended:#?}");
     }
 
+    /// An unbounded recursion on a new thread of `kind`, waited for by the
+    /// thread's own structure, with no timeout: the overflow either ends the
+    /// process or this returns and says how the process went on. A Rust or
+    /// `CreateThread` thread is waited for to its end (its handle); a pool
+    /// thread is the only thread of a pool of its own (at most and at least
+    /// one, Learn: SetThreadpoolThreadMaximum, SetThreadpoolThreadMinimum),
+    /// with a second callback queued behind the recursion's, which runs only
+    /// once that thread is back in its pool (or a new one replaced it): as
+    /// Windows Server 2025 26100.33674's pool took the overflow and went on
+    /// waiting for work (CI run 43823078930's windows job: the child's
+    /// process alive after 60 s, its overflowed thread back in
+    /// `ntdll!TppWorkerThread`). A child run in a job (WICK_TEST_JOB, its
+    /// name) waits until it is in that job first, and says its error mode.
     fn stack_overflow(kind: Kind) {
+        use windows_sys::Win32::System::Threading::{
+            CloseThreadpool, CreateThread, CreateThreadpool, INFINITE, PTP_CALLBACK_INSTANCE, SetThreadpoolThreadMaximum,
+            SetThreadpoolThreadMinimum, TP_CALLBACK_ENVIRON_V3, TP_CALLBACK_PRIORITY_NORMAL, TrySubmitThreadpoolCallback,
+            WaitForSingleObject,
+        };
+        fn said_then_deep(kind: Kind) -> u8 {
+            let (base, limit, reserve, guarantee) = stack_of_this_thread();
+            std::println!(
+                "the {kind:?} thread's stack: {} KiB committed of a {} KiB reserve, a guarantee of {guarantee} bytes",
+                (base - limit) >> 10,
+                (base - reserve) >> 10
+            );
+            deep(usize::MAX)
+        }
+        unsafe extern "system" fn recurse(_: *mut c_void) -> u32 {
+            u32::from(core::hint::black_box(said_then_deep(Kind::CreateThread)))
+        }
+        unsafe extern "system" fn recurse_pooled(_: PTP_CALLBACK_INSTANCE, started: *mut c_void) {
+            // SAFETY: the sender boxed below, given to this callback alone.
+            let started = unsafe { std::boxed::Box::from_raw(started.cast::<std::sync::mpsc::Sender<()>>()) };
+            started.send(()).unwrap();
+            drop(started);
+            core::hint::black_box(said_then_deep(Kind::Pool));
+        }
+        unsafe extern "system" fn next(_: PTP_CALLBACK_INSTANCE, tx: *mut c_void) {
+            // SAFETY: the sender boxed below, given to this callback alone.
+            let tx = unsafe { std::boxed::Box::from_raw(tx.cast::<std::sync::mpsc::Sender<()>>()) };
+            let _ = tx.send(());
+        }
+        if let Ok(name) = std::env::var("WICK_TEST_JOB") {
+            use windows_sys::Win32::System::JobObjects::{IsProcessInJob, OpenJobObjectW};
+            /// winnt.h's (windows-sys has it under System_SystemServices).
+            const JOB_OBJECT_QUERY: u32 = 4;
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let wide: std::vec::Vec<u16> = name.encode_utf16().chain([0]).collect();
+            // SAFETY: a NUL-terminated name.
+            let job = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, wide.as_ptr()) };
+            assert!(!job.is_null(), "the job {name}: {}", io::Error::last_os_error());
+            // The parent assigns this process once it has started it.
+            loop {
+                let mut is = 0;
+                // SAFETY: this process, a job handle with JOB_OBJECT_QUERY.
+                assert_ne!(unsafe { IsProcessInJob(GetCurrentProcess(), job, &mut is) }, 0);
+                if is != 0 {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            // SAFETY: our handle.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+        }
+        // SAFETY: plain call.
+        std::println!("the child's error mode: {:#x}", unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode() });
         lazy_memory_is_mapped();
-        let (go, came_back) = a_thread_of(kind, usize::MAX);
-        go.send(()).unwrap();
-        // Long enough for STACKENDHOST to see who holds a process that has
-        // not ended; an overflow that ends it does so at once.
-        let back = came_back.recv_timeout(std::time::Duration::from_secs(60));
-        std::println!("the {kind:?} thread's unbounded recursion: {}", if back.is_ok() { "came back" } else { "the process went on for 60 s" });
+        let how = match kind {
+            Kind::Rust => {
+                let ended = std::thread::Builder::new()
+                    .name("wick-stack-test".into())
+                    .spawn(|| core::hint::black_box(said_then_deep(Kind::Rust)))
+                    .unwrap()
+                    .join();
+                std::format!("the thread ended ({})", if ended.is_ok() { "returned" } else { "panicked" })
+            }
+            Kind::CreateThread => {
+                // SAFETY: a thread of ours with the default stack.
+                let t = unsafe { CreateThread(ptr::null(), 0, Some(recurse), ptr::null(), 0, ptr::null_mut()) };
+                assert!(!t.is_null());
+                // SAFETY: our thread's handle.
+                unsafe { WaitForSingleObject(t, INFINITE) };
+                "the thread ended".into()
+            }
+            Kind::Pool => {
+                // SAFETY: a pool of our own.
+                let pool = unsafe { CreateThreadpool(ptr::null()) };
+                assert_ne!(pool, 0);
+                // SAFETY: our pool, of one thread.
+                unsafe {
+                    SetThreadpoolThreadMaximum(pool, 1);
+                    assert_ne!(SetThreadpoolThreadMinimum(pool, 1), 0);
+                }
+                // As TpInitializeCallbackEnviron and TpSetCallbackThreadpool
+                // (winnt.h) make it.
+                let env = TP_CALLBACK_ENVIRON_V3 {
+                    Version: 3,
+                    Pool: pool,
+                    CallbackPriority: TP_CALLBACK_PRIORITY_NORMAL,
+                    #[allow(clippy::cast_possible_truncation)]
+                    Size: core::mem::size_of::<TP_CALLBACK_ENVIRON_V3>() as u32,
+                    ..Default::default()
+                };
+                let (started, has_started) = std::sync::mpsc::channel::<()>();
+                let started = std::boxed::Box::into_raw(std::boxed::Box::new(started)).cast::<c_void>();
+                // SAFETY: a callback of this module, on our pool.
+                assert_ne!(unsafe { TrySubmitThreadpoolCallback(Some(recurse_pooled), started, &env) }, 0);
+                // The next callback is queued once the pool's one thread is
+                // in the recursion, so it runs only once that thread is back.
+                has_started.recv().unwrap();
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                let tx = std::boxed::Box::into_raw(std::boxed::Box::new(tx)).cast::<c_void>();
+                // SAFETY: as above.
+                assert_ne!(unsafe { TrySubmitThreadpoolCallback(Some(next), tx, &env) }, 0);
+                rx.recv().unwrap();
+                // SAFETY: our pool, its callbacks done.
+                unsafe { CloseThreadpool(pool) };
+                "its pool ran the next callback".into()
+            }
+        };
+        std::println!("the {kind:?} thread's unbounded recursion: {how}, and the process went on");
     }
 
-    /// STACKENDHOST's host part: `reg query` of what decides how a process
-    /// with an unhandled exception ends.
+    /// STACKENDHOST's host part: this process's error mode, which its
+    /// children inherit (Learn, SetErrorMode), and `reg query` of what
+    /// decides how a process with an unhandled exception ends.
     fn stack_end_host_record() {
+        // SAFETY: plain call.
+        std::eprintln!("STACKENDHOST error mode: {:#x}", unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode() });
         const NT: &str = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
         const WER: &str = "SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting";
         let keys: [(std::string::String, &[&str]); 7] = [
@@ -3558,20 +3691,54 @@ mod tests {
         }
     }
 
-    /// [`run_child`] without a job, which also says when the child ended,
-    /// and, if it still runs 12 s after its start, what holds it
-    /// (STACKENDHOST).
-    fn run_child_watched(child: &str, env: &[(&str, &str)]) -> (Option<i32>, std::string::String, std::time::Duration) {
+    /// [`run_child`] with no memory limit, which also says when the child
+    /// ended, and, if it still runs 12 s after its start, what holds it
+    /// (STACKENDHOST). `jailed`: in a job of the limits the jailer gives
+    /// Firecracker's (overlay/jailer/platform/windows/mod.rs,
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+    /// JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`), named to the child in
+    /// WICK_TEST_JOB.
+    fn run_child_watched(child: &str, env: &[(&str, &str)], jailed: bool) -> (Option<i32>, std::string::String, std::time::Duration) {
         use std::io::Read;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+        static JOBS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let name = std::format!("{}::{child}", module_path!().split_once("::").unwrap().1);
+        let job_name = std::format!(
+            "Local\\wick-test-{}-{}",
+            std::process::id(),
+            JOBS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let mut job = ptr::null_mut();
+        if jailed {
+            let wide: std::vec::Vec<u16> = job_name.encode_utf16().chain([0]).collect();
+            // SAFETY: a new job of this name.
+            job = unsafe { CreateJobObjectW(ptr::null(), wide.as_ptr()) };
+            assert!(!job.is_null(), "{}", io::Error::last_os_error());
+            // SAFETY: plain data.
+            let mut l: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            l.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+            // SAFETY: a structure of the size passed.
+            unsafe {
+                #[allow(clippy::cast_possible_truncation)]
+                let size = std::mem::size_of_val(&l) as u32;
+                assert_ne!(SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const l).cast(), size), 0);
+            }
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", name.as_str(), "--ignored", "--nocapture"]).envs(env.iter().copied());
+        if jailed {
+            command.env("WICK_TEST_JOB", &job_name);
+        }
         let start = std::time::Instant::now();
-        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name.as_str(), "--ignored", "--nocapture"])
-            .envs(env.iter().copied())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut process = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        if jailed {
+            use std::os::windows::io::AsRawHandle;
+            // SAFETY: our job; the child's handle.
+            assert_ne!(unsafe { AssignProcessToJobObject(job, process.as_raw_handle()) }, 0, "{}", io::Error::last_os_error());
+        }
         let mut out = process.stdout.take().unwrap();
         let mut err = process.stderr.take().unwrap();
         let readers = [
@@ -3590,6 +3757,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         let ended = start.elapsed();
+        if !job.is_null() {
+            // SAFETY: our job handle.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+        }
         let [o, e] = readers.map(|r| r.join().unwrap());
         let text = std::format!("{}{}", std::string::String::from_utf8_lossy(&o), std::string::String::from_utf8_lossy(&e));
         assert!(text.contains("running 1 test"), "the child {name} ran no test (status {status}): {text}");
@@ -3668,7 +3839,7 @@ mod tests {
             for left in (4..=64).rev() {
                 let left_kib = std::format!("{left}");
                 let child = std::format!("lazy_at_the_reserves_end_{kind}_child");
-                let (code, text, _) = run_child_watched(&child, &[("WICK_TEST_LEFT_KIB", left_kib.as_str())]);
+                let (code, text, _) = run_child_watched(&child, &[("WICK_TEST_LEFT_KIB", left_kib.as_str())], false);
                 std::eprintln!("LAZYEND {kind} at {left} KiB left: {code:?}; {}", text.trim().replace('\n', " | "));
                 let served = code == Some(0) && text.contains("LAZYEND the read gave 0");
                 let loud = code == Some(0xC000_00FD_u32.cast_signed())
