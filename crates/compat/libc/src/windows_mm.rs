@@ -3474,19 +3474,36 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
     Some((copied, dead))
 }
 
-/// The parts of `[s, s + len)` in each region of the table, in order (the
-/// whole of it if none holds it): a commit or protection change stays
-/// within one view.
-fn region_pieces(s: usize, len: usize) -> Vec<(usize, usize)> {
-    let t = table().lock().unwrap();
+/// Calls `f` with the part of `[s, s + len)` in each region of the table,
+/// in order (the whole of it if no region holds any of it), until `f`
+/// gives `false`; whether every call gave `true`. A commit or protection
+/// change stays within one view. Each part is found under the table's lock
+/// and `f` runs without it, as the parts were listed before (a fill at the
+/// job's limit allocates nothing: `test_a_fill_at_the_limit_allocates_nothing`).
+fn each_region_piece(s: usize, len: usize, mut f: impl FnMut(usize, usize) -> bool) -> bool {
     let e = s + len;
-    let v: Vec<(usize, usize)> = overlapping(&t, s, e)
-        .into_iter()
-        .map(|b| (s.max(b), e.min(b + t[&b].len)))
-        .filter(|(a, z)| a < z)
-        .map(|(a, z)| (a, z - a))
-        .collect();
-    if v.is_empty() { std::vec![(s, len)] } else { v }
+    let mut at = s;
+    let mut any = false;
+    while at < e {
+        let piece = {
+            let t = table().lock().unwrap();
+            // The region holding `at`, else the first one after it.
+            t.range(..=at)
+                .next_back()
+                .filter(|(b, r)| **b + r.len > at)
+                .or_else(|| t.range(at..e).next())
+                .map(|(b, r)| (at.max(*b), e.min(*b + r.len)))
+        };
+        let Some((a, z)) = piece else {
+            break;
+        };
+        any = true;
+        if !f(a, z - a) {
+            return false;
+        }
+        at = z;
+    }
+    any || f(s, len)
 }
 
 /// Commits the pages `[s, s + len)` of a userfaultfd range's reserved
@@ -3507,7 +3524,7 @@ pub(crate) fn uffd_commit(s: usize, len: usize) -> bool {
             return false;
         }
     }
-    region_pieces(s, len).into_iter().all(|(a, n)| commit(a, n, PAGE_NOACCESS, false))
+    each_region_piece(s, len, |a, n| commit(a, n, PAGE_NOACCESS, false))
 }
 
 

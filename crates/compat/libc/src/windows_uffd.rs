@@ -4546,7 +4546,6 @@ mod tests {
     /// `__mcopy_atomic`). In a job of its own, with no room left
     /// ([`no_room_left`]).
     #[test]
-    #[ignore = "until a fill walks the region table in place"]
     fn test_a_fill_at_the_limit_allocates_nothing() {
         let (code, text) = run_child("fill_allocations_child", Some(96 << 20));
         assert!(text.contains("room left before the reclaim: 0 KiB"), "{text}");
