@@ -139,6 +139,24 @@ and the main checkout use; they never set the variable.
 - New files start with `Copyright 2026 toollyst contributors.` and an
   `SPDX-License-Identifier`.
 
+Before pushing, run the checks of CI's patches job; none builds anything:
+
+```sh
+tools/patches.sh check
+python3 tools/check-claims.py --strict-windows
+python3 -I tools/compat-counts.py --check docs/COMPATIBILITY.md
+tools/gen-windows-sources.sh --check
+python3 -I -B tools/check-unit-graph.py --fetch
+```
+
+`tools/check-unit-graph.py` compares `cargo tree`'s packages and features:
+every crate upstream's Linux builds compile, wick's compile at the same
+version (or the one `tools/linux/dependency-moves.txt` moves it to) with the
+same features, on x86_64 and aarch64, gnu and musl; the macOS builds must be
+their baseline in `tools/unit-graph`, which a commit that changes them
+rewrites (`--write-baseline`), so the change is in its diff. "The same units
+as upstream" is this check's result, not a commit message's claim.
+
 ## Following upstream
 
 wick follows upstream release tags. `patches/base` names the tag, and the
@@ -190,7 +208,7 @@ rebase, carry upstream's changes over and update the hash.
 An advisory is fixed by moving to a fixed version of the crate (`cargo update
 -p <crate>` in lib/firecracker, then amend the lockfile patch, and list the
 move with its advisory in `tools/linux/dependency-moves.txt`, which the
-Linux unit-test comparison checks), not by ignoring it. An `ignore` entry is accepted only for an advisory upstream
+Linux unit-test comparison and `tools/check-unit-graph.py` check), not by ignoring it. An `ignore` entry is accepted only for an advisory upstream
 ignores in its own `deny.toml`, with upstream's reason. A crate moved by a
 backported upstream commit (patches/0049's vm-superio 0.8.2) is listed there
 too, with the commit (`upstream-<commit>`). A new git source or a

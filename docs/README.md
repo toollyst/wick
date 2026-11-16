@@ -109,6 +109,7 @@ The table below is a selection: the tools a contributor runs most. Every script 
 | [`tools/gen-windows-sources.sh`](../tools/gen-windows-sources.sh) | Generates the Windows builds of the rust-vmm crates and of `polling` (`--check` in CI) |
 | [`tools/gen-kvm-bindings-windows.sh`](../tools/gen-kvm-bindings-windows.sh) | Generates `kvm-bindings` with the Linux x86_64 layout for Windows (`--check` in CI) |
 | [`tools/package-release.sh`](../tools/package-release.sh) | Packages a macOS release in upstream's release layout, with each binary's SBOM ([`tools/sbom.py`](../tools/sbom.py) checks it against `Cargo.lock`) |
+| [`tools/check-unit-graph.py`](../tools/check-unit-graph.py) | Without a build: wick's Linux builds compile every crate upstream's do with upstream's features, and the macOS builds are their baseline in [`tools/unit-graph`](../tools/unit-graph) (`--selftest`; CI's patches job; before a push) |
 | [`tools/check-dependencies.sh`](../tools/check-dependencies.sh) | Dependency checks: advisories, licenses, banned and duplicate crates, sources ([CONTRIBUTING.md](../CONTRIBUTING.md#dependencies)) |
 | [`tools/fuzz.sh`](../tools/fuzz.sh) | Runs the fuzz targets in `fuzz/` for a given time each (`-t SECONDS`, `-j JOBS`) |
 | [`tools/clean.sh`](../tools/clean.sh) | What every test script runs at its start: kills a test run's processes and the shell tools' loops left by a killed run (parent pid 1), removes test directories no process names, and says how many; `--dry-run` lists without touching |

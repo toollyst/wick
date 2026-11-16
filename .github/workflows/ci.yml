@@ -49,6 +49,14 @@ jobs:
           (cd lib/firecracker && cargo fetch --locked -q)
           tools/gen-kvm-bindings-windows.sh --check
           tools/gen-windows-sources.sh --check
+      # Without a build: wick's Linux builds compile every crate upstream's do,
+      # with upstream's features, and the macOS builds are their baseline
+      # (tools/unit-graph); a change to either is a finding, not a sentence in
+      # a commit message (CI run 43790310601).
+      - name: Linux and macOS compile upstream's crates with upstream's features
+        run: |
+          python3 -I -B tools/check-unit-graph.py --selftest
+          python3 -I -B tools/check-unit-graph.py --fetch
       - name: Actions are pinned by commit
         run: |
           unpinned="$(grep -nE '^\s*(-\s+)?uses:' .github/workflows/*.yml | grep -vE 'uses:\s*[^@ ]+@[0-9a-f]{40}( |$)' || true)"
