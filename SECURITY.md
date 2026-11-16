@@ -706,6 +706,29 @@ has the per-control details and results.
   committed lazy page among them (not run here: its first run is CI's). What stays: an emulated instruction's other operand in RAM is
   still copied by the host on the vCPU thread, and a page the host refuses there ends the VMM with 0xC0000005
   (docs/COMPATIBILITY.md, `mem_size_mib`).
+- **Windows: a guest's write of `IA32_TSC` or `IA32_TSC_ADJUST` could end its own VMM while another of its vCPUs was
+  in a TSC-deadline exit** (from 87d03287, which suspends partition time for such a write, `guest_tsc_write`, in
+  every WHP guest; found by CI's `jailer-test.ps1 x2storm`, twice, both times in the fourth pair's storm, about
+  5.5 s in; why that pair was not found). WHP refuses the legacy local
+  APIC get and set (`WHvGetVirtualProcessorInterruptControllerState` and its set) with WHV_E_INVALID_VP_STATE
+  (0x80370308) when they overlap another thread's `WHvSuspendPartitionTime` call, and no other state call, nor
+  either of them while time is suspended or being resumed (TIMEGET, `test_state_calls_against_time_suspension_on_record`,
+  its first CI run: in the transitions arm 5387 of 9195 legacy gets refused on a VP that had run and 5955 of 9396
+  on a VP not run, each in a phase that overlapped the Suspend call; State2 get and set and `WHvRequestInterrupt`
+  never, so no interrupt request is lost to it). The backend's hold (`with_time_stopped`) keeps
+  the other vCPUs out of the guest, not out of their exit handlers, so a vCPU's own `IA32_TSC_DEADLINE` exit made the
+  legacy get during the hold's Suspend call, and the refusal failed its run (exit 1, "os error 87"). The trigger is
+  any guest's TSC or TSC_ADJUST write (Linux writes TSC_ADJUST on a secondary CPU whose value differs, v6.1
+  arch/x86/kernel/tsc_sync.c 231 to 233), and in record builds the held LVT timer write; it ends only the guest's own
+  VM, and KVM never fails there. Now each Suspend call holds a per-partition gate exclusive and each legacy exchange
+  holds it shared for its call alone (`VmInner::state_gate`), so the two never overlap: a legacy exchange waits at
+  most for one Suspend call (16 to 218 us unloaded in that run, up to 32 ms with every processor busy), the Suspend
+  for the exchanges under way. The legacy exchanges through the backend's own path while another thread holds the
+  VM in a loop are none refused (`test_legacy_apic_exchanges_wait_for_a_suspension_of_time`, which needs WHP and
+  has not run yet: it is to fail first in CI's WHP step on the commit before the gate), and a refused exchange's
+  line now names its caller's line and where partition time was
+  (`test_a_refused_legacy_get_names_its_caller_and_the_suspension`, not run yet either). The documented call
+  (`WHvGetVirtualProcessorState` of `InterruptControllerState2`, never refused in TIMEGET) is the later step.
 
 ## Not at parity yet
 

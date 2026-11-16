@@ -238,6 +238,48 @@ pub(crate) struct VmInner {
     /// and a reader holds nothing else and waits on nothing, so it is in no
     /// lock-order cycle.
     pub(crate) requests: RwLock<()>,
+    /// The legacy local APIC exchanges against a suspension of partition
+    /// time. WHP refuses `WHvGetVirtualProcessorInterruptControllerState`
+    /// and its set with WHV_E_INVALID_VP_STATE (0x80370308) when they
+    /// overlap a `WHvSuspendPartitionTime` call of another thread, and no
+    /// other state call, nor either of them while time is suspended or
+    /// being resumed (TIMEGET's first CI run: in the transitions arm 5387
+    /// of 9195 legacy gets refused on a VP that had run, 5955 of 9396 on a
+    /// VP not run, every one in a phase that overlapped the
+    /// Suspend call; State2 get and set, `WHvRequestInterrupt` and the rest
+    /// never). So the Suspend call takes this exclusive
+    /// ([`VmInner::suspend_time`]) and each legacy exchange takes it shared
+    /// for its call alone (`VcpuFd::lapic_page`, `put_lapic_page`). Neither
+    /// side holds it across anything else, so it is in no lock-order
+    /// cycle: a reader waits at most for one Suspend call (16 to 218 us
+    /// unloaded in that run, up to 32 ms with every processor busy), and
+    /// the Suspend for the exchanges under way, since std's lock on Windows
+    /// lets no new reader in while a writer waits (library/std/src/sys/sync/
+    /// rwlock/futex.rs in 1.97.0, `is_read_lockable` :47 to :55, chosen for
+    /// Windows at mod.rs :1 to :14).
+    state_gate: RwLock<()>,
+    /// Where partition time is ([`TIME_RUNNING`] and the rest), for the
+    /// line of a refused state call.
+    pub(crate) time_phase: AtomicU8,
+}
+
+/// [`VmInner::time_phase`]: partition time runs.
+pub(crate) const TIME_RUNNING: u8 = 0;
+/// [`VmInner::time_phase`]: a `WHvSuspendPartitionTime` call is under way.
+pub(crate) const TIME_SUSPENDING: u8 = 1;
+/// [`VmInner::time_phase`]: partition time is suspended.
+pub(crate) const TIME_SUSPENDED: u8 = 2;
+/// [`VmInner::time_phase`]: a `WHvResumePartitionTime` call is under way.
+pub(crate) const TIME_RESUMING: u8 = 3;
+
+/// The name of a [`VmInner::time_phase`] value.
+pub(crate) fn time_phase_name(phase: u8) -> &'static str {
+    match phase {
+        TIME_RUNNING => "running",
+        TIME_SUSPENDING => "being suspended",
+        TIME_SUSPENDED => "suspended",
+        _ => "being resumed",
+    }
 }
 
 /// The partition's exception exits (`ExceptionExitBitmap`), which are
@@ -575,11 +617,10 @@ impl VmInner {
         super::vcpu::hold_vcpus(self, None);
         #[cfg(test)]
         let (out, suspend) = (ns_since(out), std::time::Instant::now());
-        // SAFETY: the VM's partition.
-        let hres = unsafe { whv::WHvSuspendPartitionTime(self.part) };
+        let suspended = self.suspend_time(|| "to hold the VM's vCPUs (a guest's TSC or LVT timer write)".into());
         #[cfg(test)]
         let (mut time, mut work) = (ns_since(suspend), 0);
-        let result = ffi::hr_of("WHvSuspendPartitionTime", hres, || "to hold the VM's vCPUs (a guest's TSC or LVT timer write)".into()).and_then(|()| {
+        let result = suspended.and_then(|()| {
             #[cfg(test)]
             let working = std::time::Instant::now();
             let done = f();
@@ -588,13 +629,12 @@ impl VmInner {
                 work = ns_since(working);
                 std::time::Instant::now()
             };
-            // SAFETY: the VM's partition, whose time this call suspended.
-            let hres = unsafe { whv::WHvResumePartitionTime(self.part) };
+            let resumed = self.resume_time();
             #[cfg(test)]
             {
                 time += ns_since(resume);
             }
-            done.and_then(|v| ffi::hr_of("WHvResumePartitionTime", hres, String::new).map(|()| v))
+            done.and_then(|v| resumed.map(|()| v))
         });
         #[cfg(test)]
         let release = std::time::Instant::now();
@@ -613,6 +653,40 @@ impl VmInner {
             c.release_ns += ns_since(release);
         });
         Some(result)
+    }
+
+    /// `WHvSuspendPartitionTime`, with [`VmInner::state_gate`] held
+    /// exclusive for the call alone, so that no legacy local APIC exchange
+    /// overlaps it (which WHP refuses); `why` names the suspension in the
+    /// line of a refusal.
+    pub(crate) fn suspend_time(&self, why: impl FnOnce() -> String) -> Result<()> {
+        // A poisoned lock guards no data (`()`).
+        let gate = self.state_gate.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.time_phase.store(TIME_SUSPENDING, Ordering::SeqCst);
+        // SAFETY: the VM's partition.
+        let hres = unsafe { whv::WHvSuspendPartitionTime(self.part) };
+        self.time_phase.store(if hres == 0 { TIME_SUSPENDED } else { TIME_RUNNING }, Ordering::SeqCst);
+        drop(gate);
+        ffi::hr_of("WHvSuspendPartitionTime", hres, why)
+    }
+
+    /// `WHvResumePartitionTime` of time [`Self::suspend_time`] suspended.
+    /// No gate: WHP refuses no state call during it (TIMEGET).
+    pub(crate) fn resume_time(&self) -> Result<()> {
+        self.time_phase.store(TIME_RESUMING, Ordering::SeqCst);
+        // SAFETY: the VM's partition, whose time the caller suspended.
+        let hres = unsafe { whv::WHvResumePartitionTime(self.part) };
+        self.time_phase.store(if hres == 0 { TIME_RUNNING } else { TIME_SUSPENDED }, Ordering::SeqCst);
+        ffi::hr_of("WHvResumePartitionTime", hres, String::new)
+    }
+
+    /// [`VmInner::state_gate`] held shared, for one legacy local APIC
+    /// exchange (`VcpuFd::lapic_page`, `put_lapic_page`): the call alone
+    /// runs under it.
+    pub(crate) fn legacy_apic_call<T>(&self, call: impl FnOnce() -> T) -> T {
+        // A poisoned lock guards no data (`()`).
+        let _gate = self.state_gate.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        call()
     }
 
     /// Sets gdb's exception exits to `bitmap`: with every vCPU held out of
@@ -1133,6 +1207,8 @@ impl VmInner {
             bp_window: (Mutex::new(Exits { base, written: (base != 0).then_some(base), ..Exits::default() }), Condvar::new()),
             bp_owner: AtomicI64::new(-1),
             requests: RwLock::new(()),
+            state_gate: RwLock::new(()),
+            time_phase: AtomicU8::new(TIME_RUNNING),
         })
     }
 }

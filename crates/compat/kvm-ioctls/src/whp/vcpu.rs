@@ -475,8 +475,9 @@ impl VcpuShared {
     /// time stands still before a partition first runs if WHP keeps it so
     /// (two reads of the TSC 20 us apart are equal), else it is suspended
     /// for the copy (`WHvSuspendPartitionTime`, which Learn says no running
-    /// vCPU allows) and resumed after it. A refusal fails the write, naming
-    /// it, rather than writing an offset of its own.
+    /// vCPU allows, through `VmInner::suspend_time`, which no legacy local
+    /// APIC exchange overlaps) and resumed after it. A refusal fails the
+    /// write, naming it, rather than writing an offset of its own.
     fn take_offset_of(&self, reference: &VcpuShared) -> Result<()> {
         let part = self.part;
         let tsc = |vp: u32| -> Result<u64> {
@@ -489,9 +490,7 @@ impl VcpuShared {
         }
         let suspend = tsc(reference.index)? != first;
         if suspend {
-            // SAFETY: the VM's partition.
-            let hres = unsafe { whv::WHvSuspendPartitionTime(part) };
-            super::ffi::hr_of("WHvSuspendPartitionTime", hres, || {
+            self.inner.suspend_time(|| {
                 format!(
                     "for vCPU {} to take vCPU {}'s TSC offset, as KVM's TSC matching does; refused while a vCPU runs",
                     self.index, reference.index
@@ -507,9 +506,7 @@ impl VcpuShared {
             self.log_matched_tscs(reference.index, suspend);
         }
         if suspend {
-            // SAFETY: the VM's partition, whose time this call suspended.
-            let hres = unsafe { whv::WHvResumePartitionTime(part) };
-            super::ffi::hr_of("WHvResumePartitionTime", hres, String::new)?;
+            self.inner.resume_time()?;
         }
         copied
     }
@@ -1739,25 +1736,37 @@ impl VcpuFd {
     /// at its MMIO offset, 16 bytes apart, but the ISR, TMR and IRR, whose
     /// words are 4 bytes apart, and with no PPR ([`LAPIC_VECTOR_ARRAYS`]);
     /// `kvm_lapic_state` is its first KiB, the part that holds registers,
-    /// in KVM's layout ([`legacy_to_kvm`]).
+    /// in KVM's layout ([`legacy_to_kvm`]). The call runs with the
+    /// partition's state gate held shared, so that no suspension of
+    /// partition time overlaps it (`VmInner::state_gate`); a refusal's line
+    /// names the caller's line and where partition time was before and
+    /// after the call.
+    #[track_caller]
     fn lapic_page(&self) -> Result<(Box<[u8; LAPIC_PAGE]>, u32)> {
+        let caller = std::panic::Location::caller();
         let mut page = Box::new([0u8; LAPIC_PAGE]);
         let mut written = 0u32;
-        #[cfg(any(test, feature = "whp-trace"))]
-        let before = super::ffi::trace::stack();
-        // SAFETY: valid output buffer of the given size.
-        let hres = unsafe {
-            whv::WHvGetVirtualProcessorInterruptControllerState(
-                self.part(),
-                self.vp(),
-                page.as_mut_ptr().cast(),
-                LAPIC_PAGE as u32,
-                &mut written,
-            )
-        };
-        #[cfg(any(test, feature = "whp-trace"))]
-        super::ffi::trace::note("WHvGetVirtualProcessorInterruptControllerState", self.vp(), &[], None, before, hres);
-        super::ffi::hr_of("WHvGetVirtualProcessorInterruptControllerState", hres, || format!("vp {}", self.vp()))?;
+        let inner = &self.shared.inner;
+        let phase = || inner.time_phase.load(Ordering::SeqCst);
+        let (hres, was, is) = inner.legacy_apic_call(|| {
+            let was = phase();
+            #[cfg(any(test, feature = "whp-trace"))]
+            let before = super::ffi::trace::stack();
+            // SAFETY: valid output buffer of the given size.
+            let hres = unsafe {
+                whv::WHvGetVirtualProcessorInterruptControllerState(
+                    self.part(),
+                    self.vp(),
+                    page.as_mut_ptr().cast(),
+                    LAPIC_PAGE as u32,
+                    &mut written,
+                )
+            };
+            #[cfg(any(test, feature = "whp-trace"))]
+            super::ffi::trace::note("WHvGetVirtualProcessorInterruptControllerState", self.vp(), &[], None, before, hres);
+            (hres, was, phase())
+        });
+        super::ffi::hr_of("WHvGetVirtualProcessorInterruptControllerState", hres, || legacy_call_detail(self.vp(), caller, was, is))?;
         // Anything shorter is not the register page this conversion assumes.
         if (written as usize) < LAPIC_REGS {
             return err(libc::EIO);
@@ -1847,17 +1856,26 @@ impl VcpuFd {
     }
 
     /// Sets the APIC register page read by [`Self::lapic_page`] (`size`
-    /// bytes of it, as WHP gave them).
+    /// bytes of it, as WHP gave them), with the partition's state gate held
+    /// shared for the call, as [`Self::lapic_page`].
+    #[track_caller]
     fn put_lapic_page(&self, page: &[u8; LAPIC_PAGE], size: u32) -> Result<()> {
-        #[cfg(any(test, feature = "whp-trace"))]
-        let before = super::ffi::trace::stack();
-        // SAFETY: the register page is valid for `size` bytes.
-        let hres = unsafe {
-            whv::WHvSetVirtualProcessorInterruptControllerState(self.part(), self.vp(), page.as_ptr().cast(), size)
-        };
-        #[cfg(any(test, feature = "whp-trace"))]
-        super::ffi::trace::note("WHvSetVirtualProcessorInterruptControllerState", self.vp(), &[], None, before, hres);
-        super::ffi::hr_of("WHvSetVirtualProcessorInterruptControllerState", hres, || format!("vp {}", self.vp()))
+        let caller = std::panic::Location::caller();
+        let inner = &self.shared.inner;
+        let phase = || inner.time_phase.load(Ordering::SeqCst);
+        let (hres, was, is) = inner.legacy_apic_call(|| {
+            let was = phase();
+            #[cfg(any(test, feature = "whp-trace"))]
+            let before = super::ffi::trace::stack();
+            // SAFETY: the register page is valid for `size` bytes.
+            let hres = unsafe {
+                whv::WHvSetVirtualProcessorInterruptControllerState(self.part(), self.vp(), page.as_ptr().cast(), size)
+            };
+            #[cfg(any(test, feature = "whp-trace"))]
+            super::ffi::trace::note("WHvSetVirtualProcessorInterruptControllerState", self.vp(), &[], None, before, hres);
+            (hres, was, phase())
+        });
+        super::ffi::hr_of("WHvSetVirtualProcessorInterruptControllerState", hres, || legacy_call_detail(self.vp(), caller, was, is))
     }
 
     // ---- vCPU events ----
@@ -3590,6 +3608,21 @@ impl Drop for Watchdog {
             t.join().unwrap();
         }
     }
+}
+
+/// The detail of a refused legacy local APIC exchange's line: the VP, the
+/// caller's line (`lapic_page`'s and `put_lapic_page`'s callers are the run
+/// loop's TSC-deadline exits, the LVT timer write and `KVM_GET_LAPIC` and
+/// `KVM_SET_LAPIC`), and where partition time was before the call and after
+/// it (`VmInner::time_phase`).
+fn legacy_call_detail(vp: u32, caller: &std::panic::Location<'_>, was: u8, is: u8) -> String {
+    format!(
+        "vp {vp}, called at {}:{}; partition time {} before the call, {} after it",
+        caller.file(),
+        caller.line(),
+        super::vm::time_phase_name(was),
+        super::vm::time_phase_name(is)
+    )
 }
 
 /// For a record (SWAPSTRESS): the run loop's memory access exits at guest
@@ -13353,6 +13386,18 @@ mod fpu_tests {
         assert!(failed_control.is_empty(), "a get was refused with nothing else made: {failed_control:?}");
     }
 
+    /// A refused legacy local APIC exchange's line names the caller's line
+    /// and where partition time was before and after the call.
+    #[test]
+    fn test_a_legacy_exchanges_line_names_its_caller_and_the_time() {
+        let here = std::panic::Location::caller();
+        let line = legacy_call_detail(3, here, super::super::vm::TIME_SUSPENDING, super::super::vm::TIME_SUSPENDED);
+        assert_eq!(
+            line,
+            format!("vp 3, called at {}:{}; partition time being suspended before the call, suspended after it", here.file(), here.line())
+        );
+    }
+
     /// The legacy local APIC get and set, through the backend's own path
     /// (`lapic_page`, `put_lapic_page`), on vCPU 0 (run to an exit first)
     /// and vCPU 1 (never run), while another thread holds the VM with its
@@ -13419,6 +13464,53 @@ mod fpu_tests {
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
         assert!(holds >= 100 && gets >= 100, "too few holds ({holds}) or gets ({gets}) to overlap");
         assert!(refused.is_empty(), "{} legacy exchanges refused, the first: {}", refused.len(), refused[0]);
+    }
+
+    /// A legacy local APIC get refused while another thread's
+    /// `WHvSuspendPartitionTime` (made directly, past the gate, as no
+    /// product path makes it) overlaps it names its caller's line and the
+    /// time's phase in its line (here "running": only the backend's own
+    /// suspensions set it, `VmInner::suspend_time`). LEGACYLINE line: the
+    /// first such line.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_refused_legacy_get_names_its_caller_and_the_suspension() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let (vm, zero, m) = mmio_guest(&[0xE6, 0x80, 0xEB, 0xFC]);
+        let one = vm.create_vcpu(1).unwrap();
+        let part = zero.part();
+        let stop = AtomicBool::new(false);
+        let mut line = None;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(Ordering::SeqCst) {
+                    // SAFETY: the test's partition, no VP running.
+                    unsafe {
+                        whv::WHvSuspendPartitionTime(part);
+                        whv::WHvResumePartitionTime(part);
+                    }
+                }
+            });
+            let t = Instant::now();
+            while line.is_none() && t.elapsed() < Duration::from_secs(10) {
+                let called = line!() + 1;
+                if super::super::ffi::quietly(|| one.lapic_page()).is_err() {
+                    line = super::super::ffi::LAST_FAILURE.with(|l| l.borrow().clone()).map(|l| (l, called));
+                }
+            }
+            stop.store(true, Ordering::SeqCst);
+        });
+        eprintln!("LEGACYLINE {line:?}");
+        drop(one);
+        drop(zero);
+        drop(vm);
+        // SAFETY: the test's memory, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        let (line, called) = line.expect("no legacy get refused in 10 s of suspensions");
+        assert!(line.contains(&format!("called at {}:{called};", file!())), "{line}");
+        assert!(line.contains("partition time "), "{line}");
+        assert!(line.contains("0x80370308"), "{line}");
     }
 
     /// What WHP answers a VP's state calls made while the partition's time
