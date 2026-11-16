@@ -1,0 +1,6 @@
+crate	test	result	started
+vmm	arch::aarch64::cache_info::tests::test_build_clidr_from_caches	pass	yes
+vmm	arch::aarch64::cache_info::tests::test_cache_coherency	pass	yes
+vmm	arch::aarch64::fdt::tests::test_create_fdt	fail-listed	yes
+vmm	arch::aarch64::gic::gicv2::regs::dist_regs::tests::test_access_dist_regs	fail-listed	yes
+vmm	ext::api_process::macos::tests::api_fifo_child	ignored	yes

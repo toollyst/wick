@@ -1,0 +1,28 @@
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running unittests src\lib.rs (build/cargo_target\debug\deps\kvm_ioctls-73d88cf5a82df648.exe)
+
+running 1 test
+test whp::vcpu::fpu_tests::test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages ... 
+thread 'whp::vcpu::fpu_tests::test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages' (9388) panicked at D:\a\wick\wick\crates\compat\kvm-ioctls\src\whp\vcpu.rs:8315:9:
+
+running 1 test
+
+thread '<unknown>' (4652) has overflowed its stack
+wick: a thread's stack could not grow: the memory limit (the jail's memory.max, or the host's commit limit) refused its next page with 1996 KiB of its reserve left (its guarantee 20480 bytes); the VMM ends, as the cgroup OOM killer ends it on Linux (exit 137), not as a stack overflow
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    whp::vcpu::fpu_tests::test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 178 filtered out; finished in 0.37s
+
+error: test failed, to rerun pass `--lib`
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s

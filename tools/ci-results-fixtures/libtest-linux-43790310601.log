@@ -1,0 +1,17 @@
+     Running unittests src/lib.rs (/home/runner/work/_temp/unit/wick/target/x86_64-unknown-linux-musl/debug/deps/acpi_tables-6a0399fd879ceb98)
+
+running 22 tests
+test aml::tests::test_arg_if ... ok
+test aml::tests::test_buffer ... ok
+test aml::tests::test_create_field ... ok
+test aml::tests::test_device ... ok
+test aml::tests::test_eisa_name ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/home/runner/work/_temp/unit/wick/target/x86_64-unknown-linux-musl/debug/deps/clippy_tracing-0d8d2dc43d0568b9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

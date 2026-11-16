@@ -126,6 +126,7 @@ fails on a tool in neither. Every script under `tools/` (with `tools/linux/`, `t
 | [`tools/check-background-loops.py`](../tools/check-background-loops.py) | Fails a loop a shell tool under `tools/` starts in the background without a liveness test of its owner, a numeric bound and a `# background loop:` comment (CI, with `--selftest`) |
 | [`tools/check-claims.py`](../tools/check-claims.py) | That the docs name what exists and what checks it: test names, stages, paths, cited commits and headings, table cells, this table's completeness, and status claims that name no test (CI's patches job) |
 | [`tools/check-derived.py`](../tools/check-derived.py) | That the numbers the docs derive from the tree (README's line count, PORTING row 1's counts) are the tree's (CI's patches job) |
+| [`tools/ci-results.py`](../tools/ci-results.py) | Each test's result in one format, `results.tsv` (run, commit, job, host, CPU, test, result), read from what a job already writes (libtest's output, pytest's JSON report, a scenario script's summary.txt, check-unit-tests.py's tests.tsv); the Linux and macOS jobs upload it as `results-<job>`; `validate` checks a file of it, `--selftest` its readers on cuts of real CI logs ([`ci-results-fixtures/`](../tools/ci-results-fixtures/)) |
 | [`tools/compat-counts.py`](../tools/compat-counts.py) | Writes and checks the generated parts of docs/COMPATIBILITY.md: progress per host and the counts per upstream test file (`--check` in CI) |
 
 ## Where the rules live

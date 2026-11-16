@@ -1,0 +1,6 @@
+boot     kernel reaches init                PASS yes
+boot     serial input (stdin pipe)          PASS echoed
+boot     guest sees 1 CPU                   PASS 1
+boot     clocksource (informational)        PASS tsc
+boot     hypervisor CPUID bit               PASS 1
+boot     seccomp filter on every thread     PASS 3 of 3 threads (firecracker,fc_vcpu 0,kvm-nx-lpage-re)

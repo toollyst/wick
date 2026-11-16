@@ -1,0 +1,6 @@
+PASS  refuse: 11 options, a CPU limit without the sandbox and a binary without the hand-over refused; hand-over needs root
+PASS  cgroup-devices: 5 devices options refused, exit 1; v1 at the cgroup step (the binary copied), v2 with no jail
+PASS  freeze: macOS 26.7.2: 11 of 11 cases pass (v1, v2, refused, thawed-start, start, daemon, daemon-thawed, start-daemon, start-pidns, firecracker, many-starts); the supervisor 1504 KiB resident and 0.0 s CPU per idle second
+PASS  jail: uid/gid, pid file, chroot, exec'd from a root-owned copy, no inherited descriptors; outside files unreachable
+PASS  daemonize: double fork, setsid, no terminal, pid file, API answers
+PASS  pidns: jailer exits 0, pid file names its child; 9 unhandled signals dropped, SIGHUP (handled) delivered; control without the flag ended by SIGTERM

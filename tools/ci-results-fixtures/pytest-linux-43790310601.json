@@ -1,0 +1,278 @@
+{
+ "exitcode": 0,
+ "summary": {
+  "passed": 416,
+  "skipped": 6,
+  "total": 422,
+  "collected": 422
+ },
+ "tests": [
+  {
+   "nodeid": "integration_tests/functional/test_snapshot_basic.py::test_physical_counter_reset_aarch64[PCI_ON-vmlinux-6.1.188-kvm]",
+   "lineno": 617,
+   "outcome": "skipped",
+   "keywords": [
+    "test_physical_counter_reset_aarch64[PCI_ON-vmlinux-6.1.188-kvm]",
+    "parametrize",
+    "skipif",
+    "pytestmark",
+    "PCI_ON-vmlinux-6.1.188-kvm",
+    "test_snapshot_basic.py",
+    "functional",
+    "integration_tests",
+    "tests",
+    ""
+   ],
+   "setup": {
+    "duration": 0.00017759500019565166,
+    "outcome": "skipped",
+    "longrepr": "[gw2] linux -- Python 3.12.3 /opt/venv/bin/python\n('/home/runner/work/wick/wick/lib/firecracker/tests/integration_tests/functional/test_snapshot_basic.py', 618, 'Skipped: This test requires aarch64 and either kernel 6.4+ or Amazon Linux')"
+   },
+   "teardown": {
+    "duration": 0.0001776509998308029,
+    "outcome": "passed",
+    "longrepr": "[gw2] linux -- Python 3.12.3 /opt/venv/bin/python"
+   }
+  },
+  {
+   "nodeid": "integration_tests/functional/test_snapshot_basic.py::test_vmgenid[PCI_OFF-SnapshotType.DIFF-vmlinux-6.1.188-kvm]",
+   "lineno": 594,
+   "outcome": "passed",
+   "keywords": [
+    "test_vmgenid[PCI_OFF-SnapshotType.DIFF-vmlinux-6.1.188-kvm]",
+    "parametrize",
+    "pytestmark",
+    "PCI_OFF-SnapshotType.DIFF-vmlinux-6.1.188-kvm",
+    "test_snapshot_basic.py",
+    "functional",
+    "integration_tests",
+    "tests",
+    ""
+   ],
+   "setup": {
+    "duration": 0.00605387099994914,
+    "outcome": "passed",
+    "longrepr": "[gw2] linux -- Python 3.12.3 /opt/venv/bin/python"
+   },
+   "call": {
+    "duration": 6.849663298999985,
+    "outcome": "passed",
+    "longrepr": "[gw2] linux -- Python 3.12.3 /opt/venv/bin/python"
+   },
+   "user_properties": [
+    {
+     "cpu_architecture": "x86_64"
+    },
+    {
+     "cpu_model": "Intel(R) Xeon(R) 6975P-C"
+    },
+    {
+     "cpu_codename": "INTEL_GRANITE_RAPIDS"
+    },
+    {
+     "cpu_vendor": "intel"
+    },
+    {
+     "cpu_microcode": "0x1000434"
+    },
+    {
+     "host_linux_full_version": "7.0.0-1016-aws"
+    },
+    {
+     "host_linux_version": "7.0"
+    },
+    {
+     "host_linux_patch": "7.0.0"
+    },
+    {
+     "os": "Ubuntu 24.04.4 LTS"
+    },
+    {
+     "host_os": "7.0.0-1016-aws"
+    },
+    {
+     "libc_ver": "glibc-2.39"
+    },
+    {
+     "rust_version": "1.97.0"
+    },
+    {
+     "buildkite_pipeline_slug": null
+    },
+    {
+     "buildkite_build_number": null
+    },
+    {
+     "buildkite_pr": false
+    },
+    {
+     "buildkite_revision_a": null
+    },
+    {
+     "is_dev_env": false
+    },
+    {
+     "git_commit_id": "f1904965060c038d695c570e8d338b0301d3e99e"
+    },
+    {
+     "git_branch": "HEAD -> wick"
+    },
+    {
+     "git_origin_url": "https://github.com/firecracker-microvm/firecracker.git"
+    },
+    {
+     "environment": "ec2"
+    },
+    {
+     "instance": "m8id.xlarge"
+    },
+    {
+     "instance_id": "i-064043bcac96ad573"
+    },
+    {
+     "ami": "ami-040ffb1158a8594ff"
+    },
+    {
+     "is_ec2_virt": true
+    },
+    {
+     "description": "Test VMGenID device upon snapshot resume"
+    },
+    {
+     "vm_backend": "kvm"
+    },
+    {
+     "firecracker_bin": "/home/runner/work/wick/wick/lib/firecracker/build/cargo_target/x86_64-unknown-linux-musl/release/firecracker"
+    },
+    {
+     "guest_kernel": "linux-6.1"
+    }
+   ],
+   "teardown": {
+    "duration": 0.008262393999984852,
+    "outcome": "passed",
+    "longrepr": "[gw2] linux -- Python 3.12.3 /opt/venv/bin/python"
+   }
+  },
+  {
+   "nodeid": "integration_tests/functional/test_api.py::test_api_happy_start[kvm-PCI_ON-vmlinux-6.1.188]",
+   "lineno": 42,
+   "outcome": "passed",
+   "keywords": [
+    "test_api_happy_start[kvm-PCI_ON-vmlinux-6.1.188]",
+    "parametrize",
+    "pytestmark",
+    "kvm-PCI_ON-vmlinux-6.1.188",
+    "test_api.py",
+    "functional",
+    "integration_tests",
+    "tests",
+    ""
+   ],
+   "setup": {
+    "duration": 0.00607897400004731,
+    "outcome": "passed",
+    "longrepr": "[gw0] linux -- Python 3.12.3 /opt/venv/bin/python"
+   },
+   "call": {
+    "duration": 0.29017195799997353,
+    "outcome": "passed",
+    "longrepr": "[gw0] linux -- Python 3.12.3 /opt/venv/bin/python"
+   },
+   "user_properties": [
+    {
+     "cpu_architecture": "x86_64"
+    },
+    {
+     "cpu_model": "Intel(R) Xeon(R) 6975P-C"
+    },
+    {
+     "cpu_codename": "INTEL_GRANITE_RAPIDS"
+    },
+    {
+     "cpu_vendor": "intel"
+    },
+    {
+     "cpu_microcode": "0x1000434"
+    },
+    {
+     "host_linux_full_version": "7.0.0-1016-aws"
+    },
+    {
+     "host_linux_version": "7.0"
+    },
+    {
+     "host_linux_patch": "7.0.0"
+    },
+    {
+     "os": "Ubuntu 24.04.4 LTS"
+    },
+    {
+     "host_os": "7.0.0-1016-aws"
+    },
+    {
+     "libc_ver": "glibc-2.39"
+    },
+    {
+     "rust_version": "1.97.0"
+    },
+    {
+     "buildkite_pipeline_slug": null
+    },
+    {
+     "buildkite_build_number": null
+    },
+    {
+     "buildkite_pr": false
+    },
+    {
+     "buildkite_revision_a": null
+    },
+    {
+     "is_dev_env": false
+    },
+    {
+     "git_commit_id": "f1904965060c038d695c570e8d338b0301d3e99e"
+    },
+    {
+     "git_branch": "HEAD -> wick"
+    },
+    {
+     "git_origin_url": "https://github.com/firecracker-microvm/firecracker.git"
+    },
+    {
+     "environment": "ec2"
+    },
+    {
+     "instance": "m8id.xlarge"
+    },
+    {
+     "instance_id": "i-064043bcac96ad573"
+    },
+    {
+     "ami": "ami-040ffb1158a8594ff"
+    },
+    {
+     "is_ec2_virt": true
+    },
+    {
+     "description": "Test that a regular microvm API config and boot sequence works."
+    },
+    {
+     "vm_backend": "kvm"
+    },
+    {
+     "firecracker_bin": "/home/runner/work/wick/wick/lib/firecracker/build/cargo_target/x86_64-unknown-linux-musl/release/firecracker"
+    },
+    {
+     "guest_kernel": "linux-6.1"
+    }
+   ],
+   "teardown": {
+    "duration": 0.07768379499998446,
+    "outcome": "passed",
+    "longrepr": "[gw0] linux -- Python 3.12.3 /opt/venv/bin/python"
+   }
+  }
+ ]
+}

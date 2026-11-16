@@ -75,6 +75,8 @@ jobs:
         run: python3 -I tools/compat-counts.py --check docs/COMPATIBILITY.md
       # The numbers the docs derive from the tree that the two checks above
       # do not keep: README's line count, PORTING row 1's sandbox counts.
+      - name: Results readers and format
+        run: python3 -I tools/ci-results.py --selftest
       - name: Numbers derived from the tree are current
         run: |
           python3 -I -B tools/check-derived.py --selftest
@@ -183,6 +185,28 @@ jobs:
         run: |
           tools/linux/compare-unit-tests.py "$RUNNER_TEMP/unit/upstream" "$RUNNER_TEMP/unit/wick" \
             --summary "$GITHUB_STEP_SUMMARY"
+      # Every test's result in one format (tools/ci-results.py, results.tsv),
+      # for the docs' run claims; a step that did not run gives no rows.
+      - name: Results in one format
+        if: always() && steps.setup.outcome == 'success'
+        env:
+          WICK_RESULTS_JOB: linux-unit-tests (${{ matrix.runner }})
+        run: |
+          for tree in upstream wick; do
+            for f in "$RUNNER_TEMP/unit/$tree/lib.run.log" "$RUNNER_TEMP/unit/$tree/examples.run.log"; do
+              if [ -f "$f" ]; then python3 -I tools/ci-results.py add libtest "$f" --tree "$tree" --out "$RUNNER_TEMP/results.tsv"; fi
+            done
+          done
+          r="$RUNNER_TEMP/results.tsv"
+          if [ -f "$r" ]; then python3 -I tools/ci-results.py validate "$r"; else echo "no results: no test step wrote its output"; fi
+      - name: Upload the results
+        if: always() && steps.setup.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-linux-unit-tests-${{ runner.arch }}
+          path: ${{ runner.temp }}/results.tsv
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Upload logs
         if: always() && steps.setup.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -289,6 +313,26 @@ jobs:
       # the windows-guest job, with the whole snapshot kept below).
       - name: A snapshot's state file for the other hosts' tests
         run: python3 -I tools/linux/make-vmstate.py "lib/firecracker/build/cargo_target/$(uname -m)-unknown-linux-musl/release/firecracker" "$RUNNER_TEMP/boot-test" "$RUNNER_TEMP/vmstate" "$RUNNER_TEMP/vmsnapshot"
+      # Every test's result in one format (tools/ci-results.py, results.tsv),
+      # for the docs' run claims; a step that did not run gives no rows.
+      - name: Results in one format
+        if: always() && steps.setup.outcome == 'success'
+        env:
+          WICK_RESULTS_JOB: linux-boot
+        run: |
+          for f in "$RUNNER_TEMP"/boot-test/results-*/summary.txt; do
+            if [ -f "$f" ]; then python3 -I tools/ci-results.py add summary "$f" --suite tools/linux/boot-test.sh --out "$RUNNER_TEMP/results.tsv"; fi
+          done
+          r="$RUNNER_TEMP/results.tsv"
+          if [ -f "$r" ]; then python3 -I tools/ci-results.py validate "$r"; else echo "no results: no test step wrote its output"; fi
+      - name: Upload the results
+        if: always() && steps.setup.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-linux-boot
+          path: ${{ runner.temp }}/results.tsv
+          if-no-files-found: ignore
+          retention-days: 14
       # The whole snapshot, memory file too (128 MiB before the artifact's
       # compression): what a Windows host of the same architecture restores
       # (boot-test.ps1 linux-snapshot).
@@ -415,6 +459,27 @@ jobs:
       - name: The build kept Cargo.lock
         if: (success() || failure()) && steps.setup.outcome == 'success'
         run: git -C lib/firecracker diff --exit-code -- Cargo.lock
+      # Every test's result in one format (tools/ci-results.py, results.tsv),
+      # for the docs' run claims; a step that did not run gives no rows.
+      - name: Results in one format
+        if: always() && steps.setup.outcome == 'success'
+        env:
+          WICK_RESULTS_JOB: linux-integration-tests
+        run: |
+          for tree in upstream wick; do
+            f="$RUNNER_TEMP/it/$tree/test-report.json"
+            if [ -f "$f" ]; then python3 -I tools/ci-results.py add pytest-json "$f" --tree "$tree" --out "$RUNNER_TEMP/results.tsv"; fi
+          done
+          r="$RUNNER_TEMP/results.tsv"
+          if [ -f "$r" ]; then python3 -I tools/ci-results.py validate "$r"; else echo "no results: no test step wrote its output"; fi
+      - name: Upload the results
+        if: always() && steps.setup.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-linux-integration-tests-${{ env.SUITE }}
+          path: ${{ runner.temp }}/results.tsv
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Upload logs
         if: always() && steps.setup.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -647,6 +712,31 @@ jobs:
             ${{ runner.temp }}/unit/watchdog/
           if-no-files-found: warn
           retention-days: 14
+      # Every test's result in one format (tools/ci-results.py, results.tsv),
+      # for the docs' run claims; a step that did not run gives no rows.
+      - name: Results in one format
+        if: always() && steps.build.outcome == 'success'
+        env:
+          WICK_RESULTS_JOB: macos
+        run: |
+          f="$RUNNER_TEMP/unit/tests.tsv"
+          if [ -f "$f" ]; then python3 -I tools/ci-results.py add unit-tsv "$f" --out "$RUNNER_TEMP/results.tsv"; fi
+          # The newest run: its directory is named by its time, the glob sorted.
+          d=""
+          for x in build/jailer-test/*/; do d="$x"; done
+          if [ -n "$d" ] && [ -f "$d/summary.txt" ]; then
+            python3 -I tools/ci-results.py add summary "$d/summary.txt" --suite tools/macos/jailer-test.py --out "$RUNNER_TEMP/results.tsv"
+          fi
+          r="$RUNNER_TEMP/results.tsv"
+          if [ -f "$r" ]; then python3 -I tools/ci-results.py validate "$r"; else echo "no results: no test step wrote its output"; fi
+      - name: Upload the results
+        if: always() && steps.build.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-macos
+          path: ${{ runner.temp }}/results.tsv
+          if-no-files-found: ignore
+          retention-days: 14
       # Why a test's terminal could not be opened (run 43435331370: posix_openpt
       # failed in 3 children of test_unfiltered_syscalls_are_limited_by_their_rule).
       # XNU prints "reached max_retries" when two openers raced for one minor
@@ -755,6 +845,29 @@ jobs:
             echo "$left"
             exit 1
           fi
+      # Every test's result in one format (tools/ci-results.py, results.tsv),
+      # for the docs' run claims; a step that did not run gives no rows.
+      - name: Results in one format
+        if: always() && !cancelled()
+        env:
+          WICK_RESULTS_JOB: macos-15-root-vmnet
+        run: |
+          # The newest run: its directory is named by its time, the glob sorted.
+          d=""
+          for x in build/boot-test/*/vmnet; do d="$x"; done
+          if [ -n "$d" ] && [ -f "$d/summary.txt" ]; then
+            python3 -I tools/ci-results.py add summary "$d/summary.txt" --suite tools/macos/boot-test.py --out "$RUNNER_TEMP/results.tsv"
+          fi
+          r="$RUNNER_TEMP/results.tsv"
+          if [ -f "$r" ]; then python3 -I tools/ci-results.py validate "$r"; else echo "no results: no test step wrote its output"; fi
+      - name: Upload the results
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-macos-15-root-vmnet
+          path: ${{ runner.temp }}/results.tsv
+          if-no-files-found: ignore
+          retention-days: 14
 
   macos-seatbelt:
     strategy:
@@ -791,11 +904,14 @@ jobs:
       - name: Host sandbox tests
         working-directory: lib/firecracker
         run: |
+          # Each test's line kept for the results (tee); the step's exit is the tests'.
+          set -o pipefail
           sw_vers
           python3 -I ../../tools/macos/watchdog.py 600 --out "$RUNNER_TEMP/watchdog" -- \
             cargo test --locked -p vmm --lib "ext::sandbox" -- \
             --skip ext::sandbox::macos::tests::test_a_denied_call_never_returns_to_its_thread \
-            --skip ext::sandbox::macos::tests::test_system_socket_is_not_consulted_for_these
+            --skip ext::sandbox::macos::tests::test_system_socket_is_not_consulted_for_these \
+            2>&1 | tee -a "$RUNNER_TEMP/tests.log"
           # Alone and with --nocapture, so each kind of call's count of kills
           # and of returns is in the log, passing or not: wick's denials rest
           # on Seatbelt's SIGKILL action ending a process inside the call, on
@@ -804,13 +920,13 @@ jobs:
           python3 -I ../../tools/macos/watchdog.py 900 --out "$RUNNER_TEMP/watchdog" -- \
             cargo test --locked -p vmm --lib \
             ext::sandbox::macos::tests::test_a_denied_call_never_returns_to_its_thread \
-            -- --exact --nocapture
+            -- --exact --nocapture 2>&1 | tee -a "$RUNNER_TEMP/tests.log"
           # Which socket families Seatbelt consults system-socket for, alone
           # and with --nocapture so that each major's findings are in the log.
           python3 -I ../../tools/macos/watchdog.py 180 --out "$RUNNER_TEMP/watchdog" -- \
             cargo test --locked -p vmm --lib \
             ext::sandbox::macos::tests::test_system_socket_is_not_consulted_for_these \
-            -- --exact --nocapture
+            -- --exact --nocapture 2>&1 | tee -a "$RUNNER_TEMP/tests.log"
       # Seatbelt's SIGKILL action alone, with a one-rule profile and no wick
       # code (tools/macos/seatbelt-kill-probe.py): if the test above fails on
       # a major, this tells a change in Seatbelt from a change in wick. Run
@@ -846,10 +962,11 @@ jobs:
         if: (success() || failure()) && steps.build.outcome == 'success'
         working-directory: lib/firecracker
         run: |
+          set -o pipefail
           python3 -I ../../tools/macos/watchdog.py 300 --out "$RUNNER_TEMP/watchdog" -- \
-            cargo test --locked -p vmm --lib "ext::fifo" -- --test-threads=1
+            cargo test --locked -p vmm --lib "ext::fifo" -- --test-threads=1 2>&1 | tee -a "$RUNNER_TEMP/tests.log"
           python3 -I ../../tools/macos/watchdog.py 300 --out "$RUNNER_TEMP/watchdog" -- \
-            cargo test --locked -p vmm --lib "ext::api_process" -- --test-threads=1
+            cargo test --locked -p vmm --lib "ext::api_process" -- --test-threads=1 2>&1 | tee -a "$RUNNER_TEMP/tests.log"
       # What the sandbox denied the test processes (vmm-<hash>), for a
       # failure above: the kernel reports a denied call by its number
       # ("deny(1) syscall-unix 117"), killed or not. All of the lines: the
@@ -857,6 +974,25 @@ jobs:
       # tests of every number leave one line a process). A test process that
       # a denial killed, but should have had none, is named only here: the
       # kill leaves it no way to print the call.
+      # Every test's result in one format (tools/ci-results.py, results.tsv),
+      # for the docs' run claims; a step that did not run gives no rows.
+      - name: Results in one format
+        if: always() && steps.build.outcome == 'success'
+        env:
+          WICK_RESULTS_JOB: macos-seatbelt (${{ matrix.runner }})
+        run: |
+          f="$RUNNER_TEMP/tests.log"
+          if [ -f "$f" ]; then python3 -I tools/ci-results.py add libtest "$f" --out "$RUNNER_TEMP/results.tsv"; fi
+          r="$RUNNER_TEMP/results.tsv"
+          if [ -f "$r" ]; then python3 -I tools/ci-results.py validate "$r"; else echo "no results: no test step wrote its output"; fi
+      - name: Upload the results
+        if: always() && steps.build.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-macos-seatbelt-${{ matrix.runner }}
+          path: ${{ runner.temp }}/results.tsv
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Sandbox reports
         if: failure() && steps.build.outcome == 'success'
         run: |
@@ -910,7 +1046,27 @@ jobs:
       # its #GP exit's decode and merge (whp_gp::tests) and KVM's CR4 rule
       # (whp_cr4::tests) are checked on Linux and macOS too.
       - name: The fuzzed modules' unit tests
-        run: cargo test --manifest-path fuzz/Cargo.toml --lib
+        id: fuzz_units
+        run: cargo test --manifest-path fuzz/Cargo.toml --lib 2>&1 | tee "$RUNNER_TEMP/tests.log"
+      # Every test's result in one format (tools/ci-results.py, results.tsv),
+      # for the docs' run claims; a step that did not run gives no rows.
+      - name: Results in one format
+        if: always() && steps.fuzz_units.conclusion != 'skipped' && runner.os != 'Windows'
+        env:
+          WICK_RESULTS_JOB: fuzz (${{ matrix.runner }})
+        run: |
+          f="$RUNNER_TEMP/tests.log"
+          if [ -f "$f" ]; then python3 -I tools/ci-results.py add libtest "$f" --out "$RUNNER_TEMP/results.tsv"; fi
+          r="$RUNNER_TEMP/results.tsv"
+          if [ -f "$r" ]; then python3 -I tools/ci-results.py validate "$r"; else echo "no results: no test step wrote its output"; fi
+      - name: Upload the results
+        if: always() && steps.fuzz_units.conclusion != 'skipped' && runner.os != 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-fuzz-${{ matrix.runner }}
+          path: ${{ runner.temp }}/results.tsv
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Fuzz each target for 60 seconds
         run: tools/fuzz.sh -t 60
       - name: Upload the inputs that failed

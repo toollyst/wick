@@ -132,7 +132,9 @@ and the main checkout use; they never set the variable.
   tree is checked too: the patch and file counts by `tools/patches.sh check`,
   COMPATIBILITY's counts by `tools/compat-counts.py`, README's line count and
   PORTING row 1's sandbox counts by `tools/check-derived.py` (a new derived
-  number gets its extractor there). A probe that once showed something is
+  number gets its extractor there). Every CI job on Linux and macOS uploads
+  its tests' results in one format (`results-<job>`, `tools/ci-results.py`):
+  a test with no row there did not run in that job. A probe that once showed something is
   not a test; the claim waits until the product does it and a test in the
   repository shows it.
 - A number in a doc says how it was measured. On a loaded machine, measure
