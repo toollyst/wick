@@ -536,6 +536,11 @@ fn refuse(name: &str, why: fmt::Arguments<'_>) -> TapError {
 /// one and fails on what is left in it but the files listed in
 /// tools/macos/unit-test-litter.txt (two of upstream's tests leak their
 /// devices), so that no run fills the user's directory and new litter fails.
+/// Without it a test process uses `fcnet-test-<pid>` in the same temporary
+/// directory, removed when the process exits ([`test_dir::remove_at_exit`];
+/// tools/clean.sh removes one whose process is gone), never the user's
+/// `firecracker-net`; a test that runs the test binary again gives it its
+/// own directory in [`TEST_ENDPOINT_DIR`] (`platform::net::test_binary`).
 pub fn user_endpoint_dir() -> io::Result<PathBuf> {
     static DIR: std::sync::OnceLock<Result<PathBuf, i32>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
@@ -550,10 +555,62 @@ pub fn user_endpoint_dir() -> io::Result<PathBuf> {
             return Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL));
         }
         let dir = CStr::from_bytes_until_nul(&buf).map_err(|_| libc::EINVAL)?;
-        Ok(Path::new(OsStr::from_bytes(dir.to_bytes())).join("firecracker-net"))
+        let temp = Path::new(OsStr::from_bytes(dir.to_bytes()));
+        #[cfg(test)]
+        {
+            let dir = temp.join(format!("fcnet-test-{}", std::process::id()));
+            test_dir::remove_at_exit(dir.clone());
+            return Ok(dir);
+        }
+        #[allow(unreachable_code)]
+        Ok(temp.join("firecracker-net"))
     })
     .clone()
     .map_err(io::Error::from_raw_os_error)
+}
+
+/// A test process's own directory of endpoints ([`user_endpoint_dir`]),
+/// removed when that process exits, and only by it: a child forked by a test
+/// that exits runs the same atexit handlers and must leave its parent's.
+#[cfg(test)]
+pub(crate) mod test_dir {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// (pid, directory) of each directory to remove at exit.
+    static OWNED: Mutex<Vec<(u32, PathBuf)>> = Mutex::new(Vec::new());
+
+    /// Removes `dir` when this process exits (libc's atexit: libtest's end
+    /// runs it), not when a child of it does.
+    pub(crate) fn remove_at_exit(dir: PathBuf) {
+        let mut owned = OWNED.lock().unwrap();
+        if owned.is_empty() {
+            // SAFETY: registers a function that lives as long as the process.
+            assert_eq!(unsafe { libc::atexit(remove_owned) }, 0, "atexit refused");
+        }
+        owned.push((std::process::id(), dir));
+    }
+
+    /// The handler: removes the directories this very process registered.
+    /// A forked child may find the lock held by a thread that no longer
+    /// exists in it: it then leaves everything, as it must anyway.
+    extern "C" fn remove_owned() {
+        remove(None);
+    }
+
+    /// Removes the directories this process registered (`only`: just that
+    /// one, as the handler would).
+    pub(crate) fn remove(only: Option<&std::path::Path>) {
+        let Ok(owned) = OWNED.try_lock() else {
+            return;
+        };
+        let me = std::process::id();
+        for (pid, dir) in owned.iter() {
+            if *pid == me && only.is_none_or(|o| o == dir) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
 }
 
 /// The variable that names the user's directory of endpoints in the crate's
@@ -1727,6 +1784,41 @@ mod tests {
     use super::simulator::*;
     use super::*;
 
+    #[test]
+    fn test_a_forked_childs_exit_leaves_its_parents_endpoint_directory() {
+        let dir = std::env::temp_dir().join(format!("fcnet-fork-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        test_dir::remove_at_exit(dir.clone());
+        // SAFETY: the child calls only exit, which runs the atexit handlers
+        // (ours among them), as a test's forked child ending with exit does.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "{}", io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: ends the child.
+            unsafe { libc::exit(0) };
+        }
+        let mut status = 0;
+        // SAFETY: our own child.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "{status:#x}");
+        assert!(dir.is_dir(), "the child's exit removed its parent's {}", dir.display());
+        // The owner's own exit handler removes it.
+        test_dir::remove(Some(&dir));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn test_a_test_process_uses_its_own_endpoint_directory() {
+        let dir = user_endpoint_dir().unwrap();
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        if std::env::var_os(TEST_ENDPOINT_DIR).is_some() {
+            assert_eq!(Some(dir.as_os_str()), std::env::var_os(TEST_ENDPOINT_DIR).as_deref());
+        } else {
+            assert_eq!(name, format!("fcnet-test-{}", std::process::id()));
+        }
+        assert_ne!(name, "firecracker-net");
+    }
+
     fn frame(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 253) as u8).collect()
     }
@@ -1872,7 +1964,7 @@ mod tests {
         use std::io::BufRead;
         let name = format!("fcbz{}", std::process::id());
         let (_switch, entry) = operator_entry(&name);
-        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut holder = crate::platform::net::test_binary()
             .args(["--exact", "platform::macos::net::tests::iface_holder_child", "--ignored", "--nocapture"])
             .env("WICK_TEST_CASE", &name)
             // Its end of this pipe closes with this process, however it
@@ -2202,7 +2294,7 @@ mod tests {
         let name = format!("fckc{}", std::process::id());
         let lock = user_endpoint_dir().unwrap().join(format!("{name}.lock"));
         let _ = std::fs::remove_file(&lock);
-        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut holder = crate::platform::net::test_binary()
             .args(["--exact", "platform::macos::net::tests::iface_holder_child", "--ignored", "--nocapture"])
             .env("WICK_TEST_CASE", &name)
             .env("WICK_TEST_AS", "creator")

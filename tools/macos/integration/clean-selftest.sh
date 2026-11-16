@@ -18,9 +18,12 @@
 # - leave both while the owner lives, also with the screen session gone;
 # - take both with no owner file, a garbled one, a pid whose start time is
 #   another process's, or a dead owner.
-# --remove then runs clean.sh for real and checks that both are gone, if its
-# dry run lists nothing but this test's (another run's leftovers would go
-# too). CLEAN_SH (default tools/clean.sh) is the script under test.
+# A vmm unit test process's endpoint directory ($DARWIN_USER_TEMP_DIR/
+# fcnet-test-<pid>) must be left while its pid lives and taken once it is gone.
+# --remove then runs clean.sh for real and checks that what it must take is
+# gone and the live process's directory is not, if its dry run lists nothing
+# but this test's (another run's leftovers would go too). CLEAN_SH (default
+# tools/clean.sh) is the script under test.
 set -Eeuo pipefail
 # A command that ends the script (set -e), in a function or a trap too (-E),
 # says so: a failure after "all passed" was once silent (CI run 43790310601).
@@ -61,6 +64,10 @@ owner_pid=""
 screen_pid=""
 window_pid=""
 loop_pid=""
+endpoint_pid=""
+user_temp="$(getconf DARWIN_USER_TEMP_DIR)"
+live_endpoint=""
+dead_endpoint=""
 # Kills what is still alive of `pid`s: one already gone (clean.sh --remove
 # killed it) is not a failure.
 kill_if_alive() {
@@ -73,9 +80,13 @@ kill_if_alive() {
 }
 finish() {
     local rc=$?
-    kill_if_alive "$loop_pid" "$screen_pid" "$window_pid" "$owner_pid"
+    kill_if_alive "$loop_pid" "$screen_pid" "$window_pid" "$owner_pid" "$endpoint_pid"
+    # Reaped here, or bash reports the sleep's SIGTERM as it exits.
+    [[ -z "$endpoint_pid" ]] || wait "$endpoint_pid" 2>/dev/null || true
     "$SCREEN" -wipe >/dev/null 2>&1 || true
     rm -rf "$session"
+    [[ -z "$live_endpoint" ]] || rm -rf "$live_endpoint"
+    [[ -z "$dead_endpoint" ]] || rm -rf "$dead_endpoint"
     ((rc == 0)) || echo "clean-selftest: exit $rc" >&2
     exit "$rc"
 }
@@ -158,13 +169,40 @@ else
     fails=$((fails + 1))
 fi
 
+# A unit test process's endpoint directory: one whose pid is running (a test
+# binary in its tests) is kept; one whose pid is gone (a test binary killed
+# before its exit removed it) is taken.
+sleep 600 &
+endpoint_pid=$!
+live_endpoint="${user_temp}fcnet-test-$endpoint_pid"
+mkdir "$live_endpoint"
+true &
+dead=$!
+wait "$dead"
+dead_endpoint="${user_temp}fcnet-test-$dead"
+if kill -0 "$dead" 2>/dev/null; then
+    echo "FAIL: pid $dead, just reaped, is running again"
+    fails=$((fails + 1))
+else
+    mkdir "$dead_endpoint"
+    dry="$("$clean" --dry-run 2>&1)"
+    if grep -qF "would remove $dead_endpoint " <<<"$dry" && ! grep -qF "would remove $live_endpoint " <<<"$dry" &&
+        grep -qF "keeping $live_endpoint: its test process $endpoint_pid is running" <<<"$dry"; then
+        echo "ok: a gone test process's endpoint directory is taken, a running one's kept"
+    else
+        echo "FAIL: endpoint directories: want $dead_endpoint taken and $live_endpoint kept"
+        echo "$dry" | sed 's/^/    /'
+        fails=$((fails + 1))
+    fi
+fi
+
 if ((remove)); then
     # What every test script's start removes anyway (passed runs' images)
     # aside, only this test's may be listed.
     dry="$("$clean" --dry-run 2>&1)"
     others="$(grep -E '^would (kill|remove)' <<<"$dry" | grep -vF -e "would kill $screen_pid " \
         -e "would remove /private$session " -e ": snapshot or image of a passed run" \
-        -e "would kill $loop_pid " || true)"
+        -e "would kill $loop_pid " -e "would remove $dead_endpoint " || true)"
     if [[ -n "$others" ]]; then
         echo "not run for real: clean.sh would also take what is not this test's:"
         echo "$others" | sed 's/^/    /'
@@ -181,6 +219,12 @@ if ((remove)); then
             fails=$((fails + 1))
         else
             echo "ok: clean.sh removed the session of a dead owner and killed its screen"
+        fi
+        if [[ -e "$dead_endpoint" || ! -d "$live_endpoint" ]]; then
+            echo "FAIL: clean.sh left $dead_endpoint or took $live_endpoint"
+            fails=$((fails + 1))
+        else
+            echo "ok: clean.sh removed the gone test process's endpoint directory and kept the running one's"
         fi
     fi
 fi

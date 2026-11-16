@@ -95,6 +95,22 @@ pub(crate) use super::backend::net::tests_as;
 #[cfg(all(target_os = "macos", test))]
 pub(crate) use super::backend::net::bind as bind_endpoint;
 
+/// This test binary, to run one of its tests in a process of its own, with
+/// this process's directory of endpoints (`TEST_ENDPOINT_DIR`), as
+/// tools/macos/check-unit-tests.py's run gives every process of a binary
+/// one: without it the child's own pid gives it a directory of its own
+/// ([`user_endpoint_dir`]), where it finds none of this process's endpoints
+/// and leaves its own where this process does not look, and which it leaves
+/// behind when it ends without exiting (a kill, the sandbox's `SIGKILL`).
+/// For a child that makes, opens or names endpoints: its own, a sandbox's
+/// profile (`ext::sandbox::profile_for`), an interface's lock file.
+#[cfg(all(target_os = "macos", test))]
+pub(crate) fn test_binary() -> std::process::Command {
+    let mut binary = std::process::Command::new(std::env::current_exe().unwrap());
+    binary.env(super::backend::net::TEST_ENDPOINT_DIR, user_endpoint_dir().unwrap());
+    binary
+}
+
 #[cfg(test)]
 mod tests {
     // Interface tests: they run against the backend of the host they are

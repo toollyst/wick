@@ -15,7 +15,12 @@ limit), and the check fails on:
     longer leave. Each test binary is given an empty directory of its own
     for the endpoints of interfaces named without `/` (WICK_TEST_ENDPOINT_DIR,
     which only vmm's own tests read: overlay/vmm/platform/macos/net.rs), in
-    place of the user's, and it is removed after the binary has run.
+    place of the user's, and it is removed after the binary has run;
+  - in the crates DEFAULT_MODE names, run a second time with no endpoint
+    directory given, as a plain `cargo test` runs them (each test process
+    then uses $DARWIN_USER_TEMP_DIR/fcnet-test-<pid> and removes it as it
+    exits): a failure the list does not name, and any fcnet-test-<pid> the
+    run leaves, its own or a child's.
 So nothing goes unrun silently, nothing is left behind unnoticed, and the
 lists cannot rot.
 
@@ -53,6 +58,12 @@ LITTER = os.path.join(ROOT, "tools", "macos", "unit-test-litter.txt")
 # What vmm's tests read for their endpoint directory (net.rs, TEST_ENDPOINT_DIR).
 ENDPOINT_DIR_ENV = "WICK_TEST_ENDPOINT_DIR"
 KINDS = {"no-hvf", "linux-path", "error-text", "bug"}
+# The crates whose binaries run a second time, whole, with no endpoint
+# directory given: vmm's, whose tests make endpoints and run the binary again
+# (platform::net::test_binary). Whole, as it takes 274 s on CI's runner
+# (libtest's "finished in 273.83s" in run 43833851623's macos-unit-tests
+# vmm.log), so a test added later is covered too.
+DEFAULT_MODE = {"vmm"}
 # Seconds a test binary may take (the longest, vmm --lib, takes about 6
 # minutes on an M1 Pro).
 BINARY_LIMIT = 1800
@@ -186,7 +197,11 @@ def run(exe, cwd, env, endpoints):
                            capture_output=True, text=True, timeout=BINARY_LIMIT)
     except subprocess.TimeoutExpired:
         return None, f"did not finish in {BINARY_LIMIT} s"
-    out = p.stdout + p.stderr
+    return failures(p.stdout + p.stderr, p.returncode)
+
+
+def failures(out, returncode):
+    """(failed names, output) of a binary's run, or (None, why)."""
     failed = set()
     section = out.rfind("\nfailures:\n")
     if section >= 0:
@@ -194,9 +209,55 @@ def run(exe, cwd, env, endpoints):
             m = re.match(r"^    (\S+)$", line)
             if m:
                 failed.add(m.group(1))
-    if p.returncode != 0 and not failed:
-        return None, f"exit {p.returncode} with no failure named:\n" + "\n".join(out.splitlines()[-20:])
+    if returncode != 0 and not failed:
+        return None, f"exit {returncode} with no failure named:\n" + "\n".join(out.splitlines()[-20:])
     return failed, out
+
+
+def pid_alive(pid):
+    """Whether process `pid` exists (kill -0, as tools/clean.sh decides)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def own_endpoint_dirs(temp):
+    """{name: pid} of the fcnet-test-<pid> directories in `temp`."""
+    out = {}
+    for name in os.listdir(temp):
+        m = re.fullmatch(r"fcnet-test-(\d+)", name)
+        if m:
+            out[name] = int(m.group(1))
+    return out
+
+
+def run_default_mode(exe, cwd, env):
+    """(failed names, output, left), or (None, why, left): `exe` run with no
+    endpoint directory given, as a plain `cargo test` runs it (net.rs
+    `user_endpoint_dir`: each process's $DARWIN_USER_TEMP_DIR/fcnet-test-<pid>,
+    removed by that process as it exits). `left` names each fcnet-test-<pid>
+    there after the run that was not before it and whose pid is gone, the
+    run's own or a child's (one a child killed before its exit leaves); a
+    directory of a process still running, another checkout's test run on a
+    developer's Mac, is not counted. Each one counted is removed here."""
+    env = {k: v for k, v in env.items() if k != ENDPOINT_DIR_ENV}
+    temp = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+    before = own_endpoint_dirs(temp)
+    try:
+        p = subprocess.run([exe, "--test-threads=1"], cwd=cwd, env=env, capture_output=True, text=True,
+                           timeout=BINARY_LIMIT)
+        failed, out = failures(p.stdout + p.stderr, p.returncode)
+    except subprocess.TimeoutExpired:
+        failed, out = None, f"did not finish in {BINARY_LIMIT} s"
+    left = sorted(n for n, pid in own_endpoint_dirs(temp).items() if n not in before and not pid_alive(pid))
+    for name in left:
+        shutil.rmtree(os.path.join(temp, name), ignore_errors=True)
+    return failed, out, left
 
 
 def failure_output(out, test):
@@ -267,6 +328,18 @@ def main():
             failed |= f
             for test in f:
                 outputs[test] = failure_output(out, test)
+            if crate in DEFAULT_MODE:
+                df, dout, dleft = run_default_mode(exe, cwd, exe_env)
+                log.append(f"==== {os.path.basename(exe)} again, with no endpoint directory given\n{dout}\n")
+                if df is None:
+                    errors.append(f"{crate}: {os.path.basename(exe)} with no endpoint directory given: {dout}")
+                want_here = {test for (c, test) in entries if c == crate}
+                for test in sorted((df or set()) - want_here):
+                    said = "\n    ".join(failure_output(dout, test).splitlines()[-30:])
+                    errors.append(f"{crate}: {test} fails with no endpoint directory given and is not listed"
+                                  + (f":\n    {said}" if said else ""))
+                for name in dleft:
+                    errors.append(f"{crate}: {os.path.basename(exe)} with no endpoint directory given left {name}")
         if a.out:
             text = "".join(log)
             (a.out / f"{crate}.log").write_text(text)

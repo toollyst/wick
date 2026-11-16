@@ -527,7 +527,9 @@ jobs:
     needs: linux-boot
     if: ${{ !cancelled() }}
     runs-on: macos-latest
-    timeout-minutes: 30
+    # 18.5 minutes in run 43833851623, and the unit step's second vmm run
+    # (below) adds about 5.
+    timeout-minutes: 40
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
@@ -726,16 +728,20 @@ jobs:
       # Hypervisor.framework) are listed by name and reason, and the check
       # fails on an unlisted failure, a listed test that passes, or a listed
       # name that is no test. tools/macos/test.sh runs the listed ones on a
-      # Mac, and tools/macos/boot-test.sh the scenarios.
+      # Mac, and tools/macos/boot-test.sh the scenarios. vmm's binary runs
+      # twice: with an endpoint directory of its own, then as a plain
+      # `cargo test` runs it, with none given (check-unit-tests.py
+      # DEFAULT_MODE), where it must leave no fcnet-test-<pid>.
       # Last in the job, so a unit test's failure does not keep the jailer and
       # harness steps above from running.
       - name: Unit tests of every crate but the jailer (tools/macos/unit-test-differences.txt)
         # Runs after an earlier step's failure too: each step answers its own question.
         if: (success() || failure()) && steps.build.outcome == 'success'
         # Under the watchdog (macos-seatbelt's steps say why): about twice its
-        # usual 8 minutes, and inside the job's 30.
+        # usual 13 minutes (8 in run 43833851623, and vmm's second run's
+        # 274 s), and inside the job's 40.
         run: >-
-          python3 -I tools/macos/watchdog.py 900 --out "$RUNNER_TEMP/unit/watchdog" --
+          python3 -I tools/macos/watchdog.py 1500 --out "$RUNNER_TEMP/unit/watchdog" --
           python3 -I tools/macos/check-unit-tests.py --out "$RUNNER_TEMP/unit" --summary "$GITHUB_STEP_SUMMARY"
       # Every test's result by name (tests.tsv) and each crate's output.
       - name: Upload the unit tests' output

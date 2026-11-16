@@ -1158,7 +1158,9 @@ mod macos {
         /// sandbox on, the API thread's loop. Returns the status, stdout
         /// (logs and metrics) and stderr.
         fn api_violation(case: &str) -> std::process::Output {
-            std::process::Command::new(std::env::current_exe().unwrap())
+            // Its directory of endpoints is this process's: the child
+            // applies Firecracker's profile, which names it.
+            crate::platform::net::test_binary()
                 .args([
                     "--exact",
                     "ext::api_process::macos::tests::api_violation_child",
@@ -1286,7 +1288,8 @@ mod macos {
             let _metrics_r = reader(&metrics);
             let sock = std::path::PathBuf::from(format!("/tmp/wick-apif-{}.sock", std::process::id()));
             let _ = std::fs::remove_file(&sock);
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            // As `api_violation`'s child: it applies Firecracker's profile.
+            let mut child = crate::platform::net::test_binary()
                 .args(["--exact", "ext::api_process::macos::tests::api_fifo_child", "--ignored", "--nocapture"])
                 .env("WICK_TEST_LOG", &log)
                 .env("WICK_TEST_METRICS", &metrics)

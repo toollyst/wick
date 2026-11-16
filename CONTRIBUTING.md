@@ -346,11 +346,29 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   user's `firecracker-net`, removed after it: the check fails on a file left
   there that `tools/macos/unit-test-litter.txt` does not list with the test
   that leaves it (two of upstream's net tests `mem::forget` their devices), and
-  on a listed one no longer left. A plain `cargo test -p vmm --lib` still
-  makes those four files (`net-device0` and `net-device1`, each socket and its
-  `.lock`) in `$(getconf DARWIN_USER_TEMP_DIR)firecracker-net`, beside your
-  own microVMs' endpoints; give it a directory of its own instead:
-  `d=$(mktemp -d) && WICK_TEST_ENDPOINT_DIR=$d cargo test -p vmm --lib; rm -r "$d"`.
+  on a listed one no longer left. A plain `cargo test -p vmm --lib` uses a
+  directory of its own too, never your `firecracker-net`:
+  `$(getconf DARWIN_USER_TEMP_DIR)fcnet-test-<pid>`, which the test process
+  removes as it exits, a child it forks leaving it
+  (`test_a_test_process_uses_its_own_endpoint_directory`,
+  `test_a_forked_childs_exit_leaves_its_parents_endpoint_directory`), and a
+  test that runs the binary again passes it on in `WICK_TEST_ENDPOINT_DIR`
+  (`platform::net::test_binary`;
+  `test_an_interface_held_is_busy_until_its_holder_goes`,
+  `test_a_killed_creators_lock_file_stays_and_is_nobodys`); one a
+  killed run leaves, `tools/clean.sh` removes once its pid is gone, and keeps
+  while it runs (`tools/macos/integration/clean-selftest.sh`). So the check
+  runs each binary in the first mode, and then vmm's whole binary a second
+  time in the plain run's, with no directory given (its `DEFAULT_MODE`),
+  failing on a failure there the list does not name and on any
+  `fcnet-test-<pid>` that run leaves, its own or a child's (a new one whose
+  pid is gone: another test run's, still running, is not counted). A whole
+  plain run, libtest's default threads, left none on macOS 27.2; three of
+  upstream's tests that count a metric other tests count too fail in a
+  parallel run of their module (`test_end_of_region`, `test_muxer_killq`,
+  `test_vsock_basic_metrics`) and pass alone, as upstream runs its unit tests
+  on one thread (`RUST_TEST_THREADS` 1 in lib/firecracker's
+  `tests/host_tools/cargo_build.py`), and so does the check.
   With `--out DIR`, check-unit-tests.py keeps each
   crate's output and every test's result by name (`tests.tsv`); CI's `macos`
   job uploads them as the `macos-unit-tests` artifact.

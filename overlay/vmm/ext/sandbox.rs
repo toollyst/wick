@@ -2059,8 +2059,9 @@ mod macos {
             use std::io::Read;
             use std::process::Stdio;
             use std::sync::mpsc;
-            let exe = std::env::current_exe().unwrap();
-            let mut proc = Command::new(exe)
+            // With this process's directory of endpoints: the children
+            // run under Firecracker's profile, which names it.
+            let mut proc = crate::platform::net::test_binary()
                 .args([
                     "--exact",
                     &format!("ext::sandbox::macos::tests::{name}"),

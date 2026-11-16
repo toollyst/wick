@@ -15,6 +15,9 @@
 #   the vhost-user and uffd test backends whose test runner is gone);
 # - shell loops a killed tool left running (a background subshell of a script
 #   under tools/ whose script is gone), with how many it found;
+# - the endpoint directory of a vmm unit test process that is gone
+#   ($DARWIN_USER_TEMP_DIR/fcnet-test-<pid>, which the process removes at its
+#   exit unless it was killed: overlay/vmm/platform/macos/net.rs);
 # - temporary directories of test runs no process uses any more
 #   (/tmp/wick-bt-*, /private/tmp/wick-jt-*, the integration tests' /tmp/wit-*,
 #   the jails inside; root-owned ones
@@ -38,12 +41,14 @@ while (($#)); do
         --keep) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--keep needs a number"; keep="$2"; shift 2 ;;
         --all) all=1; shift ;;
         --quiet) quiet=1; shift ;;
-        -h|--help) sed -n '4,28p' "$0"; exit 0 ;;
+        -h|--help) sed -n '4,33p' "$0"; exit 0 ;;
         *) die "unknown option $1 (see --help)" ;;
     esac
 done
 
 linux_workdir="${WICK_LINUX_BOOT_TEST_WORKDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/wick-boot-test}"
+# The user's temporary directory on macOS (with its trailing /), or nothing.
+user_temp="$( [[ "$(uname)" == Darwin ]] && getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
 failed=0
 freed_kb=0
 
@@ -60,6 +65,7 @@ allowed() {
         /tmp/wit-*|/private/tmp/wit-*) return 0 ;;
         "$linux_workdir"/results-*) return 0 ;;
     esac
+    [[ -n "$user_temp" && "$p" == "$user_temp"fcnet-test-* ]] && return 0
     return 1
 }
 
@@ -207,6 +213,24 @@ clean_processes() {
     done)
 }
 
+# A vmm unit test process's endpoint directory, fcnet-test-<pid>, whose
+# process is gone (killed before its exit could remove it). A live pid keeps
+# it, whoever's it is now.
+clean_test_endpoints() {
+    local d pid
+    [[ -n "$user_temp" ]] || return 0
+    for d in "$user_temp"fcnet-test-*; do
+        [[ -d "$d" && ! -L "$d" ]] || continue
+        pid="${d##*fcnet-test-}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        if ps -p "$pid" >/dev/null 2>&1; then
+            say "keeping $d: its test process $pid is running"
+            continue
+        fi
+        remove "$d" "endpoint directory of a test process that is gone"
+    done
+}
+
 # Temporary directories of test runs no running process names.
 clean_temp() {
     local d
@@ -228,6 +252,7 @@ clean_temp() {
 
 clean_processes
 clean_loops
+clean_test_endpoints
 clean_temp
 clean_runs "$WICK_ROOT/build/boot-test" '^[0-9]{8}-[0-9]{6}$'
 clean_runs "$WICK_ROOT/build/jailer-test" '^[0-9]{8}-[0-9]{6}$'
