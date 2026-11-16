@@ -1529,6 +1529,10 @@ unsafe extern "system" fn lazy_on_exception(
         let addr = if rec.NumberParameters >= 2 { rec.ExceptionInformation[1] } else { 0 };
         stack_ask_record(unsafe { (*(*info).ContextRecord).Rsp } as usize, addr);
     }
+    #[cfg(target_arch = "x86_64")]
+    if rec.ExceptionCode == STACK_OVERFLOW && stack_page_after_the_reclaim() {
+        return windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION;
+    }
     if rec.ExceptionCode == ACCESS_VIOLATION && rec.NumberParameters >= 2 {
         // [0]: 0 read, 1 write, 8 execute; [1]: the address.
         let stack = stack_committed();
@@ -1624,6 +1628,211 @@ const STACK_OVERFLOW: i32 = 0xC000_00FD_u32.cast_signed();
 /// three pages. More left is a commit the system refused ([`stack_filter`]).
 fn reserve_at_its_end(guarantee: usize) -> usize {
     guarantee.next_multiple_of(PAGE).max(PAGE) + 4 * PAGE
+}
+
+/// How long a thread whose stack page the job's limit refused waits for the
+/// reclaim under way at most ([`stack_page_after_the_reclaim`]): the wait is
+/// for the reclaim's next step, the end of a move or of the reclaim, which
+/// is a move's time (4435 and 4614 us a chunk median on record, RECLAIMREC),
+/// so 1 s is over 200 of them; it is a backstop, for a wait that could not
+/// end (the thread holding something the reclaim needs that is not one of
+/// wick's memory locks, which it waits only without), and it ends as
+/// without the wait, with 137.
+pub(crate) const STACK_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The stack a wait for the reclaim needs under the exception handler's
+/// frame: the wait and the retry use STACKWAIT's measured bytes of it
+/// (`test_a_stack_page_refused_during_a_move_is_had_once_it_ends`); a
+/// thread with less left (no stack guarantee: about 2.7 KiB under the
+/// handler, STACKASK) is not made to wait and ends as before.
+const STACK_WAIT_ROOM: usize = 4096;
+
+/// Why a refused stack page was not had: for [`stack_filter`]'s line, set on
+/// the thread by [`stack_page_after_the_reclaim`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StackWait {
+    /// No reclaim was under way (or not a refused commit): as before.
+    NoReclaim,
+    /// A reclaim was under way, not waited for: this thread held (or was
+    /// taking) this many of wick's memory locks, which the reclaim takes.
+    Held(u32),
+    /// A reclaim was under way, not waited for: this thread is the reclaim's.
+    Reclaimer,
+    /// A reclaim was under way, not waited for: this many bytes of stack
+    /// were left under the handler, less than [`STACK_WAIT_ROOM`].
+    Room(usize),
+    /// Waited for so many microseconds, the reclaim's step seen (`true`) or
+    /// the bound reached, and the page refused again.
+    Waited(u64, bool),
+}
+
+std::thread_local! {
+    /// [`StackWait`] of this thread's last refused stack page: no
+    /// destructor, a plain TLS access from the handler and the filter.
+    static STACK_WAIT: core::cell::Cell<StackWait> = const { core::cell::Cell::new(StackWait::NoReclaim) };
+}
+
+/// Stack pages had after a wait for the reclaim ([`stack_page_after_the_reclaim`]).
+static STACK_PAGES_AFTER_A_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tests: a thread is in [`stack_page_after_the_reclaim`]'s wait now (the
+/// count of those that began one).
+#[cfg(test)]
+pub(crate) static STACK_WAITS_BEGUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tests: the retry after the wait is refused as at the limit, for the
+/// line of a page refused again after a reclaim that ended
+/// (`test_a_stack_page_refused_again_after_the_wait_ends_with_137`).
+#[cfg(test)]
+pub(crate) static REFUSE_STACK_RETRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stack pages had after a wait for the reclaim so far.
+pub(crate) fn stack_pages_after_a_wait() -> u64 {
+    STACK_PAGES_AFTER_A_WAIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A stack page the job's limit refused while the reclaim moves a chunk:
+/// the thread waits once for the reclaim's next step and asks for the page
+/// once more; whether it has it, and the access that overflowed runs again.
+/// For the vectored handler ([`lazy_on_exception`]), first in the chain, at
+/// `STATUS_STACK_OVERFLOW`; every other case goes on as before, to
+/// [`stack_filter`] and its 137, with [`STACK_WAIT`] saying why.
+///
+/// Why: a move gives a chunk's dead pages back only at its end, and holds
+/// its new section's commit before (`uffd_move_chunk`), so a thread whose
+/// stack must grow in between finds no room, where Linux's memory cgroup
+/// would reclaim and charge the page (v6.1 mm/memcontrol.c,
+/// `try_charge_memcg` :2714 to :2743: reclaim, then charge again, before
+/// its out-of-memory kill). After the step there is room, the moved
+/// chunk's dead pages (RECLAIMREC: a reader of the moved chunks' live
+/// pages was refused a stack page in a move's middle).
+///
+/// When it waits: only for a refused commit (not the reserve's end,
+/// [`reserve_at_its_end`]), only while the reclaim's thread answers an ask
+/// ([`wick_uffd::reclaim_in_flight`](crate::wick_uffd::reclaim_in_flight)), and only on a thread that holds none of wick's memory
+/// locks (`windows_stacklock::held_here`: every lock of the crate's Windows
+/// code, counted from before it is asked for), is not the reclaim's own
+/// ([`wick_uffd::on_the_reclaimer`](crate::wick_uffd::on_the_reclaimer)),
+/// and has [`STACK_WAIT_ROOM`] bytes of stack under this frame. The reclaim
+/// takes those locks (the region table, `RELEASED`, `CHARGES`, ... after the
+/// userfaultfd's `LOCK`, which its asker holds), so a thread holding one
+/// could be what the reclaim waits for: such a thread does not wait. It
+/// may hold locks that are not wick's (the process heap's, the loader's,
+/// the standard streams', another crate's): the reclaim takes none, as it
+/// allocates nothing (`test_a_reclaim_allocates_nothing`), writes its lines
+/// with one `WriteFile` ([`say_at_the_limit`]) and calls only memory
+/// functions of the system; for anything else the wait is bounded
+/// ([`STACK_WAIT_BOUND`]).
+///
+/// The retry is what `_resetstkoflw` does after an overflow (the UCRT's
+/// misc/resetstk.cpp, Windows Kits 10.0.26100.0): the guard region below
+/// the committed stack made again, the thread's stack guarantee rounded up
+/// to a page and one page more, two pages at least, committed read-write
+/// and then made guard pages (`VirtualAlloc2`, then `VirtualProtect` with
+/// `PAGE_GUARD`, as the UCRT's two calls), here below the TEB's StackLimit, where the system's
+/// refused commit left the reserve (STACKASK: the page below StackLimit
+/// reserved). The system had committed the guard region it held as the
+/// thread's stack before it raised the overflow (STACKASK: below the
+/// faulting address, the guarantee), so the access runs again on committed
+/// stack, and the next growth goes through the new guard pages as any
+/// other. One wait and one retry: a refusal of the retry ends the VMM with
+/// 137, its line saying it waited ([`StackWait::Waited`]).
+///
+/// The wait and the retry allocate nothing and take no lock; their stack is
+/// STACKWAIT's, under [`STACK_WAIT_ROOM`].
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+fn stack_page_after_the_reclaim() -> bool {
+    STACK_WAIT.set(StackWait::NoReclaim);
+    let (limit, reserve, guarantee) = this_threads_stack();
+    if limit.saturating_sub(reserve) <= reserve_at_its_end(guarantee) {
+        return false;
+    }
+    let Some(seen) = crate::wick_uffd::reclaim_in_flight() else {
+        return false;
+    };
+    let here = core::ptr::addr_of!(seen) as usize;
+    let held = crate::windows_stacklock::held_here();
+    let left = here.saturating_sub(limit);
+    let not = if crate::wick_uffd::on_the_reclaimer() {
+        Some(StackWait::Reclaimer)
+    } else if held != 0 {
+        Some(StackWait::Held(held))
+    } else if left < STACK_WAIT_ROOM {
+        Some(StackWait::Room(left))
+    } else {
+        None
+    };
+    if let Some(not) = not {
+        STACK_WAIT.set(not);
+        return false;
+    }
+    #[cfg(test)]
+    let paint = stack_wait_paint(limit, here);
+    #[cfg(test)]
+    STACK_WAITS_BEGUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let (ended, us) = crate::wick_uffd::wait_for_the_reclaim(seen, STACK_WAIT_BOUND);
+    let mut guard = guarantee.next_multiple_of(PAGE);
+    if guard != 0 {
+        guard += PAGE;
+    }
+    let guard = guard.max(2 * PAGE);
+    let at = limit - guard;
+    #[cfg(test)]
+    let refuse = REFUSE_STACK_RETRY.swap(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let refuse = false;
+    let mut old = 0;
+    // SAFETY: the reserved pages of this thread's own stack below its
+    // committed part: below every frame, and above the reserve's last page
+    // (`left` is over the guard and four pages more, `reserve_at_its_end`).
+    let had = !refuse
+        && unsafe {
+            !VirtualAlloc2(proc(), at as *const c_void, guard, MEM_COMMIT, PAGE_READWRITE, std::ptr::null_mut(), 0).is_null()
+                && VirtualProtect(at as *const c_void, guard, PAGE_READWRITE | PAGE_GUARD, &mut old) != 0
+        };
+    #[cfg(test)]
+    stack_wait_record(paint, here, left, us, ended, had);
+    if had {
+        STACK_PAGES_AFTER_A_WAIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    STACK_WAIT.set(StackWait::Waited(us, ended));
+    false
+}
+
+/// STACKWAIT (tests): paints this thread's committed stack from `limit` to
+/// 512 bytes under `here` before the wait, for [`stack_wait_record`]; the
+/// painted range's low end.
+#[cfg(all(test, target_arch = "x86_64"))]
+#[inline(never)]
+fn stack_wait_paint(limit: usize, here: usize) -> usize {
+    let top = here - 512;
+    // SAFETY: committed stack of this thread below every live frame.
+    unsafe { core::ptr::write_bytes(limit as *mut u8, 0xc3, top - limit) };
+    limit
+}
+
+/// STACKWAIT (tests): the stack the wait and the retry used under
+/// [`stack_page_after_the_reclaim`]'s frame (from `here`, the lowest byte
+/// no longer painted), of `left`; the wait's microseconds, whether the
+/// reclaim's step ended it, and whether the page was had. Written after the
+/// measure, without allocating.
+#[cfg(all(test, target_arch = "x86_64"))]
+#[inline(never)]
+fn stack_wait_record(low: usize, here: usize, left: usize, us: u64, ended: bool, had: bool) {
+    let top = here - 512;
+    let mut a = low;
+    // SAFETY: as `stack_wait_paint`'s range; reads only.
+    while a < top && unsafe { core::ptr::read_volatile(a as *const u8) } == 0xc3 {
+        a += 1;
+    }
+    say_at_the_limit(format_args!(
+        "STACKWAIT the wait and the retry used {} B under the handler's frame, of {left} B left there; waited {us} us, {}; the page {}",
+        here - a,
+        if ended { "the reclaim's step seen" } else { "the bound reached" },
+        if had { "had" } else { "refused again" }
+    ));
 }
 
 /// The calling thread's stack from its TEB (x86-64): the lowest committed
@@ -1943,6 +2152,27 @@ impl core::fmt::Display for Ascii<'_> {
     }
 }
 
+/// [`StackWait`] as [`stack_filter`]'s line says it, without allocating:
+/// nothing when no reclaim was under way, so that line is as before.
+struct WhyNotHad(StackWait);
+
+impl core::fmt::Display for WhyNotHad {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let under = "a reclaim was under way and was not waited for";
+        match self.0 {
+            StackWait::NoReclaim => Ok(()),
+            StackWait::Held(n) => write!(f, "; {under}: the thread held {n} of wick's memory locks, which the reclaim takes"),
+            StackWait::Reclaimer => write!(f, "; {under}: the thread is the reclaim's own, whose stack is committed whole at its start"),
+            StackWait::Room(b) => write!(f, "; {under}: {b} B of stack were left under the handler, under the {STACK_WAIT_ROOM} B the wait needs"),
+            StackWait::Waited(us, ended) => write!(
+                f,
+                "; a reclaim was under way and was waited for, {us} us ({}), and the page was still refused",
+                if ended { "to its next step" } else { "its bound reached" }
+            ),
+        }
+    }
+}
+
 /// UTF-16 shown without allocating (a character that is not valid as `?`).
 struct Utf16<'a>(&'a [u16]);
 
@@ -2022,11 +2252,12 @@ unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::
             say_at_the_limit(format_args!(
                 "wick: a thread's stack could not grow: the memory limit (the jail's memory.max, or the host's commit \
                  limit) refused its next page with {} KiB of its reserve left (thread {} \"{}\", its guarantee {guarantee} \
-                 bytes); the VMM ends, as the cgroup OOM killer ends it on Linux (exit {OOM_EXIT}), not as a stack overflow",
+                 bytes){}; the VMM ends, as the cgroup OOM killer ends it on Linux (exit {OOM_EXIT}), not as a stack overflow",
                 left >> 10,
                 // SAFETY: plain call.
                 unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
-                Utf16(&name[..len])
+                Utf16(&name[..len]),
+                WhyNotHad(STACK_WAIT.get()),
             ));
             stack_137_frames();
             // SAFETY: ends this process at once, as SIGKILL does.
@@ -4936,6 +5167,15 @@ impl Record {
 /// The records, as many as the userfaultfd's ranges (`wick_uffd::MAX_RANGES`).
 /// Taken after the region table's lock and before [`CHARGES`].
 static RELEASED: ProbedMutex<[Record; 64]> = ProbedMutex::new("RELEASED", [const { Record::FREE }; 64]);
+
+/// Tests: runs `f` with [`RELEASED`]'s lock held, as `released_resolve`
+/// holds it over its charge and commit, where a stack page can be needed
+/// (`test_a_stack_page_refused_with_a_lock_held_is_not_waited_for`).
+#[cfg(test)]
+pub(crate) fn with_released_held<T>(f: impl FnOnce() -> T) -> T {
+    let _records = RELEASED.lock().unwrap();
+    f()
+}
 /// The records not free: 0, and no access needs [`RELEASED`]'s lock.
 static RELEASED_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

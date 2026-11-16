@@ -777,11 +777,19 @@ upstream Firecracker and its jailer.
   difference from Linux, which uncharged at the discard. The reclaim runs on its own thread with its 64 KiB stack
   committed at creation, so it grows no stack at the limit; the touching thread's own path to it is 8528 bytes deep
   on record (RECLAIMSTACK); a thread whose stack has less committed below its frame, and cannot grow it at the limit,
-  ends the VMM with 137 (below). The line that ends a VMM at the limit (`out_of_memory`) is written after 256 KiB of commit set
+  ends the VMM with 137 (below), but while a reclaim is under way: a move holds its new section's commit until its
+  end, and a thread holding none of wick's memory locks whose stack page is refused in its middle waits for the
+  move's end or the reclaim's, at most 1 s, makes its guard pages again as `_resetstkoflw` does, and goes on
+  (`test_a_stack_page_refused_during_a_move_is_had_once_it_ends`; a thread holding such a lock does not wait, as the
+  reclaim takes them, nor does the reclaim's own: `test_a_stack_page_refused_with_a_lock_held_is_not_waited_for`,
+  `test_the_reclaimers_own_stack_page_is_not_waited_for`; a refusal after the wait ends with 137, its line saying
+  it waited: `test_a_stack_page_refused_again_after_the_wait_ends_with_137`,
+  `test_a_stack_page_waits_for_a_move_that_does_not_end_to_its_bound`; all on Windows Server 2022 20348 and 2025
+  26100). The line that ends a VMM at the limit (`out_of_memory`) is written after 256 KiB of commit set
   aside for it is given back, so its stack can grow.
   Not before a commit made at once (`MAP_POPULATE`, a
   private file mapping's read, a `MAP_FIXED` recommit, a discard of private memory that is not lazy, a committing
-  `mprotect`) or an allocation of the VMM's own (its heap, a thread's stack): those are refused at the limit with no
+  `mprotect`) or an allocation of the VMM's own (its heap, a thread's stack with no reclaim under way): those are refused at the limit with no
   reclaim first (`ENOMEM`, or the process ends: a thread whose stack must grow ends it with 137 and a line, its
   refused commit told from a stack used up by the thread's TEB in an unhandled-exception filter, which bypasses
   Windows Error Reporting on purpose, as an end at the limit is not a crash; a stack used up still reaches it,

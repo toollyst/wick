@@ -253,31 +253,37 @@ pub(crate) fn deepest_uses() -> std::vec::Vec<(&'static str, usize)> {
     DEEPEST.lock().unwrap_or_else(PoisonError::into_inner).iter().copied().filter(|(n, _)| !n.is_empty()).collect()
 }
 
-#[cfg(test)]
 std::thread_local! {
-    /// How many of these locks this thread holds: only the first is
-    /// watched (and, with [`Probing::Guard`], probes), as its probe covers
-    /// the deepest nesting (condition A3.4), and a nested probe would itself
-    /// commit below the first one.
+    /// How many of these locks this thread holds, or is taking: counted
+    /// from before the lock is asked for until its guard drops. A thread
+    /// whose stack page the job's limit refused while a reclaim runs waits
+    /// for the reclaim only when it holds none
+    /// (`windows_mm::stack_page_after_the_reclaim`): the reclaim takes these
+    /// locks, so a thread holding one could be what it waits for. In
+    /// tests only the first is watched (and, with [`Probing::Guard`],
+    /// probes), as its probe covers the deepest nesting (condition A3.4),
+    /// and a nested probe would itself commit below the first one. A
+    /// const-initialised `Cell` with no destructor: a plain TLS read, from
+    /// an exception handler too ([`test_a_lock_taken_in_a_threads_teardown_is_probed`]'s
+    /// comment).
     static HELD: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
 }
 
-/// Tests: how many of these locks this thread holds now
+/// How many of these locks this thread holds now, or is taking
 /// (`wick_uffd::unmapping` asserts 0: no `munmap` or `MAP_FIXED` runs under
-/// one of this layer's locks).
-#[cfg(test)]
+/// one of this layer's locks; a refused stack page waits for a reclaim only
+/// at 0).
 pub(crate) fn held_here() -> u32 {
     HELD.with(core::cell::Cell::get)
 }
 
-/// A lock of this module held by this thread, with, in tests, its count in
-/// `HELD` and the outermost one's watch.
+/// A lock of this module held by this thread, counted in [`HELD`], with,
+/// in tests, the outermost one's watch.
 pub(crate) struct Held {
     #[cfg(test)]
     _watch: Option<Watch>,
 }
 
-#[cfg(test)]
 impl Drop for Held {
     fn drop(&mut self) {
         HELD.with(|h| h.set(h.get() - 1));
@@ -323,7 +329,6 @@ impl<'a, T> Probed<MutexGuard<'a, T>> {
 /// thread holds none of these locks yet, watched first (see [`Probing`]).
 #[track_caller]
 fn probed<G>(name: &'static str, take: impl FnOnce() -> LockResult<G>) -> LockResult<Probed<G>> {
-    #[cfg(test)]
     let first = HELD.with(|h| {
         let n = h.get();
         h.set(n + 1);
@@ -348,7 +353,7 @@ fn probed<G>(name: &'static str, take: impl FnOnce() -> LockResult<G>) -> LockRe
     };
     #[cfg(not(test))]
     let held = {
-        let _ = name;
+        let _ = (name, first);
         Held {}
     };
     match take() {
@@ -628,8 +633,9 @@ mod tests {
 
     /// A lock of this module taken in a thread's teardown, by one of its
     /// thread-locals' destructors, is watched and taken as anywhere else:
-    /// [`HELD`], read on every lock in tests (and by the probe of the stack
-    /// reclaim's step 3), is a const-initialised thread-local of
+    /// [`HELD`], counted on every lock and read by a refused stack page's
+    /// wait for a reclaim (`windows_mm::stack_page_after_the_reclaim`, in
+    /// an exception handler), is a const-initialised thread-local of
     /// a type with no destructor, which std on Windows (native TLS, the
     /// target has `has-thread-local`) makes a plain `#[thread_local]`
     /// static, with no registration, no allocation and no destroyed state

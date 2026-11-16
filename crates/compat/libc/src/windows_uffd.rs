@@ -1977,6 +1977,9 @@ unsafe extern "system" fn reclaimer(_: *mut c_void) -> u32 {
     // The asker holds the lock: a reclaim a fault here would start takes
     // nothing ([`reclaim_at_touch`]).
     HOLDS_LOCK.set(true);
+    // A stack page refused here is never waited for: the wait would be for
+    // this thread ([`on_the_reclaimer`]).
+    ON_THE_RECLAIMER.set(true);
     loop {
         // SAFETY: our event.
         unsafe { WaitForSingleObject(ASKED.load(Ordering::Acquire) as HANDLE, INFINITE) };
@@ -1985,6 +1988,7 @@ unsafe extern "system" fn reclaimer(_: *mut c_void) -> u32 {
         tests::COUNTING_ALLOCATIONS.with(|c| c.set(m.count));
         #[cfg(test)]
         tests::ALLOCATIONS.with(|a| a.set(0));
+        reclaim_progress(true);
         m.answer = match m.ask {
             Ask::None => Reclaimed::default(),
             Ask::Fill(need) => fill_pass(need),
@@ -1993,9 +1997,13 @@ unsafe extern "system" fn reclaimer(_: *mut c_void) -> u32 {
             Ask::Touch(need, skipped) => touch_pass(need, unsafe { skipped.as_mut() }),
             Ask::Move(d) => move_again(&d),
             #[cfg(test)]
-            Ask::End => return 0,
+            Ask::End => {
+                reclaim_progress(false);
+                return 0;
+            }
         };
         m.ask = Ask::None;
+        reclaim_progress(false);
         #[cfg(test)]
         {
             tests::COUNTING_ALLOCATIONS.with(|c| c.set(false));
@@ -2005,6 +2013,64 @@ unsafe extern "system" fn reclaimer(_: *mut c_void) -> u32 {
         // SAFETY: our event.
         unsafe { SetEvent(ANSWERED.load(Ordering::Acquire) as HANDLE) };
     }
+}
+
+std::thread_local! {
+    /// This thread is [`reclaimer`]'s.
+    static ON_THE_RECLAIMER: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Whether the calling thread is the reclaim's own ([`reclaimer`]), which
+/// makes every move: its stack is committed whole at its start
+/// ([`RECLAIMER_STACK`], `test_the_reclaimers_stack_on_record`), and a
+/// stack page refused on it is never waited for
+/// (`windows_mm::stack_page_after_the_reclaim`), as the wait would be for
+/// itself (`test_the_reclaimers_own_stack_page_is_not_waited_for`).
+pub(crate) fn on_the_reclaimer() -> bool {
+    ON_THE_RECLAIMER.get()
+}
+
+/// The reclaim's progress, for a thread whose stack page the job's limit
+/// refused while a reclaim runs (`windows_mm::stack_page_after_the_reclaim`):
+/// a count of its steps, shifted left once, and in the low bit whether
+/// [`reclaimer`] is answering an ask. The count goes up when an answer
+/// begins, at the end of each move ([`move_chunk`], made or not) and when
+/// the answer is given, so a value read with the bit set changes at the
+/// next move's end or the answer's, whichever comes first: where a moved
+/// chunk's dead pages have been given back, or the reclaim is over. Only
+/// [`reclaimer`] writes it.
+static RECLAIM_STATE: AtomicU64 = AtomicU64::new(0);
+
+/// A step of the reclaim ([`RECLAIM_STATE`]); `busy`, an answer under way.
+fn reclaim_progress(busy: bool) {
+    let s = RECLAIM_STATE.load(Ordering::Relaxed);
+    RECLAIM_STATE.store((((s >> 1) + 1) << 1) | u64::from(busy), Ordering::Release);
+}
+
+/// The reclaim's state ([`RECLAIM_STATE`]) if an answer is under way, for
+/// [`wait_for_the_reclaim`]; `None` if none is.
+pub(crate) fn reclaim_in_flight() -> Option<u64> {
+    let s = RECLAIM_STATE.load(Ordering::Acquire);
+    (s & 1 == 1).then_some(s)
+}
+
+/// Waits until the reclaim's state is no longer `seen` (a move ended or the
+/// answer was given), or for `bound` at most: whether it changed, and the
+/// microseconds waited. Yields between its reads (`SwitchToThread`), as an
+/// access to a moving chunk waits ([`fault`]); allocates nothing, takes no
+/// lock, and its stack is two shallow frames (STACKWAIT).
+pub(crate) fn wait_for_the_reclaim(seen: u64, bound: std::time::Duration) -> (bool, u64) {
+    let t = std::time::Instant::now();
+    let ended = loop {
+        if RECLAIM_STATE.load(Ordering::Acquire) != seen {
+            break true;
+        }
+        if t.elapsed() >= bound {
+            break false;
+        }
+        std::thread::yield_now();
+    };
+    (ended, u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX))
 }
 
 /// Asks [`reclaimer`] for `ask` and waits for the answer; the caller holds
@@ -2214,6 +2280,9 @@ pub struct ReclaimCounts {
     pub refused: u64,
     /// The address of the chunk moved last (its guest view), 0 for none.
     pub last_moved: usize,
+    /// Stack pages the job's limit refused during a reclaim and had after
+    /// a wait for its next step (`windows_mm::stack_page_after_the_reclaim`).
+    pub stack_pages_after_a_wait: u64,
 }
 
 /// The reclaim's counts so far: read-only, for a record of what it did
@@ -2227,6 +2296,7 @@ pub fn reclaim_counts() -> ReclaimCounts {
         moves: MOVES_MADE.load(Ordering::Relaxed) as u64,
         refused: crate::windows_mm::moves_refused(),
         last_moved: LAST_MOVED.load(Ordering::Relaxed),
+        stack_pages_after_a_wait: crate::windows_mm::stack_pages_after_a_wait(),
     }
 }
 
@@ -2247,6 +2317,7 @@ fn move_chunk(d: &Candidate) -> Reclaimed {
     let us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
     MOVING_START.store(0, Ordering::SeqCst);
     MOVING_END.store(0, Ordering::SeqCst);
+    reclaim_progress(true);
     let Some((copied, freed)) = moved else {
         return Reclaimed::default();
     };
@@ -4152,6 +4223,229 @@ mod tests {
     #[ignore = "run by test_a_stack_that_must_grow_at_the_limit_ends_with_137 in a job of its own"]
     fn stack_at_the_limit_pool_child() {
         stack_at_the_limit(Kind::Pool);
+    }
+
+    /// What a child of [`stack_during_a_move`] does once a move is held in
+    /// its middle with no room left in the job.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum DuringMove {
+        /// A thread holding no lock goes 128 KiB deep, is refused a stack
+        /// page, waits; the move is let go once it waits.
+        Ends,
+        /// The same thread goes deep holding `RELEASED`.
+        Held,
+        /// The thread waits; the move is never let go.
+        Never,
+        /// As `Ends`, its retry refused (`REFUSE_STACK_RETRY`).
+        Again,
+        /// The reclaim's own thread goes 128 KiB deep in the move's middle.
+        Reclaimer,
+    }
+
+    static MOVE_HELD: AtomicBool = AtomicBool::new(false);
+    static MOVE_GO: AtomicBool = AtomicBool::new(false);
+    static DEEP_GO: AtomicBool = AtomicBool::new(false);
+    static TOUCH_GO: AtomicBool = AtomicBool::new(false);
+
+    /// [`windows_mm::MOVE_HOOK`]'s: holds the move (on the reclaim's
+    /// thread) until [`MOVE_GO`], which may never come.
+    fn hold_the_move() {
+        MOVE_HELD.store(true, Ordering::SeqCst);
+        while !MOVE_GO.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
+    /// [`windows_mm::MOVE_HOOK`]'s: the reclaim's own thread goes 128 KiB
+    /// deep in the move's middle, past the 64 KiB committed at its start.
+    fn deep_on_the_reclaimer() {
+        MOVE_HELD.store(true, Ordering::SeqCst);
+        core::hint::black_box(deep(32));
+    }
+
+    /// Waits for `n` waits of a refused stack page to have begun.
+    fn wait_for_stack_waits(n: u64) {
+        let t = std::time::Instant::now();
+        while crate::windows_mm::STACK_WAITS_BEGUN.load(Ordering::SeqCst) < n {
+            assert!(t.elapsed() < std::time::Duration::from_secs(20), "no refused stack page waited");
+            std::thread::yield_now();
+        }
+    }
+
+    /// A chunk with 1 MiB of dead pages, moved by a touch's reclaim at the
+    /// job's limit and held in the move's middle ([`hold_the_move`]); a
+    /// Rust thread (its stack guarantee 20 KiB) then goes 128 KiB deep, or
+    /// the reclaim's own thread does, as `mode` says.
+    fn stack_during_a_move(mode: DuringMove) {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 2 * CHUNK;
+        let mem = map(len as usize);
+        register(ctx, mem, len).unwrap();
+        let data = std::vec![0x5au8; len as usize];
+        // SAFETY: `data` holds `len` bytes.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, len, true) }.unwrap(), len);
+        for p in (0..CHUNK).step_by(2 * PAGE as usize) {
+            // SAFETY: registered memory of ours.
+            assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        }
+        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = Some(if mode == DuringMove::Reclaimer { deep_on_the_reclaimer } else { hold_the_move });
+        crate::windows_mm::REFUSE_STACK_RETRY.store(mode == DuringMove::Again, Ordering::SeqCst);
+        // Both threads made before the limit, the toucher's stack grown.
+        let deep_one = std::thread::Builder::new()
+            .name("wick-stack-wait".into())
+            .spawn(move || {
+                while !DEEP_GO.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                if mode == DuringMove::Held { crate::windows_mm::with_released_held(|| deep(32)) } else { deep(32) }
+            })
+            .unwrap();
+        let toucher = std::thread::spawn(|| {
+            core::hint::black_box(deep(16));
+            while !TOUCH_GO.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            reclaim_at_touch(PAGE as usize)
+        });
+        let mut held = no_room_left();
+        TOUCH_GO.store(true, Ordering::SeqCst);
+        wait_for(&MOVE_HELD, "the move");
+        if mode != DuringMove::Reclaimer {
+            DEEP_GO.store(true, Ordering::SeqCst);
+        }
+        if matches!(mode, DuringMove::Ends | DuringMove::Again) {
+            wait_for_stack_waits(1);
+            MOVE_GO.store(true, Ordering::SeqCst);
+        } else {
+            // The process ends with 137 meanwhile.
+            wait_for(&MOVE_GO, "the end with 137");
+        }
+        let r = toucher.join().expect("the toucher failed");
+        let v = deep_one.join().expect("the deep thread failed");
+        give_back_every_page(&mut held);
+        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = None;
+        std::println!(
+            "DURINGMOVE {mode:?}: {} chunk moved; the deep thread came back ({v}); {} stack page(s) had after a wait",
+            r.chunks,
+            crate::windows_mm::stack_pages_after_a_wait()
+        );
+        assert_eq!(r.chunks, 1);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// The lines of a [`stack_during_a_move`] child, for the record.
+    fn during_move_lines(text: &str) -> std::string::String {
+        text.lines()
+            .filter(|l| l.starts_with("STACKWAIT") || l.starts_with("DURINGMOVE") || l.starts_with("wick: a thread's stack"))
+            .collect::<std::vec::Vec<_>>()
+            .join(" | ")
+    }
+
+    /// A stack page the job's limit refuses while a move is in its middle
+    /// is had once the move ends, and the thread goes on: the thread,
+    /// holding none of wick's memory locks, waits for the reclaim's next
+    /// step and asks once more (`windows_mm::stack_page_after_the_reclaim`),
+    /// as Linux's memory cgroup reclaims and charges the page (where before
+    /// the process ended with 137). STACKWAIT: the stack the wait and the
+    /// retry used under the handler's frame, of what was left there.
+    #[test]
+    fn test_a_stack_page_refused_during_a_move_is_had_once_it_ends() {
+        let (code, text) = run_child("stack_during_a_move_ends_child", Some(96 << 20));
+        std::eprintln!("STACKWAIT ends: {code:?}; {}", during_move_lines(&text));
+        assert!(text.contains("DURINGMOVE Ends: 1 chunk moved; the deep thread came back"), "{text}");
+        assert!(text.lines().any(|l| l.starts_with("STACKWAIT") && l.contains("the reclaim's step seen; the page had")), "{text}");
+        assert!(!text.contains("wick: a thread's stack could not grow"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_page_refused_during_a_move_is_had_once_it_ends in a job of its own"]
+    fn stack_during_a_move_ends_child() {
+        stack_during_a_move(DuringMove::Ends);
+    }
+
+    /// A thread that holds one of wick's memory locks (`RELEASED`, as
+    /// `released_resolve` holds it over its charge and commit) when its
+    /// stack page is refused during a move does not wait: the move may need
+    /// that lock, so the wait could be for itself. It ends as before, with
+    /// 137, at once, its line saying why it did not wait.
+    #[test]
+    fn test_a_stack_page_refused_with_a_lock_held_is_not_waited_for() {
+        let (code, text) = run_child("stack_during_a_move_held_child", Some(96 << 20));
+        std::eprintln!("STACKWAIT held: {code:?}; {}", during_move_lines(&text));
+        let line = text.lines().find(|l| l.starts_with("wick: a thread's stack could not grow")).unwrap_or_default();
+        assert!(line.contains("\"wick-stack-wait\"") && line.contains("a reclaim was under way and was not waited for: the thread held 1 of wick's memory locks"), "{text}");
+        assert!(!text.contains("STACKWAIT the wait"), "{text}");
+        assert_eq!(code, Some(137), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_page_refused_with_a_lock_held_is_not_waited_for in a job of its own"]
+    fn stack_during_a_move_held_child() {
+        stack_during_a_move(DuringMove::Held);
+    }
+
+    /// A wait for a move that does not end is bounded
+    /// (`windows_mm::STACK_WAIT_BOUND`, 1 s): the page is asked for once
+    /// more, refused, and the process ends with 137, its line saying it
+    /// waited to the bound.
+    #[test]
+    fn test_a_stack_page_waits_for_a_move_that_does_not_end_to_its_bound() {
+        let (code, text) = run_child("stack_during_a_move_never_child", Some(96 << 20));
+        std::eprintln!("STACKWAIT never: {code:?}; {}", during_move_lines(&text));
+        let line = text.lines().find(|l| l.starts_with("wick: a thread's stack could not grow")).unwrap_or_default();
+        assert!(line.contains("a reclaim was under way and was waited for, ") && line.contains("(its bound reached), and the page was still refused"), "{text}");
+        let us: u64 = line.split("waited for, ").nth(1).and_then(|r| r.split(' ').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
+        assert!((1_000_000..3_000_000).contains(&us), "waited {us} us: {text}");
+        assert_eq!(code, Some(137), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_page_waits_for_a_move_that_does_not_end_to_its_bound in a job of its own"]
+    fn stack_during_a_move_never_child() {
+        stack_during_a_move(DuringMove::Never);
+    }
+
+    /// One wait and one retry: a page refused again after the move ended
+    /// (the retry refused by `REFUSE_STACK_RETRY`, a test hook) ends the
+    /// process with 137, its line saying it waited for the reclaim's step
+    /// and the page was still refused, which tells it from the end without
+    /// a wait.
+    #[test]
+    fn test_a_stack_page_refused_again_after_the_wait_ends_with_137() {
+        let (code, text) = run_child("stack_during_a_move_again_child", Some(96 << 20));
+        std::eprintln!("STACKWAIT again: {code:?}; {}", during_move_lines(&text));
+        let line = text.lines().find(|l| l.starts_with("wick: a thread's stack could not grow")).unwrap_or_default();
+        assert!(line.contains("a reclaim was under way and was waited for, ") && line.contains("(to its next step), and the page was still refused"), "{text}");
+        assert_eq!(code, Some(137), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_page_refused_again_after_the_wait_ends_with_137 in a job of its own"]
+    fn stack_during_a_move_again_child() {
+        stack_during_a_move(DuringMove::Again);
+    }
+
+    /// The reclaim's own thread never waits for a reclaim (it would wait
+    /// for itself): its stack is committed whole at its start
+    /// (`RECLAIMER_STACK`, `test_the_reclaimers_stack_on_record`); made to
+    /// go past it in a move's middle at the limit, it ends the process with
+    /// 137 at once, its line naming it.
+    #[test]
+    fn test_the_reclaimers_own_stack_page_is_not_waited_for() {
+        let (code, text) = run_child("stack_during_a_move_reclaimer_child", Some(96 << 20));
+        std::eprintln!("STACKWAIT reclaimer: {code:?}; {}", during_move_lines(&text));
+        let line = text.lines().find(|l| l.starts_with("wick: a thread's stack could not grow")).unwrap_or_default();
+        assert!(line.contains("a reclaim was under way and was not waited for: the thread is the reclaim's own"), "{text}");
+        assert!(!text.contains("STACKWAIT the wait"), "{text}");
+        assert_eq!(code, Some(137), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_the_reclaimers_own_stack_page_is_not_waited_for in a job of its own"]
+    fn stack_during_a_move_reclaimer_child() {
+        stack_during_a_move(DuringMove::Reclaimer);
     }
 
     /// A stack overflow at the reserve's end is still one, with the stack
