@@ -4000,6 +4000,14 @@ mod macos {
                 // SAFETY: registered memory, filled.
                 let r = unsafe { libc::madvise(registered as *mut _, LEN, advice) };
                 assert_eq!(r, 0, "registered, advice {advice}: {:?}", errno());
+                // The remove event is written before madvise returns, so it
+                // is waited for at most 5 s: without it the child fails
+                // here, where a blocking read would hang it to CHILD_LIMIT.
+                let mut ready = libc::pollfd { fd: user, events: libc::POLLIN, revents: 0 };
+                // SAFETY: one pollfd, ours.
+                let polled = unsafe { libc::poll(&mut ready, 1, 5000) };
+                let why = if polled < 0 { format!(", errno {:?}", errno()) } else { String::new() };
+                assert_eq!(polled, 1, "registered, advice {advice}: no event in 5 s (poll returned {polled}{why})");
                 let mut record = [0u8; proto::RECORD];
                 // SAFETY: reads one record into a local buffer.
                 let n = unsafe { libc::read(user, record.as_mut_ptr().cast(), proto::RECORD) };
