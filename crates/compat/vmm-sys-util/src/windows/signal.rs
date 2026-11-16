@@ -6,8 +6,17 @@
 //!
 //! - Thread-directed signals ([`Killable::kill`], `pthread_kill`) are special
 //!   user APCs (`QueueUserAPC2`, or `NtQueueApcThreadEx` before Windows 11):
-//!   they interrupt the target thread wherever it runs, without it waiting
-//!   alertably, and run the handler on that thread, as a signal does.
+//!   they interrupt the target thread in user code or in an alertable wait,
+//!   and run the handler on that thread, as a signal does. Not as Linux: a
+//!   thread in a system call or a non-alertable wait (a blocking read, a
+//!   lock, a channel's `recv`) runs the handler only once that call or wait
+//!   ends (Learn, QueueUserAPC2: "If the target thread is executing a system
+//!   call, or performing a non-alertable wait, the APC will be executed
+//!   after the system call or non-alertable wait finishes (the wait is not
+//!   interrupted)"), where Linux runs it at once and the call restarts or
+//!   fails with `EINTR` (`test_a_signal_to_a_thread_in_a_wait_runs_once_its_wait_ends`).
+//!   Firecracker's vCPU kick does not wait for its handler: the WHP backend's
+//!   `set_kvm_immediate_exit` cancels the run itself.
 //! - Faults are delivered from the unhandled-exception filter, so exceptions
 //!   that structured exception handling catches stay with it, as they never
 //!   become signals on Linux either: access violations are `SIGSEGV`
@@ -183,12 +192,55 @@ thread_local! {
     static PENDING: AtomicU64 = const { AtomicU64::new(0) };
 }
 
+/// What became of each signal sent with `send`, by number, for the tests'
+/// record of a signal that was not delivered (KILLREC): process-wide, as a
+/// thread's own storage may not be there yet.
+#[cfg(test)]
+pub(crate) mod record {
+    use std::sync::atomic::AtomicU64;
+
+    const N: usize = 65;
+    /// `send`: queued after its thread-local storage was seen.
+    pub(crate) static QUEUED: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// `send`: queued with no look at the thread's storage (its TEB not
+    /// read, or gone when read).
+    pub(crate) static QUEUED_UNSEEN: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// `send`: the thread had exited; nothing queued.
+    pub(crate) static EXITED: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// `apc` ran.
+    pub(crate) static RAN: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// `apc` ran with the thread's storage pointer not set: dropped.
+    pub(crate) static NO_STORAGE: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// `deliver` found the signal blocked: kept pending.
+    pub(crate) static PENDED: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// `deliver` found no handler.
+    pub(crate) static NO_HANDLER: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// `deliver` ran the handler.
+    pub(crate) static HANDLED: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+
+    pub(crate) fn bump(what: &[AtomicU64; N], num: usize) {
+        if let Some(c) = what.get(num) {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The counts of `num`, in the order above.
+    pub(crate) fn of(num: usize) -> [u64; 8] {
+        [&QUEUED, &QUEUED_UNSEEN, &EXITED, &RAN, &NO_STORAGE, &PENDED, &NO_HANDLER, &HANDLED]
+            .map(|c| c[num].load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
 /// Runs the handler of `num` on this thread, or keeps it pending if blocked.
 fn deliver(num: c_int) {
     if MASK.with(|m| m.load(Ordering::SeqCst)) & bit(num) != 0 {
         PENDING.with(|p| p.fetch_or(bit(num), Ordering::SeqCst));
+        #[cfg(test)]
+        record::bump(&record::PENDED, num as usize);
         return;
     }
+    #[cfg(test)]
+    record::bump(if handler(num).is_some() { &record::HANDLED } else { &record::NO_HANDLER }, num as usize);
     if let Some(f) = handler(num) {
         let mut info = siginfo_t::new(num, SI_TKILL, std::ptr::null_mut());
         f(num, &mut info, std::ptr::null_mut());
@@ -419,8 +471,12 @@ fn own_tls_ready() -> bool {
 }
 
 unsafe extern "system" fn apc(num: usize) {
+    #[cfg(test)]
+    record::bump(&record::RAN, num);
     // Handlers and the signal mask live in thread-local storage.
     if !own_tls_ready() {
+        #[cfg(test)]
+        record::bump(&record::NO_STORAGE, num);
         return;
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -444,6 +500,8 @@ type NtQueryInformationThread =
 /// Waits until `thread` has its thread-local storage. `false` if it does not
 /// get it in time (a suspended thread).
 fn wait_tls_ready(thread: HANDLE) -> bool {
+    #[cfg(test)]
+    SEEN.with(|s| s.set(false));
     static QUERY: std::sync::OnceLock<Option<NtQueryInformationThread>> =
         std::sync::OnceLock::new();
     let query = QUERY.get_or_init(|| {
@@ -483,6 +541,8 @@ fn wait_tls_ready(thread: HANDLE) -> bool {
         };
         if read == 0 || value != 0 {
             // Ready, or the TEB is gone: queue, and send judges the result.
+            #[cfg(test)]
+            SEEN.with(|s| s.set(read != 0));
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -490,6 +550,13 @@ fn wait_tls_ready(thread: HANDLE) -> bool {
         }
         std::thread::yield_now();
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether this thread's last `wait_tls_ready` saw the storage pointer
+    /// set (the record's QUEUED against QUEUED_UNSEEN).
+    static SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 unsafe extern "system" fn nt_apc(num: usize, _: usize, _: usize) {
@@ -558,11 +625,15 @@ fn send(thread: HANDLE, num: c_int) -> errno::Result<()> {
     // (31: KILLTEST, CI run 43306073982), which vmm's kick of a vCPU thread
     // that had finished returned (test_vcpu_dump_cpu_config, run 43292883636).
     if exited(thread, 0) {
+        #[cfg(test)]
+        record::bump(&record::EXITED, arg);
         return Ok(());
     }
     if !wait_tls_ready(thread) {
         return Err(errno::Error::new(libc::EAGAIN));
     }
+    #[cfg(test)]
+    record::bump(if SEEN.with(std::cell::Cell::get) { &record::QUEUED } else { &record::QUEUED_UNSEEN }, arg);
     match queue() {
         // SAFETY: queues an APC on a thread handle the caller holds.
         Queue::Kernel32(f) => {
@@ -753,27 +824,97 @@ mod tests {
         t.join().unwrap();
     }
 
+    /// This test's handler's count: its own, as `CALLED` is the other
+    /// tests' too (one of theirs running meanwhile would pass it).
+    static AFTER_SPAWN: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn count_after_spawn(num: c_int, info: *mut siginfo_t, _: *mut c_void) {
+        assert_eq!(unsafe { (*info).si_signo }, num);
+        AFTER_SPAWN.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A signal sent to a thread that may still be starting, and then runs
+    /// user code: delivered once it can run handlers, every time. The
+    /// thread runs user code throughout (it spins), as a special user APC
+    /// interrupts only that or an alertable wait: one that waited in a
+    /// non-alertable wait instead (this test's earlier `recv_timeout`) ran
+    /// its handler only when the wait ended, and the test failed in 7 of 40
+    /// runs of the crate's tests on Windows Server 2022 20348, KILLREC
+    /// showing the APC queued and run once the thread was woken
+    /// (`test_a_signal_to_a_thread_in_a_wait_runs_once_its_wait_ends`).
     #[test]
     fn test_kill_right_after_spawn() {
-        // Sent while the thread may still be starting: delivered once it can
-        // run handlers, every time.
         let num = SIGRTMIN() + 3;
-        register_signal_handler(num, count).unwrap();
-        for _ in 0..200 {
-            let before = CALLED.load(Ordering::SeqCst);
-            let (tx, rx) = mpsc::channel::<()>();
-            let t = std::thread::spawn(move || {
-                let _ = rx.recv_timeout(Duration::from_secs(5));
-            });
+        register_signal_handler(num, count_after_spawn).unwrap();
+        for round in 0..200 {
+            let before = AFTER_SPAWN.load(Ordering::SeqCst);
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let t = {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let start = std::time::Instant::now();
+                    while !stop.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(10) {
+                        std::hint::spin_loop();
+                    }
+                })
+            };
+            let sent = record::of(num as usize);
             t.kill(num).unwrap();
             let start = std::time::Instant::now();
-            while CALLED.load(Ordering::SeqCst) == before {
-                assert!(start.elapsed() < Duration::from_secs(5), "not delivered");
+            while AFTER_SPAWN.load(Ordering::SeqCst) == before {
+                if start.elapsed() >= Duration::from_secs(5) {
+                    let now = record::of(num as usize);
+                    let d: Vec<u64> = now.iter().zip(sent).map(|(a, b)| a - b).collect();
+                    stop.store(true, Ordering::SeqCst);
+                    panic!(
+                        "not delivered in round {round}: KILLREC queued {} (unseen {}), exited {}, the APC ran {} \
+                         (no storage {}), pended {}, no handler {}, handled {}",
+                        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+                    );
+                }
                 std::thread::yield_now();
             }
-            tx.send(()).unwrap();
+            stop.store(true, Ordering::SeqCst);
             t.join().unwrap();
         }
+    }
+
+    static AFTER_WAIT: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn count_after_wait(num: c_int, info: *mut siginfo_t, _: *mut c_void) {
+        assert_eq!(unsafe { (*info).si_signo }, num);
+        AFTER_WAIT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A signal sent to a thread in a non-alertable wait (a channel's
+    /// `recv`) runs its handler once the wait ends, and not before (Learn,
+    /// QueueUserAPC2: "If the target thread is executing a system call, or
+    /// performing a non-alertable wait, the APC will be executed after the
+    /// system call or non-alertable wait finishes (the wait is not
+    /// interrupted)"); Linux runs it at once and the wait goes on (a futex
+    /// wait restarts, or fails with `EINTR`). Asserted: it is run once, by
+    /// the end; whether it ran during the wait is printed (KILLWAIT).
+    #[test]
+    fn test_a_signal_to_a_thread_in_a_wait_runs_once_its_wait_ends() {
+        let num = SIGRTMIN() + 4;
+        register_signal_handler(num, count_after_wait).unwrap();
+        let (tx, rx) = mpsc::channel::<()>();
+        let (in_tx, in_rx) = mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            in_tx.send(()).unwrap();
+            let _ = rx.recv_timeout(Duration::from_secs(30));
+        });
+        in_rx.recv().unwrap();
+        // In its wait by now, all but surely.
+        std::thread::sleep(Duration::from_millis(100));
+        t.kill(num).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let during = AFTER_WAIT.load(Ordering::SeqCst);
+        tx.send(()).unwrap();
+        t.join().unwrap();
+        let by_the_end = AFTER_WAIT.load(Ordering::SeqCst);
+        println!("KILLWAIT run during the wait {during} times (Linux: 1), by the end {by_the_end} (Linux: 1)");
+        assert_eq!(by_the_end, 1, "the handler of a signal sent to a waiting thread");
     }
 
     #[test]

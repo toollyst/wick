@@ -324,8 +324,14 @@ semantics on Win32. The details are in the comments of each
   count and re-arms. Clocks: QPC (MONOTONIC), interrupt time (BOOTTIME),
   `GetSystemTimePreciseAsFileTime` (REALTIME), process/thread times (CPU
   clocks).
-- **signals = APCs and an exception filter.** A signal to a thread is a user
-  APC (`QueueUserAPC2`, else `NtQueueApcThreadEx`); faults are caught by
+- **signals = APCs and an exception filter.** A signal to a thread is a
+  special user APC (`QueueUserAPC2`, else `NtQueueApcThreadEx`), which
+  interrupts the thread in user code or an alertable wait; a thread in a
+  system call or a non-alertable wait runs the handler once that ends, where
+  Linux interrupts it (`EINTR` or a restart): a stated difference
+  (`test_a_signal_to_a_thread_in_a_wait_runs_once_its_wait_ends`; Learn,
+  QueueUserAPC2). Firecracker's vCPU kick does not depend on it: the WHP
+  backend's `set_kvm_immediate_exit` cancels a run itself. Faults are caught by
   `SetUnhandledExceptionFilter` and reported with Linux `si_code` and
   `si_addr`. Console control events are `SIGINT`, `SIGQUIT` and `SIGHUP`.
 - **mmap = placeholder virtual memory (Windows 10 1803+).** One mapping is one
