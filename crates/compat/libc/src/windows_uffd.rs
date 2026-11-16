@@ -1299,6 +1299,13 @@ fn fill(
         }
     };
     let bytes = done * PAGE;
+    // The wake may run without `LOCK`: after an ENOENT from `wait_and_move`
+    // the guard was let go for the wait and not taken again. That is in
+    // order, as `wake_range` (`UFFDIO_WAKE`) wakes without it too: a wake
+    // touches only the waiters' slots and semaphores, and a woken waiter's
+    // access runs again, faulting again if its page is still missing (Linux's
+    // `wake_userfault` takes no `mmap_lock` either, v6.1 fs/userfaultfd.c
+    // :1216).
     if wake_up && bytes > 0 {
         wake_ctx(ctx, dst, bytes);
     }

@@ -617,8 +617,8 @@ upstream Firecracker and its jailer.
   `ENOMEM`. While the VMM lives, no copy is refused. This is what v6.1's charge path does: it reclaims, then calls
   the OOM killer and charges again once a task was killed, and returns `-ENOMEM` only when no task can be killed
   (mm/memcontrol.c, `try_charge_memcg` :2714 to :2743, `mem_cgroup_oom` :1891). Here, the same now: a fill the job
-  still refuses after the reclaim at the limit (`reclaim_for_a_fill`, which waits for the system calls copying the
-  chunks it passed over and reclaims again, the memory.max row) ends the VMM with 137 and a line naming the fill, the
+  still refuses after the reclaim at the limit (`reclaim_for_a_fill`, which lists the chunks it passed over for system
+  calls copying them; the fill waits for those calls, moves the chunks and reclaims again, the memory.max row) ends the VMM with 137 and a line naming the fill, the
   bytes it filled and the chunks it waited for, so the handler finds its socket closed
   (`test_a_fill_past_the_job_limit_ends_the_vmm_with_137`, `test_a_fill_with_nothing_reclaimable_ends_named`; before,
   the handler got `ENOMEM` and the VMM went on). What stays different: the page table a fill needs is charged on Linux
