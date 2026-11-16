@@ -46,7 +46,11 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::boxed::Box;
 use std::io;
-use std::sync::{Mutex, Once};
+use std::sync::Once;
+#[cfg(test)]
+use std::sync::Mutex;
+
+use crate::windows_stacklock::ProbedMutex;
 use std::vec::Vec;
 
 use windows_sys::Win32::Foundation::HANDLE;
@@ -189,7 +193,7 @@ static WAITERS: [Waiter; MAX_WAITERS] = [const {
 /// Number of registered ranges (the I/O wrappers skip all work at 0).
 static REGISTERED: AtomicUsize = AtomicUsize::new(0);
 /// Serializes changes to the ranges. Taken through [`lock`].
-static LOCK: Mutex<()> = Mutex::new(());
+static LOCK: ProbedMutex<()> = ProbedMutex::new("the userfaultfd ranges' LOCK", ());
 
 std::thread_local! {
     /// This thread holds [`LOCK`]: a reclaim it would start (a lazy page a
@@ -198,7 +202,7 @@ std::thread_local! {
 }
 
 /// [`LOCK`], held until the guard drops.
-struct Locked(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+struct Locked(#[allow(dead_code)] crate::windows_stacklock::Probed<std::sync::MutexGuard<'static, ()>>);
 
 impl Drop for Locked {
     fn drop(&mut self) {
@@ -206,6 +210,7 @@ impl Drop for Locked {
     }
 }
 
+#[track_caller]
 fn lock() -> Locked {
     let g = LOCK.lock().unwrap();
     HOLDS_LOCK.set(true);
@@ -1202,8 +1207,8 @@ struct Candidate {
 /// `CANDIDATES` is a reclaim's list, under [`LOCK`]; `TOUCH_SKIPPED` the
 /// chunks a touch's reclaim passed over and waits for, under its own lock,
 /// which one touch's wait holds ([`reclaim_at_touch`]).
-static CANDIDATES: Mutex<Vec<Candidate>> = Mutex::new(Vec::new());
-static TOUCH_SKIPPED: Mutex<Vec<Candidate>> = Mutex::new(Vec::new());
+static CANDIDATES: ProbedMutex<Vec<Candidate>> = ProbedMutex::new("CANDIDATES", Vec::new());
+static TOUCH_SKIPPED: ProbedMutex<Vec<Candidate>> = ProbedMutex::new("TOUCH_SKIPPED", Vec::new());
 
 /// Reserves the reclaim's working memory for `chunks` chunks registered at
 /// once ([`CANDIDATES`], [`TOUCH_SKIPPED`]) and room for its discard guards
@@ -1269,7 +1274,7 @@ struct Mailbox {
 // while the thread that owns it waits for the answer.
 unsafe impl Send for Mailbox {}
 
-static MAILBOX: Mutex<Mailbox> = Mutex::new(Mailbox {
+static MAILBOX: ProbedMutex<Mailbox> = ProbedMutex::new("MAILBOX", Mailbox {
     ask: Ask::None,
     answer: Reclaimed { chunks: 0, copied: 0, freed: 0, skipped: 0 },
     #[cfg(test)]
@@ -1758,6 +1763,93 @@ mod tests {
             unsafe { copy(ctx, data.as_ptr(), page, PAGE, true) }.unwrap();
         }
         event
+    }
+
+    /// PROBECOST: the fill path's time per page with the stack probe of its
+    /// locks as the product has it (`windows_stacklock::probe`, which writes
+    /// nothing) and with the probe that zeroed its 16 KiB frame, no watch
+    /// in either. Per round, 4 MiB of a registered range not yet used: a
+    /// fill (`copy`) of each page by this thread; or a host thread's read of
+    /// each page, each filled by this thread as its handler (the fault, the
+    /// event, the fill, the wake). 5 rounds of each kind in turn; the least
+    /// and the median round printed, in microseconds a page. One range is
+    /// registered for all rounds: a range unregistered keeps its slot until
+    /// the userfaultfd is released, so the same addresses mapped again
+    /// cannot be registered before that. Asserted only that the fills went
+    /// on. Run with `--release --ignored --nocapture`.
+    #[test]
+    #[ignore = "a record: run alone, with --release --ignored --nocapture"]
+    fn test_the_fills_cost_on_record() {
+        use crate::windows_stacklock::{PROBING, Probing};
+        const ROUND: u64 = 4 << 20;
+        const PAGES: u64 = ROUND / PAGE;
+        const ROUNDS: u64 = 5;
+        let len = 2 * 2 * ROUNDS * ROUND;
+        let (ctx, user) = create(0, false, true).unwrap();
+        // SAFETY: a new anonymous mapping, committed at first touch, as a
+        // guest's memory is.
+        let mem = unsafe {
+            crate::mmap(
+                ptr::null_mut(),
+                len as usize,
+                crate::PROT_READ | crate::PROT_WRITE,
+                crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, crate::MAP_FAILED);
+        let mem = mem as u64;
+        register(ctx, mem, len).unwrap();
+        let next = core::cell::Cell::new(mem);
+        let slice = || {
+            let at = next.get();
+            next.set(at + ROUND);
+            at
+        };
+        let page = std::vec![0x5au8; PAGE as usize];
+        let fills = |kind: Probing| {
+            PROBING.with(|p| p.set(kind));
+            let at = slice();
+            let t = std::time::Instant::now();
+            for p in 0..PAGES {
+                // SAFETY: `page` holds a page.
+                unsafe { copy(ctx, page.as_ptr(), at + p * PAGE, PAGE, false) }.unwrap();
+            }
+            t.elapsed().as_secs_f64() * 1e6 / PAGES as f64
+        };
+        let faults = |kind: Probing| {
+            PROBING.with(|p| p.set(kind));
+            let at = slice();
+            let t = std::time::Instant::now();
+            let reader = std::thread::spawn(move || {
+                PROBING.with(|p| p.set(kind));
+                for p in 0..PAGES {
+                    // SAFETY: registered memory; the read waits for the fill.
+                    assert_eq!(unsafe { core::ptr::read_volatile((at + p * PAGE) as *const u8) }, 0x6b);
+                }
+            });
+            for _ in 0..PAGES {
+                assert_eq!(serve_one(user, ctx, 0x6b)[0], proto::EVENT_PAGEFAULT);
+            }
+            reader.join().unwrap();
+            t.elapsed().as_secs_f64() * 1e6 / PAGES as f64
+        };
+        let was = PROBING.with(core::cell::Cell::get);
+        for (what, run) in [("fill", &fills as &dyn Fn(Probing) -> f64), ("fault", &faults)] {
+            let (mut probe, mut zeroing) = (std::vec::Vec::new(), std::vec::Vec::new());
+            for _ in 0..ROUNDS {
+                probe.push(run(Probing::Probe));
+                zeroing.push(run(Probing::Zeroing));
+            }
+            for (name, v) in [("probe", &mut probe), ("zeroing", &mut zeroing)] {
+                v.sort_by(f64::total_cmp);
+                std::println!("PROBECOST {what} {name}: {:.2} us a page least, {:.2} median, of {ROUNDS} rounds of {PAGES} pages", v[0], v[2]);
+            }
+        }
+        PROBING.with(|p| p.set(was));
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
     }
 
     #[test]

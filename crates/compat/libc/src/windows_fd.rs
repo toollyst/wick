@@ -60,7 +60,9 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+use crate::windows_stacklock::ProbedMutex;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE,
@@ -312,9 +314,13 @@ pub mod wick_fd {
         }
     }
 
-    fn table() -> &'static Mutex<HashMap<c_int, Entry>> {
-        static T: OnceLock<Mutex<HashMap<c_int, Entry>>> = OnceLock::new();
-        T.get_or_init(Mutex::default)
+    /// The attachments, by descriptor: a lock the memory code takes too (a
+    /// file mapping's section, through [`attached`]), so, as every lock of
+    /// this crate's Windows modules, it is taken with its stack committed
+    /// first (`windows_stacklock`).
+    fn table() -> &'static ProbedMutex<HashMap<c_int, Entry>> {
+        static T: OnceLock<ProbedMutex<HashMap<c_int, Entry>>> = OnceLock::new();
+        T.get_or_init(|| ProbedMutex::new("the descriptor table", HashMap::new()))
     }
 
     fn own(h: HANDLE) -> Option<HANDLE> {
@@ -469,10 +475,10 @@ pub mod wick_fd {
         flags
     }
 
-    fn drains() -> &'static Mutex<HashMap<c_int, Arc<std::sync::atomic::AtomicU64>>> {
-        static D: OnceLock<Mutex<HashMap<c_int, Arc<std::sync::atomic::AtomicU64>>>> =
+    fn drains() -> &'static ProbedMutex<HashMap<c_int, Arc<std::sync::atomic::AtomicU64>>> {
+        static D: OnceLock<ProbedMutex<HashMap<c_int, Arc<std::sync::atomic::AtomicU64>>>> =
             OnceLock::new();
-        D.get_or_init(Mutex::default)
+        D.get_or_init(|| ProbedMutex::new("the drain counters", HashMap::new()))
     }
 
     /// The drain counter of `fd`, for edge-triggered polling (the Windows

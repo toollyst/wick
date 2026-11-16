@@ -133,6 +133,9 @@ pub use windows_socket::{
 };
 #[cfg(windows)]
 mod windows_mm;
+// The locks of wick's memory code, taken with the stack committed first.
+#[cfg(windows)]
+mod windows_stacklock;
 // The records for section memory charged against memory.max (SECTREC).
 #[cfg(all(windows, test))]
 mod windows_sectrec;

@@ -51,7 +51,11 @@
 //! pages.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex;
+
+use crate::windows_stacklock::{ProbedMutex, ProbedRwLock};
 use std::vec::Vec;
 
 use windows_sys::Win32::Foundation::{
@@ -336,7 +340,7 @@ impl Drop for Charge {
 /// The views whose pages are charged ([`Charge`]): view start to `(len,
 /// charge)`, the view's offset being its section's (a view of a whole
 /// anonymous section). A leaf lock, held only around the charge's commits.
-static CHARGES: Mutex<BTreeMap<usize, (usize, Arc<Charge>)>> = Mutex::new(BTreeMap::new());
+static CHARGES: ProbedMutex<BTreeMap<usize, (usize, Arc<Charge>)>> = ProbedMutex::new("CHARGES", BTreeMap::new());
 /// Whether [`CHARGES`] has any: the commit's one look at it otherwise.
 static CHARGES_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -555,9 +559,9 @@ impl Region {
 
 type Table = BTreeMap<usize, Region>;
 
-fn table() -> &'static Mutex<Table> {
-    static T: OnceLock<Mutex<Table>> = OnceLock::new();
-    T.get_or_init(Mutex::default)
+fn table() -> &'static ProbedMutex<Table> {
+    static T: ProbedMutex<Table> = ProbedMutex::new("the region table", BTreeMap::new());
+    &T
 }
 
 fn win_prot(prot: c_int) -> Option<PAGE_PROTECTION_FLAGS> {
@@ -915,7 +919,7 @@ fn make_placeholder(t: &mut Table, start: usize, end: usize) -> Result<(), c_int
 /// An `mprotect` keeps memory lazy ([`protect_lazy`]): the protection of a
 /// range is the one its pages get when committed, and a `PAGE_NOACCESS`
 /// range (`PROT_NONE`) is committed by no access, which faults, as on Linux.
-static LAZY: Mutex<Vec<(usize, usize, PAGE_PROTECTION_FLAGS)>> = Mutex::new(Vec::new());
+static LAZY: ProbedMutex<Vec<(usize, usize, PAGE_PROTECTION_FLAGS)>> = ProbedMutex::new("LAZY", Vec::new());
 
 /// What a first access commits: a page, as Linux charges an anonymous
 /// mapping a page at a time where it uses no transparent huge page
@@ -934,7 +938,7 @@ const HUGE_PAGE: usize = 2 << 20;
 /// `MAP_FIXED` mapping over the range and `MADV_NOHUGEPAGE`) and a
 /// record's ([`wick_mm::record_grain`]). Sorted, disjoint
 /// `(start, len, grain)`.
-static GRAINS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+static GRAINS: ProbedMutex<Vec<(usize, usize, usize)>> = ProbedMutex::new("GRAINS", Vec::new());
 /// Whether [`GRAINS`] has any: the commit's one look at it otherwise.
 static GRAINS_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1028,7 +1032,7 @@ fn lazy_within(start: usize, len: usize) -> Vec<(usize, usize, PAGE_PROTECTION_F
 /// asks `VirtualQuery` and [`LAZY`] about a page whose bit is clear before it
 /// takes the page as zeros (a page wrongly clear costs a query): a wrong bit
 /// costs time, never data. Keyed by the allocation's base; `(len, bits)`.
-static TOUCHED: std::sync::RwLock<BTreeMap<usize, Arc<Touched>>> = std::sync::RwLock::new(BTreeMap::new());
+static TOUCHED: ProbedRwLock<BTreeMap<usize, Arc<Touched>>> = ProbedRwLock::new("TOUCHED", BTreeMap::new());
 
 #[derive(Debug)]
 struct Touched {
@@ -2253,13 +2257,13 @@ struct Broker {
 // SAFETY: pipe handles may be used from any thread; behind a lock.
 unsafe impl Send for Broker {}
 
-fn broker() -> Option<&'static Mutex<Broker>> {
-    static BROKER: OnceLock<Option<Mutex<Broker>>> = OnceLock::new();
+fn broker() -> Option<&'static ProbedMutex<Broker>> {
+    static BROKER: OnceLock<Option<ProbedMutex<Broker>>> = OnceLock::new();
     BROKER
         .get_or_init(|| {
             let v = std::env::var("WICK_LARGE_PAGES").ok()?;
             let (a, b) = v.split_once(',')?;
-            Some(Mutex::new(Broker {
+            Some(ProbedMutex::new("the large-page broker", Broker {
                 request: a.trim().parse::<usize>().ok()? as HANDLE,
                 reply: b.trim().parse::<usize>().ok()? as HANDLE,
             }))
@@ -3069,7 +3073,7 @@ const MOVE_ROOM: usize = 3 * PAGE;
 /// refused (`ENOMEM`, the reclaim then moving the owing chunk) if it cannot;
 /// the owing chunk's move, made, frees the pages. 0 for none. Taken after
 /// the table's lock and before [`CHARGES`].
-static OWED: Mutex<[usize; MOVE_ROOM / PAGE]> = Mutex::new([0; MOVE_ROOM / PAGE]);
+static OWED: ProbedMutex<[usize; MOVE_ROOM / PAGE]> = ProbedMutex::new("OWED", [0; MOVE_ROOM / PAGE]);
 /// Whether [`OWED`] holds a page: a commit's one look at it otherwise.
 static OWES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -3455,7 +3459,7 @@ pub(crate) fn uffd_stale(s: usize, len: usize, alias: usize) {
 /// alias while it is still closed, and opens it ([`resolve_stale`]): no
 /// thread or vCPU sees what was there. Taken after the table's lock and
 /// before [`CHARGES`].
-static STALE: Mutex<BTreeMap<usize, (usize, usize)>> = Mutex::new(BTreeMap::new());
+static STALE: ProbedMutex<BTreeMap<usize, (usize, usize)>> = ProbedMutex::new("STALE", BTreeMap::new());
 /// Whether [`STALE`] has any: the access path's one look at it otherwise.
 static STALE_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -3550,7 +3554,8 @@ fn unalias(base: usize, len: usize, kind: &Kind) {
 /// `reserved`: the alias is one view per [`UFFD_CHUNK`], else one view.
 pub(crate) fn uffd_unalias(start: usize, len: usize, alias: usize, reserved: bool) {
     let step = if reserved { UFFD_CHUNK } else { len };
-    let mut t = table().lock().unwrap();
+    let mut guard = table().lock().unwrap();
+    let t: &mut Table = &mut guard;
     for o in (0..len).step_by(step) {
         let n = step.min(len - o);
         if !stale_within(start + o, n).is_empty() {
@@ -3637,7 +3642,7 @@ struct InFlight {
     discards: Vec<(usize, usize)>,
 }
 
-static IN_FLIGHT: Mutex<InFlight> = Mutex::new(InFlight { calls: Vec::new(), discards: Vec::new() });
+static IN_FLIGHT: ProbedMutex<InFlight> = ProbedMutex::new("IN_FLIGHT", InFlight { calls: Vec::new(), discards: Vec::new() });
 static IN_FLIGHT_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
 
 fn any_overlaps(ranges: &[(usize, usize)], s: usize, e: usize) -> bool {
@@ -3678,7 +3683,7 @@ pub(crate) fn copying(addr: usize, len: usize) -> Copying {
     let (s, e) = (addr, addr.saturating_add(len));
     let mut f = IN_FLIGHT.lock().unwrap();
     while any_overlaps(&f.discards, s, e) {
-        f = IN_FLIGHT_CHANGED.wait(f).unwrap();
+        f = f.wait_on(&IN_FLIGHT_CHANGED).unwrap();
     }
     f.calls.push((s, e));
     IN_CALL.set(IN_CALL.get() + 1);
@@ -3710,7 +3715,7 @@ pub(crate) fn discard_waiting_within(addr: usize, len: usize) -> Option<Discardi
     }
     f.discards.push((s, e));
     while any_overlaps(&f.calls, s, e) {
-        f = IN_FLIGHT_CHANGED.wait(f).unwrap();
+        f = f.wait_on(&IN_FLIGHT_CHANGED).unwrap();
     }
     Some(Discarding(s, e))
 }
@@ -3745,7 +3750,7 @@ pub(crate) fn discard_waiting(addr: usize, len: usize) -> Discarding {
     let mut f = IN_FLIGHT.lock().unwrap();
     f.discards.push((s, e));
     while any_overlaps(&f.calls, s, e) {
-        f = IN_FLIGHT_CHANGED.wait(f).unwrap();
+        f = f.wait_on(&IN_FLIGHT_CHANGED).unwrap();
     }
     Discarding(s, e)
 }
