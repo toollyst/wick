@@ -4535,8 +4535,29 @@ mod tests {
         }
     }
 
+    /// A fill at the job's limit allocates nothing: fills of a page each,
+    /// from no room left, refused, reclaimed for and made, until one is
+    /// refused with `ENOMEM`, allocate nothing on the filling thread, the
+    /// serve thread or the reclaimer, where a heap that must grow is refused
+    /// there; Linux's fill takes only the page it fills and the page tables
+    /// it needs (v6.1 mm/userfaultfd.c: `mcopy_atomic_pte`'s
+    /// `alloc_page_vma`, 156, charged by `mem_cgroup_charge`, 205;
+    /// `mm_alloc_pmd`'s `pmd_alloc`, 317, and `__pte_alloc`, 643, in
+    /// `__mcopy_atomic`). In a job of its own, with no room left
+    /// ([`no_room_left`]).
     #[test]
-    #[ignore = "run by test_what_the_limit_paths_allocate_on_record in a job of its own"]
+    #[ignore = "until a fill walks the region table in place"]
+    fn test_a_fill_at_the_limit_allocates_nothing() {
+        let (code, text) = run_child("fill_allocations_child", Some(96 << 20));
+        assert!(text.contains("room left before the reclaim: 0 KiB"), "{text}");
+        for kind in ["the serve thread", "the reclaimer", "the caller"] {
+            assert!(text.contains(&std::format!("ALLOCS fills at the limit: {kind} 0 allocations")), "{text}");
+        }
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_fill_at_the_limit_allocates_nothing and test_what_the_limit_paths_allocate_on_record in a job of their own"]
     fn fill_allocations_child() {
         let (ctx, user, mem, done) = fill_to_the_limit_and_discard_in_part();
         let page = std::vec![0x5au8; PAGE as usize];
