@@ -1034,7 +1034,9 @@ mod tests {
     // jail is made there: one the jail's uid owns (but root's jail), one its
     // group or others may write, one whose ACL lets another uid add a name;
     // an ACL entry only for what is made later, or for the owner, and a
-    // jail of uid 0 are not refusals. Only the operator's switch makes the
+    // jail of uid 0 are not refusals. Run as the user and as root (CI's
+    // jailer step), with a jail's uid that is not 0 for the refusals in
+    // both. Only the operator's switch makes the
     // interfaces (vmm::platform::net), so no jail can make its own.
     fn test_the_jailer_refuses_a_network_others_may_write() {
         use std::os::unix::fs::PermissionsExt;
@@ -1051,7 +1053,18 @@ mod tests {
             assert!(!net.join("a").exists(), "{what}");
         };
         mode(0o755);
-        refused(me, "the jail's uid's");
+        // A network its jail's uid owns. As the user, the user's own; as
+        // root (the CI step runs these tests under sudo), the jail's uid is
+        // not 0, whose own network root's is, so the directory is given to
+        // another uid for the case and taken back.
+        let chown = |uid: u32| std::os::unix::fs::chown(&net, Some(uid), None).unwrap();
+        if me == 0 {
+            chown(54321);
+            refused(54321, "the jail's uid's");
+            chown(0);
+        } else {
+            refused(me, "the jail's uid's");
+        }
         for m in [0o775, 0o757, 0o777] {
             mode(m);
             refused(54321, &format!("mode {m:o}"));
