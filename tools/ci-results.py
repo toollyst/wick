@@ -92,7 +92,13 @@ class Crates(dict):
 
 def read_libtest(path):
     cut = compare_unit_tests()
-    results, _ = cut.parse_run(Path(path), Crates())
+    problems = []
+    results, _ = cut.parse_run(Path(path), Crates(), problems)
+    for problem in problems:
+        # A binary whose lines do not add up to libtest's counts: its tests
+        # begun with no result of their own are "crash" rows below
+        # (tools/libtest-results.py).
+        print(f"ci-results: {problem}", file=sys.stderr)
     rows = []
     word = {"ok": "pass", "FAILED": "fail", "ignored": "skip"}
     for binary, tests in results.items():
@@ -699,8 +705,20 @@ def selftest():
         text = (FIXTURES / "libtest-windows-43790310601.log").read_text()
         cut.write_text(text[:text.index("\nFAILED\n")] + "\n")
         expect("crash", {(r[0], r[1]): r[2] for r in read_libtest(cut)}.get(("kvm_ioctls", moved)), "crash")
+    # A test that runs its binary again as a child (tools/libtest-results.py):
+    # the child's lines stand for no result of the parent's.
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "child.log"
+        log.write_text(
+            "     Running unittests src/lib.rs (target/debug/deps/vmm-0b)\n\nrunning 3 tests\n"
+            "test a::api_child ... ignored\ntest a::test_serves ... \nrunning 1 test\ntest a::api_child ... ok\n\n"
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.10s\n\n"
+            "test a::z ... ok\n\n"
+            "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.00s\n")
+        expect("a child's lines", {r[1]: r[2] for r in read_libtest(log)},
+               {"a::api_child": "skip", "a::test_serves": "pass", "a::z": "pass"})
     got = rows_of("libtest", "libtest-linux-43790310601.log")
-    expect("linux libtest", (len(got), got.get(("acpi_tables", "aml::tests::test_buffer"))), (5, "pass"))
+    expect("linux libtest", (len(got), got.get(("acpi_tables", "aml::tests::test_buffer"))), (22, "pass"))
     got = rows_of("pytest-json", "pytest-linux-43790310601.json")
     expect("pytest", sorted(got.values()), ["pass", "pass", "skip"])
     got = rows_of("summary", "summary-macos-jailer-43784960688.txt", "tools/macos/jailer-test.py")

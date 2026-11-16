@@ -197,18 +197,27 @@ def run(exe, cwd, env, endpoints):
                            capture_output=True, text=True, timeout=BINARY_LIMIT)
     except subprocess.TimeoutExpired:
         return None, f"did not finish in {BINARY_LIMIT} s"
-    return failures(p.stdout + p.stderr, p.returncode)
+    return failures(p.stdout, p.stderr, p.returncode)
 
 
-def failures(out, returncode):
-    """(failed names, output) of a binary's run, or (None, why)."""
-    failed = set()
-    section = out.rfind("\nfailures:\n")
-    if section >= 0:
-        for line in out[section:].splitlines()[1:]:
-            m = re.match(r"^    (\S+)$", line)
-            if m:
-                failed.add(m.group(1))
+def libtest_results():
+    """tools/libtest-results.py, the reader of one test binary's results."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("libtest_results", os.path.join(ROOT, "tools", "libtest-results.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def failures(stdout, stderr, returncode):
+    """(failed names, output) of a binary's run, or (None, why): the tests
+    libtest's own process failed, read from its standard output as it gave
+    them (tools/libtest-results.py), not a child's lines in a failure
+    message, which a test that runs its binary again as a child prints."""
+    out = stdout + stderr
+    found, _, _ = libtest_results().section_results(stdout.splitlines())
+    failed = {name for name, result in found.items() if result == "FAILED"}
     if returncode != 0 and not failed:
         return None, f"exit {returncode} with no failure named:\n" + "\n".join(out.splitlines()[-20:])
     return failed, out
@@ -251,7 +260,7 @@ def run_default_mode(exe, cwd, env):
     try:
         p = subprocess.run([exe, "--test-threads=1"], cwd=cwd, env=env, capture_output=True, text=True,
                            timeout=BINARY_LIMIT)
-        failed, out = failures(p.stdout + p.stderr, p.returncode)
+        failed, out = failures(p.stdout, p.stderr, p.returncode)
     except subprocess.TimeoutExpired:
         failed, out = None, f"did not finish in {BINARY_LIMIT} s"
     left = sorted(n for n, pid in own_endpoint_dirs(temp).items() if n not in before and not pid_alive(pid))

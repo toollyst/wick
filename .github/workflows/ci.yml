@@ -91,7 +91,9 @@ jobs:
       # The numbers the docs derive from the tree that the two checks above
       # do not keep: README's line count, PORTING row 1's sandbox counts.
       - name: Results readers and format
-        run: python3 -I tools/ci-results.py --selftest
+        run: |
+          python3 -I -B tools/libtest-results.py --selftest
+          python3 -I tools/ci-results.py --selftest
       - name: Numbers derived from the tree are current
         run: |
           python3 -I -B tools/check-derived.py --selftest

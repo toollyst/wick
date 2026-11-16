@@ -6,6 +6,23 @@ test aml::tests::test_buffer ... ok
 test aml::tests::test_create_field ... ok
 test aml::tests::test_device ... ok
 test aml::tests::test_eisa_name ... ok
+test aml::tests::test_field ... ok
+test aml::tests::test_local_if ... ok
+test aml::tests::test_method ... ok
+test aml::tests::test_method_call ... ok
+test aml::tests::test_mutex ... ok
+test aml::tests::test_name ... ok
+test aml::tests::test_name_path ... ok
+test aml::tests::test_notify ... ok
+test aml::tests::test_numbers ... ok
+test aml::tests::test_op_region ... ok
+test aml::tests::test_package ... ok
+test aml::tests::test_pkg_length ... ok
+test aml::tests::test_resource_template ... ok
+test aml::tests::test_scope ... ok
+test aml::tests::test_string ... ok
+test aml::tests::test_while ... ok
+test tests::test_checksum ... ok
 
 test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 

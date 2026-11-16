@@ -28,6 +28,7 @@ Markdown to --summary (e.g. $GITHUB_STEP_SUMMARY).
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -39,11 +40,8 @@ RUNS = ("lib", "examples")
 RUNNING = re.compile(r"^\s*Running (?:unittests )?(.+?) \((.+)\)\s*$")
 DOCTESTS = re.compile(r"^\s*Doc-tests (\S+)\s*$")
 LISTED = re.compile(r"^(.+): (test|benchmark)$")
-RESULT = re.compile(r"^test (.+?)(?: - should panic)? \.\.\. (ok|FAILED|ignored(?:, .*)?)$")
+# A test libtest began (its result, if any, is read by tools/libtest-results.py).
 STARTED = re.compile(r"^test (.+?)(?: - should panic)? \.\.\. ?(.*)$")
-# libtest's result word ends the line, after anything a test wrote to the
-# terminal itself (a guest's serial output, say: "test x ... HHok").
-LATE_RESULT = re.compile(r"(ok|FAILED|ignored(?:, .*)?)$")
 LINE_NO = re.compile(r"\s*\(line \d+\)$")
 
 
@@ -193,67 +191,47 @@ def parse_list(path, exes):
     return tests
 
 
-SUMMARY = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored;")
+def libtest_results():
+    """tools/libtest-results.py, the reader of one test binary's results."""
+    spec = importlib.util.spec_from_file_location("libtest_results", Path(__file__).parents[1] / "libtest-results.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def parse_run(path, exes):
+def parse_run(path, exes, problems=None):
     """binary -> {test: ok|FAILED|ignored}, and binary -> libtest's own
-    (passed, failed, ignored) counts."""
+    (passed, failed, ignored) counts. Each binary's section is read as its
+    own process gave it (tools/libtest-results.py: a child's lines, from a
+    test that runs its binary again, do not stand for the parent's); a
+    section whose lines do not add up to its counts is appended to
+    `problems`. A test begun with no result in a section with no summary
+    (its process ended) has no result here."""
+    reader = libtest_results()
     results = defaultdict(dict)
     summaries = defaultdict(lambda: [0, 0, 0])
-    binary = None
-    pending = None
-    in_failures = False
-    failed = []
+    sections = []
     name = Namer()
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.rstrip("\r")
         b = binary_of(line, exes)
         if b:
-            binary, pending, in_failures = b, None, False
+            sections.append((b, []))
             continue
-        if binary is None:
-            continue
-        m = RESULT.match(line)
-        if m:
-            results[binary][name(binary, m.group(1))] = m.group(2).split(",")[0]
-            pending = None
-            continue
-        m = STARTED.match(line)
-        if m:
-            # The test wrote to the terminal itself, past libtest's capture:
-            # its result follows that output, on this line or a later one.
-            pending = name(binary, m.group(1))
-            late = LATE_RESULT.search(m.group(2))
-            if late:
-                results[binary][pending] = late.group(1).split(",")[0]
-                pending = None
-            continue
-        if pending:
-            m = LATE_RESULT.search(line)
-            if m:
-                results[binary][pending] = m.group(1).split(",")[0]
-                pending = None
-                continue
-        # libtest ends a binary with "failures:" (each failed test's output),
-        # "failures:" again (the names, indented) and "test result:". The
-        # names catch a failure whose result word was lost in a test's output.
-        if line == "failures:":
-            in_failures = True
-            failed = []
-            continue
-        if in_failures and re.match(r"^    \S", line):
-            failed.append(line.strip())
-        m = SUMMARY.match(line)
-        if m:
+        if sections:
+            sections[-1][1].append(line)
+    for binary, lines in sections:
+        found, counts, problem = reader.section_results(lines, lambda n, b=binary: name(b, n))
+        for t, r in found.items():
+            # The same name in two sections of a binary: a failure in either
+            # is the test's result.
+            if results[binary].get(t) != "FAILED":
+                results[binary][t] = r
+        if counts:
             for i in range(3):
-                summaries[binary][i] += int(m.group(i + 1))
-        if line.startswith("test result:"):
-            if in_failures:
-                for t in failed:
-                    if not LINE_NO.search(t):
-                        results[binary][t] = "FAILED"
-            in_failures = False
+                summaries[binary][i] += counts[i]
+        if problem and problems is not None:
+            problems.append(f"{path.name}: {binary}: {problem}")
     return results, summaries
 
 
