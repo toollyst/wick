@@ -2168,6 +2168,15 @@ jobs:
           Get-CimInstance Win32_ComputerSystem | Format-List Model, TotalPhysicalMemory, HypervisorPresent
           whoami /user /priv
           Get-ChildItem -Recurse -File lib, tools, winprobe.exe | Select-Object Length, FullName | Format-Table -AutoSize
+      # HOSTWARP on the runner the guests run on, before them and after
+      # their TSC checks (smp, cpu-templates, x2apic): the guests' warp
+      # loop natively between every pair of this host's logical CPUs, with
+      # RDTSCP and with LFENCE;RDTSC, three rounds each: the least step at
+      # a hand-over each way, their round trip and the offset they give
+      # (winprobe hostwarp, tools/windows/winprobe.c). A record: never fails.
+      - name: HOSTWARP before the guests
+        continue-on-error: true
+        run: .\winprobe.exe hostwarp 3
       # Every stage of `all`, as a PC's default run has them, but hugepages
       # (its own step below), and diff-nospace, which needs the elevation
       # this runner has. Not in `all`: foreign-snapshot (it wants a state of
@@ -2226,6 +2235,9 @@ jobs:
             if ($code -ne 0) { $failed++ }
           }
           if ($failed) { Write-Host "::error::boot-test.ps1 x2apic failed in $failed of 5 runs"; exit 1 }
+      - name: HOSTWARP after the guests
+        if: success() || failure()
+        run: .\winprobe.exe hostwarp 3
       # The guest files are the boot test's (-Assets). pidns, bindlink,
       # sections and hugepages have steps of their own.
       - name: jailer-test.ps1

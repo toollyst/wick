@@ -3,7 +3,11 @@
 - `boot-test.ps1`: scenario tests of the Windows build against upstream
   Firecracker's x86_64 CI guest, the counterpart of `tools/macos/boot-test.py`.
 - `winprobe.c` (`winprobe.exe` in CI's artifact): measures the host
-  mechanisms the sandbox and jailer backends use.
+  mechanisms the sandbox and jailer backends use; `winprobe hostwarp [rounds]`
+  runs the guests' TSC warp loop natively between pairs of the host's logical
+  CPUs (HOSTWARP lines: each pair's least step at a hand-over each way, their
+  round trip and the offset they give, with RDTSCP and with LFENCE;RDTSC), the
+  control CI's windows-guest job runs before and after its guests.
 - `jailer-test.ps1`: the jailer on WHP hardware, the counterpart of
   `tools/macos/jailer-test.py`. Stages without a guest: `refuse` (what
   Windows cannot enforce is refused, each cgroup controller and resource
@@ -301,9 +305,10 @@ the firmware, and nothing else installed: the script is Windows PowerShell 5.1.
    cmd /c "winprobe.exe appcontainer > probe-appcontainer.txt 2>&1"
    cmd /c "winprobe.exe profile > probe-profile.txt 2>&1"
    cmd /c "winprobe.exe fsctl > probe-fsctl.txt 2>&1"
+   cmd /c "winprobe.exe hostwarp > probe-hostwarp.txt 2>&1"
    ```
 
-5. **Send back** `results-<time>.zip` and the three `probe-*.txt` files.
+5. **Send back** `results-<time>.zip` and the four `probe-*.txt` files.
 
 ## What the boot test checks
 

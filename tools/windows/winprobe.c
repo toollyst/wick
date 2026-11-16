@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <intrin.h>
 
 #ifndef PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
 #define PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES 0x00020009
@@ -861,6 +862,139 @@ static const char *ALL[] = {"whp",     "w32k",        "w32k-create",  "fsctl",  
                             "job-mem-private", "job-mem-section", "job-mem-file", "job-cpu", "appcontainer",
                             "largepages"};
 
+/* hostwarp: HOSTWARP, the control for the guests' TSC warp check
+   (tools/guest-counter-warp.py) on the machine the guests run on: the
+   guest's loop (tools/guest-counter-warp-loop.c, the kernel's
+   check_tsc_warp algorithm, v6.1 arch/x86/kernel/tsc_sync.c:267-321, the
+   turns alternating), run natively by two threads pinned to two logical
+   CPUs of processor group 0, for every pair of them (at most 64 CPUs;
+   with more, each CPU with CPU 0 and with the next), `rounds` rounds of at
+   most 500000 turns or 0.1 s each, with each of two reads of the TSC:
+   RDTSCP, as the guest's loop and kvm-ioctls' HOSTWARP test read it, and
+   LFENCE; RDTSC, as the kernel's rdtsc_ordered reads it (v6.1
+   arch/x86/include/asm/msr.h). Each round: the hand-overs, the warps and
+   the most a TSC went back, the least step at a hand-over each way, their
+   sum (the round trip, which an offset does not change) and half their
+   difference (the offset between the two TSCs plus half the paths'
+   difference, which only a change of read sequence or a pair's closure
+   tells apart); then, per read and pair, the least steps over the rounds.
+   A record: never fails. */
+typedef struct {
+    volatile LONG64 *s; /* [0] lock, [1] last counter, [2] last reader (CPU + 1) */
+    LONG64 me;
+    int cpu, lfence, pinned;
+    ULONG64 bound;
+    volatile LONG *ready;
+    ULONG64 warps, back, handovers, turns;
+    LONG64 least;
+} hw_side;
+
+static __inline ULONG64 hw_counter(int lfence) {
+    if (lfence) {
+        _mm_lfence();
+        return __rdtsc();
+    }
+    unsigned aux;
+    return __rdtscp(&aux);
+}
+
+static DWORD WINAPI hw_thread(LPVOID p) {
+    hw_side *h = p;
+    h->pinned = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << h->cpu) != 0;
+    InterlockedIncrement(h->ready);
+    while (*h->ready < 2) _mm_pause();
+    volatile LONG64 *s = h->s;
+    ULONG64 start = hw_counter(h->lfence), last = start, i;
+    h->least = MAXLONG64;
+    for (i = 0; i < 500000; i++) {
+        if (last - start > h->bound) break;
+        while (InterlockedExchange64(&s[0], 1)) _mm_pause();
+        ULONG64 prev = (ULONG64)s[1];
+        ULONG64 now = hw_counter(h->lfence);
+        last = now;
+        LONG64 who = s[2];
+        s[1] = (LONG64)now;
+        s[2] = h->me;
+        InterlockedExchange64(&s[0], 0);
+        for (int k = 0; k < 1000 && s[2] == h->me; k++) _mm_pause();
+        if (who != h->me && who != 0) {
+            h->handovers++;
+            LONG64 step = (LONG64)(now - prev);
+            if (step < h->least) h->least = step;
+            if (prev > now) {
+                h->warps++;
+                if (prev - now > h->back) h->back = prev - now;
+            }
+        }
+    }
+    h->turns = i;
+    return 0;
+}
+
+static int t_hostwarp(int rounds) {
+    DWORD n = GetActiveProcessorCount(0);
+    LARGE_INTEGER f, q0, q1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&q0);
+    ULONG64 c0 = __rdtsc();
+    Sleep(50);
+    ULONG64 c1 = __rdtsc();
+    QueryPerformanceCounter(&q1);
+    double hz = (double)(c1 - c0) * (double)f.QuadPart / (double)(q1.QuadPart - q0.QuadPart);
+    LOG("HOSTWARP host: %lu logical CPUs in processor group 0, TSC about %.0f Hz, %d rounds a pair and read\n", n, hz, rounds);
+    if (n < 2) {
+        LOG("HOSTWARP one logical CPU: nothing to compare\n");
+        return 0;
+    }
+    if (n > 64) n = 64;
+    int pairs[64 * 63 / 2][2], np = 0;
+    for (DWORD a = 0; a < n; a++)
+        for (DWORD b = a + 1; b < n; b++)
+            if (n <= 16 || a == 0 || b == a + 1) { pairs[np][0] = (int)a; pairs[np][1] = (int)b; np++; }
+    static const char *reads[2] = {"RDTSCP", "LFENCE;RDTSC"};
+    for (int r = 0; r < 2; r++) {
+        for (int p = 0; p < np; p++) {
+            int a = pairs[p][0], b = pairs[p][1];
+            LONG64 best_a = MAXLONG64, best_b = MAXLONG64;
+            ULONG64 warps = 0;
+            for (int round = 1; round <= rounds; round++) {
+                __declspec(align(64)) volatile LONG64 s[8] = {0};
+                volatile LONG ready = 0;
+                hw_side sa = {s, a + 1, a, r, 0, (ULONG64)(hz * 0.1), &ready, 0, 0, 0, 0, 0};
+                hw_side sb = sa;
+                sb.me = b + 1;
+                sb.cpu = b;
+                HANDLE ta = CreateThread(NULL, 0, hw_thread, &sa, 0, NULL), tb = CreateThread(NULL, 0, hw_thread, &sb, 0, NULL);
+                if (!ta || !tb) {
+                    LOG("HOSTWARP CreateThread failed: %lu\n", GetLastError());
+                    return 0;
+                }
+                WaitForSingleObject(ta, INFINITE);
+                WaitForSingleObject(tb, INFINITE);
+                CloseHandle(ta);
+                CloseHandle(tb);
+                warps += sa.warps + sb.warps;
+                if (sa.least < best_a) best_a = sa.least;
+                if (sb.least < best_b) best_b = sb.least;
+                if (sa.least == MAXLONG64 || sb.least == MAXLONG64) {
+                    LOG("HOSTWARP %s CPUs %d and %d (pinned %d %d), round %d: %llu turns, %llu hand-overs: a side had none\n", reads[r], a, b,
+                        sa.pinned, sb.pinned, round, min(sa.turns, sb.turns), sa.handovers + sb.handovers);
+                    continue;
+                }
+                LOG("HOSTWARP %s CPUs %d and %d (pinned %d %d), round %d: %llu turns, %llu hand-overs, %llu warps (most %llu ticks back), "
+                    "least step to CPU %d %lld ticks, to CPU %d %lld: round trip %lld, CPU %d's TSC %+.1f ticks ahead of CPU %d's\n",
+                    reads[r], a, b, sa.pinned, sb.pinned, round, min(sa.turns, sb.turns), sa.handovers + sb.handovers, sa.warps + sb.warps,
+                    max(sa.back, sb.back), a, sa.least, b, sb.least, sa.least + sb.least, b, (double)(sb.least - sa.least) / 2.0, a);
+            }
+            if (best_a != MAXLONG64 && best_b != MAXLONG64)
+                LOG("HOSTWARP %s CPUs %d and %d, least over the rounds: to CPU %d %lld, to CPU %d %lld: round trip %lld, CPU %d's TSC %+.1f "
+                    "ticks ahead of CPU %d's; %llu warps\n",
+                    reads[r], a, b, a, best_a, b, best_b, best_a + best_b, b, (double)(best_b - best_a) / 2.0, a, warps);
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     GetModuleFileNameA(NULL, g_self, sizeof g_self);
@@ -875,6 +1009,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(t, "whp")) { whp_probe(); return 0; }
+    if (!strcmp(t, "hostwarp")) return t_hostwarp(argc > 2 ? atoi(argv[2]) : 3);
     if (!strcmp(t, "w32k")) return t_w32k();
     if (!strcmp(t, "w32k-create")) return t_w32k_create();
     if (!strcmp(t, "w32k-child")) return t_w32k_child();
