@@ -207,12 +207,16 @@ vm_stop() {
         # once, which cut its log before the reason (CI run 43823078930, the
         # macOS harness). A watchdog bounds the wait; its expiry is a failure.
         # The watchdog exits 0 only if it killed Firecracker; stopped first,
-        # it stops its sleep too (nothing of it outlives vm_stop).
+        # it stops its sleep too (nothing of it outlives vm_stop): whatever
+        # its job table holds, none before the fork, the sleep from the fork
+        # on, so a TERM between the fork and the next command finds it too.
         (
-            trap 'kill "$s" 2>/dev/null; exit 3' TERM
+            # shellcheck disable=SC2046 # one pid a word, or none
+            trap 'kill $(jobs -p) 2>/dev/null || true; exit 3' TERM
             sleep "$EXIT_BOUND" &
-            s=$!
-            wait "$s"
+            # The selftest's hook: the sleep is forked.
+            "${VM_WATCHDOG_FORKED:-:}"
+            wait "$!"
             trap '' TERM
             kill -KILL "$VM_PID" 2>/dev/null || exit 4
         ) &
@@ -464,15 +468,22 @@ exit 1
 SELFTEST_FAULT='{"fault_message":"The VMM has ended and Firecracker is exiting; its log and standard error say why."}'
 
 selftest_release() { printf x >&"$SELFTEST_GO"; }
+# The watchdog's hook for case "early": it says its sleep is forked, then
+# waits for vm_stop's TERM (a read nothing answers); vm_stop's hook lets the
+# stand-in go only once the watchdog is there, so the TERM comes between the
+# fork and whatever follows it.
+selftest_forked() { printf x >&"$SELFTEST_FORKED"; read -r -n 1 _ <&"$SELFTEST_NEVER"; }
+selftest_release_forked() { read -r -n 1 _ <&"$SELFTEST_FORKED"; selftest_release; }
 
-# selftest_vm NAME HOOK: the stand-in as VM NAME, stopped with HOOK as
-# vm_stop's waiting hook; prints vm_stop's output, then "exit CODE pid PID".
+# selftest_vm NAME HOOK [WATCHDOG_HOOK]: the stand-in as VM NAME, stopped
+# with HOOK as vm_stop's waiting hook (and WATCHDOG_HOOK as its watchdog's,
+# once the sleep is forked); prints vm_stop's output, then "exit CODE pid PID".
 # Run in a command substitution, which ends when the last holder of its
 # output closes it: whatever vm_stop leaves running holds it.
 selftest_vm() {
     vm_start "$1" "" "$results/$1.sock"
     printf '%s' "$SELFTEST_FAULT" >"$VM_DIR/api-reply.txt"
-    VM_WAITING_EXIT="$2"
+    VM_WAITING_EXIT="$2" VM_WATCHDOG_FORKED="${3:-}"
     vm_stop
     echo "exit $VM_EXIT pid $VM_PID"
 }
@@ -487,26 +498,37 @@ selftest() {
     chmod 755 "$fc"
     mkfifo "$results/go"
     exec {SELFTEST_GO}<>"$results/go"
+    mkfifo "$results/forked" "$results/never"
+    exec {SELFTEST_FORKED}<>"$results/forked" {SELFTEST_NEVER}<>"$results/never"
     export WICK_BT_SELFTEST_GO="$results/go"
 
     # Exits once the harness waits: both lines in its log, exit 1, no kill,
-    # and nothing of vm_stop's left (its output closed within the bound).
-    t0=$SECONDS
-    out="$(selftest_vm ended selftest_release 2>"$results/ended.err")"
-    (((SECONDS - t0) < EXIT_BOUND)) ||
-        fails+=("exiting: vm_stop's output stayed open $((SECONDS - t0)) s: something it started outlived it")
-    last="${out##*$'\n'}"
-    if [[ "$out" == *$'\n'* ]]; then out="${out%$'\n'*}"; else out=""; fi
-    pid="${last##* }"
-    log="$(cat "$results/ended/firecracker.log")"
-    for want in "RunWithApiError error: Failed to build MicroVM from Json" \
-        "Firecracker exiting with error. exit_code=1"; do
-        [[ "$log" == *"$want"* ]] ||
-            fails+=("exiting: the log lacks '$want' (the harness did not wait for the exit): $log")
+    # and nothing of vm_stop's left (its output closed within the bound);
+    # "early": the same with vm_stop's TERM to its watchdog just after the
+    # watchdog forked its sleep, as when Firecracker exits at once.
+    local case
+    for case in ended early; do
+        t0=$SECONDS
+        if [[ "$case" == ended ]]; then
+            out="$(selftest_vm ended selftest_release 2>"$results/ended.err")"
+        else
+            out="$(selftest_vm early selftest_release_forked selftest_forked 2>"$results/early.err")"
+        fi
+        (((SECONDS - t0) < EXIT_BOUND)) ||
+            fails+=("$case: vm_stop's output stayed open $((SECONDS - t0)) s: something it started outlived it")
+        last="${out##*$'\n'}"
+        if [[ "$out" == *$'\n'* ]]; then out="${out%$'\n'*}"; else out=""; fi
+        pid="${last##* }"
+        log="$(cat "$results/$case/firecracker.log")"
+        for want in "RunWithApiError error: Failed to build MicroVM from Json" \
+            "Firecracker exiting with error. exit_code=1"; do
+            [[ "$log" == *"$want"* ]] ||
+                fails+=("$case: the log lacks '$want' (the harness did not wait for the exit): $log")
+        done
+        [[ "$last" == "exit 1 pid "* && -z "$out" && "$log" != *"killed by the harness"* ]] ||
+            fails+=("$case: $last, vm_stop's output '$out', log: $log; $(cat "$results/$case.err")")
+        ! kill -0 "$pid" 2>/dev/null || fails+=("$case: the stand-in still runs")
     done
-    [[ "$last" == "exit 1 pid "* && -z "$out" && "$log" != *"killed by the harness"* ]] ||
-        fails+=("exiting: $last, vm_stop's output '$out', log: $log; $(cat "$results/ended.err")")
-    ! kill -0 "$pid" 2>/dev/null || fails+=("exiting: the stand-in still runs")
 
     # Never let go: a failure of its own at the bound, killed, its log saying so.
     EXIT_BOUND=1
@@ -524,7 +546,7 @@ selftest() {
         fails+=("stuck: $last, log: $log")
     ! kill -0 "$pid" 2>/dev/null || fails+=("stuck: the stand-in still runs")
 
-    exec {SELFTEST_GO}>&-
+    exec {SELFTEST_GO}>&- {SELFTEST_FORKED}>&- {SELFTEST_NEVER}>&-
     rm -rf -- "$results"
     if ((${#fails[@]} > 0)); then
         printf 'boot-test: selftest failed:\n' >&2
