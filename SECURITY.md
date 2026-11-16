@@ -317,7 +317,11 @@ upstream Firecracker and its jailer.
   (`test_a_wholly_discarded_chunk_gives_its_section_commit_back`, passed in CI run 43545368906, 305a806). A page discarded in a chunk not discarded whole
   (balloon inflation's scattered pages) keeps its section page committed (a SEC_RESERVE page cannot be decommitted)
   and its charge with it, so that what the jail is charged is never less than the host commit it holds
-  (`test_registered_memory_is_charged_as_it_is_filled`; passed in CI run 43545368906, 305a806, and each saved run since). A reclaim of
+  (`test_registered_memory_is_charged_as_it_is_filled`; passed in CI run 43545368906, 305a806, and each saved run since). The
+  guest has such a page back at once, its fill taking nothing new (made with no room left, no reclaim asked), while the
+  job and the jail's count read the dead pages, exactly, more than Linux's memory.current until their chunk moves or is
+  discarded whole, never past `memory.max`, as each was charged within it
+  (`test_a_scattered_discard_keeps_its_charge_and_its_refill_takes_none`, on Windows Server 2022 20348). A reclaim of
   such pages before a charge is refused at the limit, as Linux's memory cgroup reclaims, moves their chunks into new
   sections, and works with no room left in the job: each move gives back the charge of up to 12 KiB of its own dead
   pages for its maps first (their page tables take commit: VIEWCHARGE), and a chunk with one dead page is room enough

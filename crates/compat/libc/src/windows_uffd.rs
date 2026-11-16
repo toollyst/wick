@@ -1360,6 +1360,7 @@ unsafe extern "system" fn reclaimer(_: *mut c_void) -> u32 {
 /// only (`test_an_ask_of_a_reclaimer_that_has_ended_aborts`).
 fn ask_the_reclaimer(ask: Ask) -> Reclaimed {
     use windows_sys::Win32::System::Threading::{INFINITE, SetEvent, WaitForMultipleObjects};
+    RECLAIM_ASKS.fetch_add(1, Ordering::Relaxed);
     if !RECLAIMER_RUNS.load(Ordering::Acquire) {
         return Reclaimed::default();
     }
@@ -1527,6 +1528,44 @@ static MOVES_MADE: AtomicUsize = AtomicUsize::new(0);
 /// The accesses that waited for a move ([`fault`]), and how long in all.
 static MOVE_WAITS: AtomicU64 = AtomicU64::new(0);
 static MOVE_WAITED_US: AtomicU64 = AtomicU64::new(0);
+/// The reclaims asked for (a fill or a touch refused at the job's limit),
+/// the candidate chunks their passes found, and the view of the chunk moved
+/// last ([`reclaim_counts`]).
+static RECLAIM_ASKS: AtomicU64 = AtomicU64::new(0);
+static CANDIDATES_FOUND: AtomicU64 = AtomicU64::new(0);
+static LAST_MOVED: AtomicUsize = AtomicUsize::new(0);
+
+/// What the reclaim at the job's memory limit has done in this process
+/// ([`reclaim_counts`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReclaimCounts {
+    /// Reclaims asked for: each a fill or a first touch the job's limit
+    /// refused.
+    pub asks: u64,
+    /// The chunks holding dead pages their passes found, summed.
+    pub candidates: u64,
+    /// The chunks moved into new sections.
+    pub moves: u64,
+    /// The moves begun and not made (`windows_mm::uffd_move_chunk`'s
+    /// refusals: a view not mapped, live pages not committed).
+    pub refused: u64,
+    /// The address of the chunk moved last (its guest view), 0 for none.
+    pub last_moved: usize,
+}
+
+/// The reclaim's counts so far: read-only, for a record of what it did
+/// (MOVEUNDERVCPU). Each is bumped only where a reclaim is asked for, on
+/// the reclaim's thread, or by a move; a fill or touch the limit does not
+/// refuse reaches none of them.
+pub fn reclaim_counts() -> ReclaimCounts {
+    ReclaimCounts {
+        asks: RECLAIM_ASKS.load(Ordering::Relaxed),
+        candidates: CANDIDATES_FOUND.load(Ordering::Relaxed),
+        moves: MOVES_MADE.load(Ordering::Relaxed) as u64,
+        refused: crate::windows_mm::moves_refused(),
+        last_moved: LAST_MOVED.load(Ordering::Relaxed),
+    }
+}
 
 /// Moves one chunk (`windows_mm::uffd_move_chunk`), marked moving for its
 /// time: an access to it meanwhile waits in [`fault`] until the mark goes
@@ -1549,6 +1588,7 @@ fn move_chunk(d: &Candidate) -> Reclaimed {
         return Reclaimed::default();
     };
     let copied = copied / PAGE as usize;
+    LAST_MOVED.store(d.view, Ordering::Relaxed);
     let n = MOVES_MADE.fetch_add(1, Ordering::Relaxed);
     if n < MOVES_KEPT {
         MOVES[n].store((copied as u64) << 32 | us.min(u64::from(u32::MAX)), Ordering::Relaxed);
@@ -1593,6 +1633,7 @@ fn reclaim_for_a_fill(need: usize) -> Reclaimed {
 fn fill_pass(need: usize) -> Reclaimed {
     let mut c = CANDIDATES.lock().unwrap();
     find_candidates(&mut c);
+    CANDIDATES_FOUND.fetch_add(c.len() as u64, Ordering::Relaxed);
     let r = reclaim_pass(need.max(crate::windows_mm::UFFD_CHUNK), &c, None);
     c.clear();
     r
@@ -1602,6 +1643,7 @@ fn fill_pass(need: usize) -> Reclaimed {
 fn touch_pass(need: usize, skipped: Option<&mut Vec<Candidate>>) -> Reclaimed {
     let mut c = CANDIDATES.lock().unwrap();
     find_candidates(&mut c);
+    CANDIDATES_FOUND.fetch_add(c.len() as u64, Ordering::Relaxed);
     let r = reclaim_pass(need, &c, skipped);
     c.clear();
     r
@@ -2642,6 +2684,67 @@ mod tests {
         }
     }
 
+    /// What a guest that gives back scattered pages (a balloon's 4 KiB
+    /// pages, no chunk whole) gets back, and when, in a child under a job
+    /// limit: the discard of every other page of a chunk gives none of the
+    /// process's private commit back (the dead pages keep their section
+    /// commit and its charge: the job and the jailer's count read that much
+    /// more than Linux's memory.current, which uncharged them at the
+    /// discard); with no room left in the job ([`no_room_left`]) each dead
+    /// page is filled again, as its commit and charge are still there,
+    /// with no reclaim asked and no chunk moved (`reclaim_counts`). The
+    /// commit goes back to the job only when the chunk moves
+    /// (`test_a_chunk_with_one_dead_page_at_the_limit`) or is discarded
+    /// whole (`test_a_wholly_discarded_chunk_gives_its_section_commit_back`).
+    /// SCATTERED line.
+    #[test]
+    fn test_a_scattered_discard_keeps_its_charge_and_its_refill_takes_none() {
+        let (code, text) = run_child("scattered_discard_child", Some(96 << 20));
+        std::eprintln!("{text}");
+        assert!(text.contains("SCATTERED "), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_scattered_discard_keeps_its_charge_and_its_refill_takes_none in a job of its own"]
+    fn scattered_discard_child() {
+        let (ctx, user, mem, _) = fill_to_the_limit();
+        let before = private_commit();
+        for p in (0..CHUNK).step_by(2 * PAGE as usize) {
+            // SAFETY: registered memory of ours.
+            assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        }
+        let after = private_commit();
+        let dead = CHUNK / (2 * PAGE);
+        let mut held = no_room_left();
+        let counts = reclaim_counts();
+        let mut made = 0;
+        for p in (0..CHUNK).step_by(2 * PAGE as usize) {
+            if fill_a_page(ctx, mem + p) == "made" {
+                made += 1;
+            }
+        }
+        let filled = reclaim_counts();
+        give_back_every_page(&mut held);
+        std::println!(
+            "SCATTERED the discard of {dead} pages gave back {} KiB of the process's private commit (Linux: {} KiB); with no \
+             room left, {made} of {dead} dead pages filled again, {} reclaims asked, {} chunks moved",
+            (before as i64 - after as i64) / 1024,
+            dead * PAGE / 1024,
+            filled.asks - counts.asks,
+            filled.moves - counts.moves
+        );
+        // Within 64 KiB: the heap's own blocks for the lines may move it.
+        assert!(before.abs_diff(after) < 64 << 10, "the discard moved the private commit by {} KiB", (before as i64 - after as i64) / 1024);
+        assert_eq!((made, filled.asks - counts.asks, filled.moves - counts.moves), (dead, 0, 0));
+        for p in (0..CHUNK).step_by(PAGE as usize) {
+            // SAFETY: a filled page.
+            assert_eq!(unsafe { *((mem + p + 9) as *const u8) }, 0x5a, "{p:#x}");
+        }
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
     /// A fill refused at the job's limit while partly discarded chunks hold
     /// dead pages (their section commit and charge, as (A) keeps them)
     /// reclaims them first and succeeds, as Linux's memory cgroup reclaims
@@ -2864,9 +2967,9 @@ mod tests {
         let (ctx, user, mem, done) = fill_to_the_limit();
         let moves = || moves_on_record().0.len();
         let mut held = no_room_left();
-        let (m0, refused0) = (moves(), crate::windows_mm::moves_refused_for_tests());
+        let (m0, refused0) = (moves(), crate::windows_mm::moves_refused());
         let none = fill_a_page(ctx, mem + done);
-        let (m1, refused1) = (moves(), crate::windows_mm::moves_refused_for_tests());
+        let (m1, refused1) = (moves(), crate::windows_mm::moves_refused());
         crate::windows_mm::say_at_the_limit(format_args!(
             "no dead page: the fill {none}, {} moves made, {} tried",
             m1 - m0,
@@ -2883,11 +2986,11 @@ mod tests {
                 assert_eq!(unsafe { crate::madvise((chunk + (2 * i + 1) * PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
             }
             let mut held = no_room_left();
-            let (m1, refused1) = (moves(), crate::windows_mm::moves_refused_for_tests());
+            let (m1, refused1) = (moves(), crate::windows_mm::moves_refused());
             let before = private_commit();
             let one = fill_a_page(ctx, mem + done + k * PAGE);
             let after = private_commit();
-            let (m2, refused2) = (moves(), crate::windows_mm::moves_refused_for_tests());
+            let (m2, refused2) = (moves(), crate::windows_mm::moves_refused());
             let owed = crate::windows_mm::owed_bytes();
             let view = crate::windows_mm::LAST_MOVE_VIEW.load(Ordering::Relaxed);
             give_back_every_page(&mut held);
@@ -2941,9 +3044,9 @@ mod tests {
         // SAFETY: registered memory of ours.
         assert_eq!(unsafe { crate::madvise(last as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
         let mut held = no_room_left();
-        let (m1, refused1) = (moves_on_record().0.len(), crate::windows_mm::moves_refused_for_tests());
+        let (m1, refused1) = (moves_on_record().0.len(), crate::windows_mm::moves_refused());
         let fill = fill_a_page(ctx, mem + done);
-        let (m2, refused2) = (moves_on_record().0.len(), crate::windows_mm::moves_refused_for_tests());
+        let (m2, refused2) = (moves_on_record().0.len(), crate::windows_mm::moves_refused());
         let owed = crate::windows_mm::owed_bytes();
         give_back_every_page(&mut held);
         std::println!(

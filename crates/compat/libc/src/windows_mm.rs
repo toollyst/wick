@@ -2911,9 +2911,9 @@ pub(crate) fn charged_view_at_for_tests(at: usize) -> bool {
     CHARGES.lock().unwrap().range(..=at).next_back().is_some_and(|(v, (n, _))| at < v + n)
 }
 
-/// How many moves were not made ([`MOVE_MAPS_REFUSED`]), for tests.
-#[cfg(test)]
-pub(crate) fn moves_refused_for_tests() -> u64 {
+/// How many moves were not made ([`MOVE_MAPS_REFUSED`]): the tests', and
+/// `wick_uffd::reclaim_counts`.
+pub(crate) fn moves_refused() -> u64 {
     MOVE_MAPS_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 

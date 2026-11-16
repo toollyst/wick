@@ -8266,28 +8266,36 @@ mod fpu_tests {
     /// log keeps the pages the guest wrote before the move (WHP follows the
     /// host's address, UFFDCHUNK a; the bitmap is per GPA). In a child under
     /// a job limit, held at the limit by commit made and never touched, to
-    /// the last 4 KiB (no room left: in CI run 43640510155, before a move
-    /// gave back part of its dead pages' charge for its own maps, 0 of the
-    /// 40 rounds moved), so that a fill
-    /// there is refused and reclaims (`reclaim_for_a_fill`).
+    /// the last 4 KiB, so that a fill there that needs a new charge is
+    /// refused and reclaims (`reclaim_for_a_fill`).
     /// The guest (at `MMIO_PROGRAM`, RAM 2-4 MiB registered, the mailbox at
     /// 0x7000 resident): over and over, each odd page of the chunk checked
     /// against the value it last wrote (r8; a mismatch counts in r9), and,
     /// in mode 1, written with the next; after each pass r9, r8 and the
-    /// pass count to the mailbox; mode 3 ends it with `out 0x86`. Each of
-    /// `ROUNDS` rounds: mode 1 and the dirty log cleared, two passes; mode
-    /// 2 (reads only), two passes; the chunk's even pages discarded (dead:
-    /// committed and charged, as a balloon's scattered pages are); a fill of
-    /// one of them at the limit, which moves the chunk under the guest's
-    /// reads; the move seen (an even page no longer committed); every odd
-    /// page dirty; the other even pages filled again (the move gave their
-    /// charge back). Then `ROUNDS` more in which the guest writes through
+    /// pass count to the mailbox; mode 3 ends it with `out 0x86`. The
+    /// guest's loop is on chunk 1 (GPA 2-4 MiB), the chunk that moves. Each
+    /// of `ROUNDS` rounds: mode 1 and the dirty log cleared, two passes;
+    /// mode 2 (reads only), two passes; the chunk's even pages discarded
+    /// (dead: committed and charged, as a balloon's scattered pages are);
+    /// one of them filled again, which takes nothing new (its commit and
+    /// charge are still there) and asks no reclaim; a fresh page filled (in
+    /// chunk 0, from GPA 1 MiB, one a round, never committed), which the
+    /// limit refuses, so the reclaim moves chunk 1 under the guest's reads
+    /// and the fill is made; the move seen in `wick_uffd::reclaim_counts`
+    /// (one move more, its chunk the guest's) and in the chunk's new
+    /// section (a dead page no longer committed); a page of ballast given
+    /// back for the fresh page; every odd page dirty; the other even pages
+    /// filled again (the move gave their charge back). In CI runs
+    /// 43680983973 and 43688550565 the round's fill was the dead page's
+    /// alone, which the limit never refuses, so no reclaim was asked and 0
+    /// of 40 rounds moved. Then `ROUNDS` more in which the guest writes through
     /// the move: mode 1 kept during the discard and the fill, and two
     /// passes after the move, so that a write made while the chunk was
     /// closed and copied that did not reach the new section (WHP letting it
     /// into the old one after the guest's view was closed) is a bad value
     /// at the next pass. Asserted: no bad value, every round moved, no
-    /// dirty page lost. MOVEUNDERVCPU lines.
+    /// dirty page lost, no reclaim asked by a dead page's fill.
+    /// MOVEUNDERVCPU lines, one a round with its reclaim counts.
     ///
     /// ```text
     ///     xor r8d, r8d; xor r9d, r9d
@@ -8312,7 +8320,8 @@ mod fpu_tests {
     #[ignore = "run by test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages in a job of its own"]
     fn moved_under_a_vcpu_child() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery,
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            VirtualQuery,
         };
         const MAILBOX: u64 = 0x7000;
         const CHUNK: u64 = 2 << 20;
@@ -8380,13 +8389,24 @@ mod fpu_tests {
         };
         let fill_even = |from: u64| {
             for p in (from..CHUNK).step_by(2 * PAGE as usize) {
-                assert_eq!(libc::wick_uffd::zeropage(ctx, chunk + p, PAGE, true), Ok(PAGE), "the fill of {p:#x}");
+                let counts = libc::wick_uffd::reclaim_counts();
+                assert_eq!(libc::wick_uffd::zeropage(ctx, chunk + p, PAGE, true), Ok(PAGE), "the fill of {p:#x} ({counts:?})");
             }
         };
-        // (moved, the dirty odd pages lost, the guest's bad values) by round.
+        // The fresh page a round's fill takes, one each: in chunk 0, from
+        // GPA 1 MiB (never touched, so never committed nor charged).
+        let mut fresh = 0x10_0000u64;
+        // (moved, the dirty odd pages lost, the guest's bad values) by round,
+        // and its record line.
         let mut rounds: Vec<(bool, u64, u64)> = Vec::with_capacity(2 * ROUNDS as usize + 1);
+        let mut lines: Vec<String> = Vec::with_capacity(2 * ROUNDS as usize + 1);
+        // How many pages of ballast a round gave back (a page a round, for
+        // the fresh page it took).
+        let mut given_back = 0usize;
+        // The reclaims a dead page's fill asked for, all rounds (none).
+        let mut dead_asked = 0u64;
         // A round; `writing`: the guest writes through the move (mode 1).
-        let mut round = |at_the_limit: bool, writing: bool| {
+        let mut round = |at_the_limit: bool, writing: bool, give_back: &mut dyn FnMut()| {
             mailbox(0).store(1, Ordering::SeqCst);
             vm.get_dirty_log(0, MEM).unwrap();
             passes(2);
@@ -8396,10 +8416,23 @@ mod fpu_tests {
             }
             discard_even();
             assert!(committed(chunk + 2 * PAGE), "a discarded page inside the chunk keeps its commit until a reclaim");
-            // The first even page's fill: at the limit, refused until the
-            // reclaim has moved the chunk.
-            assert_eq!(libc::wick_uffd::zeropage(ctx, chunk, PAGE, true), Ok(PAGE), "the first fill (at the limit: {at_the_limit})");
-            let moved = !committed(chunk + 2 * PAGE);
+            // A dead page filled again: its commit and its charge are still
+            // there (the memory.max row), so the fill takes nothing new and
+            // asks no reclaim, at the limit too.
+            let before = libc::wick_uffd::reclaim_counts();
+            assert_eq!(libc::wick_uffd::zeropage(ctx, chunk, PAGE, true), Ok(PAGE), "a dead page's fill (at the limit: {at_the_limit})");
+            let after_dead = libc::wick_uffd::reclaim_counts();
+            dead_asked += after_dead.asks - before.asks;
+            // A fresh page's fill: at the limit refused, so the reclaim moves
+            // the chunk with dead pages, chunk 1, which the guest's loop is
+            // reading (or writing) meanwhile, and is made.
+            assert_eq!(libc::wick_uffd::zeropage(ctx, at as u64 + fresh, PAGE, true), Ok(PAGE), "the fresh page's fill (at the limit: {at_the_limit})");
+            fresh += PAGE;
+            let after = libc::wick_uffd::reclaim_counts();
+            give_back();
+            // Moved: one move more, of the guest's chunk, whose new section
+            // holds its live pages only (a dead page not committed).
+            let moved = after.moves == before.moves + 1 && after.last_moved == chunk as usize && !committed(chunk + 2 * PAGE);
             if writing {
                 // Each odd page checked against the guest's last write to
                 // it, the ones made during the move among them.
@@ -8410,9 +8443,19 @@ mod fpu_tests {
             let lost = (first..2 * first).filter(|p| p % 2 == 1).filter(|&p| dirty[(p / 64) as usize] & (1 << (p % 64)) == 0).count() as u64;
             fill_even(2 * PAGE);
             rounds.push((moved, lost, mailbox(2).load(Ordering::SeqCst)));
+            lines.push(format!(
+                "at the limit {at_the_limit}, writing {writing}: the dead page's fill asked {} reclaims; the fresh page's asked {}, \
+                 found {} candidates, moved {} (refused {}), the last moved chunk the guest's {}; moved {moved}",
+                after_dead.asks - before.asks,
+                after.asks - after_dead.asks,
+                after.candidates - after_dead.candidates,
+                after.moves - after_dead.moves,
+                after.refused - after_dead.refused,
+                after.last_moved == chunk as usize,
+            ));
         };
         // A round before the limit: the heap's blocks for these calls made.
-        round(false, false);
+        round(false, false, &mut || {});
         // Held at the limit: commit made until the job refuses it, then
         // pages down to 4 KiB, never touched.
         let mut ballast: Vec<(usize, usize)> = Vec::with_capacity(100_000);
@@ -8430,9 +8473,16 @@ mod fpu_tests {
             }
         }
         let held: usize = ballast.iter().map(|b| b.1).sum();
+        // The first ballast block, whose pages are given back one a round.
+        let (spare, spare_len) = ballast[0];
         for writing in [false, true] {
             for _ in 0..ROUNDS {
-                round(true, writing);
+                round(true, writing, &mut || {
+                    assert!((given_back + 1) * PAGE as usize <= spare_len, "no ballast left to give back");
+                    // SAFETY: a page of our ballast, never accessed.
+                    assert_ne!(unsafe { VirtualFree((spare + given_back * PAGE as usize) as *mut core::ffi::c_void, PAGE as usize, MEM_DECOMMIT) }, 0);
+                    given_back += 1;
+                });
             }
         }
         for (b, _) in ballast.drain(..) {
@@ -8448,6 +8498,9 @@ mod fpu_tests {
         let bad = mailbox(2).load(Ordering::SeqCst);
         // The guest's bad values when the reading rounds ended.
         let bad_reading = at_limit[ROUNDS as usize - 1].2;
+        for (i, l) in lines.iter().enumerate() {
+            eprintln!("MOVEUNDERVCPU round {i}: {l}");
+        }
         eprintln!(
             "MOVEUNDERVCPU {} of {} rounds at the limit moved the chunk ({} of {ROUNDS} under the guest's reads, {moved_writing} of {ROUNDS} under its writes; {} MiB held as ballast); dirty odd pages lost {lost}; the guest's bad values {bad} after {} passes ({bad_reading} after the reading rounds); before the limit: moved {}; the vCPU's last exit {end}",
             moved,
@@ -8460,6 +8513,7 @@ mod fpu_tests {
         // SAFETY: closes the user end.
         unsafe { libc::close(user) };
         assert_eq!((moved, lost, bad), (2 * ROUNDS as usize, 0, 0), "{rounds:?}");
+        assert_eq!(dead_asked, 0, "a dead page's fill asked for a reclaim");
         assert!(end.starts_with("out 0x86"), "the vCPU ended with {end}");
         eprintln!("MOVEUNDERVCPU all {} rounds moved, reading and writing, nothing lost", 2 * ROUNDS);
         drop(vm);

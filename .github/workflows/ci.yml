@@ -1365,8 +1365,12 @@ jobs:
           # live pages copied into a new section) under the guest's reads and
           # then its writes, 20 rounds each in a child held at the limit with
           # no room left: no value lost, every round moved, the dirty log
-          # keeps the pages written before each move (MOVEUNDERVCPU lines;
-          # in run 43640510155, before a move gave back part of its dead
+          # keeps the pages written before each move; each round's move is
+          # asked by a fresh page's fill (a discarded page's takes nothing
+          # new: in runs 43680983973 and 43688550565 it was the round's
+          # only fill and 0 of 40 moved), and counted on the guest's chunk
+          # (MOVEUNDERVCPU lines, "round N:" with the reclaim's counts; in
+          # run 43640510155, before a move gave back part of its dead
           # pages' charge for its own maps, 0 of 40 moved).
           alone whp::vcpu::fpu_tests::test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record
