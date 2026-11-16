@@ -1410,6 +1410,12 @@ unsafe extern "system" fn lazy_on_exception(
     const ACCESS_VIOLATION: i32 = 0xC000_0005_u32 as i32;
     // SAFETY: the system passes valid exception pointers.
     let rec = unsafe { &*(*info).ExceptionRecord };
+    #[cfg(all(test, target_arch = "x86_64"))]
+    if rec.ExceptionCode == STACK_OVERFLOW {
+        // SAFETY: as above; the faulting thread's context.
+        let addr = if rec.NumberParameters >= 2 { rec.ExceptionInformation[1] } else { 0 };
+        stack_ask_record(unsafe { (*(*info).ContextRecord).Rsp } as usize, addr);
+    }
     if rec.ExceptionCode == ACCESS_VIOLATION && rec.NumberParameters >= 2 {
         // [0]: 0 read, 1 write, 8 execute; [1]: the address.
         let stack = stack_committed();
@@ -1424,6 +1430,45 @@ unsafe extern "system" fn lazy_on_exception(
         }
     }
     windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH
+}
+
+/// STACKASK (tests): where a stack overflow's first-chance handler runs,
+/// for the reclaim a refused stack commit is to ask from there
+/// (agent design, condition A1): the faulting RSP's and the faulting
+/// address's heights above the TEB's StackLimit (what is committed below
+/// them; a frame that probes its pages faults below its RSP), how deep the dispatcher went
+/// before this handler (the faulting RSP less this frame's), what is left
+/// under this frame, the guarantee and the reserve left, and the page
+/// below StackLimit (its state and protection). Measured before the line
+/// is formatted; written without allocating.
+#[cfg(all(test, target_arch = "x86_64"))]
+#[inline(never)]
+fn stack_ask_record(fault_rsp: usize, fault_addr: usize) {
+    let here = core::ptr::addr_of!(fault_rsp) as usize;
+    let (limit, reserve, guarantee) = this_threads_stack();
+    // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+    let mut below: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    unsafe { VirtualQuery((limit - 1) as *const c_void, &mut below, std::mem::size_of_val(&below)) };
+    // SAFETY: as above.
+    let mut at: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    unsafe { VirtualQuery(limit as *const c_void, &mut at, std::mem::size_of_val(&at)) };
+    say_at_the_limit(format_args!(
+        "STACKASK committed below the faulting rsp {} B, below the faulting address {} B, the dispatcher's frames {} B, left under the handler {} B, \
+         guarantee {guarantee} B, reserve left {} KiB; the page at StackLimit {:#x}/{:#x}, below it {:#x}/{:#x} \
+         (state/protection; {} B committed there)",
+        fault_rsp.saturating_sub(limit),
+        fault_addr.saturating_sub(limit),
+        fault_rsp.saturating_sub(here),
+        here.saturating_sub(limit),
+        limit.saturating_sub(reserve) >> 10,
+        at.State,
+        at.Protect,
+        below.State,
+        below.Protect,
+        if below.State == MEM_COMMIT { below.RegionSize } else { 0 },
+    ));
 }
 
 /// Installs [`lazy_on_exception`] once, and [`stack_filter`] with it;
