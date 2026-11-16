@@ -27,7 +27,7 @@
 0025-api-the-HTTP-server-in-a-process-of-its-own-where-th.patch
 0026-vmm-the-huge-page-guest-region-test-runs-on-Windows-.patch
 0027-tests-on-macOS-the-session-s-host-side-is-wick-s-plu.patch
-0028-jailer-new-pid-ns-on-macOS-forks-where-Linux-clones.patch
+0028-jailer-new-pid-ns-and-daemonize-on-macOS-fork-throug.patch
 0029-wick-the-huge-page-region-test-runs-on-macOS-where-a.patch
 0030-windows-rebase-snap-and-cpu-template-helper-build-on.patch
 0031-windows-an-API-socket-in-use-is-reported-as-upstream.patch

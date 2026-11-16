@@ -1207,11 +1207,9 @@ const SETTLE_GAP_MS: u64 = 5;
 pub(crate) fn self_check(os: &mut dyn Os) -> Result<(), String> {
     // SAFETY: no arguments.
     let parent = unsafe { libc::getpid() };
-    // SAFETY: the supervisor has one thread; the child only spins.
-    let child = unsafe { libc::fork() };
-    if child < 0 {
-        return Err(format!("fork: {}", io::Error::last_os_error()));
-    }
+    // The child only spins and calls getppid and _exit, which take no lock:
+    // the check is a second defence here.
+    let child = super::fork_alone("the freezer's self-check").map_err(|e| e.to_string())?;
     if child == 0 {
         // Spins until killed, or until its parent is gone (a supervisor
         // killed mid-check leaves no spinner).
@@ -1522,20 +1520,18 @@ pub(crate) fn start_supervisor(files: Files) -> Result<(), String> {
     // SAFETY: no arguments.
     let root = unsafe { libc::getpid() };
     let start = start_time(root).ok_or("cannot read the jailer's start time")?;
-    // SAFETY: the jailer has one thread.
-    let first = unsafe { libc::fork() };
-    if first < 0 {
-        return Err(format!("fork: {}", io::Error::last_os_error()));
-    }
+    // The supervisor, the grandchild, runs the freezer's whole loop, so a
+    // lock another thread held would be met there: the check is the defence.
+    let first = super::fork_alone("the freezer's supervisor").map_err(|e| e.to_string())?;
     if first == 0 {
         drop(rd);
-        // SAFETY: the first child has one thread.
-        match unsafe { libc::fork() } {
-            0 => supervisor(files, root, start, wr),
+        // The first child has the one thread the check above counted.
+        match super::fork_alone("the freezer's supervisor, second fork") {
+            Ok(0) => supervisor(files, root, start, wr),
             // SAFETY: ends the first child; the supervisor's parent is launchd.
-            pid => unsafe {
-                if pid < 0 {
-                    let msg = format!("efork: {}", io::Error::last_os_error());
+            done => unsafe {
+                if let Err(e) = done {
+                    let msg = format!("e{e}");
                     let _ = write_all_at_pipe(&wr, msg.as_bytes());
                 }
                 libc::_exit(0)
@@ -2805,6 +2801,17 @@ mod tests {
             eprintln!("test_self_check_under_load: NOT RUN: pid_suspend needs root (see test_pid_suspend_binding)");
             return;
         }
+        // With one thread, as the supervisor has (self_check's fork needs it).
+        crate::platform::macos::tests::run_alone("platform::macos::freezer::tests::self_check_under_load_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_self_check_under_load in a process of its own"]
+    fn self_check_under_load_child() {
+        crate::platform::macos::tests::in_one_thread(self_check_under_load);
+    }
+
+    fn self_check_under_load() {
         let busy = load();
         let mut os = RealOs;
         let mut early = 0;
@@ -2852,6 +2859,17 @@ mod tests {
             );
             return;
         }
+        // With one thread, as the supervisor has (its self_check forks).
+        crate::platform::macos::tests::run_alone("platform::macos::freezer::tests::pid_suspend_binding_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_pid_suspend_binding in a process of its own"]
+    fn pid_suspend_binding_child() {
+        crate::platform::macos::tests::in_one_thread(pid_suspend_binding);
+    }
+
+    fn pid_suspend_binding() {
         let mut child = std::process::Command::new("/usr/bin/yes").stdout(std::process::Stdio::null()).spawn().unwrap();
         let pid = libc::pid_t::try_from(child.id()).unwrap();
         let mut os = RealOs;
@@ -2878,5 +2896,49 @@ mod tests {
         self_check(&mut os).unwrap();
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // The self-check's fork is refused while the process has a second
+    // thread, naming the point and the count, before anything is suspended.
+    // Its child only spins, so the check is a second defence there.
+    #[test]
+    fn test_the_freezer_self_check_refuses_a_second_thread() {
+        crate::platform::macos::tests::run_alone(
+            "platform::macos::freezer::tests::the_freezer_self_check_refuses_a_second_thread_child",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by test_the_freezer_self_check_refuses_a_second_thread in a process of its own"]
+    fn the_freezer_self_check_refuses_a_second_thread_child() {
+        crate::platform::macos::tests::in_one_thread(|| {
+            crate::platform::macos::tests::second_thread();
+            let mut os = Recorded(Vec::new());
+            let err = self_check(&mut os).unwrap_err();
+            assert!(err.starts_with("the freezer's self-check: the jailer has 2 threads"), "{err}");
+            assert!(os.0.is_empty(), "{:?}", os.0);
+        });
+    }
+
+    // The supervisor's fork is refused while the jailer has a second
+    // thread, naming the point and the count: the supervisor runs the
+    // freezer's whole loop and would meet a lock the other thread held.
+    #[test]
+    fn test_the_freezer_supervisor_refuses_a_second_thread() {
+        crate::platform::macos::tests::run_alone(
+            "platform::macos::freezer::tests::the_freezer_supervisor_refuses_a_second_thread_child",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by test_the_freezer_supervisor_refuses_a_second_thread in a process of its own"]
+    fn the_freezer_supervisor_refuses_a_second_thread_child() {
+        crate::platform::macos::tests::in_one_thread(|| {
+            let tmp = vmm_sys_util::tempdir::TempDir::new().unwrap();
+            let files = Files::create(tmp.as_path(), Version::V1, State::Thawed, uid()).unwrap();
+            crate::platform::macos::tests::second_thread();
+            let err = start_supervisor(files).unwrap_err();
+            assert!(err.starts_with("the freezer's supervisor: the jailer has 2 threads"), "{err}");
+        });
     }
 }

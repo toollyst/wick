@@ -406,8 +406,49 @@ pub fn set_validator(validate: fn(&Request)) {
 
 #[cfg(target_os = "macos")]
 pub use macos::{set_waiting, split, wait_for_server, watch_child};
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{ForkAloneError, fork_alone};
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::threads;
+
+/// For tests of a fork made with one thread ([`fork_alone`]), in a test run
+/// in a process of its own: libtest's main thread only waits there, so the
+/// fork these run in may panic.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod one_thread {
+    /// Runs `body` in a fork of the calling thread, where that thread is
+    /// the process's only one, as Firecracker's main thread is at its
+    /// forks, and checks that the fork ended well (a panic ends it with 101).
+    pub(crate) fn in_one_thread(body: impl FnOnce()) {
+        // SAFETY: the fork runs `body` and ends by _exit, never returning
+        // into libtest.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok();
+            // SAFETY: ends the fork.
+            unsafe { libc::_exit(if ok { 0 } else { 101 }) };
+        }
+        let mut status = 0;
+        // SAFETY: our child; an out-pointer.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "the fork ended with {status:#x}");
+    }
+
+    /// A thread that waits for good, as a second thread of the process.
+    pub(crate) fn second_thread() {
+        std::thread::spawn(|| {
+            loop {
+                std::thread::park();
+            }
+        });
+        let t0 = std::time::Instant::now();
+        while super::threads().unwrap() != 2 {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{} threads", super::threads().unwrap());
+            std::thread::yield_now();
+        }
+    }
+}
 
 #[cfg(windows)]
 pub use windows::{
@@ -626,6 +667,39 @@ mod macos {
     /// Keeps the link to the API process the jail made.
     pub fn set_waiting(link: UnixStream) {
         *WAITING.lock().unwrap() = Some(link);
+    }
+
+    /// A fork Firecracker refused ([`fork_alone`]).
+    #[derive(Debug, thiserror::Error, displaydoc::Display)]
+    pub enum ForkAloneError {
+        /// {0}: Firecracker has {1} threads where its fork needs one: the child would have the calling thread alone, and a lock another thread held at the fork would stay held there for good
+        Threads(&'static str, usize),
+        /// {0}: {1}
+        Fork(&'static str, std::io::Error),
+    }
+
+    /// A `fork` made only while this process has one thread, the caller, as
+    /// [`split`]'s: the child has the calling thread alone, so a lock
+    /// another thread held at the fork would stay held there for good.
+    /// libmalloc's fork handlers reset malloc's locks (libmalloc-812.100.31
+    /// src/malloc.c `_malloc_fork_prepare` :3723, `_malloc_fork_child`
+    /// :3737); the Rust standard library's (standard error, the panic hook,
+    /// the thread registry), the logger's and the frameworks' are not
+    /// reset. With more threads the fork is refused, naming `point` and the
+    /// count.
+    pub(crate) fn fork_alone(point: &'static str) -> Result<libc::pid_t, ForkAloneError> {
+        let n = threads().map_err(|e| match e {
+            ApiProcessError::Fork(e) => ForkAloneError::Fork(point, e),
+            other => ForkAloneError::Fork(point, std::io::Error::other(other.to_string())),
+        })?;
+        if n != 1 {
+            return Err(ForkAloneError::Threads(point, n));
+        }
+        // SAFETY: one thread, the caller (checked above).
+        match unsafe { libc::fork() } {
+            -1 => Err(ForkAloneError::Fork(point, std::io::Error::last_os_error())),
+            pid => Ok(pid),
+        }
     }
 
     /// Threads of this process, as the kernel counts them (xnu

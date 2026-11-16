@@ -1760,9 +1760,12 @@ mod macos {
         /// own memory (tests/host_tools/memory.py), would carry that for
         /// good. The child's memory goes with the child.
         ///
+        /// Refused, naming the count, unless the process has one thread
+        /// ([`crate::ext::api_process::fork_alone`]).
+        ///
         /// # Safety
         /// The process has one thread (the child runs libsandbox's
-        /// compiler, which allocates).
+        /// compiler, which takes locks of its own); checked, as above.
         unsafe fn in_child(profile: &str) -> Result<Self, SandboxError> {
             use std::io::Read;
             let fail = |what: &str| {
@@ -1776,8 +1779,21 @@ mod macos {
             if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
                 return Err(fail("pipe"));
             }
-            // SAFETY: the caller guarantees one thread.
-            let pid = unsafe { libc::fork() };
+            // The child runs libsandbox's compiler, which takes locks of its
+            // own (it imports `os_unfair_lock_lock` and `dispatch_once`), so
+            // a lock another thread held would be met there: the check is
+            // the defence.
+            let pid = match crate::ext::api_process::fork_alone("the sandbox profile's compiler") {
+                Ok(pid) => pid,
+                Err(e) => {
+                    // SAFETY: our own descriptors.
+                    unsafe {
+                        libc::close(fds[0]);
+                        libc::close(fds[1]);
+                    }
+                    return Err(SandboxError::Install(e.to_string()));
+                }
+            };
             if pid == 0 {
                 // The child: the bytecode, or an error message, then exit.
                 // SAFETY: our own descriptors; _exit ends the child without
@@ -1803,11 +1819,6 @@ mod macos {
             }
             // SAFETY: our own descriptor.
             unsafe { libc::close(fds[1]) };
-            if pid < 0 {
-                // SAFETY: our own descriptor.
-                unsafe { libc::close(fds[0]) };
-                return Err(fail("fork"));
-            }
             // SAFETY: the pipe's read end, owned here from now on.
             let mut pipe = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[0]) };
             let mut out = Vec::new();
@@ -2263,16 +2274,43 @@ mod macos {
         #[test]
         #[ignore = "run by test_profile_compiles_in_a_child in a separate process"]
         fn profile_compiles_in_a_child_child() {
-            let profile = profile_for(None, None).unwrap();
-            // SAFETY: see above.
-            let child = unsafe { Compiled::in_child(&profile) }.unwrap();
-            assert_eq!(child.0, Compiled::here(&profile).unwrap().0);
-            assert!(!child.0.is_empty());
-            // SAFETY: as above.
-            let err = unsafe { Compiled::in_child("(version 1)\n(allow no-such-operation)\n") }
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("no-such-operation"), "{err}");
+            // With one thread, as prepare() has first thing in main.
+            crate::ext::api_process::one_thread::in_one_thread(|| {
+                let profile = profile_for(None, None).unwrap();
+                // SAFETY: one thread.
+                let child = unsafe { Compiled::in_child(&profile) }.unwrap();
+                assert_eq!(child.0, Compiled::here(&profile).unwrap().0);
+                assert!(!child.0.is_empty());
+                // SAFETY: as above.
+                let err = unsafe { Compiled::in_child("(version 1)\n(allow no-such-operation)\n") }
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("no-such-operation"), "{err}");
+            });
+            println!("CHILD-OK");
+        }
+
+        // The compiler's fork is refused while Firecracker has a second
+        // thread, naming the point and the count: libsandbox's compiler in
+        // the child could wait on a lock the other thread held at the fork.
+        #[test]
+        fn test_the_sandbox_compiler_fork_refuses_a_second_thread() {
+            run_child("the_sandbox_compiler_fork_refuses_a_second_thread_child", &[]);
+        }
+
+        #[test]
+        #[ignore = "run by test_the_sandbox_compiler_fork_refuses_a_second_thread in a separate process"]
+        fn the_sandbox_compiler_fork_refuses_a_second_thread_child() {
+            use crate::ext::api_process::one_thread::{in_one_thread, second_thread};
+            in_one_thread(|| {
+                let profile = profile_for(None, None).unwrap();
+                second_thread();
+                // SAFETY: the check refuses the fork (with it left out, the
+                // child compiles and ends).
+                let err = unsafe { Compiled::in_child(&profile) }.map(|_| ()).unwrap_err().to_string();
+                let want = "Failed to install the process sandbox: the sandbox profile's compiler: Firecracker has 2 threads";
+                assert!(err.starts_with(want), "{err}");
+            });
             println!("CHILD-OK");
         }
 

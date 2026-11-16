@@ -117,6 +117,85 @@ pub enum HostError {
     Spawn(&'static str, io::Error),
     #[error("The jail's network {0:?} (--netns): {1}")]
     Netns(PathBuf, io::Error),
+    #[error(
+        "{0}: the jailer has {1} threads where its fork needs one: the child would have the calling thread \
+         alone, and a lock another thread held at the fork would stay held there for good"
+    )]
+    Threads(&'static str, usize),
+}
+
+/// Threads of this process, as the kernel counts them (xnu
+/// osfmk/kern/bsd_kern.c `fill_taskprocinfo`: `task->thread_count`).
+pub(crate) fn threads() -> io::Result<usize> {
+    // SAFETY: an all-zero proc_taskinfo is a valid output buffer.
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = i32::try_from(std::mem::size_of::<libc::proc_taskinfo>()).expect("proc_taskinfo fits an int");
+    // SAFETY: a valid output buffer of the size passed.
+    let got = unsafe {
+        libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDTASKINFO, 0, std::ptr::from_mut(&mut info).cast(), size)
+    };
+    if got != size {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(info.pti_threadnum).map_err(io::Error::other)
+}
+
+/// A `fork` made only while this process has one thread, the caller: the
+/// child has the calling thread alone, so a lock another thread held at the
+/// fork would stay held there for good. libmalloc's fork handlers reset
+/// malloc's locks (libmalloc-812.100.31 src/malloc.c `_malloc_fork_prepare`
+/// :3723, `_malloc_fork_child` :3737); the Rust standard library's (standard
+/// error, the panic hook, the thread registry) and the frameworks' are not
+/// reset. With more threads the fork is refused, naming `point` and the
+/// count, as Firecracker's split of its API process is
+/// (`vmm::ext::api_process`). The jailer starts no thread of its own, so a
+/// refusal means one was started that this code does not know of.
+pub(crate) fn fork_alone(point: &'static str) -> Result<libc::pid_t, HostError> {
+    let n = threads().map_err(|e| HostError::Spawn(point, e))?;
+    if n != 1 {
+        return Err(HostError::Threads(point, n));
+    }
+    // SAFETY: one thread, the caller (checked above).
+    match unsafe { libc::fork() } {
+        -1 => Err(HostError::Spawn(point, io::Error::last_os_error())),
+        pid => Ok(pid),
+    }
+}
+
+/// Upstream's `--daemonize` (jailer env.rs, `Env::run`), its two forks made
+/// by [`fork_alone`]: the child of each goes on as the whole jailer, as
+/// `--new-pid-ns`'s does. The rest is upstream's: each parent exits 0, the
+/// first child calls `setsid` (so that the second fork's child is no
+/// session leader and cannot take a controlling terminal), the second's
+/// standard input, output and error are `dev_null`, and the process CPU
+/// time after each fork is added to `cpu_time_us` (upstream's
+/// `jailer_cpu_time_us`).
+// Each parent ends with `std::process::exit(0)`, as upstream's does (the
+// workspace warns of `exit` outside `main`; upstream's call is in Linux's
+// block of env.rs, which macOS does not build).
+#[allow(clippy::exit)]
+pub(crate) fn daemonize(dev_null: &File, cpu_time_us: &mut u64) -> Result<(), JailerError> {
+    use utils::time::{ClockType, get_time_us};
+    use vmm_sys_util::syscall::SyscallReturnCode;
+    if fork_alone("--daemonize")? != 0 {
+        std::process::exit(0);
+    }
+    // SAFETY: a plain call.
+    SyscallReturnCode(unsafe { libc::setsid() })
+        .into_empty_result()
+        .map_err(JailerError::SetSid)?;
+    *cpu_time_us += get_time_us(ClockType::ProcessCpu);
+    if fork_alone("--daemonize, second fork")? != 0 {
+        std::process::exit(0);
+    }
+    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: two descriptors this process holds.
+        SyscallReturnCode(unsafe { libc::dup2(dev_null.as_raw_fd(), fd) })
+            .into_empty_result()
+            .map_err(JailerError::Dup2)?;
+    }
+    *cpu_time_us += get_time_us(ClockType::ProcessCpu);
+    Ok(())
 }
 
 impl From<HostError> for JailerError {
@@ -669,11 +748,9 @@ static NEW_PID_NS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// child.
 pub fn new_pid_ns() -> Result<i32, JailerError> {
     NEW_PID_NS.store(true, std::sync::atomic::Ordering::Relaxed);
-    // SAFETY: the jailer has one thread.
-    match unsafe { libc::fork() } {
-        -1 => Err(HostError::Spawn("new-pid-ns", io::Error::last_os_error()).into()),
-        pid => Ok(pid),
-    }
+    // The child goes on as the whole jailer, so a lock another thread held
+    // would be met there: the check is the defence.
+    Ok(fork_alone("new-pid-ns")?)
 }
 
 /// The device nodes upstream creates in the jail. None is needed on macOS;
@@ -1434,20 +1511,192 @@ mod tests {
         }
     }
 
-    // --new-pid-ns: a child, as upstream's clone, and Firecracker is told
-    // it runs in a namespace of its own (its exec's environment).
-    #[test]
-    fn test_new_pid_ns_forks() {
-        let pid = new_pid_ns().unwrap();
+    /// Runs the ignored test `name` (its path in the crate) in a process of
+    /// its own, which runs nothing else, and checks that it passed.
+    pub(crate) fn run_alone(name: &str) {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--ignored", "--nocapture", "--test-threads=1"])
+            .output()
+            .unwrap();
+        let text = format!(
+            "{:?}\n{}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+    }
+
+    /// In a test run alone ([`run_alone`]): runs `body` in a fork of the
+    /// calling thread, where that thread is the process's only one, as the
+    /// jailer's is at its forks, and checks that it ended well. The process
+    /// runs this test alone (libtest's main thread only waits for it), so
+    /// the fork may panic, which ends it with 101.
+    pub(crate) fn in_one_thread(body: impl FnOnce()) {
+        // SAFETY: the fork runs `body` and ends by _exit, never returning
+        // into libtest.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
         if pid == 0 {
-            // SAFETY: the child ends at once.
-            unsafe { libc::_exit(7) };
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok();
+            // SAFETY: ends the fork.
+            unsafe { libc::_exit(if ok { 0 } else { 101 }) };
         }
         let mut status = 0;
         // SAFETY: our child; an out-pointer.
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 7, "{status:#x}");
-        assert!(NEW_PID_NS.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "the fork ended with {status:#x}");
+    }
+
+    /// A thread that waits for good, as a second thread of the process.
+    pub(crate) fn second_thread() {
+        std::thread::spawn(|| {
+            loop {
+                std::thread::park();
+            }
+        });
+        let t0 = std::time::Instant::now();
+        while threads().unwrap() != 2 {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{} threads", threads().unwrap());
+            std::thread::yield_now();
+        }
+    }
+
+    // --new-pid-ns: a child, as upstream's clone, and Firecracker is told
+    // it runs in a namespace of its own (its exec's environment). With one
+    // thread, as the jailer has.
+    #[test]
+    fn test_new_pid_ns_forks() {
+        run_alone("platform::macos::tests::new_pid_ns_forks_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_new_pid_ns_forks in a process of its own"]
+    fn new_pid_ns_forks_child() {
+        in_one_thread(|| {
+            let pid = new_pid_ns().unwrap();
+            if pid == 0 {
+                // SAFETY: the child ends at once.
+                unsafe { libc::_exit(7) };
+            }
+            let mut status = 0;
+            // SAFETY: our child; an out-pointer.
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 7, "{status:#x}");
+            assert!(NEW_PID_NS.load(std::sync::atomic::Ordering::Relaxed));
+        });
+    }
+
+    // --new-pid-ns's fork is refused while the jailer has a second thread,
+    // naming the point and the count: its child goes on as the whole
+    // jailer and would meet a lock the other thread held at the fork.
+    #[test]
+    fn test_new_pid_ns_refuses_a_second_thread() {
+        run_alone("platform::macos::tests::new_pid_ns_refuses_a_second_thread_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_new_pid_ns_refuses_a_second_thread in a process of its own"]
+    fn new_pid_ns_refuses_a_second_thread_child() {
+        in_one_thread(|| {
+            second_thread();
+            match new_pid_ns() {
+                // SAFETY: a fork made without the check ends at once.
+                Ok(0) => unsafe { libc::_exit(0) },
+                Err(JailerError::Host(HostError::Threads(point, 2))) => assert_eq!(point, "new-pid-ns"),
+                other => {
+                    if let Ok(pid) = other {
+                        // SAFETY: our child; an out-pointer.
+                        unsafe { libc::waitpid(pid, &mut 0, 0) };
+                    }
+                    panic!("forked with two threads: {other:?}");
+                }
+            }
+            let err = HostError::Threads("new-pid-ns", 2).to_string();
+            assert!(err.starts_with("new-pid-ns: the jailer has 2 threads"), "{err}");
+        });
+    }
+
+    // --daemonize's forks are refused while the jailer has a second thread,
+    // naming the point and the count, before any fork: the child of each
+    // goes on as the whole jailer. The child test says so on its standard
+    // output; a fork made anyway exits its parent with 0 and says nothing.
+    #[test]
+    fn test_daemonize_refuses_a_second_thread() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::macos::tests::daemonize_refuses_a_second_thread_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        let text = format!("{:?}\n{}{}", out.status, String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && text.contains("DAEMONIZE-REFUSED"), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_daemonize_refuses_a_second_thread in a process of its own"]
+    fn daemonize_refuses_a_second_thread_child() {
+        in_one_thread(|| {
+            second_thread();
+            let dev_null = File::open("/dev/null").unwrap();
+            let mut cpu = 0;
+            match daemonize(&dev_null, &mut cpu) {
+                Err(JailerError::Host(HostError::Threads(point, 2))) => {
+                    assert_eq!(point, "--daemonize");
+                    assert_eq!(cpu, 0, "nothing ran past the refusal");
+                    println!("DAEMONIZE-REFUSED");
+                }
+                // A daemon made anyway: its standard output is /dev/null.
+                // SAFETY: ends the daemon.
+                Ok(()) => unsafe { libc::_exit(0) },
+                Err(other) => panic!("{other:?}"),
+            }
+        });
+    }
+
+    // --daemonize with one thread, as the jailer has: two forks, the daemon
+    // in the first child's session and no session leader, its standard
+    // output /dev/null. The daemon writes its pid and session to a pipe,
+    // read within 10 s.
+    #[test]
+    fn test_daemonize_forks_twice() {
+        run_alone("platform::macos::tests::daemonize_forks_twice_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_daemonize_forks_twice in a process of its own"]
+    fn daemonize_forks_twice_child() {
+        let mut fds = [0; 2];
+        // SAFETY: an out-array of two.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        in_one_thread(|| {
+            let dev_null = File::open("/dev/null").unwrap();
+            let mut cpu = 0;
+            daemonize(&dev_null, &mut cpu).unwrap();
+            // The daemon.
+            // SAFETY: plain calls; a pipe this process holds.
+            unsafe {
+                let ids = [libc::getpid(), libc::getsid(0), libc::isatty(libc::STDOUT_FILENO)];
+                libc::write(fds[1], ids.as_ptr().cast(), std::mem::size_of_val(&ids));
+                libc::_exit(0);
+            }
+        });
+        // SAFETY: the write end, the reader's no longer.
+        unsafe { libc::close(fds[1]) };
+        let mut poll = libc::pollfd { fd: fds[0], events: libc::POLLIN, revents: 0 };
+        // SAFETY: one pollfd.
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 10_000) }, 1, "no word from the daemon within 10 s");
+        let mut ids = [0 as libc::pid_t; 3];
+        // SAFETY: a buffer of the size read.
+        let n = unsafe { libc::read(fds[0], ids.as_mut_ptr().cast(), std::mem::size_of_val(&ids)) };
+        assert_eq!(usize::try_from(n), Ok(std::mem::size_of_val(&ids)), "the daemon's word");
+        let [pid, sid, tty] = ids;
+        assert!(sid != pid && sid > 0, "the daemon is a session leader or has no session: pid {pid}, sid {sid}");
+        assert_eq!(tty, 0, "the daemon's standard output is a terminal");
     }
 
     #[test]

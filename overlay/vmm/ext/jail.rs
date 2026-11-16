@@ -140,6 +140,9 @@ pub enum JailError {
     CpuTooSmall(u8),
     /// Failed to set the jetsam memory limit of {0} MiB: {1}
     MemoryLimit(u32, std::io::Error),
+    /// {0}
+    #[cfg(target_os = "macos")]
+    Fork(crate::ext::api_process::ForkAloneError),
     /// Failed to make the API process: {0}
     ApiProcess(std::io::Error),
     /// The jail's network {0:?} (WICK_NETNS): {1}
@@ -550,6 +553,35 @@ mod imp {
         crate::ext::api_process::wait_for_server(link, firecracker)
     }
 
+    /// Makes the jail's API process ([`api_process`]) with its share of the
+    /// limits; the link to it. Called first thing in main, with one thread:
+    /// the child runs the whole API process, so a lock another thread held
+    /// at the fork would be met there, and the fork is refused with more
+    /// threads ([`crate::ext::api_process::fork_alone`]).
+    pub(super) fn fork_api_process(
+        uid: u32,
+        gid: u32,
+        api_cpu: Option<u8>,
+        api_memory: Option<u32>,
+    ) -> Result<std::os::unix::net::UnixStream, JailError> {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().map_err(JailError::ApiProcess)?;
+        // Firecracker's pid, which the API process ends with: taken before
+        // the fork (`api_process::end_with_firecracker`).
+        // SAFETY: no arguments.
+        let firecracker = unsafe { libc::getpid() };
+        match crate::ext::api_process::fork_alone("the jail's API process").map_err(JailError::Fork)? {
+            0 => {
+                drop(ours);
+                api_process(theirs, firecracker, uid, gid, api_cpu, api_memory);
+            }
+            child => {
+                drop(theirs);
+                crate::ext::api_process::watch_child(child);
+            }
+        }
+        Ok(ours)
+    }
+
     pub fn enter() -> Result<(), JailError> {
         let cpu = std::env::var_os(CPU_ENV).map(|v| v.to_string_lossy().into_owned());
         let memory = std::env::var_os(MEMORY_ENV).map(|v| v.to_string_lossy().into_owned());
@@ -625,24 +657,7 @@ mod imp {
         let api = !std::env::args().any(|a| a == "--no-api");
         if api && (cpu.is_some() || memory.is_some()) {
             let ((vmm_cpu, api_cpu), (vmm_memory, api_memory)) = share(cpu, memory)?;
-            let (ours, theirs) =
-                std::os::unix::net::UnixStream::pair().map_err(JailError::ApiProcess)?;
-            // Firecracker's pid, which the API process ends with: taken
-            // before the fork (`api_process::end_with_firecracker`).
-            // SAFETY: no arguments.
-            let firecracker = unsafe { libc::getpid() };
-            // SAFETY: called first thing in main, with one thread.
-            match unsafe { libc::fork() } {
-                -1 => return Err(JailError::ApiProcess(Error::last_os_error())),
-                0 => {
-                    drop(ours);
-                    api_process(theirs, firecracker, uid, gid, api_cpu, api_memory);
-                }
-                child => {
-                    drop(theirs);
-                    crate::ext::api_process::watch_child(child);
-                }
-            }
+            let ours = fork_api_process(uid, gid, api_cpu, api_memory)?;
             if let Some(mib) = vmm_memory {
                 limit_memory(mib)?;
             }
@@ -1065,6 +1080,34 @@ mod tests {
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(out.status.success(), "{name}: {:?}\n{stdout}", out.status);
         stdout
+    }
+
+    // The jail's fork of its API process is refused while Firecracker has
+    // a second thread, naming the point and the count: the child runs the
+    // whole API process and would meet a lock the other thread held.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_the_jails_api_process_fork_refuses_a_second_thread() {
+        let out = run_child("the_jails_api_process_fork_refuses_a_second_thread_child", &[]);
+        assert!(out.contains("API-PROCESS-FORK-REFUSED"), "{out}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by test_the_jails_api_process_fork_refuses_a_second_thread in a separate process"]
+    fn the_jails_api_process_fork_refuses_a_second_thread_child() {
+        use crate::ext::api_process::one_thread::{in_one_thread, second_thread};
+        in_one_thread(|| {
+            second_thread();
+            // SAFETY: no arguments.
+            let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+            // With the check left out, the fork's child fails to drop
+            // privileges as a plain user and ends; this side gets the link.
+            let err = imp::fork_api_process(uid, gid, None, None).map(drop).unwrap_err().to_string();
+            let want = "the jail's API process: Firecracker has 2 threads where its fork needs one";
+            assert!(err.starts_with(want), "{err}");
+        });
+        println!("API-PROCESS-FORK-REFUSED");
     }
 
     #[cfg(target_os = "macos")]

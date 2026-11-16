@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Wed, 11 Nov 2026 19:59:03 +0900
+Subject: [PATCH] jailer: --new-pid-ns and --daemonize on macOS fork through
+ the platform
+
+macOS has no PID namespaces. The jailer takes Linux's path with a fork
+in place of clone(CLONE_NEWPID): the pid file names the child, the
+child leaves the jailer's session if the jailer led one, and the jailer
+exits 0. What the namespace would hold is the jail's
+(overlay/jailer/platform/macos new_pid_ns, vmm::ext::jail).
+
+--daemonize's double fork is platform::daemonize on macOS: upstream's
+steps, each fork made only while the jailer has one thread
+(platform::fork_alone), since the child of each goes on as the whole
+jailer. Linux's block is upstream's code, unchanged; the helpers only
+it uses are built on Linux alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/jailer/src/env.rs | 33 ++++++++++++++++++++++++++-------
+ 1 file changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/src/jailer/src/env.rs b/src/jailer/src/env.rs
+index 026620e98fe13213383e2d8dff8849f3be86a27d..7ce292a10bf7659f89577d1c2fe8436c295bb347 100644
+--- a/src/jailer/src/env.rs
++++ b/src/jailer/src/env.rs
+@@ -11,14 +11,16 @@ use std::io;
+ use std::io::Write;
+ #[cfg(not(windows))] // wick: Windows has no file modes or owners (platform)
+ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
+-#[cfg(not(windows))] // wick: as above
++#[cfg(target_os = "linux")] // wick: setns and daemonize; macOS's are platform's
+ use std::os::unix::io::AsRawFd;
+ #[cfg(target_os = "linux")] // wick: the exec as uid:gid is Linux's backend
+ use std::os::unix::process::CommandExt;
+ use std::path::{Component, Path, PathBuf};
+ #[cfg(target_os = "linux")] // wick: as above
+ use std::process::{Command, Stdio};
+-use std::process::{exit, id};
++use std::process::id;
++#[cfg(target_os = "linux")] // wick: daemonize's; macOS's is platform::daemonize
++use std::process::exit;
+ 
+ use utils::arg_parser::UtilsArgParserError::MissingValue;
+ use utils::time::{ClockType, get_time_us};
+@@ -32,8 +34,12 @@ use crate::resource_limits::{FSIZE_ARG, NO_FILE_ARG, ResourceLimits};
+ 
+ pub const PROC_MOUNTS: &str = "/proc/mounts";
+ 
++// wick: daemonize's; macOS's is platform::daemonize.
++#[cfg(target_os = "linux")]
+ const STDIN_FILENO: libc::c_int = 0;
++#[cfg(target_os = "linux")]
+ const STDOUT_FILENO: libc::c_int = 1;
++#[cfg(target_os = "linux")]
+ const STDERR_FILENO: libc::c_int = 2;
+ 
+ // Kernel-based virtual machine (hardware virtualization extensions)
+@@ -84,6 +90,7 @@ const FOLDER_PERMISSIONS: u32 = 0o700;
+ const PID_FILE_EXTENSION: &str = ".pid";
+ 
+ // Helper function, since we'll use libc::dup2 a bunch of times for daemonization.
++#[cfg(target_os = "linux")] // wick: macOS's daemonize is platform::daemonize
+ fn dup2(old_fd: libc::c_int, new_fd: libc::c_int) -> Result<(), JailerError> {
+     // SAFETY: This is safe because we are using a library function with valid parameters.
+     SyscallReturnCode(unsafe { libc::dup2(old_fd, new_fd) })
+@@ -366,16 +373,16 @@ impl Env {
+     }
+ 
+     // wick: outside Linux, PID namespaces are platform::new_pid_ns (overlay/jailer/platform):
+-    // macOS refuses; on Windows the jailer has handed over to a keeper (env::run), which runs
+-    // Firecracker as without the flag.
+-    #[cfg(not(target_os = "linux"))]
++    // on Windows the jailer has handed over to a keeper (env::run), which runs Firecracker as
++    // without the flag; macOS takes Linux's path below, with a fork in place of the clone.
++    #[cfg(windows)]
+     fn exec_into_new_pid_ns(&mut self, chroot_exec_file: PathBuf) -> Result<(), JailerError> {
+         crate::platform::new_pid_ns()?;
+         self.save_exec_file_pid(id().try_into().unwrap(), chroot_exec_file.clone())?;
+         Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
+     }
+ 
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "macos"))] // wick: macOS: a fork (below)
+     fn exec_into_new_pid_ns(&mut self, chroot_exec_file: PathBuf) -> Result<(), JailerError> {
+         // https://man7.org/linux/man-pages/man7/pid_namespaces.7.html
+         // > a process in an ancestor namespace can send signals to the "init" process of a child
+@@ -412,7 +419,12 @@ impl Env {
+         // Duplicate the current process. The child process will belong to the previously created
+         // PID namespace. The current process will not be moved into the newly created namespace,
+         // but its first child will assume the role of init(1) in the new namespace.
++        #[cfg(target_os = "linux")] // wick: macOS has no PID namespaces
+         let pid = clone(std::ptr::null_mut(), libc::CLONE_NEWPID)?;
++        // wick: a child Firecracker becomes, whose jail holds what the namespace would
++        // (platform::new_pid_ns).
++        #[cfg(target_os = "macos")]
++        let pid = crate::platform::new_pid_ns()?;
+         match pid {
+             0 => {
+                 if is_session_leader {
+@@ -828,7 +840,14 @@ impl Env {
+         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;
+ 
+         // Daemonize before exec, if so required (when the dev_null variable != None).
+-        #[cfg(not(windows))] // wick: refused on Windows above
++        // wick: on macOS the double fork is platform::daemonize, each fork made only
++        // while the jailer has one thread (platform::fork_alone): the child of each
++        // goes on as the whole jailer. Linux's below is upstream's, unchanged.
++        #[cfg(target_os = "macos")]
++        if let Some(dev_null) = dev_null {
++            crate::platform::daemonize(&dev_null, &mut self.jailer_cpu_time_us)?;
++        }
++        #[cfg(target_os = "linux")] // wick: refused on Windows above; macOS's is above
+         if let Some(dev_null) = dev_null {
+             // We follow the double fork method to daemonize the jailer referring to
+             // https://0xjet.github.io/3OHA/2022/04/11/post.html
