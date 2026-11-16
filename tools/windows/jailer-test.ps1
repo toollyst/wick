@@ -189,15 +189,16 @@ class JailedVm {
 # A jail for `id` under `base` with the guest's files, and a VM in it.
 # -Api keeps the API socket (/run/firecracker.socket in the jail) and sets
 # `Sock` and `Root` on the VM; -NoConfig starts Firecracker with nothing
-# configured (the API configures it); `drives` are added to the root drive.
-function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(), [int]$memMib = 256, [switch]$Api, [switch]$NoConfig, [object[]]$drives = @(), [string]$hugePages = '', [int]$vcpus = 2, [string]$exec = '') {
+# configured (the API configures it); `drives` are added to the root drive;
+# `bootArgs` go at the end of the guest kernel's command line.
+function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(), [int]$memMib = 256, [switch]$Api, [switch]$NoConfig, [object[]]$drives = @(), [string]$hugePages = '', [int]$vcpus = 2, [string]$exec = '', [string]$bootArgs = '') {
     if (-not $exec) { $exec = $Fc }
     $root = Join-Path $base "firecracker.exe\$id\root"
     New-Item -ItemType Directory -Force -Path $root | Out-Null
     Copy-Item (Join-Path $Assets 'vmlinux-6.1.188') (Join-Path $root 'vmlinux')
     Copy-Item (Join-Path $Assets 'ubuntu-24.04.squashfs') (Join-Path $root 'rootfs')
     $cfg = [ordered]@{
-        'boot-source'    = [ordered]@{ kernel_image_path = '/vmlinux'; boot_args = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd root=/dev/vda ro rootfstype=squashfs init=/bin/sh' }
+        'boot-source'    = [ordered]@{ kernel_image_path = '/vmlinux'; boot_args = ('console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd root=/dev/vda ro rootfstype=squashfs init=/bin/sh ' + $bootArgs).Trim() }
         'drives'         = @([ordered]@{ drive_id = 'rootfs'; path_on_host = '/rootfs'; is_root_device = $true; is_read_only = $true }) + $drives
         'machine-config' = [ordered]@{ vcpu_count = $vcpus; mem_size_mib = $memMib }
     }
@@ -1909,7 +1910,9 @@ function Stage-Cpu([int]$Boots = 12) {
 #   `allow_writes = MSR_WRITES_OFF` (its msr.c :51), so filter_write
 #   refuses every write with EPERM (:95) unless the command line has
 #   msr.allow_writes=on (:296 to :329): CI run 43927377548's storm died so
-#   at its first write. Before the runs the stage says what A's kernel
+#   at its first write. A boots with msr.allow_writes=on on its command
+#   line (this stage's guests only; B and every other stage boot without
+#   it). Before the runs the stage says what A's kernel
 #   has (X2STORMMSR: uname -r, the msr module's allow_writes, the lockdown
 #   LSM's state or its absence, the config's lockdown and X86_MSR lines)
 #   and makes one write of the value read; a write refused fails the stage
@@ -2058,7 +2061,7 @@ function Stage-X2storm([int]$Runs = 5, [int]$Secs = 10) {
             $idb = "b$run$(if ($cap) { 'c' } else { 'u' })"
             $capArgs = if ($cap) { @('--cgroup-version', '2', '--cgroup', "cpu.max=$cap") } else { @() }
             try {
-                $a = Start-JailedVm $base $ida $capArgs 256 -Api -vcpus 4 -exec $x2
+                $a = Start-JailedVm $base $ida $capArgs 256 -Api -vcpus 4 -exec $x2 -bootArgs 'msr.allow_writes=on'
                 $b = Start-JailedVm $base $idb @() 256 -vcpus 2
                 Wait-Shell $a
                 Wait-Shell $b
