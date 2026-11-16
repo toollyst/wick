@@ -196,7 +196,10 @@ collected keeps also every test a "not run" claim names, as it is the run
 that answers them; collecting a newer run shrinks the one before to its
 cited rows (it never removes a cited one). So the commit that cites a run
 collects it, and a sentence citing an older run names only tests that run
-kept.
+kept. A run no sentence cites keeps its line in `runs-index.tsv` with no
+rows: it was collected (collect refuses it again), and a sentence citing it
+later finds no row and fails. A sentence naming several tests is checked
+for each (an alias and the test it names are one).
 Artifacts last 14 days: a run older than that can no longer be collected,
 and a document cannot cite it (the rows already collected stay, checked
 against the hash collect recorded in `docs/evidence/runs-index.tsv`). The

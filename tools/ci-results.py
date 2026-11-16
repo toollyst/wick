@@ -302,6 +302,12 @@ def validate(text, name="results.tsv"):
 
 
 # --- the evidence: docs/evidence/runs.tsv, written by collect only ---------
+# A run's line in runs-index.tsv stays for good, also when its rows are gone:
+# a run no sentence cites shrinks to no rows when a newer one is collected,
+# its rows_sha256 that of no rows. The line records that the run was
+# collected (collect refuses a run twice), and a claim that cites the run
+# finds no row for its test and fails. A historical claim is checked for
+# each test it names (claim_units: an alias and its test's name are one).
 
 EVIDENCE = "docs/evidence/runs.tsv"
 INDEX = "docs/evidence/runs-index.tsv"
@@ -508,6 +514,21 @@ def is_ancestor(repo, a, b):
     return out.returncode == 0
 
 
+def claim_units(subs, rows):
+    """A historical claim's subjects, each checked by itself, except names
+    one row answers to together (an alias and its test's name, MOVEUNDERVCPU
+    and `test_a_chunk_moved_...`): those are one test, checked once."""
+    units = []
+    for s in sorted(subs):
+        joined = [u for u in units
+                  if s[0] == "name" and any(t[0] == "name" and any(row_is(r, s) and row_is(r, t) for r in rows)
+                                            for t in u)]
+        for u in joined:
+            units.remove(u)
+        units.append(set().union({s}, *joined))
+    return units
+
+
 def check_run_claims(root, repo, documents, evidence_since=None):
     """(errors, warnings) of the documents' run claims against the evidence:
     a not-run claim on a test a run after the sentence ran, and a historical
@@ -550,28 +571,23 @@ def check_run_claims(root, repo, documents, evidence_since=None):
             for p in g["historical"]:
                 for m in p.finditer(sentence):
                     verb = m.group("verb").lower()
-                    tests = subs
-                    names = {t[1] for t in tests if t[0] == "name"}
-                    if len(tests) != 1 and not (len(tests) == 2 and len(names) == 2 and
-                                                any(r["alias"] in names and any(row_is(r, t) for t in tests)
-                                                    for r in rows)):
-                        continue
-                    for run in RUN_ID.findall(m.group("runs")):
-                        if run not in runs:
-                            continue
-                        got = [r for r in rows if r["run"] == run and any(row_is(r, s) for s in tests)
-                               and host_family(r) in hosts]
-                        said = " / ".join(sorted(subject_label(t) for t in tests))
-                        results = {r["result"] for r in got}
-                        # passed: one passed and none failed (a parametrised
-                        # test's rows); failed: one failed; ran: any row.
-                        right = {"passed": "pass" in results and not results & {"fail", "crash"},
-                                 "failed": bool(results & {"fail", "crash"}), "ran": bool(results)}[verb]
-                        if not got:
-                            errors.append(f"{name}:{n} says {said} {verb} in run {run}, which has no row for it")
-                        elif not right:
-                            errors.append(f"{name}:{n} says {said} {verb} in run {run}, "
-                                          f"which has it {', '.join(sorted(results))}")
+                    for tests in claim_units(subs, rows):
+                        for run in RUN_ID.findall(m.group("runs")):
+                            if run not in runs:
+                                continue
+                            got = [r for r in rows if r["run"] == run and any(row_is(r, s) for s in tests)
+                                   and host_family(r) in hosts]
+                            said = " / ".join(sorted(subject_label(t) for t in tests))
+                            results = {r["result"] for r in got}
+                            # passed: one passed and none failed (a parametrised
+                            # test's rows); failed: one failed; ran: any row.
+                            right = {"passed": "pass" in results and not results & {"fail", "crash"},
+                                     "failed": bool(results & {"fail", "crash"}), "ran": bool(results)}[verb]
+                            if not got:
+                                errors.append(f"{name}:{n} says {said} {verb} in run {run}, which has no row for it")
+                            elif not right:
+                                errors.append(f"{name}:{n} says {said} {verb} in run {run}, "
+                                              f"which has it {', '.join(sorted(results))}")
     return errors, warnings
 
 
@@ -847,6 +863,26 @@ def claims_selftest(expect):
         expect("the shrunk evidence checks", errs, [])
         errors, _ = check_run_claims(repo, repo, {"c.md": bound["c.md"].splitlines()[0]}, 43688550565)
         expect("a cited row answers its claim after the shrink", errors, [])
+        # A run no sentence cites shrinks to no rows and keeps its index line
+        # (it was collected: collect refuses it again), and a claim citing it
+        # finds no row: one subject or several, each subject is checked.
+        collect(repo, "43900000003", [one("43900000003", ["test_cited"])], bound.values())
+        rows, runs, errs = load_evidence(repo)
+        expect("an uncited run keeps its index line and no rows",
+               ("43900000002" in runs, [r for r in rows if r["run"] == "43900000002"], errs), (True, [], []))
+        for text, want in (
+                ("`test_claimed` failed in run 43900000002.",
+                 ["z.md:1 says test_claimed failed in run 43900000002, which has no row for it"]),
+                ("`test_cited` and `test_claimed` failed in run 43900000002.",
+                 ["z.md:1 says test_cited failed in run 43900000002, which has no row for it",
+                  "z.md:1 says test_claimed failed in run 43900000002, which has no row for it"]),
+                ("`test_cited` and `test_other` failed in run 43900000001.",
+                 ["z.md:1 says test_other failed in run 43900000001, which has no row for it"]),
+                ("`test_cited` and `test_claimed` passed in run 43900000001.",
+                 ["z.md:1 says test_cited passed in run 43900000001, which has it fail",
+                  "z.md:1 says test_claimed passed in run 43900000001, which has no row for it"])):
+            errors, _ = check_run_claims(repo, repo, {"z.md": text}, 43688550565)
+            expect(f"zero rows, subjects one by one: {text[:50]}", sorted(errors), sorted(want))
         # A row edited by hand fails its run's hash.
         ev = repo / EVIDENCE
         ev.write_text(ev.read_text().replace("\tfail\t", "\tpass\t"))
