@@ -227,6 +227,21 @@ has the per-control details and results.
     the libc and vmm-sys-util code it runs is the tests' above.
   - the API process: the same polling callbacks on pool threads. Not run: needs WHP's DLLs (the PC).
 
+- **Windows: a userfaultfd could be refused to a process whose pid a killed process had used** (since b0dfb35b,
+  which made the userfaultfd kernel side; fixed by the commit that adds this entry). Its two ends are an AF_UNIX pair
+  made through a listener on `%TEMP%\wick-uffd-<pid>-<n>.sock`, and the path was removed only after the pair was
+  accepted. A process that died before that left the path, and a later process with the same pid was refused the
+  bind (WSAEADDRINUSE) and so its userfaultfd, where Linux's `socketpair` cannot fail so. Seen on Windows Server 2022
+  20348 after a debugger ended a test process; reproduced by leaving such paths
+  (`test_a_userfaultfd_is_made_over_paths_a_dead_process_of_this_pid_left`, failing before the fix). Now the path is
+  removed as soon as the connection is made, before it is accepted, so it exists only from the bind to the connect.
+  A path of this process's pid left by a dead one is removed before the bind; nothing live can hold that name.
+  The accepted end must be this process's own connection (`SIO_AF_UNIX_GETPEERPID`), or the pair fails with a line
+  naming the path. Any writer of the temporary directory could connect while the path existed and be the end
+  accepted, which was not checked before; no such connection was seen. The behaviour this relies on is measured on
+  the host (`test_af_unix_paths_and_abstract_addresses_on_record`): a connection queued on the listener is accepted
+  after its path is deleted, and both ends report this process's pid.
+
 ## Not at parity yet
 
 Until these are done, **do not run untrusted multi-tenant workloads on macOS or Windows hosts.** On Linux, wick is

@@ -55,11 +55,12 @@ use std::sync::Mutex;
 use crate::windows_stacklock::ProbedMutex;
 use std::vec::Vec;
 
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
     self as ws, AF_UNIX, INVALID_SOCKET, POLLERR, POLLHUP, POLLRDNORM, SOCKET, SOCKET_ERROR,
     SOCK_STREAM, WSAPOLLFD, WSAPROTOCOL_INFOW, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
 };
+use windows_sys::Win32::Storage::FileSystem::DeleteFileW;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
     EXCEPTION_POINTERS,
@@ -611,8 +612,65 @@ fn protect_as(addr: u64, len: u64, prot: PAGE_PROTECTION_FLAGS) -> io::Result<()
     Ok(())
 }
 
+/// Removes the socket path a dead process of this pid left at `path`,
+/// before this process binds it (`bind` refuses a path that exists with
+/// WSAEADDRINUSE: `test_af_unix_paths_and_abstract_addresses_on_record`).
+/// Removing it cannot take anything live: the name carries this process's
+/// pid, which no other live process has, and a sequence number this process
+/// has not used yet (`socket_pair`'s only rises), so nothing of ours listens
+/// there, and a file there was left by a dead process of this pid that was
+/// killed between its bind and its removal of the path (cdb's quit left
+/// `wick-uffd-3332-1.sock` on fc-win, and a later process with pid 3332 was
+/// refused its userfaultfd). `DeleteFileW` deletes a symbolic link, not its
+/// target (Learn, DeleteFileW: "If the path points to a symbolic link, the
+/// symbolic link is deleted, not the target"), and removes no directory, so
+/// whoever else may write in the temporary directory (the jail's `tmp`: the
+/// jailed processes, the jailer, the user; unjailed, the user's processes)
+/// cannot make it delete anything but this name. Microsoft's AF_UNIX
+/// guidance asks the same: "DeleteFile (or any other file delete API) should
+/// be used to delete the socket file prior to calling bind with the same
+/// path" (devblogs.microsoft.com, "AF_UNIX comes to Windows"). A name that
+/// is there and cannot be removed fails the userfaultfd, with a line naming
+/// it; a second name is never tried in its place.
+fn remove_left_path(path: &std::path::Path, wide: &[u16]) -> io::Result<()> {
+    // SAFETY: a NUL-terminated path.
+    if unsafe { DeleteFileW(wide.as_ptr()) } != 0 {
+        std::eprintln!(
+            "wick: userfaultfd: removed {}, a socket path a dead process of this pid left",
+            path.display()
+        );
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND.cast_signed()) {
+        return Ok(());
+    }
+    std::eprintln!(
+        "wick: userfaultfd: the socket path {} could not be removed before its bind: {e}",
+        path.display()
+    );
+    Err(e)
+}
+
 /// A connected pair of `AF_UNIX` stream sockets (Windows has no
-/// `socketpair`): a listener on a temporary path, connected to and removed.
+/// `socketpair`): a listener on a temporary path, connected to. The path is
+/// removed as soon as the connection is made, before it is accepted (a
+/// queued connection is accepted without its path:
+/// `test_af_unix_paths_and_abstract_addresses_on_record`), so it exists only
+/// from the bind to the connect, and a process that dies in that window
+/// leaves a path the next process of its pid removes (`remove_left_path`).
+/// The accepted end must be this process's own connection: any writer of
+/// the temporary directory may connect to the listener while its path
+/// exists, and the first connection queued is the one accepted; an end
+/// whose peer is another process fails the pair, loudly.
+///
+/// Not an abstract address (a NUL first in `sun_path`, no file): it has no
+/// file and so no DACL, the one control Microsoft names for AF_UNIX ("can
+/// be secured by controlling the file (or directory) permissions"), and no
+/// namespace scopes it as a network namespace scopes Linux's; any process
+/// that guessed the name could be the end accepted. (On 20348 such a bind
+/// and listen worked and the connect was refused with WSAEINVAL, with the
+/// length delimiting the name as on Linux: the same record.)
 fn socket_pair() -> io::Result<(c_int, c_int)> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     wick_wsa_startup();
@@ -654,6 +712,13 @@ fn socket_pair() -> io::Result<(c_int, c_int)> {
     addr[0] = 1; // AF_UNIX
     addr[2..2 + bytes.len()].copy_from_slice(&bytes);
     let addr_len = i32::try_from(addr.len()).unwrap();
+    let wide: Vec<u16> = {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str().encode_wide().chain([0]).collect()
+    };
+    remove_left_path(&path, &wide)?;
+    // Whether the path is removed already (at the connect).
+    let mut removed = false;
     let listener = new()?;
     // SAFETY: a valid AF_UNIX address.
     let bound = unsafe {
@@ -673,11 +738,37 @@ fn socket_pair() -> io::Result<(c_int, c_int)> {
             close(a);
             return Err(e);
         }
+        // The connection is queued on the listener; its path is no longer
+        // needed.
+        // SAFETY: a NUL-terminated path.
+        removed = unsafe { DeleteFileW(wide.as_ptr()) } != 0;
         // SAFETY: accepts the connection just made.
         let b = unsafe { ws::accept(listener, ptr::null_mut(), ptr::null_mut()) };
         if b == INVALID_SOCKET {
             // SAFETY: plain call.
             let e = io::Error::from_raw_os_error(unsafe { ws::WSAGetLastError() });
+            close(a);
+            return Err(e);
+        }
+        // The accepted end's peer: this process, whose connection it is.
+        let (mut pid, mut n) = (0u32, 0u32);
+        // SAFETY: a u32 out-buffer, on the socket accepted above.
+        let asked = unsafe {
+            ws::WSAIoctl(b, ws::SIO_AF_UNIX_GETPEERPID, ptr::null(), 0, (&raw mut pid).cast(), 4, &mut n, ptr::null_mut(), None)
+        };
+        if asked != 0 || pid != std::process::id() {
+            let e = if asked != 0 {
+                // SAFETY: plain call.
+                io::Error::from_raw_os_error(unsafe { ws::WSAGetLastError() })
+            } else {
+                errno_err(crate::EPERM)
+            };
+            std::eprintln!(
+                "wick: userfaultfd: the connection accepted on {} is not this process's (its peer: {}): {e}",
+                path.display(),
+                if asked != 0 { std::string::String::from("not known") } else { std::format!("pid {pid}") }
+            );
+            close(b);
             close(a);
             return Err(e);
         }
@@ -693,7 +784,12 @@ fn socket_pair() -> io::Result<(c_int, c_int)> {
         }
     });
     close(listener);
-    let _ = std::fs::remove_file(&path);
+    if !removed {
+        // A pair not connected (or a path whose removal at the connect was
+        // refused): removed now, as before.
+        // SAFETY: a NUL-terminated path.
+        unsafe { DeleteFileW(wide.as_ptr()) };
+    }
     result
 }
 
@@ -6277,5 +6373,211 @@ mod tests {
         assert_eq!(got, 0x5a);
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// A plain AF_UNIX stream socket, for the tests below.
+    fn unix_socket() -> SOCKET {
+        wick_wsa_startup();
+        // SAFETY: creates a socket.
+        let s = unsafe {
+            ws::WSASocketW(i32::from(AF_UNIX), SOCK_STREAM, 0, ptr::null(), 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT)
+        };
+        assert_ne!(s, INVALID_SOCKET, "WSASocketW: {}", io::Error::last_os_error());
+        s
+    }
+
+    /// A `sockaddr_un` for `name` (a path, or an abstract name when it
+    /// starts with NUL) and the length to pass: the family, then the name's
+    /// bytes, with no terminator for an abstract name (Linux's rule for
+    /// abstract names: the length delimits it).
+    fn unix_addr(name: &[u8]) -> ([u8; 110], i32) {
+        let mut a = [0u8; 110];
+        a[0] = 1; // AF_UNIX
+        a[2..2 + name.len()].copy_from_slice(name);
+        let len = if name.first() == Some(&0) { 2 + name.len() } else { a.len() };
+        (a, i32::try_from(len).unwrap())
+    }
+
+    fn wsa_error() -> i32 {
+        // SAFETY: plain call.
+        unsafe { ws::WSAGetLastError() }
+    }
+
+    /// The path of this process's userfaultfd socket number `seq`, as
+    /// `socket_pair` names it.
+    fn uffd_socket_path(seq: u64) -> std::path::PathBuf {
+        std::env::temp_dir().join(std::format!("wick-uffd-{}-{seq}.sock", std::process::id()))
+    }
+
+    /// A process killed between `socket_pair`'s bind and its removal of
+    /// the path leaves the path (cdb's quit left `wick-uffd-3332-1.sock` on
+    /// fc-win, 2026-11-16, and a later test process with pid 3332 was
+    /// refused its second userfaultfd: `bind` WSAEADDRINUSE, 10048). The
+    /// next process of that pid must make its userfaultfds all the same, as
+    /// Linux's `socketpair`, which has no path, always does; and no path of
+    /// a userfaultfd it made may stay once `create` returned. In a process
+    /// of its own (its sequence numbers start at 0).
+    #[test]
+    fn test_a_userfaultfd_is_made_over_paths_a_dead_process_of_this_pid_left() {
+        let (code, out) = run_child("sockpath_leftover_child", None);
+        std::eprintln!("{out}");
+        assert_eq!(code, Some(0), "the child failed");
+        assert!(out.contains("SOCKPATH made 4 userfaultfds over 4 left paths"), "the child did not get to its end");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_userfaultfd_is_made_over_paths_a_dead_process_of_this_pid_left"]
+    fn sockpath_leftover_child() {
+        // This child's paths, removed at its end however it ends.
+        struct Paths;
+        impl Drop for Paths {
+            fn drop(&mut self) {
+                for seq in 0..4 {
+                    let _ = std::fs::remove_file(uffd_socket_path(seq));
+                }
+            }
+        }
+        let _paths = Paths;
+        // Left as a killed process leaves them: a socket bound to the path
+        // and closed, its file (an NTFS reparse point) still there.
+        for seq in 0..4 {
+            let path = uffd_socket_path(seq);
+            let (a, len) = unix_addr(path.to_str().unwrap().as_bytes());
+            let s = unix_socket();
+            // SAFETY: a valid AF_UNIX address.
+            assert_eq!(unsafe { ws::bind(s, a.as_ptr().cast(), len) }, 0, "bind {}: {}", path.display(), wsa_error());
+            // SAFETY: our socket.
+            unsafe { ws::closesocket(s) };
+            assert!(path.exists(), "{} went with its socket", path.display());
+        }
+        for seq in 0..4 {
+            let made = create(0, false, true);
+            let (ctx, user) = made.unwrap_or_else(|e| panic!("userfaultfd {seq} over a path a dead process left: {e}"));
+            assert!(!uffd_socket_path(seq).exists(), "{} stayed after create returned", uffd_socket_path(seq).display());
+            release(ctx, user);
+        }
+        std::eprintln!("SOCKPATH made 4 userfaultfds over 4 left paths; none of their paths stayed");
+    }
+
+    /// SOCKPATH: what AF_UNIX on this host does with the cases
+    /// `socket_pair` meets (note-uffd-sockpath.md): (a) an abstract address
+    /// (a NUL first in `sun_path`): bind, listen, connect, accept; (b) the
+    /// listener's path deleted (DeleteFileW) after a connect and before its
+    /// accept: is the queued connection still accepted; (c) the pid
+    /// `SIO_AF_UNIX_GETPEERPID` gives for each end of a pair this process
+    /// made; (d) a bind over a path a closed socket left: its error, and the
+    /// bind after DeleteFileW. On record: it prints what it saw and fails
+    /// only on a call the cases need that it could not make.
+    #[test]
+    fn test_af_unix_paths_and_abstract_addresses_on_record() {
+        let wide = |p: &std::path::Path| -> Vec<u16> {
+            use std::os::windows::ffi::OsStrExt;
+            p.as_os_str().encode_wide().chain([0]).collect()
+        };
+        let peer = |s: SOCKET| -> std::string::String {
+            let (mut pid, mut n) = (0u32, 0u32);
+            // SAFETY: a u32 out-buffer.
+            let rc = unsafe {
+                ws::WSAIoctl(s, ws::SIO_AF_UNIX_GETPEERPID, ptr::null(), 0, (&raw mut pid).cast(), 4, &mut n, ptr::null_mut(), None)
+            };
+            if rc == 0 { std::format!("pid {pid}") } else { std::format!("error {}", wsa_error()) }
+        };
+        let me = std::process::id();
+        let close = |s: SOCKET| {
+            // SAFETY: our socket.
+            unsafe { ws::closesocket(s) };
+        };
+        // (a) An abstract address.
+        let name = std::format!("\0wick-sockpath-rec-{me}");
+        let (a, len) = unix_addr(name.as_bytes());
+        let l = unix_socket();
+        // SAFETY: valid addresses and our sockets, here and below.
+        let bound = unsafe { ws::bind(l, a.as_ptr().cast(), len) };
+        let bound_err = if bound == 0 { 0 } else { wsa_error() };
+        // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+        let listened = if bound == 0 { unsafe { ws::listen(l, 1) } } else { -1 };
+        let mut line = std::format!("SOCKPATH abstract: bind {bound} (error {bound_err}), listen {listened}");
+        if listened == 0 {
+            let c = unix_socket();
+            // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+            let connected = unsafe { ws::connect(c, a.as_ptr().cast(), len) };
+            let connect_err = if connected == 0 { 0 } else { wsa_error() };
+            line.push_str(&std::format!(", connect {connected} (error {connect_err})"));
+            if connected == 0 {
+                // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+                let s = unsafe { ws::accept(l, ptr::null_mut(), ptr::null_mut()) };
+                line.push_str(&std::format!(", accept {}", if s == INVALID_SOCKET { std::format!("error {}", wsa_error()) } else { std::format!("ok, its peer {}", peer(s)) }));
+                if s != INVALID_SOCKET {
+                    close(s);
+                }
+            }
+            close(c);
+        }
+        close(l);
+        std::eprintln!("{line}");
+        // (b), (c): a path deleted between connect and accept.
+        let path = std::env::temp_dir().join(std::format!("wick-sockpath-rec-{me}.sock"));
+        let (a, len) = unix_addr(path.to_str().unwrap().as_bytes());
+        let l = unix_socket();
+        // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+        assert_eq!(unsafe { ws::bind(l, a.as_ptr().cast(), len) }, 0, "bind {}: {}", path.display(), wsa_error());
+        // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+        assert_eq!(unsafe { ws::listen(l, 1) }, 0);
+        let c = unix_socket();
+        // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+        assert_eq!(unsafe { ws::connect(c, a.as_ptr().cast(), len) }, 0, "connect: {}", wsa_error());
+        // SAFETY: a NUL-terminated path.
+        let deleted = unsafe { DeleteFileW(wide(&path).as_ptr()) };
+        let delete_err = if deleted != 0 { 0 } else { io::Error::last_os_error().raw_os_error().unwrap_or(0) };
+        let gone = !path.exists();
+        // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+        let s = unsafe { ws::accept(l, ptr::null_mut(), ptr::null_mut()) };
+        let accepted = if s == INVALID_SOCKET { std::format!("error {}", wsa_error()) } else { "ok".into() };
+        let mut moved = std::string::String::from("not tried");
+        if s != INVALID_SOCKET {
+            // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+            let sent = unsafe { ws::send(c, b"x".as_ptr(), 1, 0) };
+            let mut b = [0u8; 1];
+            // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+            let got = unsafe { ws::recv(s, b.as_mut_ptr(), 1, 0) };
+            moved = std::format!("send {sent}, recv {got} ({:?})", b[0] as char);
+        }
+        std::eprintln!(
+            "SOCKPATH path deleted after connect, before accept: DeleteFileW {deleted} (error {delete_err}), the path gone {gone}; accept {accepted}; a byte through it: {moved}"
+        );
+        if s != INVALID_SOCKET {
+            std::eprintln!("SOCKPATH peers (this process is pid {me}): of the accepted end {}, of the connected end {}", peer(s), peer(c));
+            close(s);
+        }
+        close(c);
+        close(l);
+        // (d) A bind over a path a closed socket left, then after DeleteFileW.
+        let l = unix_socket();
+        // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+        assert_eq!(unsafe { ws::bind(l, a.as_ptr().cast(), len) }, 0, "bind {}: {}", path.display(), wsa_error());
+        close(l);
+        let left = path.exists();
+        let l = unix_socket();
+        // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+        let again = unsafe { ws::bind(l, a.as_ptr().cast(), len) };
+        let again_err = if again == 0 { 0 } else { wsa_error() };
+        close(l);
+        // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+        let deleted = unsafe { DeleteFileW(wide(&path).as_ptr()) };
+        let l = unix_socket();
+        // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+        let after = unsafe { ws::bind(l, a.as_ptr().cast(), len) };
+        let after_err = if after == 0 { 0 } else { wsa_error() };
+        close(l);
+        // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+        let deleted_last = unsafe { DeleteFileW(wide(&path).as_ptr()) };
+        std::eprintln!(
+            "SOCKPATH a path a closed socket left: there {left}; bind over it {again} (error {again_err}); DeleteFileW {deleted}; bind after it {after} (error {after_err}); removed at the end {deleted_last}"
+        );
+        // (e) DeleteFileW of a name that is missing: its error.
+        // SAFETY: our sockets, valid addresses and NUL-terminated paths.
+        let missing = unsafe { DeleteFileW(wide(&path).as_ptr()) };
+        std::eprintln!("SOCKPATH DeleteFileW of a missing name: {missing} (error {})", io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        assert!(!path.exists());
     }
 }
