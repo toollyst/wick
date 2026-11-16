@@ -111,6 +111,8 @@ The table below is a selection: the tools a contributor runs most. Every script 
 | [`tools/package-release.sh`](../tools/package-release.sh) | Packages a macOS release in upstream's release layout, with each binary's SBOM ([`tools/sbom.py`](../tools/sbom.py) checks it against `Cargo.lock`) |
 | [`tools/check-dependencies.sh`](../tools/check-dependencies.sh) | Dependency checks: advisories, licenses, banned and duplicate crates, sources ([CONTRIBUTING.md](../CONTRIBUTING.md#dependencies)) |
 | [`tools/fuzz.sh`](../tools/fuzz.sh) | Runs the fuzz targets in `fuzz/` for a given time each (`-t SECONDS`, `-j JOBS`) |
+| [`tools/clean.sh`](../tools/clean.sh) | What every test script runs at its start: kills a test run's processes and the shell tools' loops left by a killed run (parent pid 1), removes test directories no process names, and says how many; `--dry-run` lists without touching |
+| [`tools/check-background-loops.py`](../tools/check-background-loops.py) | Fails a loop a shell tool under `tools/` starts in the background without a liveness test of its owner, a numeric bound and a `# background loop:` comment (CI, with `--selftest`) |
 
 ## Where the rules live
 
