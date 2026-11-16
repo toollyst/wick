@@ -407,7 +407,12 @@ jobs:
       - name: Install clippy
         working-directory: lib/firecracker
         run: rustup component add clippy
+      # Each test step runs after an earlier test's failure, so that one
+      # failure does not hide the rest, but never after a failed checkout,
+      # setup or build (steps.build: skipped or failed), whose cause it
+      # would bury under failures of its own.
       - name: Build firecracker
+        id: build
         working-directory: lib/firecracker
         run: cargo build --locked -p firecracker --bin firecracker
       - name: Clippy
@@ -416,13 +421,16 @@ jobs:
       # As upstream on a Linux host without /dev/nitro_enclaves (linux-boot
       # runs the same script there).
       - name: Nitro Enclave refused without the device
+        if: (success() || failure()) && steps.build.outcome == 'success'
         run: python3 -I tools/macos/enclave-refusal-test.py lib/firecracker/build/cargo_target/debug/firecracker
       # As linux-boot runs it on Linux (patches/0050).
       - name: API request in flight when the VMM ends
+        if: (success() || failure()) && steps.build.outcome == 'success'
         run: python3 -I tools/macos/api-vmm-ended-test.py lib/firecracker/build/cargo_target/debug/firecracker
       # The jailer's tests run as root, as upstream's do (they set resource
       # limits and change owners); the runners have passwordless sudo.
       - name: Jailer unit tests
+        if: (success() || failure()) && steps.build.outcome == 'success'
         working-directory: lib/firecracker
         run: |
           bin=$(cargo test --locked -p jailer --no-run --message-format=json |
@@ -437,8 +445,10 @@ jobs:
       # 43467381837): spinners held with SIGSTOP judged thawed, and running
       # ones judged frozen, must fail by name. Needs no root.
       - name: Freeze judgement self-check
+        if: (success() || failure()) && steps.build.outcome == 'success'
         run: python3 -I tools/macos/jailer-test.py --freeze-self-check
       - name: Jailer scenario tests (without a VM)
+        if: (success() || failure()) && steps.build.outcome == 'success'
         id: jailer_scenarios
         run: tools/macos/jailer-test.sh --no-vm
       # What each jailer and Firecracker of a failed stage printed (the run
@@ -459,7 +469,7 @@ jobs:
       # root-owned tools/macos/integration/__pycache__ failed py_compile).
       # build/ (the scenarios' logs) and the cargo target are outputs.
       - name: No root-owned files in the source tree
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         run: |
           left=$(find . \( -path ./build -o -path ./lib/firecracker/build \) -prune -o -user 0 -print)
           if [ -n "$left" ]; then
@@ -473,11 +483,21 @@ jobs:
       # left in the build directories the user's own builds share (a root
       # batch's `sudo tools/macos/boot-test.sh vmnet` once left 283 there,
       # and the user's next jailer-test build failed with "Permission denied").
+      # The user's root batch (tools/macos/root-batch.sh): what can be run
+      # without root. Its steps themselves need root and a VM; only the
+      # user's run shows them.
+      - name: The root batch's own logic
+        if: (success() || failure()) && steps.build.outcome == 'success'
+        run: |
+          bash -n tools/macos/root-batch.sh
+          tools/macos/root-batch.sh --list
+          tools/macos/root-batch.sh --selftest
+          /bin/bash tools/macos/root-batch.sh --selftest
       - name: The scenario scripts refuse to run as root
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         run: |
           before=$(find build lib/firecracker/build -user 0 2>/dev/null | wc -l)
-          for script in tools/macos/boot-test.sh tools/macos/jailer-test.sh tools/macos/integration-tests.sh; do
+          for script in tools/macos/boot-test.sh tools/macos/jailer-test.sh tools/macos/integration-tests.sh tools/macos/root-batch.sh; do
             if out=$(sudo "$script" 2>&1); then
               echo "$script ran under sudo: $out"
               exit 1
@@ -500,14 +520,14 @@ jobs:
       # after are not held back.
       - name: Download the state file made on Linux
         # Runs after an earlier step's failure too: each step answers its own question.
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         id: vmstate
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: linux-vmstate
           path: ${{ runner.temp }}/linux-vmstate
       - name: A snapshot made on Linux x86_64 is refused
-        if: (success() || failure()) && steps.vmstate.outcome == 'success'
+        if: (success() || failure()) && steps.build.outcome == 'success' && steps.vmstate.outcome == 'success'
         working-directory: lib/firecracker
         run: |
           cargo build --locked -p snapshot-editor
@@ -519,7 +539,7 @@ jobs:
       # run here.
       - name: Integration test harness (without a VM)
         # Runs after an earlier step's failure too: each step answers its own question.
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         run: |
           brew install libslirp pkg-config
           cc -O2 -Wall -Wextra -Werror -o "$RUNNER_TEMP/netns-slirp" tools/macos/integration/netns-slirp.c \
@@ -546,7 +566,7 @@ jobs:
       # read against.
       - name: Timer coalescing on this runner (informational)
         # Runs after an earlier step's failure too: each step answers its own question.
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         run: python3 -I tools/macos/timer-coalescing.py
       # Every test of every crate but the jailer runs; the ones that cannot
       # pass on a runner (they create a VM, and GitHub's macOS runners have no
@@ -558,7 +578,7 @@ jobs:
       # harness steps above from running.
       - name: Unit tests of every crate but the jailer (tools/macos/unit-test-differences.txt)
         # Runs after an earlier step's failure too: each step answers its own question.
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         # Under the watchdog (macos-seatbelt's steps say why): about twice its
         # usual 8 minutes, and inside the job's 30.
         run: >-
@@ -705,7 +725,12 @@ jobs:
       # every process it started listed and sampled (each thread's stack)
       # into the log, then is killed, and the step fails with that evidence
       # before the job's timeout.
+      # Each test step runs after an earlier test's failure, so that one
+      # failure does not hide the rest, but never after a failed checkout,
+      # setup or build (steps.build: skipped or failed), whose cause it
+      # would bury under failures of its own.
       - name: Build the tests
+        id: build
         working-directory: lib/firecracker
         run: cargo test --locked -p vmm --lib --no-run
       - name: Host sandbox tests
@@ -737,14 +762,14 @@ jobs:
       # 43497862443 (87d0328) passed it on macOS 15 and 26. It prints and
       # never decides the job; the test above does.
       - name: Seatbelt SIGKILL action probe
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         continue-on-error: true
         run: python3 -I tools/macos/seatbelt-kill-probe.py --runs 50
       # The API process's profile test once failed on macos-15 with its child
       # dead before its first marker (c7d32e2); run alone, repeatedly, it
       # shows whether that is intermittent and how often.
       - name: API process profile test, 20 runs
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         working-directory: lib/firecracker
         run: |
           failed=0
@@ -763,7 +788,7 @@ jobs:
       # macos job has one. The test binary is the one the steps above built;
       # one test thread, as check-unit-tests.py runs them; none makes a VM.
       - name: FIFO relay and API process tests
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         working-directory: lib/firecracker
         run: |
           python3 -I ../../tools/macos/watchdog.py 300 --out "$RUNNER_TEMP/watchdog" -- \

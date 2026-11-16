@@ -33,6 +33,9 @@ every backend and every gap. This page is the summary.
 - `jailer-test <stage>` is [`tools/macos/jailer-test.sh`](../tools/macos/jailer-test.sh): run by the user, it builds
   as the user and runs the stages as root through sudo (run under sudo, it refuses to start, since it would build
   as root).
+  The macOS runs that need root, these stages among them, are the user's, in one go:
+  [`tools/macos/root-batch.sh`](../tools/macos/root-batch.sh) (one password prompt; `--list` names each step and the
+  row or test it stands for; logs and summary in `build/root-batch/<time>`).
   `jailer-test.ps1 <stage>` is [`tools/windows/jailer-test.ps1`](../tools/windows/jailer-test.ps1).
 - **row N** is row N of PORTING.md's table
   [Where behaviour is not the same yet](PORTING.md#where-behaviour-is-not-the-same-yet).
