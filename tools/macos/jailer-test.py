@@ -86,7 +86,9 @@ class JailedVm(bt.Vm):
         ctx.vms.append(self)
         self.seq = 0
         if wait_api:
-            self.api_wait = bt.wait_api(self.api_sock, self.ended)
+            # After a "VMM has ended" answer, its exit, so its reason is in
+            # the log (bt.Vm.wait_api).
+            self.api_wait = self.wait_api()
 
 
 def jail_config(vcpus=1, mem=256, machine=None, drives=(), **extra):
@@ -586,9 +588,35 @@ def daemon_pid(jail):
 
 def wait_daemon_api(jail, pid):
     """Waits until the API of the jail's Firecracker `pid`, which is no
-    child of this process, answers (`bt.wait_api`)."""
-    return bt.wait_api(jail.host("/run/firecracker.socket"),
-                       lambda: None if alive(pid) else f"process {pid} is gone")
+    child of this process, answers (`bt.wait_api`). After a "VMM has ended"
+    answer, waits for its exit (`daemon_ending`), as `bt.Vm.wait_api` does."""
+    try:
+        return bt.wait_api(jail.host("/run/firecracker.socket"),
+                           lambda: None if alive(pid) else f"process {pid} is gone")
+    except bt.VmmEnded as e:
+        raise Failure(f"{e}; {daemon_ending(pid)}") from None
+
+
+def daemon_ending(pid, bound=bt.Vm.EXIT_BOUND):
+    """Waits up to `bound` seconds for process `pid`, no child of this one,
+    to exit (kqueue EVFILT_PROC NOTE_EXIT, XNU bsd/kern/kern_event.c
+    filt_proc); one that does not is killed and a failure of its own."""
+    import select
+
+    kq = select.kqueue()
+    try:
+        ev = select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                           flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT, fflags=select.KQ_NOTE_EXIT)
+        try:
+            if kq.control([ev], 1, bound):
+                return "then it exited"
+        except ProcessLookupError:
+            return "then it exited"
+    finally:
+        kq.close()
+    os.kill(pid, signal.SIGKILL)
+    raise Failure(f"Firecracker {pid} said it was exiting and did not within {bound} s; "
+                  "killed by the harness while alive")
 
 
 def stage_daemonize(ctx):
@@ -1552,12 +1580,17 @@ def main():
         for name in stages:
             print(f"== {name}", flush=True)
             t0 = time.time()
+            kills = len(bt.KILLED_ALIVE)
             try:
                 results.append((name, True, STAGES[name](ctx)))
             except Failure as e:
                 results.append((name, False, str(e)))
             except Exception:
                 results.append((name, False, traceback.format_exc()))
+            if not results[-1][1]:
+                # The stage's VMs the harness killed while they ran: their
+                # logs end at the kill (bt.Vm.kill).
+                results[-1] = (name, False, bt.with_kills(results[-1][2], bt.KILLED_ALIVE[kills:]))
             ok, detail = results[-1][1:]
             print(f"   {'PASS' if ok else 'FAIL'} ({time.time() - t0:.1f}s): {detail}", flush=True)
     finally:

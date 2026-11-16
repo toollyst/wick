@@ -181,9 +181,36 @@ vm_reap() {
     fi
 }
 
+# patches/0050's answer to a request the VMM can no longer serve; and how long
+# a Firecracker that gave it gets to exit by itself (a failure past that).
+VMM_ENDED="The VMM has ended and Firecracker is exiting"
+EXIT_BOUND=10
+
 vm_stop() {
+    if vm_alive && grep -qF "$VMM_ENDED" "$VM_DIR/api-reply.txt" 2>/dev/null; then
+        # Firecracker answered that its VMM ended: it exits by itself and
+        # logs the reason after that answer (run_with_api drops the VMM's
+        # channel ends, which makes the answer, then joins the API thread;
+        # main logs the error after), so it is waited for, not killed at
+        # once, which cut its log before the reason (CI run 43823078930, the
+        # macOS harness). A watchdog bounds the wait; its expiry is a failure.
+        rm -f "$VM_DIR/exit-bound-expired"
+        (sleep "$EXIT_BOUND"; kill -KILL "$VM_PID" 2>/dev/null && : >"$VM_DIR/exit-bound-expired") &
+        local watchdog=$!
+        VM_EXIT=0
+        wait "$VM_PID" || VM_EXIT=$?
+        kill "$watchdog" 2>/dev/null || true
+        wait "$watchdog" 2>/dev/null || true
+        if [[ -e "$VM_DIR/exit-bound-expired" ]]; then
+            echo "boot-test: killed by the harness while alive (SIGKILL); its log ends above" >>"$VM_DIR/firecracker.log"
+            check "exits after answering that its VMM ended" 0 \
+                "said it was exiting and did not within ${EXIT_BOUND} s; killed by the harness while alive"
+        fi
+    fi
     if vm_alive; then
         kill -KILL "$VM_PID" 2>/dev/null || true
+        # A log cut short says why.
+        echo "boot-test: killed by the harness while alive (SIGKILL); its log ends above" >>"$VM_DIR/firecracker.log"
     fi
     vm_reap
     exec {VM_IN}>&-

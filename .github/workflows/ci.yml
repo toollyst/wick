@@ -553,6 +553,14 @@ jobs:
       - name: API request in flight when the VMM ends
         if: (success() || failure()) && steps.build.outcome == 'success'
         run: python3 -I tools/macos/api-vmm-ended-test.py lib/firecracker/build/cargo_target/debug/firecracker
+      # The scenario harness against a stand-in that answers "VMM has ended"
+      # and exits only when let go: the harness waits for the exit, so the
+      # reason Firecracker logs after that answer is in the log (CI run
+      # 43823078930), and one that never exits fails at the bound, killed,
+      # its log saying so. Needs no build and no VM.
+      - name: boot-test.py selftest
+        if: success() || failure()
+        run: python3 -I tools/macos/boot-test.py --selftest
       # The jailer's tests run as root, as upstream's do (they set resource
       # limits and change owners); the runners have passwordless sudo.
       - name: Jailer unit tests
@@ -896,6 +904,17 @@ jobs:
           name: results-macos-15-root-vmnet
           path: ${{ runner.temp }}/results.tsv
           if-no-files-found: ignore
+          retention-days: 14
+      # The stage's own logs when its step failed (Firecracker's output,
+      # the summary): run 43823078930's failure could be read only from the
+      # step's greps, the log itself not kept.
+      - name: Upload the vmnet stage's logs
+        if: failure() && steps.vmnet.conclusion == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-15-root-vmnet-logs
+          path: build/boot-test/*/vmnet/
+          if-no-files-found: warn
           retention-days: 14
 
   macos-seatbelt:

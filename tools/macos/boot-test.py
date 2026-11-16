@@ -45,6 +45,20 @@ class Failure(Exception):
     pass
 
 
+# The answer patches/0050 gives a request the VMM can no longer serve.
+VMM_ENDED = "The VMM has ended and Firecracker is exiting"
+
+
+class VmmEnded(Failure):
+    """The API answered that the VMM ended: Firecracker is exiting by itself,
+    and writes its reason after that answer (`Vm.ending`)."""
+
+
+# The names of the VMs the harness killed while they ran, in order (`Vm.kill`):
+# a stage runner takes those of a failed stage into its summary line.
+KILLED_ALIVE = []
+
+
 class ApiRefused(ConnectionRefusedError):
     """A connection to the API socket was refused; the text says what the
     refusal was (`Vm.refused`). Still the error a caller may expect."""
@@ -101,7 +115,8 @@ def wait_api(sock, ended, bound=10):
             resp = conn.getresponse()
             data = resp.read()
             if resp.status != 200:
-                raise Failure(f"the API's first answer: GET / -> {resp.status} {data[:300]!r} ({seen()})")
+                ended_answer = VmmEnded if VMM_ENDED.encode() in data else Failure
+                raise ended_answer(f"the API's first answer: GET / -> {resp.status} {data[:300]!r} ({seen()})")
             return {"absent": absent, "refused": refused, "closed": closed, "ms": (time.monotonic() - t0) * 1000}
         except FileNotFoundError:
             absent += 1
@@ -199,7 +214,43 @@ class Vm:
         ctx.vms.append(self)
         self.seq = 0
         if self.api_sock and wait:
-            self.api_wait = wait_api(self.api_sock, self.ended)
+            self.api_wait = self.wait_api()
+
+    # A Firecracker that answered that its VMM ended exits by itself at once;
+    # this bound is for one that does not, a failure of its own.
+    EXIT_BOUND = 10
+    # Not killed by the harness while it ran (`kill`).
+    killed_alive = False
+    # Set when the harness waits for an exit it was told of (the selftest's
+    # hook: it then lets its stand-in go on).
+    waiting_exit = None
+
+    def wait_api(self):
+        """`wait_api` for this VM; after a "VMM has ended" answer, the
+        process's own exit, so that its reason is in the log: Firecracker
+        answers before it writes the reason (upstream's run_with_api drops the
+        VMM's channel ends, which makes the answer, then joins the API thread
+        and returns the error, which main then logs). Killing it on the answer
+        cut the log there (CI run 43823078930, macos-15-root-vmnet)."""
+        try:
+            return wait_api(self.api_sock, self.ended)
+        except VmmEnded as e:
+            raise Failure(f"{e}; {self.ending()}") from None
+
+    def ending(self):
+        """Waits up to EXIT_BOUND for a Firecracker that said it is exiting,
+        and says how it ended. One that does not exit within the bound is a
+        failure of its own, and is killed, which its log records (`kill`)."""
+        if Vm.waiting_exit is not None:
+            Vm.waiting_exit.set()
+        try:
+            self.proc.wait(self.EXIT_BOUND)
+        except subprocess.TimeoutExpired:
+            self.kill()
+            raise Failure(f"Firecracker said it was exiting and did not within {self.EXIT_BOUND} s; "
+                          f"killed by the harness while alive; {self.exit_reason()}") from None
+        self.pump.join(5)
+        return f"then it exited: {self.exit_reason()}"
 
     def _pump(self):
         while True:
@@ -346,10 +397,18 @@ class Vm:
         check(code == 0, f"exit status {code} after guest reset ({self.exit_reason()})")
 
     def kill(self):
-        if self.proc.poll() is None:
+        """Ends the process. One still running is killed, which its log
+        records after the last line it wrote, so that a log cut short says
+        why (`killed_alive`; a failed stage's summary names it too)."""
+        alive = self.proc.poll() is None
+        if alive:
             self.proc.kill()
             self.proc.wait()
+            self.killed_alive = True
+            KILLED_ALIVE.append(self.name)
         self.pump.join(5)
+        if alive and not self.log.closed:
+            self.log.write("boot-test: killed by the harness while alive (SIGKILL); its output ends above\n")
         self.log.close()
 
 
@@ -2925,9 +2984,22 @@ class Context:
         return Vm(self, *a, **kw)
 
     def cleanup(self):
+        """Kills the stage's VMs; returns the names of those the harness
+        killed while they ran, now or earlier in the stage."""
         for vm in self.vms:
             vm.kill()
+        killed = [vm.name for vm in self.vms if vm.killed_alive]
         self.vms = []
+        return killed
+
+
+def with_kills(detail, killed):
+    """A failed stage's detail, its first line (the summary's) naming the VMs
+    the harness killed while they ran: their logs end where the kill came."""
+    if not killed:
+        return detail
+    first, sep, rest = detail.partition("\n")
+    return f"{first}; killed by the harness while alive: {', '.join(killed)}{sep}{rest}"
 
 
 def exit_on_signals():
@@ -2956,6 +3028,112 @@ def summarize(out, results):
     return failed
 
 
+# The selftest's stand-in for Firecracker: it answers the first request on
+# its API socket with patches/0050's 500, then, as Firecracker's main thread
+# does after that answer (it joins the API thread, then logs the build's
+# error), writes the two exit lines and exits 1, but only once the test lets
+# it go on: it opens the FIFO WICK_BT_SELFTEST_GO for reading, which blocks
+# until a writer comes.
+STAND_IN = r'''
+import os, socket, sys
+path = sys.argv[sys.argv.index("--api-sock") + 1]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path)
+s.listen(1)
+c, _ = s.accept()
+data = b""
+while b"\r\n\r\n" not in data:
+    chunk = c.recv(4096)
+    if not chunk:
+        break
+    data += chunk
+body = b'{"fault_message":"The VMM has ended and Firecracker is exiting; its log and standard error say why."}'
+c.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n"
+          b"Content-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
+c.close()
+with open(os.environ["WICK_BT_SELFTEST_GO"]) as f:
+    f.read()
+print("[anonymous-instance:main] RunWithApiError error: Failed to build MicroVM from Json: the stand-in's", flush=True)
+print("[anonymous-instance:main] Firecracker exiting with error. exit_code=1", flush=True)
+sys.exit(1)
+'''
+
+
+def selftest():
+    """The harness against a stand-in that answers "VMM has ended" (500) and
+    writes its exit lines only when the test lets it: the harness must wait
+    for the exit and have both lines in the VM's log (CI run 43823078930:
+    killed on the answer, the log had neither); and one that never exits is
+    a failure of its own at EXIT_BOUND, killed, the log saying so. No VM."""
+    import types
+
+    fails = []
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="wick-bts-") as tmp:
+        go = os.path.join(tmp, "go")
+        os.mkfifo(go)
+        os.environ["WICK_BT_SELFTEST_GO"] = go
+        os.environ.pop("WICK_BOOT_TEST_FC_ARGS", None)
+        standin = os.path.join(tmp, "firecracker")
+        with open(standin, "w") as f:
+            f.write(f"#!{sys.executable} -I\n" + STAND_IN)
+        os.chmod(standin, 0o755)
+
+        def start(name, release):
+            """Starts the stand-in as a VM, lets it go on once the harness
+            waits for its exit or has given up on it, and returns (the
+            failure, the VMs the cleanup found killed while alive, the log)."""
+            ctx = types.SimpleNamespace(out=tmp, sock=tmp, firecracker=standin, vms=[])
+            waiting = threading.Event()
+            Vm.waiting_exit = waiting
+            got = {}
+
+            def run():
+                try:
+                    Vm(ctx, name, [])
+                    got["failure"] = None
+                except Failure as e:
+                    got["failure"] = str(e)
+                finally:
+                    got["killed"] = Context.cleanup(ctx)
+                    waiting.set()
+
+            t = threading.Thread(target=run)
+            t.start()
+            waiting.wait(60)
+            if release:
+                # No reader (a stand-in already killed): ENXIO, nothing to let go.
+                try:
+                    os.close(os.open(go, os.O_WRONLY | os.O_NONBLOCK))
+                except OSError:
+                    pass
+            t.join(60)
+            Vm.waiting_exit = None
+            with open(os.path.join(tmp, f"{name}.log")) as f:
+                return got.get("failure") or "", got.get("killed"), f.read()
+
+        failure, killed, log = start("ended", True)
+        for want in ("RunWithApiError error: Failed to build MicroVM from Json",
+                     "Firecracker exiting with error. exit_code=1"):
+            if want not in log:
+                fails.append(f"exiting: the log lacks {want!r} (the harness did not wait for the exit):\n{log}")
+        if "then it exited: exit 1" not in failure or killed:
+            fails.append(f"exiting: failure {failure!r}, killed {killed!r}")
+        Vm.EXIT_BOUND = 1
+        try:
+            failure, killed, log = start("stuck", False)
+        finally:
+            Vm.EXIT_BOUND = 10
+        if not failure.startswith("Firecracker said it was exiting and did not within 1 s; killed by the harness"):
+            fails.append(f"stuck: failure {failure!r}")
+        if killed != ["stuck"] or "boot-test: killed by the harness while alive" not in log:
+            fails.append(f"stuck: killed {killed!r}, log:\n{log}")
+        if with_kills("a\nb", killed) != "a; killed by the harness while alive: stuck\nb":
+            fails.append("with_kills does not name the kill on the summary's line")
+    if fails:
+        sys.exit("boot-test: selftest failed:\n  " + "\n  ".join(fails))
+    print("boot-test: selftest ok")
+
+
 def fetch(cache, name):
     path = os.path.join(cache, name)
     if not os.path.exists(path):
@@ -2969,6 +3147,9 @@ def fetch(cache, name):
 
 
 def main():
+    if sys.argv[1:] == ["--selftest"]:
+        selftest()
+        return
     p = argparse.ArgumentParser()
     p.add_argument("--firecracker", required=True)
     p.add_argument("--snapshot-editor", required=True)
@@ -2994,6 +3175,7 @@ def main():
         for name in args.stages:
             print(f"== {name}", flush=True)
             t0 = time.time()
+            kills = len(KILLED_ALIVE)
             try:
                 detail = STAGES[name](ctx)
                 results.append((name, True, detail))
@@ -3003,6 +3185,8 @@ def main():
                 results.append((name, False, traceback.format_exc()))
             finally:
                 ctx.cleanup()
+            if not results[-1][1]:
+                results[-1] = (name, False, with_kills(results[-1][2], KILLED_ALIVE[kills:]))
             ok, detail = results[-1][1:]
             print(f"   {'PASS' if ok else 'FAIL'} ({time.time() - t0:.1f}s): {detail}", flush=True)
     finally:
