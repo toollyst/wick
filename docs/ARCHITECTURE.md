@@ -276,6 +276,15 @@ semantics on Win32. The details are in the comments of each
   (`FILE_PIPE_LOCAL_INFORMATION`) follows the room left, but reads 0 while
   the reader waits in a read, when a write completes at once
   (`test_pipe_write_room_reads_0_while_a_read_waits`).
+  An open defect, not fixed yet: a waitable (an eventfd's event) removed from
+  the epoll while its wait callback runs is armed again by `polling` 3.11
+  after its removal, and once the caller closes the handle the process ends
+  with `STATUS_THREADPOOL_HANDLE_EXCEPTION` (0xc000070a). CI run 43676869163's
+  kvm-ioctls unit tests ended so, in
+  `test_irqfd_writes_registrations_and_the_watcher_do_not_wait_for_each_other`
+  (which passed in the runs before and after), and a loop of add, signal,
+  remove and close through this layer ends so on Windows Server 2022 20348
+  in 7 of 7 runs. Linux's `EPOLL_CTL_DEL` and `close` leave nothing behind.
 - **eventfd = counter + manual-reset event.** The event is signalled while the
   counter is above zero. Counter, flags and lock live in a 4 KiB paging-file
   section, with a space event (counter < MAX). Every change happens under a
