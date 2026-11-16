@@ -3474,6 +3474,50 @@ pub(crate) static AFTER_DEAD_UNCHARGED: Mutex<Option<fn()>> = Mutex::new(None);
 #[cfg(test)]
 pub(crate) static LAST_MOVE_VIEW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// MOVEREC, for tests: the last move's steps ([`uffd_move_chunk`]), each
+/// the process's private commit in bytes unless said: [0] at the start,
+/// [1] after the dead pages' charge was given back, [2] the temporary view's
+/// address, [3] after it was mapped, [4] the pages committed in the 2 MiB
+/// regions it spans, outside it, when it was mapped (a page table there
+/// already), [5] after the live pages were committed in it, [6] after the
+/// copy, [7] after both views were swapped, [8] after it was unmapped, [9]
+/// the step it ended at: 1 its map refused, 2 the commit, 3 the close, 4
+/// the alias's unmap, 5 made; [4] is the 2 MiB region below its start
+/// (outside it) and [10] the one above its end; [11] how many 2 MiB regions
+/// it spans.
+#[cfg(test)]
+pub(crate) static MOVEREC: [std::sync::atomic::AtomicUsize; 12] = [const { std::sync::atomic::AtomicUsize::new(0) }; 12];
+
+/// MOVEREC: the charge page of the page at `at` of a charged view
+/// ([`Charge`]), if it has one.
+#[cfg(test)]
+pub(crate) fn charge_page_of(at: usize) -> Option<usize> {
+    let m = CHARGES.lock().unwrap();
+    let (&v, (n, c)) = m.range(..=at).next_back()?;
+    (at < v + n).then(|| c.base + (at - v))
+}
+
+/// MOVEREC: the process's private commit, allocating nothing.
+#[cfg(test)]
+fn moverec_commit() -> usize {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    // SAFETY: an all-zero counters structure is valid.
+    let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+    #[allow(clippy::cast_possible_truncation)]
+    let cb = std::mem::size_of_val(&c) as u32;
+    c.cb = cb;
+    // SAFETY: this process's pseudo handle and a structure of the size given.
+    if unsafe { K32GetProcessMemoryInfo(proc(), (&raw mut c).cast(), cb) } == 0 {
+        return 0;
+    }
+    c.PrivateUsage
+}
+
+#[cfg(test)]
+fn moverec(i: usize, v: usize) {
+    MOVEREC[i].store(v, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// How many moves were not made once begun ([`uffd_move_chunk`]: their new
 /// section's view not mapped, its live pages not committed or closed, the
 /// alias not unmapped); the line is printed for the first 16, every 1024th
@@ -3685,6 +3729,13 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
         return None;
     }
     let section = reserved_section(len)?;
+    #[cfg(test)]
+    {
+        for m in &MOVEREC {
+            m.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+        moverec(0, moverec_commit());
+    }
     // The room the maps take of the job's commit ([`MOVE_ROOM`]), which at
     // the limit there is none of else (CI run 43640510155: no move was made
     // there): given back from the chunk's dead pages' charge first, as Linux
@@ -3705,6 +3756,8 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
         });
         OWES.store(true, std::sync::atomic::Ordering::Release);
     }
+    #[cfg(test)]
+    moverec(1, moverec_commit());
     #[cfg(test)]
     if let Some(hook) = *AFTER_DEAD_UNCHARGED.lock().unwrap() {
         hook();
@@ -3733,12 +3786,32 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
     let tmp = unsafe { MapViewOfFile3(section.0, proc(), std::ptr::null(), 0, len, 0, PAGE_READWRITE, std::ptr::null_mut(), 0) }
         .Value as usize;
     if tmp == 0 {
+        #[cfg(test)]
+        {
+            moverec(3, moverec_commit());
+            moverec(9, 1);
+        }
         // SAFETY: plain call.
         not_made("map its new section", unsafe { GetLastError() });
         return None;
     }
     #[cfg(test)]
-    LAST_MOVE_VIEW.store(tmp, std::sync::atomic::Ordering::Relaxed);
+    {
+        LAST_MOVE_VIEW.store(tmp, std::sync::atomic::Ordering::Relaxed);
+        moverec(2, tmp);
+        moverec(3, moverec_commit());
+        let (lo, hi) = (tmp - tmp % HUGE_PAGE, (tmp + len).next_multiple_of(HUGE_PAGE));
+        let (mut below, mut above) = (0, 0);
+        if tmp > lo {
+            for_each_committed_run(lo, tmp - lo, |_, n| below += n / PAGE);
+        }
+        if hi > tmp + len {
+            for_each_committed_run(tmp + len, hi - (tmp + len), |_, n| above += n / PAGE);
+        }
+        moverec(4, below);
+        moverec(10, above);
+        moverec(11, (hi - lo) / HUGE_PAGE);
+    }
     let mut unmap_tmp = |what: &str| {
         // SAFETY: plain call.
         let err = unsafe { GetLastError() };
@@ -3748,7 +3821,11 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
     };
     let mut committed = true;
     for_each_picked(view, len, &live, |a, n| committed &= commit_now(tmp + (a - view), n, PAGE_READWRITE, false));
+    #[cfg(test)]
+    moverec(5, moverec_commit());
     if !committed {
+        #[cfg(test)]
+        moverec(9, 2);
         unmap_tmp("commit its live pages in the new section");
         return None;
     }
@@ -3763,6 +3840,8 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
     };
     if !protect_live(PAGE_NOACCESS) {
         protect_live(PAGE_READWRITE);
+        #[cfg(test)]
+        moverec(9, 3);
         unmap_tmp("close its live pages");
         return None;
     }
@@ -3775,6 +3854,8 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
         copied += n;
     });
     #[cfg(test)]
+    moverec(6, moverec_commit());
+    #[cfg(test)]
     if let Some(hook) = *MOVE_HOOK.lock().unwrap() {
         hook();
     }
@@ -3782,6 +3863,8 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
     // guest's view keeps the old section until it is unmapped too.
     if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
         protect_live(PAGE_READWRITE);
+        #[cfg(test)]
+        moverec(9, 4);
         unmap_tmp("unmap its alias");
         return None;
     }
@@ -3793,8 +3876,15 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
         // SAFETY: plain call.
         out_of_memory(view, unsafe { GetLastError() });
     }
+    #[cfg(test)]
+    moverec(7, moverec_commit());
     // SAFETY: unmaps the view made here.
     unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: tmp as *mut c_void }, 0) };
+    #[cfg(test)]
+    {
+        moverec(8, moverec_commit());
+        moverec(9, 5);
+    }
     // Made: the old section and its dead pages are gone with its last view;
     // the rest of their charge given back (the live pages' kept: it is
     // indexed by the view's offset, which does not move), and nothing owed.
@@ -6065,5 +6155,144 @@ mod tests {
         assert_eq!(fixed(base + large, 2 * large, PROT_READ), Err(crate::ENOMEM));
         // SAFETY: our mapping.
         assert_eq!(unsafe { munmap(base as *mut c_void, 4 << 20) }, 0);
+    }
+
+    /// MAPCOST, a record: what mapping a 2 MiB view of a new reserved
+    /// section ([`reserved_section`], as a reclaim's move maps its temporary
+    /// view, [`uffd_move_chunk`]) adds to the process's private commit, by
+    /// where the view lands: 64 views mapped anywhere and kept (each line:
+    /// the address, its offset in its 2 MiB and in its 1 GiB, the private
+    /// commit added); then at chosen addresses in a fresh 4 GiB of address
+    /// space: 1 GiB aligned, 2 MiB aligned beside it, straddling two fresh
+    /// 2 MiB regions, straddling a 1 GiB boundary, and in a fresh 1 GiB.
+    #[test]
+    #[ignore = "a record, run by hand"]
+    fn test_view_map_costs_on_record() {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        let pc = || {
+            // SAFETY: plain data.
+            let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+            c.cb = std::mem::size_of_val(&c) as u32;
+            // SAFETY: a structure of the size given.
+            assert_ne!(unsafe { K32GetProcessMemoryInfo(proc(), (&raw mut c).cast(), c.cb) }, 0);
+            c.PrivateUsage as isize
+        };
+        const GIB: usize = 1 << 30;
+        let map_at = |at: usize| -> (usize, isize) {
+            let s = reserved_section(UFFD_CHUNK).unwrap();
+            let before = pc();
+            // SAFETY: maps our new section at `at` (0: anywhere).
+            let v = unsafe { MapViewOfFile3(s.0, proc(), at as *const c_void, 0, UFFD_CHUNK, 0, PAGE_READWRITE, std::ptr::null_mut(), 0) }.Value as usize;
+            let after = pc();
+            std::mem::forget(s);
+            (v, after - before)
+        };
+        let mut costs = std::collections::BTreeMap::new();
+        for i in 0..64 {
+            let (v, d) = map_at(0);
+            *costs.entry(d / 1024).or_insert(0) += 1;
+            std::println!("MAPCOST anywhere {i}: at {v:#x}, {} KiB into its 2 MiB, {} MiB into its 1 GiB: +{} KiB", (v % UFFD_CHUNK) / 1024, (v % GIB) >> 20, d / 1024);
+        }
+        std::println!("MAPCOST anywhere, KiB added: count {costs:?}");
+        // A fresh 1 GiB-aligned 4 GiB: reserved to find it, then freed.
+        // SAFETY: reserves and frees address space of our own.
+        let base = unsafe {
+            let r = VirtualAlloc2(proc(), std::ptr::null(), 5 * GIB, MEM_RESERVE, PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize;
+            assert_ne!(r, 0);
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+            r.next_multiple_of(GIB)
+        };
+        for (what, at) in [
+            ("1 GiB aligned, fresh", base),
+            ("2 MiB aligned, beside it", base + UFFD_CHUNK),
+            ("straddling two fresh 2 MiB regions", base + 8 * UFFD_CHUNK + GRANULE),
+            ("straddling a 1 GiB boundary", base + 2 * GIB - GRANULE),
+            ("in a fresh 1 GiB", base + 3 * GIB + 16 * UFFD_CHUNK),
+        ] {
+            let (v, d) = map_at(at);
+            std::println!("MAPCOST {what}: at {v:#x} (asked {at:#x}): +{} KiB", d / 1024);
+        }
+    }
+
+    /// MAPCOST2, a record for the move's temporary view: in a fresh 1 GiB,
+    /// a 2 MiB slot made a placeholder at 64 KiB past a 2 MiB boundary
+    /// (so it spans two 2 MiB regions), (a) alone, (b) with one private page
+    /// committed in each of the two regions beside it (anchors): the private
+    /// commit added by the map into the slot, by its unmap keeping the
+    /// placeholder, and by a second map, and (b) the anchors' own cost.
+    #[test]
+    #[ignore = "a record, run by hand"]
+    fn test_a_view_slot_and_its_page_tables_on_record() {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        let pc = || {
+            // SAFETY: plain data.
+            let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+            c.cb = std::mem::size_of_val(&c) as u32;
+            // SAFETY: a structure of the size given.
+            assert_ne!(unsafe { K32GetProcessMemoryInfo(proc(), (&raw mut c).cast(), c.cb) }, 0);
+            c.PrivateUsage as isize
+        };
+        const GIB: usize = 1 << 30;
+        let kib = |d: isize| d / 1024;
+        for (case, anchors) in [("(a) no anchors", false), ("(b) anchors", true)] {
+            // A fresh 1 GiB: found by a reservation, freed, then used.
+            // SAFETY: reserves and frees address space of our own.
+            let g = unsafe {
+                let r = VirtualAlloc2(proc(), std::ptr::null(), 3 * GIB, MEM_RESERVE, PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize;
+                assert_ne!(r, 0);
+                VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+                r.next_multiple_of(GIB)
+            };
+            // [g, g + 4 MiB) as placeholders: [g, g+64K) anchor A, [g+64K,
+            // g+64K+2M) the slot, [g+64K+2M, g+4M) anchor B.
+            let slot = g + GRANULE;
+            let t0 = pc();
+            // SAFETY: a placeholder of our own at a free address, then split.
+            unsafe {
+                let p = VirtualAlloc2(proc(), g as *const c_void, 4 << 20, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize;
+                assert_eq!(p, g, "{case}: the placeholder");
+                assert_ne!(VirtualFree(g as *mut c_void, GRANULE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 0);
+                assert_ne!(VirtualFree(slot as *mut c_void, UFFD_CHUNK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 0);
+            }
+            if anchors {
+                for (a, n) in [(g, GRANULE), (slot + UFFD_CHUNK, (4 << 20) - GRANULE - UFFD_CHUNK)] {
+                    // SAFETY: our placeholder, reserved and its first page committed.
+                    unsafe {
+                        let p = VirtualAlloc2(proc(), a as *const c_void, n, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize;
+                        assert_eq!(p, a);
+                        let at = if a == g { g } else { a + n - PAGE };
+                        assert_ne!(VirtualAlloc2(proc(), at as *const c_void, PAGE, MEM_COMMIT, PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize, 0);
+                    }
+                }
+            }
+            let t1 = pc();
+            let mut line = std::format!("MAPCOST2 {case}: the slot at {slot:#x}; anchors and placeholders +{} KiB", kib(t1 - t0));
+            for round in 0..3 {
+                let s = reserved_section(UFFD_CHUNK).unwrap();
+                let before = pc();
+                // SAFETY: maps our section into our placeholder.
+                let v = unsafe { MapViewOfFile3(s.0, proc(), slot as *const c_void, 0, UFFD_CHUNK, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0) }.Value as usize;
+                assert_eq!(v, slot, "{case}: map {round}");
+                let mapped = pc();
+                // SAFETY: commits and touches two pages of it, one in each region.
+                unsafe {
+                    for at in [slot, slot + UFFD_CHUNK - PAGE] {
+                        assert_ne!(VirtualAlloc2(proc(), at as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE, std::ptr::null_mut(), 0) as usize, 0);
+                        std::ptr::write_volatile(at as *mut u8, 1);
+                    }
+                }
+                let touched = pc();
+                // SAFETY: unmaps our view, keeping the placeholder.
+                assert_ne!(unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: slot as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) }, 0);
+                let unmapped = pc();
+                line += &std::format!(
+                    "; round {round}: map +{}, two pages committed and touched +{}, unmap keeping the placeholder {:+}",
+                    kib(mapped - before),
+                    kib(touched - mapped),
+                    kib(unmapped - touched)
+                );
+            }
+            std::println!("{line}");
+        }
     }
 }

@@ -4670,6 +4670,31 @@ mod tests {
         ));
     }
 
+    /// MOVEREC: the last move's steps (`windows_mm::MOVEREC`) in one line,
+    /// private commit in KiB, said without allocating after `what`.
+    fn moverec_line(what: &str, fill: &str) {
+        let m: [usize; 12] = core::array::from_fn(|i| crate::windows_mm::MOVEREC[i].load(Ordering::SeqCst));
+        let tmp = m[2];
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "MOVEREC {what} {fill}: the move ended at step {} (1 map refused, 2 commit, 3 close, 4 alias unmap, 5 made); private commit KiB: \
+             start {}, dead charge given back {}, temporary view mapped {}, live pages committed {}, copied {}, views swapped {}, \
+             temporary view unmapped {}; the temporary view at {tmp:#x}, {} KiB into its 2 MiB, spanning {} 2 MiB regions, {} pages \
+             committed in the region below its start outside it, {} in the one above its end",
+            m[9],
+            m[0] / 1024,
+            m[1] / 1024,
+            m[3] / 1024,
+            m[5] / 1024,
+            m[6] / 1024,
+            m[7] / 1024,
+            m[8] / 1024,
+            (tmp % (2 << 20)) / 1024,
+            m[11],
+            m[4],
+            m[10]
+        ));
+    }
+
     /// One page filled at `at`: "made", "ENOMEM" or "another errno".
     fn fill_a_page(ctx: usize, at: u64) -> &'static str {
         let page = [0x5au8; PAGE as usize];
@@ -4833,7 +4858,10 @@ mod tests {
     #[test]
     fn test_a_chunk_whose_dead_pages_lie_above_unfilled_ones_moves() {
         let (code, text) = run_child("dead_above_unfilled_child", Some(96 << 20));
-        for l in text.lines().filter(|l| l.starts_with("OWEDREC") || l.starts_with("room left") || l.starts_with("wick: reclaim") || l.starts_with("filled")) {
+        for l in text
+            .lines()
+            .filter(|l| l.starts_with("OWEDREC") || l.starts_with("MOVEREC") || l.starts_with("room left") || l.starts_with("wick: reclaim") || l.starts_with("filled"))
+        {
             std::eprintln!("{l}");
         }
         assert!(text.contains("dead above unfilled: the fill made, 1 moves made, 0 not made, 0 KiB owed"), "{text}");
@@ -4866,10 +4894,29 @@ mod tests {
                 "OWEDREC the fill's page is {} KiB into its 2 MiB-aligned region, {committed} pages committed below it there; the range at {mem:#x}, the page at {target:#x}",
                 (target - region) / 1024
             ));
+            // Its charge page ([`windows_mm::charge_page_of`]): committed
+            // with the fill, a page of private commit, and a page table if
+            // its 2 MiB region has none.
+            #[allow(clippy::cast_possible_truncation)]
+            let cp = crate::windows_mm::charge_page_of(target as usize).unwrap_or(0) as u64;
+            let cregion = cp - cp % (2 << 20);
+            let mut in_region = 0;
+            let mut at = cregion;
+            while cp != 0 && at < cregion + (2 << 20) {
+                if at != cp && committed_protection(at).is_some() {
+                    in_region += 1;
+                }
+                at += PAGE;
+            }
+            crate::windows_mm::say_at_the_limit(format_args!(
+                "OWEDREC the fill's charge page at {cp:#x}, {} KiB into its 2 MiB-aligned region, {in_region} other pages committed in that region",
+                (cp - cregion) / 1024
+            ));
         }
         let (m1, refused1) = (moves_on_record().0.len(), crate::windows_mm::moves_refused());
         let fill = fill_a_page(ctx, mem + done);
         owed_step("dead above unfilled, after the fill");
+        moverec_line("dead above unfilled, the fill", fill);
         let (m2, refused2) = (moves_on_record().0.len(), crate::windows_mm::moves_refused());
         let owed = crate::windows_mm::owed_bytes();
         give_back_every_page(&mut held);
