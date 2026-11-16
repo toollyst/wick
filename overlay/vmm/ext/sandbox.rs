@@ -2061,6 +2061,15 @@ mod macos {
             })
         }
 
+        /// What asks [`child_run`] for a blocked child's stacks (`1`): CI's
+        /// macOS jobs set it (ci.yml), as tools/macos/watchdog.py,
+        /// jailer-test.py and jailer-cgroup-test.py read it.
+        const STACKS_ENV: &str = "WICK_TEST_STACKS";
+
+        fn stacks_asked() -> bool {
+            std::env::var_os(STACKS_ENV).is_some_and(|v| v == "1")
+        }
+
         /// [`child_within`], with the child's exit reason.
         fn child_run(
             name: &str,
@@ -2105,11 +2114,20 @@ mod macos {
             let (status, reason) = match done.recv_timeout(limit) {
                 Ok(status) => status.unwrap(),
                 Err(_) => {
-                    let sample = Command::new("/usr/bin/sample")
-                        .args([&pid.to_string(), "1", "-mayDie"])
-                        .output()
-                        .map(|o| String::from_utf8_lossy(&o.stdout).split("Binary Images:").next().unwrap_or("").to_owned())
-                        .unwrap_or_else(|e| format!("sample: {e}"));
+                    // sample asks for the child's task port, which on a
+                    // desktop Mac can raise the Developer Tools Access dialog
+                    // and wait behind it: only when asked (CI sets it).
+                    let sample = if stacks_asked() {
+                        Command::new("/usr/bin/sample")
+                            .args([&pid.to_string(), "1", "-mayDie"])
+                            .output()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).split("Binary Images:").next().unwrap_or("").to_owned())
+                            .unwrap_or_else(|e| format!("sample: {e}"))
+                    } else {
+                        let line = format!("stacks not taken: {STACKS_ENV} is not set; sample needs the task port");
+                        eprintln!("{name}: {line}");
+                        line
+                    };
                     // SAFETY: our child, which has not been waited for (the
                     // waiting thread has not returned).
                     unsafe { libc::kill(i32::try_from(pid).unwrap(), libc::SIGKILL) };
@@ -2164,8 +2182,10 @@ mod macos {
         }
 
         // A child that blocks fails its test at the limit, with its
-        // threads' stacks, and is killed: it cannot hold the test (and CI's
-        // step) until the job's timeout.
+        // threads' stacks when they are asked for (WICK_TEST_STACKS=1, as
+        // CI's jobs set it), and is killed: it cannot hold the test (and
+        // CI's step) until the job's timeout. Without the variable the
+        // stacks part is said not run, not passed.
         #[test]
         fn test_a_blocked_child_fails_with_its_stacks() {
             let panic = std::panic::catch_unwind(|| {
@@ -2174,8 +2194,19 @@ mod macos {
             .unwrap_err();
             let text = panic_text(&panic);
             assert!(text.contains("blocked_child") && text.contains("still running after 2s, killed"), "{text}");
-            assert!(text.contains("Call graph:"), "no stacks: {text}");
             assert!(text.contains("BLOCKED-STARTED"), "not its output: {text}");
+            if stacks_asked() {
+                assert!(text.contains("Call graph:"), "no stacks: {text}");
+            } else {
+                assert!(text.contains("stacks not taken: WICK_TEST_STACKS is not set; sample needs the task port"), "{text}");
+                // Past libtest's capture (its capture takes print! and
+                // eprint!, not a write to the stream): seen in a passing run.
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "test_a_blocked_child_fails_with_its_stacks: NOT RUN: the stacks part (WICK_TEST_STACKS is not set)"
+                );
+            }
         }
 
         #[test]

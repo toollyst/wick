@@ -504,6 +504,12 @@ def diagnose(fz, name, jd, p):
         kids = fz.kids(pid)
         if kids:
             print(f"      children of {pid}: {kids}", flush=True)
+        # sample takes the task's port, which on a desktop Mac can raise the
+        # Developer Tools Access dialog: only with WICK_TEST_STACKS=1 (CI's
+        # macOS jobs set it), as watchdog.py.
+        if os.environ.get("WICK_TEST_STACKS") != "1":
+            print(f"      stack of {pid}: not taken: WICK_TEST_STACKS is not set; sample needs the task port", flush=True)
+            continue
         report = os.path.join(fz.ctx.out, f"{name}-{pid}.sample")
         subprocess.run(["/usr/bin/sample", str(pid), "1", "-file", report], capture_output=True, timeout=30)
         if os.path.exists(report):

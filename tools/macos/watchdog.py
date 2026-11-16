@@ -23,12 +23,15 @@ then SIGKILLs the group and every process listed, and exits 124. With
 --out, each sample is also kept as DIR/sample-PID.txt (a CI artifact).
 Otherwise it exits with the command's status.
 
-With WICK_WATCHDOG_NO_SAMPLE=1 in the environment it prints the `ps` lines
-and kills as above, but runs no `sample`: on a desktop Mac a tool that asks
-for another process's task port (sample, lldb) can raise the Developer
-Tools Access dialog, and then waits behind it unanswered, so a queue of
-jobs stops behind a watchdog that never ends. A Mac's local queues set it;
-CI's runners, with no one at a dialog and none raised there, do not.
+It runs `sample` only with WICK_TEST_STACKS=1 in the environment (CI's macOS
+jobs set it); otherwise it prints the `ps` lines and kills as above, and says
+the stacks were not taken: on a desktop Mac a tool that asks for another
+process's task port (sample, lldb) can raise the Developer Tools Access
+dialog, and then waits behind it unanswered, so a queue of jobs stops behind
+a watchdog that never ends. The same variable asks the vmm sandbox tests'
+child_within, jailer-test.py and jailer-cgroup-test.py for a hung process's
+stacks. WICK_WATCHDOG_NO_SAMPLE=1, this switch's old name, still turns the
+samples off.
 """
 
 import argparse
@@ -96,8 +99,9 @@ def main():
     if args.out:
         os.makedirs(args.out, exist_ok=True)
     samples = {}
-    if os.environ.get("WICK_WATCHDOG_NO_SAMPLE") == "1":
-        print("watchdog: no samples (WICK_WATCHDOG_NO_SAMPLE=1)", flush=True)
+    if os.environ.get("WICK_TEST_STACKS") != "1" or os.environ.get("WICK_WATCHDOG_NO_SAMPLE") == "1":
+        print("watchdog: stacks not taken: WICK_TEST_STACKS is not set (or WICK_WATCHDOG_NO_SAMPLE is); "
+              "sample needs the task port", flush=True)
         found_to_sample = []
     else:
         found_to_sample = found

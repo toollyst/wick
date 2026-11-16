@@ -255,8 +255,13 @@ def describe_hang(ctx, jailer_pid, args, out, err, timeout):
     # `sample` takes the task's port: as root at once, as a user only after
     # taskgated answers (xnu bsd/kern/kern_proc.c task_for_pid: the upcall
     # is for a caller that is not root), which can wait on a password
-    # dialog (freezer.rs, test_pid_suspend_binding). Bounded here, and said.
-    for pid, _ in procs[:4]:
+    # dialog (freezer.rs, test_pid_suspend_binding). Bounded here, and said;
+    # only with WICK_TEST_STACKS=1 (CI's macOS jobs set it), as watchdog.py.
+    sampled = (procs or [])[:4]
+    if os.environ.get("WICK_TEST_STACKS") != "1":
+        print("   stacks not taken: WICK_TEST_STACKS is not set; sample needs the task port", flush=True)
+        sampled = []
+    for pid, _ in sampled:
         path = os.path.join(ctx.out, f"hang-{vm_id}-{pid}.sample.txt")
         try:
             s = subprocess.run(["/usr/bin/sample", str(pid), "1", "-mayDie", "-file", path],

@@ -540,6 +540,10 @@ jobs:
     timeout-minutes: 40
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
+      # A hung process's stacks (sample) in every step: watchdog.py, the vmm
+      # sandbox tests' blocked-child helper, jailer-test.py and
+      # jailer-cgroup-test.py take them only when asked (tools/macos/test.sh).
+      WICK_TEST_STACKS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -949,6 +953,10 @@ jobs:
     timeout-minutes: 30
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
+      # A hung process's stacks (sample) in every step: watchdog.py, the vmm
+      # sandbox tests' blocked-child helper, jailer-test.py and
+      # jailer-cgroup-test.py take them only when asked (tools/macos/test.sh).
+      WICK_TEST_STACKS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

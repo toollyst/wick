@@ -13,6 +13,12 @@
 # cargo-nextest does): a test that keeps its VM alive cannot affect the next.
 # Prints one line per test and a summary; the exit status is non-zero if any
 # test failed. WICK_TEST_LOG=<file> keeps the output of failed tests there.
+# WICK_TEST_STACKS=1 asks a test whose child blocks for the child's stacks
+# (the vmm sandbox tests' child_within runs /usr/bin/sample): sample asks for
+# the child's task port, which on a desktop Mac can raise the Developer Tools
+# Access dialog and wait behind it, so it is off unless asked; CI's macOS jobs
+# set it. Without it the stacks are said not taken, and
+# test_a_blocked_child_fails_with_its_stacks says its stacks part is not run.
 #
 # The binaries are signed in place, in cargo's target directory, and stay
 # signed until cargo links them again: tools/macos/check-unit-tests.py,
