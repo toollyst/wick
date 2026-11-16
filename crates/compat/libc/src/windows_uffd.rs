@@ -2823,11 +2823,20 @@ mod tests {
     /// process with `STATUS_STACK_OVERFLOW` (0xC00000FD) as before, through
     /// Windows' own handling (Windows Error Reporting), on each kind of
     /// thread ([`Kind`]), with room left.
+    ///
+    /// Its record, STACKENDHOST: the host's build and revision, its
+    /// just-in-time debugger (AeDebug) and Windows Error Reporting's keys;
+    /// and for each child when it ended after the filter's line, with what
+    /// status, and, if it still runs 12 s after its start, the processes it
+    /// started or that report its fault, and its threads' stacks (cdb, where
+    /// the host has it), as Windows Server 2025's pool thread went on for
+    /// 10 s in CI runs 43784960688 and 43790310601.
     #[test]
     fn test_a_stack_overflow_at_the_reserves_end_is_still_one() {
+        stack_end_host_record();
         for child in ["stack_overflow_rust_child", "stack_overflow_createthread_child", "stack_overflow_pool_child"] {
-            let (code, text) = run_child(child, None);
-            std::eprintln!("STACKEND {child}: {code:?}; {}", text.trim().replace('\n', " | "));
+            let (code, text, ended) = run_child_watched(child);
+            std::eprintln!("STACKEND {child}: {code:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
             assert!(text.contains("STACKFILTER a stack overflow at the reserve's end"), "{child}: {text}");
             assert_eq!(code, Some(0xC000_00FD_u32.cast_signed()), "{child}: {text}");
         }
@@ -2837,8 +2846,103 @@ mod tests {
         lazy_memory_is_mapped();
         let (go, came_back) = a_thread_of(kind, usize::MAX);
         go.send(()).unwrap();
-        let _ = came_back.recv_timeout(std::time::Duration::from_secs(10));
-        std::println!("the {kind:?} thread's unbounded recursion came back");
+        // Long enough for STACKENDHOST to see who holds a process that has
+        // not ended; an overflow that ends it does so at once.
+        let back = came_back.recv_timeout(std::time::Duration::from_secs(60));
+        std::println!("the {kind:?} thread's unbounded recursion: {}", if back.is_ok() { "came back" } else { "the process went on for 60 s" });
+    }
+
+    /// STACKENDHOST's host part: `reg query` of what decides how a process
+    /// with an unhandled exception ends.
+    fn stack_end_host_record() {
+        const NT: &str = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+        const WER: &str = "SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting";
+        let keys: [(std::string::String, &[&str]); 7] = [
+            (NT.into(), &["/v", "CurrentBuild"]),
+            (NT.into(), &["/v", "UBR"]),
+            (std::format!("{NT}\\AeDebug"), &["/s"]),
+            ("HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug".into(), &["/s"]),
+            (std::format!("HKLM\\{WER}"), &["/s"]),
+            (std::format!("HKCU\\{WER}"), &["/s"]),
+            ("HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Error Reporting".into(), &["/s"]),
+        ];
+        for (path, rest) in &keys {
+            let mut args = std::vec!["query", path.as_str()];
+            args.extend_from_slice(rest);
+            let out = std::process::Command::new("reg").args(&args).output();
+            let text = match out {
+                Ok(o) => std::format!("{}{}", std::string::String::from_utf8_lossy(&o.stdout), std::string::String::from_utf8_lossy(&o.stderr)),
+                Err(e) => std::format!("reg: {e}"),
+            };
+            for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                std::eprintln!("STACKENDHOST {path}: {line}");
+            }
+        }
+    }
+
+    /// [`run_child`] without a job, which also says when the child ended,
+    /// and, if it still runs 12 s after its start, what holds it
+    /// (STACKENDHOST).
+    fn run_child_watched(child: &str) -> (Option<i32>, std::string::String, std::time::Duration) {
+        use std::io::Read;
+        let name = std::format!("{}::{child}", module_path!().split_once("::").unwrap().1);
+        let start = std::time::Instant::now();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name.as_str(), "--ignored", "--nocapture"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = process.stdout.take().unwrap();
+        let mut err = process.stderr.take().unwrap();
+        let readers = [
+            std::thread::spawn(move || { let mut v = Vec::new(); let _ = out.read_to_end(&mut v); v }),
+            std::thread::spawn(move || { let mut v = Vec::new(); let _ = err.read_to_end(&mut v); v }),
+        ];
+        let mut looked = false;
+        let status = loop {
+            if let Some(status) = process.try_wait().unwrap() {
+                break status;
+            }
+            if !looked && start.elapsed() >= std::time::Duration::from_secs(12) {
+                looked = true;
+                stack_end_who_holds(child, process.id());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let ended = start.elapsed();
+        let [o, e] = readers.map(|r| r.join().unwrap());
+        let text = std::format!("{}{}", std::string::String::from_utf8_lossy(&o), std::string::String::from_utf8_lossy(&e));
+        assert!(text.contains("running 1 test"), "the child {name} ran no test (status {status}): {text}");
+        (status.code(), text, ended)
+    }
+
+    /// STACKENDHOST's look at a child that has not ended: the processes it
+    /// started and those that report faults or debug (by name), then its
+    /// threads' stacks.
+    fn stack_end_who_holds(child: &str, pid: u32) {
+        let script = std::format!(
+            "Get-CimInstance Win32_Process | Where-Object {{ $_.ParentProcessId -eq {pid} -or $_.ProcessId -eq {pid} -or $_.Name -match 'WerFault|WerSvc|vsjitdebugger|dwwin|drwtsn|windbg|cdb|ntsd|procdump' }} | ForEach-Object {{ \"$($_.ProcessId) parent $($_.ParentProcessId) $($_.Name): $($_.CommandLine)\" }}"
+        );
+        if let Ok(o) = std::process::Command::new("powershell").args(["-NoProfile", "-Command", &script]).output() {
+            for line in std::string::String::from_utf8_lossy(&o.stdout).lines().filter(|l| !l.trim().is_empty()) {
+                std::eprintln!("STACKENDHOST {child} at 12 s: {line}");
+            }
+        }
+        let cdb = "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\cdb.exe";
+        if !std::path::Path::new(cdb).exists() {
+            std::eprintln!("STACKENDHOST {child} at 12 s: no cdb at {cdb}");
+            return;
+        }
+        let pid = std::format!("{pid}");
+        if let Ok(o) = std::process::Command::new(cdb).args(["-p", pid.as_str(), "-pv", "-c", "~*kn 40; qd"]).output() {
+            for line in std::string::String::from_utf8_lossy(&o.stdout).lines() {
+                let l = line.trim();
+                if l.starts_with(|c: char| c.is_ascii_hexdigit()) || l.contains(" Id: ") {
+                    std::eprintln!("STACKENDHOST {child} stack: {l}");
+                }
+            }
+        }
     }
 
     #[test]
