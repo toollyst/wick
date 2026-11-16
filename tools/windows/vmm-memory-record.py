@@ -141,7 +141,7 @@ GUEST_MIB = 128
 # kvm-ioctls' whp::vcpu::RUN_STACK, in KiB (tools/check-derived.py checks
 # that the two say the same): what a vCPU thread's first run commits below
 # its run call.
-RUN_STACK_KIB = 96
+RUN_STACK_KIB = 112
 # A VMMSTACK thread line of a vCPU thread, anywhere in a line (CI's log
 # puts a timestamp first).
 VCPU_STACK = re.compile(r"VMMSTACK vcpus=(\d+) thread='(fc_vcpu \d+)' tid=\d+ reserved \d+ KiB, committed (\d+) KiB")
@@ -1457,8 +1457,14 @@ def selftest():
               "2026-11-16T14:36:01.3Z VMMSTACK vcpus=16 thread='fc_api' tid=1 reserved 1024 KiB, committed 12 KiB, "
               "resident 12 KiB, lowest resident page 12 KiB deep, stack pointer 3.0 KiB deep\n")
     assert short_run_stacks(before) == (2, ["vcpus=1 'fc_vcpu 0' 52 KiB", "vcpus=16 'fc_vcpu 0' 48 KiB"]), short_run_stacks(before)
-    after = before.replace("committed 52 KiB", "committed 112 KiB").replace("committed 48 KiB", "committed 110 KiB")
+    # The same threads with RUN_STACK_KIB committed below calls 15.6 and
+    # 14.8 KiB deep: none is short; with what a 96 KiB depth gives (112 and
+    # 110 KiB from the base), the second is short of 112.
+    after = (before.replace("committed 52 KiB", f"committed {RUN_STACK_KIB + 16} KiB")
+             .replace("committed 48 KiB", f"committed {RUN_STACK_KIB + 14} KiB"))
     assert short_run_stacks(after) == (2, []), short_run_stacks(after)
+    at_96 = before.replace("committed 52 KiB", "committed 112 KiB").replace("committed 48 KiB", "committed 110 KiB")
+    assert short_run_stacks(at_96) == (2, ["vcpus=16 'fc_vcpu 0' 110 KiB"]), short_run_stacks(at_96)
     assert short_run_stacks("VMMMEM boot: a guest did not boot to its shell") == (0, [])
     print("vmm-memory-record.py: selftest ok")
 

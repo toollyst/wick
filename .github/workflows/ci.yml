@@ -1735,7 +1735,7 @@ jobs:
           # the first run committed it, the child ended with 137, the
           # thread's stack refused inside WHP's run call at the limit.
           alone whp::vcpu::fpu_tests::test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages
-          # A vCPU thread's first run commits its stack 96 KiB below the
+          # A vCPU thread's first run commits its stack 112 KiB below the
           # frame that called it (RUNSTACK line).
           alone whp::vcpu::fpu_tests::test_a_vcpu_threads_stack_is_committed_before_its_first_run
           alone whp::vcpu::fpu_tests::test_what_a_commit_takes_by_size_on_record

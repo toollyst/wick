@@ -3306,14 +3306,18 @@ impl VcpuFd {
 /// committed stack page stays committed for the thread's life, so WHP's
 /// growth within this depth asks no commit at the limit.
 ///
-/// How much: twice the deepest low mark seen below the call (the record
-/// build's measure, `ffi::trace::low`, in MOVEUNDERVCPU's RUNREC lines and
-/// STACKCALL's), rounded up to 16 KiB, never under 96 KiB; the tests that
-/// print the mark say a mark over half of this in a RUNSTACK line (an
-/// assertion once this is set from recorded marks). 96 is the floor until
-/// a mark is on record: the deepest growth seen within WHP's calls was
-/// 36 KiB (STACKCALL, above, 20 to 56), with the run loop's own frames
-/// below the call besides. The overflow's own room, the thread's guarantee
+/// How much: twice the deepest low mark on record below the call (the
+/// record build's measure, `ffi::trace::low`, in MOVEUNDERVCPU's RUNREC
+/// lines and STACKCALL's), plus 16 KiB, rounded up to 16 KiB, never under
+/// 96 KiB. Twice the mark keeps half of the depth as margin; the 16 KiB is
+/// a step of headroom for the hosts with no mark on record yet, as a mark
+/// of 47.2 against a half of 48 would fail an assertion at the next host
+/// or update without telling anything. On record: 47.2 KiB, every
+/// MOVEUNDERVCPU run call and STACKCALL's first write to `MAP_NORESERVE`
+/// guest RAM, in CI's windows job at e6c08999 (Windows Server 2025 26100
+/// on an AMD EPYC): 2 x 47.2 + 16 = 110.4, so 112. Windows Server 2022
+/// 20348 and the PC (a Ryzen 9 7900) have no mark yet. The tests that print the mark assert it within half of this
+/// (`within_half`). The overflow's own room, the thread's guarantee
 /// (20 KiB, std's `SetThreadStackGuarantee`), is beyond it.
 ///
 /// The release build's own check: CI's booted release Firecracker fails its
@@ -3323,9 +3327,11 @@ impl VcpuFd {
 ///
 /// What it costs: each vCPU thread holds this much of committed stack below
 /// its run call from its first run, resident too (the probe touches each
-/// page): about 110 KiB from the stack's base, the call 13 to 16 KiB below
-/// it, where a booted guest's held 48 to 52 KiB (VMMSTACK, CI run
-/// 43881982686; the VMM memory row of docs/COMPATIBILITY.md).
+/// page), the call 13 to 16 KiB below the stack's base: at 96 KiB, 111.2
+/// KiB resident a vCPU after a boot (VMMGROW, CI's windows job at
+/// e6c08999), where a booted guest's held 48 to 52 KiB before (VMMSTACK,
+/// CI run 43881982686); at 112, about 16 more, not measured yet (the VMM
+/// memory row of docs/COMPATIBILITY.md).
 ///
 /// If the commit is refused at the first run (a job already at its limit
 /// when the VMM boots or restores), the stack filter ends the VMM with 137
@@ -3341,7 +3347,7 @@ impl VcpuFd {
 /// (`RtlpAllocateHeap`, under `destroy`), still ends the VMM with 137
 /// there, as any thread's that must grow at the limit does (SECURITY.md,
 /// Not at parity yet).
-pub(crate) const RUN_STACK: usize = 96 << 10;
+pub(crate) const RUN_STACK: usize = 112 << 10;
 
 thread_local! {
     /// Whether this thread has committed [`RUN_STACK`] ([`VcpuFd::run`]).
@@ -4772,20 +4778,19 @@ mod fpu_tests {
         }
     }
 
-    /// Says a low mark over half of [`RUN_STACK`] below the run call, where
-    /// the margin its size keeps is gone, in one line that cannot be missed
-    /// (`who` names the thread or step). Printed, not asserted: no mark is
-    /// on record yet, and the commit that sets [`RUN_STACK`] from the
-    /// recorded marks makes it an assertion.
-    fn say_if_over_half(who: &str, m: super::super::ffi::trace::low::Mark) {
+    /// What is wrong with a low mark over half of [`RUN_STACK`] below the
+    /// run call, where the margin its size keeps is gone (`who` names the
+    /// thread or step): a RUNSTACK line, for the test to fail with.
+    fn within_half(who: &str, m: super::super::ffi::trace::low::Mark) -> std::result::Result<(), String> {
         if m.past || m.below_call > RUN_STACK / 2 {
-            eprintln!(
+            return Err(format!(
                 "RUNSTACK over half: {} KiB below the run call ({who}: {m}), over half of the {} KiB committed below it; \
                  raise RUN_STACK by its rule",
                 m.below_call.div_ceil(1024),
                 RUN_STACK / 1024
-            );
+            ));
         }
+        Ok(())
     }
 
     /// [`run_a_step`] on a thread of its own, made as Firecracker makes a
@@ -4799,7 +4804,7 @@ mod fpu_tests {
     /// call they are made in already counts (`trace::Call::nested`).
     /// Returns what is wrong with the step: each WHP call that failed, and a
     /// stack used past [`STACK_BOUND`] ([`used_from_base`]); a low mark over
-    /// half of [`RUN_STACK`] is said ([`say_if_over_half`]).
+    /// half of [`RUN_STACK`] ([`within_half`]).
     fn a_step_with_its_calls(vcpu: &mut VcpuFd, thread: &str, name: &str) -> Vec<String> {
         std::thread::scope(|scope| {
             std::thread::Builder::new()
@@ -4873,8 +4878,8 @@ mod fpu_tests {
                             STACK_BOUND / 1024
                         ));
                     }
-                    if let Some(m) = low {
-                        say_if_over_half(&format!("{thread}, {name}"), m);
+                    if let Some(Err(e)) = low.map(|m| within_half(&format!("{thread}, {name}"), m)) {
+                        wrong.push(e);
                     }
                     wrong
                 })
@@ -4912,8 +4917,8 @@ mod fpu_tests {
     /// stays within [`STACK_BOUND`] (used from its base: since the first
     /// run commits [`RUN_STACK`] below the call, each STACKCALL line also
     /// gives the thread's low mark after the call, the depth below the run
-    /// call it has written, and a RUNSTACK line says any step's mark over
-    /// half of [`RUN_STACK`] below the run call, the margin its size keeps).
+    /// call it has written, asserted within half of [`RUN_STACK`] below the
+    /// run call, the margin its size keeps: a RUNSTACK line if not).
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_the_stack_each_whp_call_commits_on_record() {
@@ -9165,8 +9170,9 @@ mod fpu_tests {
     /// at the next pass. Asserted: no bad value, every round moved, no
     /// dirty page lost, no reclaim asked by a dead page's fill.
     /// MOVEUNDERVCPU lines, one a round with its reclaim counts, and one of
-    /// the vCPU thread's deepest low mark below its run call (RUNREC), with
-    /// a RUNSTACK line if it is over half of [`RUN_STACK`]: the child's
+    /// the vCPU thread's deepest low mark below its run call (RUNREC),
+    /// asserted within half of [`RUN_STACK`] (a RUNSTACK line if not; 47.2
+    /// KiB in CI's windows job at e6c08999, the rule's input): the child's
     /// output, which the test prints whether or not it passes (CI's windows
     /// job at 57b122f9 passed it with none of them printed, as only a
     /// failure's message held them). In CI run 43881982686,
@@ -9403,8 +9409,8 @@ mod fpu_tests {
             low.map_or("no run call recorded".to_string(), |m| m.to_string()),
             RUN_STACK / 1024
         );
-        if let Some(m) = low {
-            say_if_over_half("MOVEUNDERVCPU's vCPU thread", m);
+        if let Some(Err(e)) = low.map(|m| within_half("MOVEUNDERVCPU's vCPU thread", m)) {
+            panic!("{e}");
         }
         let at_limit = &rounds[1..];
         let moved = at_limit.iter().filter(|r| r.0).count();

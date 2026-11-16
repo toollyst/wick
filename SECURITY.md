@@ -683,12 +683,12 @@ upstream Firecracker and its jailer.
   with a fresh page's fill since, it ran in CI runs 43784960688 and 43790310601 and failed: a thread's stack page was
   refused at the limit before any chunk moved (exit 137, the stack filter's line), with no reclaim first where
   Linux's memory cgroup reclaims for a stack page too: the vCPU thread's, inside WHP's run call (its RUNREC lines in CI's
-  windows job at b55b2673: 52 KiB committed from 8). A vCPU thread's first run now commits its stack 96 KiB below the frame that called it,
+  windows job at b55b2673: 52 KiB committed from 8). A vCPU thread's first run now commits its stack 112 KiB below the frame that called it (twice the deepest mark on record, 47.2 KiB in CI's windows job at e6c08999, plus 16, rounded up to 16: `vcpu::RUN_STACK`),
   far from the limit, so that WHP's growth within that depth asks no commit there
-  (`test_a_vcpu_threads_stack_is_committed_before_its_first_run`, in CI's windows job at 57b122f9: 97 KiB committed
-  below the frame that called run after the first run, from 5; MOVEUNDERVCPU is the proof under a move, and passed in
-  that job, every round moved at the limit and no value lost, its RUNREC marks not printed, as a pass printed none of
-  its child's lines then). An interim until the stack reclaim (the memory.max row); it covers no other thread: the
+  (`test_a_vcpu_threads_stack_is_committed_before_its_first_run`, at 96 KiB in CI's windows jobs at 57b122f9 and
+  e6c08999: 97 KiB committed below the frame that called run after the first run, from 5; MOVEUNDERVCPU is the proof
+  under a move, and passed in both, every round moved at the limit and no value lost, its marks printed at e6c08999;
+  at 112 KiB neither run in CI yet). An interim until the stack reclaim (the memory.max row); it covers no other thread: the
   userfaultfd serve thread's stack, refused inside ntdll's heap code at the limit, still ends the VMM with 137. Where another
   commit takes that room before the move maps, the move is not made and the chunk owes the charge: the job then holds
   up to 12 KiB more than it is charged, for one chunk at a time, said on standard error, with every userfaultfd fill
