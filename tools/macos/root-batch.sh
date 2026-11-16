@@ -214,7 +214,9 @@ batch() {
     if [[ "${SUDO[0]}" == sudo ]]; then
         sudo -v || die "sudo is needed"
         # sudo's timestamp lasts 5 minutes; the steps take longer.
-        (while kill -0 $$ 2>/dev/null; do sudo -n -v 2>/dev/null; sleep 60; done) &
+        # background loop: ends with the batch (and is killed at its exit) and
+        # after 12 hours (720 rounds of 60 s) at most (tools/check-background-loops.py).
+        (rounds=0; while kill -0 $$ 2>/dev/null && ((rounds++ < 720)); do sudo -n -v 2>/dev/null; sleep 60; done) &
         KEEP=$!
     fi
     for ((i = 0; i < ${#STEPS[@]}; i += 2)); do

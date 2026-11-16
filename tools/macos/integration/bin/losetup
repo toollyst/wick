@@ -64,10 +64,14 @@ case "${1:-}" in
     # framework looks for in every command line once it killed Firecracker
     # (microvm.py kill: "processes using the supposedly dead Firecracker's
     # jailer_id"), and a waiter is no Firecracker process.
+    # background loop: outlives this script on purpose (the device goes on
+    # its last close, after the test); ends with the session, once the
+    # device is detached or holds another image, and after an hour (3600
+    # rounds of 1 s) at most (tools/check-background-loops.py).
     # shellcheck disable=SC2016 # the waiter's script expands its own arguments
     WICK_LOSETUP_IMAGE="$image" nohup /bin/sh -c '
-        dev=$1 image=$WICK_LOSETUP_IMAGE record=$2 session=$3
-        while [ -z "$session" ] || [ -d "$session" ]; do
+        dev=$1 image=$WICK_LOSETUP_IMAGE record=$2 session=$3 rounds=0
+        while { [ -z "$session" ] || [ -d "$session" ]; } && [ "$((rounds += 1))" -le 3600 ]; do
             now="$(hdiutil info 2>/dev/null | awk -v dev="$dev" "
                 /^image-path/ { sub(/^image-path *: /, \"\"); image = \$0 }
                 \$1 == dev { print image; exit }")"

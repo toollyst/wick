@@ -295,9 +295,13 @@ env_args=(
 mkdir -p "$session/tmp"
 # The session directory's peak size, sampled: the blocks of its files that
 # have one link (the guest artifacts are hard links to the cache).
+# background loop: ends with the session, with this script (a run killed
+# with SIGKILL leaves its session until tools/clean.sh) and after 12 hours
+# (4320 rounds of 10 s) at most (tools/check-background-loops.py).
+runner=$$
 (
-    peak=0
-    while [[ -d "$session" ]]; do
+    peak=0 rounds=0
+    while [[ -d "$session" ]] && kill -0 "$runner" 2>/dev/null && ((rounds++ < 4320)); do
         kib="$(find "$session" -type f -links 1 -exec stat -f %b {} + 2>/dev/null |
             awk '{ s += $1 } END { print int(s / 2) }')"
         if ((kib > peak)); then

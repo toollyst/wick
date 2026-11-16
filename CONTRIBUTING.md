@@ -411,6 +411,14 @@ without a reason in its `not_run()`. An input that fails is saved in
   `prepare_test_run` from `tools/common.sh`, which runs `tools/clean.sh`
   and checks for free disk space first. `tools/clean.sh --dry-run` shows
   what earlier runs left; `--all` also removes the build output.
+- A loop a script starts in the background ends when its owner does (it
+  tests the owner's pid with `kill -0`, or the owner's directory with `-d`)
+  and has a numeric bound in its condition, with a `# background loop:`
+  comment above it saying both: a killed run's loops otherwise fork for ever
+  (a shutdown stall on 2026-11-15 caught 375 of them).
+  `tools/check-background-loops.py` checks the scripts under `tools/` on CI,
+  and `tools/clean.sh` kills a tool's loop whose script is gone and says how
+  many it found.
 - Reviewing a pull request means reading the code behind each claim it
   makes, for every host column it touches, not only that the other columns
   did not change.

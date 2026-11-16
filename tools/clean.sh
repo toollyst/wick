@@ -13,6 +13,8 @@
 #   snapshot, memory and disk image files of the runs it keeps that passed;
 # - test processes left running by a killed test run (Firecracker, the jailer,
 #   the vhost-user and uffd test backends whose test runner is gone);
+# - shell loops a killed tool left running (a background subshell of a script
+#   under tools/ whose script is gone), with how many it found;
 # - temporary directories of test runs no process uses any more
 #   (/tmp/wick-bt-*, /private/tmp/wick-jt-*, the integration tests' /tmp/wit-*,
 #   the jails inside; root-owned ones
@@ -150,6 +152,43 @@ stray_processes() {
         }'
 }
 
+# Shell loops a killed tool left (2026-11-15: 375 orphaned bash loops at a
+# shutdown stall): a background subshell of a script under tools/, whose
+# command line is the script's, alive after the script: parent pid 1, in a
+# process group whose leader is gone. Named by the repository's path, or by
+# a relative tools/ path when its working directory is the repository.
+stray_loops() {
+    local pid ppid pgid args cwd
+    while read -r pid ppid pgid args; do
+        [[ "$ppid" == 1 && "$pgid" != "$pid" ]] || continue
+        kill -0 "$pgid" 2>/dev/null && continue
+        [[ "$args" =~ ^(/bin/|/usr/bin/|/opt/homebrew/bin/)?(ba|z)?sh\  ]] || continue
+        if [[ "$args" != *"$WICK_ROOT/tools/"* ]]; then
+            [[ "$args" =~ (^|[\ /])tools/(macos|linux)/[^\ ]+ ]] || continue
+            cwd="$(lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p')"
+            [[ "$cwd" == "$WICK_ROOT" ]] || continue
+        fi
+        echo "$pid $args"
+    done < <(ps -eo pid=,ppid=,pgid=,args=)
+}
+
+clean_loops() {
+    local pid cmd found=0
+    while read -r pid cmd; do
+        [[ -n "$pid" ]] || continue
+        found=$((found + 1))
+        if ((dry)); then
+            say "would kill $pid ($cmd): a loop left by a killed tool"
+        elif kill -KILL "$pid" 2>/dev/null; then
+            say "killed $pid ($cmd): a loop left by a killed tool"
+        else
+            echo "cannot kill $pid ($cmd)" >&2
+            failed=1
+        fi
+    done < <(stray_loops)
+    ((found == 0)) || say "found $found loop(s) left by killed tools"
+}
+
 clean_processes() {
     local pid cmd
     while read -r pid cmd; do
@@ -188,6 +227,7 @@ clean_temp() {
 }
 
 clean_processes
+clean_loops
 clean_temp
 clean_runs "$WICK_ROOT/build/boot-test" '^[0-9]{8}-[0-9]{6}$'
 clean_runs "$WICK_ROOT/build/jailer-test" '^[0-9]{8}-[0-9]{6}$'

@@ -56,8 +56,12 @@ session="$(mktemp -d /tmp/wit-XXXX)"
 name="wit-selftest-$$"
 owner_pid=""
 screen_pid=""
+window_pid=""
+loop_pid=""
 finish() {
+    [[ -n "$loop_pid" ]] && kill "$loop_pid" 2>/dev/null
     [[ -n "$screen_pid" ]] && kill "$screen_pid" 2>/dev/null
+    [[ -n "$window_pid" ]] && kill "$window_pid" 2>/dev/null
     [[ -n "$owner_pid" ]] && kill "$owner_pid" 2>/dev/null
     "$SCREEN" -wipe >/dev/null 2>&1 || true
     rm -rf "$session"
@@ -65,18 +69,28 @@ finish() {
 trap finish EXIT
 
 # As upstream's framework starts Firecracker (utils.start_screen_process),
-# with the session's path in the command line.
+# with the session's path in the command line. The window's process (sh
+# execs sleep, so the path is gone from its command line) outlives a killed
+# screen daemon, its parent then pid 1: it is killed with it, here and after
+# clean.sh's run, or each run would leave its windows behind for 600 s.
+stop_window() {
+    [[ -n "$window_pid" ]] && kill "$window_pid" 2>/dev/null
+    window_pid=""
+}
 stop_screen() {
     kill "$screen_pid" 2>/dev/null || true
     for _ in $(seq 50); do kill -0 "$screen_pid" 2>/dev/null || break; sleep 0.1; done
+    stop_window
     "$SCREEN" -wipe >/dev/null 2>&1 || true
 }
 start_screen() {
     screen_pid=""
+    window_pid=""
     "$SCREEN" -dmS "$name" /bin/sh -c 'sleep 600' "$session/jailer"
     for _ in $(seq 50); do
         screen_pid="$(ps -eo pid=,ppid=,args= | awk -v s="$session" -v n="$name" '$2 == 1 && index($0, s) && index($0, n) { print $1 }')"
-        [[ -n "$screen_pid" ]] && return
+        [[ -n "$screen_pid" ]] && window_pid="$(pgrep -P "$screen_pid" | head -1)"
+        [[ -n "$window_pid" ]] && return
         sleep 0.1
     done
 }
@@ -85,7 +99,7 @@ sleep 600 &
 owner_pid=$!
 owner_line "$owner_pid" >"$session/.owner-pid"
 start_screen
-[[ -n "$screen_pid" ]] || { echo "FAIL: no screen daemon with parent pid 1 naming $session"; exit 1; }
+[[ -n "$screen_pid" && -n "$window_pid" ]] || { echo "FAIL: no screen daemon with parent pid 1 naming $session and a window"; exit 1; }
 echo "screen daemon $screen_pid: parent pid $(ps -o ppid= -p "$screen_pid" | tr -d ' '), args name $session"
 
 verdict "live owner" kept
@@ -103,18 +117,52 @@ wait "$owner_pid" 2>/dev/null || true
 owner_pid=""
 verdict "dead owner" taken
 
+# A loop a killed tool left: a background subshell (its command line names
+# integration-tests.sh, as the session sampler's does) whose script and
+# process group leader are gone, parent pid 1. It ends by itself after 120 s
+# whatever clean.sh does.
+loop_pidfile="$(mktemp "${TMPDIR:-/tmp}/clean-selftest-loop.XXXXXX")"
+python3 -I -c 'import os, sys
+if os.fork():
+    sys.exit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+with open(sys.argv[1], "w") as f:
+    f.write(str(os.getpid()))
+os.execv("/bin/bash", ["bash", "-c", "for i in $(seq 120); do sleep 1; done", sys.argv[2]])' \
+    "$loop_pidfile" "$ROOT/tools/macos/integration-tests.sh"
+for _ in $(seq 50); do [[ -s "$loop_pidfile" ]] && break; sleep 0.1; done
+loop_pid="$(cat "$loop_pidfile")"
+rm -f "$loop_pidfile"
+for _ in $(seq 50); do [[ "$(ps -o ppid= -p "$loop_pid" | tr -d ' ')" == 1 ]] && break; sleep 0.1; done
+dry="$("$clean" --dry-run 2>&1)"
+if grep -q "^would kill $loop_pid .*: a loop left by a killed tool" <<<"$dry" &&
+    grep -q "^found 1 loop(s) left by killed tools" <<<"$dry"; then
+    echo "ok: an orphaned tool loop is found and counted"
+else
+    echo "FAIL: clean.sh did not find the orphaned loop $loop_pid (parent $(ps -o ppid= -p "$loop_pid"))"
+    fails=$((fails + 1))
+fi
+
 if ((remove)); then
     # What every test script's start removes anyway (passed runs' images)
     # aside, only this test's may be listed.
     dry="$("$clean" --dry-run 2>&1)"
     others="$(grep -E '^would (kill|remove)' <<<"$dry" | grep -vF -e "would kill $screen_pid " \
-        -e "would remove /private$session " -e ": snapshot or image of a passed run" || true)"
+        -e "would remove /private$session " -e ": snapshot or image of a passed run" \
+        -e "would kill $loop_pid " || true)"
     if [[ -n "$others" ]]; then
         echo "not run for real: clean.sh would also take what is not this test's:"
         echo "$others" | sed 's/^/    /'
     else
         "$clean" >/dev/null 2>&1 || true
         sleep 0.5
+        stop_window
+        if kill -0 "$loop_pid" 2>/dev/null; then
+            echo "FAIL: clean.sh left the orphaned loop $loop_pid"
+            fails=$((fails + 1))
+        fi
         if kill -0 "$screen_pid" 2>/dev/null || [[ -e "$session" ]]; then
             echo "FAIL: clean.sh left $([[ -e "$session" ]] && echo "$session") $(kill -0 "$screen_pid" 2>/dev/null && echo "screen $screen_pid")"
             fails=$((fails + 1))
