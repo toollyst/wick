@@ -9166,7 +9166,10 @@ mod fpu_tests {
     /// dirty page lost, no reclaim asked by a dead page's fill.
     /// MOVEUNDERVCPU lines, one a round with its reclaim counts, and one of
     /// the vCPU thread's deepest low mark below its run call (RUNREC), with
-    /// a RUNSTACK line if it is over half of [`RUN_STACK`]. In CI run 43881982686,
+    /// a RUNSTACK line if it is over half of [`RUN_STACK`]: the child's
+    /// output, which the test prints whether or not it passes (CI's windows
+    /// job at 57b122f9 passed it with none of them printed, as only a
+    /// failure's message held them). In CI run 43881982686,
     /// before the vCPU thread's stack was committed at its first run, the
     /// child ended with 137 inside WHP's first run call at the limit, its
     /// stack refused at 52 KiB committed (from 8).
@@ -9186,8 +9189,10 @@ mod fpu_tests {
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages() {
         let (code, text) = run_child("moved_under_a_vcpu_child", 512 << 20);
-        assert!(text.contains("MOVEUNDERVCPU all"), "{text}");
-        assert_eq!(code, Some(0), "{text}");
+        // The child's lines are the record, whether or not it passed.
+        eprint!("{text}");
+        assert!(text.contains("MOVEUNDERVCPU all"), "the child's lines above");
+        assert_eq!(code, Some(0), "the child's lines above");
     }
 
     #[test]

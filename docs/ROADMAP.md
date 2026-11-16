@@ -150,7 +150,7 @@ dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `
   2022 20348, and Windows Server 2025 in CI runs 43680983973 and 43688550565; MOVEUNDERVCPU, run in CI runs 43784960688 and
   43790310601, failed: a thread's stack page refused at the limit before any move, with no reclaim first, the vCPU
   thread's inside WHP's run call; a vCPU thread's first run now commits its stack 96 KiB below the call, an interim
-  not run in CI yet; the fix, the stack reclaim, in progress). A charge a move could not take back owes up to 12 KiB, stated. Left, each stated in docs/COMPATIBILITY.md's `memory.max` row: the discarded pages of a released range,
+  with which it passed in CI's windows job at 57b122f9; the fix, the stack reclaim, in progress). A charge a move could not take back owes up to 12 KiB, stated. Left, each stated in docs/COMPATIBILITY.md's `memory.max` row: the discarded pages of a released range,
   a reclaim before a refused allocation of the VMM's own (its heap, a thread's stack), and before a commit made at
   once that is refused (`MAP_POPULATE`, a private file mapping's read, a `MAP_FIXED` recommit, a discard of private
   memory that is not lazy, a committing `mprotect`), which fails with `ENOMEM` today: not done yet.
