@@ -3420,9 +3420,13 @@ fn uffd_alias_chunked(t: &mut Table, start: usize, len: usize, resident: &[u8]) 
         return Err(crate::ENOMEM);
     }
     let chunks: Vec<(usize, usize)> = (0..len).step_by(UFFD_CHUNK).map(|o| (o, UFFD_CHUNK.min(len - o))).collect();
+    #[cfg(test)]
+    let at = ALIAS_AT.swap(0, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let at = 0;
     // SAFETY: reserves address space of our own, as a placeholder.
     let alias = unsafe {
-        VirtualAlloc2(proc(), std::ptr::null(), len, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0)
+        VirtualAlloc2(proc(), at as *const c_void, len, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0)
     } as usize;
     if alias == 0 {
         return Err(crate::ENOMEM);
@@ -3552,16 +3556,16 @@ pub(crate) fn uffd_swap_chunk(view: usize, len: usize, alias: usize) -> bool {
     let Some(section) = reserved_section(len) else {
         return false;
     };
+    #[cfg(test)]
+    viewrec_alias(0);
     // SAFETY: unmaps the chunk's alias view, keeping its placeholder; the
     // guest's view keeps the old section until it is unmapped too.
     if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
         return false;
     }
-    let swapped = view_into(&section, alias, len)
-        // SAFETY: unmaps the chunk's guest view, keeping its placeholder.
-        && unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } != 0
-        && view_into(&section, view, len);
-    if !swapped {
+    #[cfg(test)]
+    viewrec_alias(1);
+    if !swap_views(&section, view, alias, len, 2) {
         // SAFETY: plain call.
         out_of_memory(view, unsafe { GetLastError() });
     }
@@ -3656,6 +3660,70 @@ fn moverec_commit() -> usize {
 #[cfg(test)]
 fn moverec(i: usize, v: usize) {
     MOVEREC[i].store(v, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// VIEWCOST, for tests: the last swap of a chunk's two views
+/// ([`swap_views`], by [`uffd_move_chunk`] or [`uffd_swap_chunk`]), the
+/// process's private commit in bytes: [0] before the alias's unmap, [1]
+/// after it, [2] after the alias's map, [3] after the guest view's unmap,
+/// [4] after its map (0 where a step was not reached); [5] 1 for a move, 2
+/// for a swap.
+#[cfg(test)]
+pub(crate) static VIEWREC: [std::sync::atomic::AtomicUsize; 6] = [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
+
+/// Run by [`swap_views`] between the guest view's unmap and its map: for
+/// the test of another commit taking the room the unmap gave
+/// (`test_a_move_whose_guest_view_room_is_taken_is_made`).
+#[cfg(test)]
+pub(crate) static BETWEEN_GUEST_UNMAP_AND_MAP: Mutex<Option<fn()>> = Mutex::new(None);
+
+/// Where [`uffd_alias_chunked`] reserves the next alias (0: anywhere,
+/// as the product does), taken by that call: for the record of the
+/// views' costs by placement (VIEWCOST).
+#[cfg(test)]
+pub(crate) static ALIAS_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The chunk's alias view, unmapped by the caller keeping its placeholder,
+/// and then its guest view, each given `section` in its place
+/// ([`uffd_swap_chunk`], [`uffd_move_chunk`]): whether all three steps
+/// were made. `kind` is for the record (VIEWREC: 1 a move, 2 a swap).
+fn swap_views(section: &Owned, view: usize, alias: usize, len: usize, #[cfg_attr(not(test), allow(unused_variables))] kind: usize) -> bool {
+    #[cfg(test)]
+    {
+        VIEWREC[2].store(0, std::sync::atomic::Ordering::SeqCst);
+        VIEWREC[3].store(0, std::sync::atomic::Ordering::SeqCst);
+        VIEWREC[4].store(0, std::sync::atomic::Ordering::SeqCst);
+        VIEWREC[5].store(kind, std::sync::atomic::Ordering::SeqCst);
+    }
+    if !view_into(section, alias, len) {
+        return false;
+    }
+    #[cfg(test)]
+    VIEWREC[2].store(moverec_commit(), std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: unmaps the chunk's guest view, keeping its placeholder.
+    if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
+        return false;
+    }
+    #[cfg(test)]
+    {
+        VIEWREC[3].store(moverec_commit(), std::sync::atomic::Ordering::SeqCst);
+        if let Some(hook) = *BETWEEN_GUEST_UNMAP_AND_MAP.lock().unwrap() {
+            hook();
+        }
+    }
+    let mapped = view_into(section, view, len);
+    #[cfg(test)]
+    if mapped {
+        VIEWREC[4].store(moverec_commit(), std::sync::atomic::Ordering::SeqCst);
+    }
+    mapped
+}
+
+/// VIEWCOST: the private commit before a chunk's alias view is unmapped
+/// ([0]) and after ([1]).
+#[cfg(test)]
+fn viewrec_alias(i: usize) {
+    VIEWREC[i].store(moverec_commit(), std::sync::atomic::Ordering::SeqCst);
 }
 
 /// How many moves were not made once begun ([`uffd_move_chunk`]: their new
@@ -4000,6 +4068,8 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
     if let Some(hook) = *MOVE_HOOK.lock().unwrap() {
         hook();
     }
+    #[cfg(test)]
+    viewrec_alias(0);
     // SAFETY: unmaps the chunk's alias view, keeping its placeholder; the
     // guest's view keeps the old section until it is unmapped too.
     if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
@@ -4009,11 +4079,9 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
         unmap_tmp("unmap its alias");
         return None;
     }
-    let swapped = view_into(&section, alias, len)
-        // SAFETY: unmaps the chunk's guest view, keeping its placeholder.
-        && unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } != 0
-        && view_into(&section, view, len);
-    if !swapped {
+    #[cfg(test)]
+    viewrec_alias(1);
+    if !swap_views(&section, view, alias, len, 1) {
         // SAFETY: plain call.
         out_of_memory(view, unsafe { GetLastError() });
     }

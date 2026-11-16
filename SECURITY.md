@@ -391,6 +391,21 @@ upstream Firecracker and its jailer.
   every page table of the VMM's memory is the VMM's own commit, in its job, so the VMM reaches its limit sooner by
   those tables. Firecracker's handler is a process of the operator's, which the jailer does not put in the VMM's
   cgroup.
+- **Windows: a reclaim's move, or the swap of a chunk discarded whole, ends the VMM with 137 when another thread's
+  commit takes a view's page table room between its unmap and its map.** Both put a new section in the place of a
+  2 MiB chunk's old one in its two views, the alias's and then the guest's: each view is unmapped, keeping its
+  placeholder, and the new section mapped there. A view's unmap gives back the page table of each 2 MiB region only
+  that view maps, and a page-directory page for each 1 GiB only it maps; its map takes them again (VIEWCOST,
+  `test_what_a_chunks_view_swap_costs_on_record`, the same on Windows Server 2022 20348 and 2025 26100: 4 KiB for
+  every chunk of a range on a 2 MiB boundary, 8 for a one-chunk range; 0 for a chunk whose regions it shares with
+  its neighbours). Firecracker places every guest memory region on a 2 MiB boundary (src/vmm/src/vstate/memory.rs,
+  `GUEST_MEMORY_ALIGNMENT` :42, `allocate_protected` :131 to :200), so every guest view's swap gives back 4 KiB and
+  needs it again. wick's own commits wait for the swap (it holds the region table's lock), but the Rust heap, a
+  thread's stack and Windows' own allocations on other threads do not: if one takes that room at the job's limit,
+  the map is refused and the VMM ends with 137 and the line "wick: guest memory: committing the pages at ... failed
+  with error 1455" (`test_a_move_whose_guest_view_room_is_taken_is_made`, ignored citing this entry: it ended so on
+  both hosts). Linux has no such step: its reclaim frees pages in place. Fix in progress: each chunk's views mapped
+  as two halves, swapped one at a time, so that the other half keeps the region's page table.
 - **Without the jailer, the VMM runs as the user who started it** on macOS and Windows: an escape from the VM and
   then the VMM lands as that user (files are then not limited, as on Linux without the jailer).
 - **macOS jailer: no namespaces in the kernel.** macOS has no network or PID namespaces (XNU's system calls,
