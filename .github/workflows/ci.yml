@@ -2050,11 +2050,26 @@ jobs:
             # (windows_mm::module_of): named with cdb against this host's
             # own copy of that DLL and Microsoft's public symbols.
             grep 'STACK137FRAMES' "$f" | grep -v ' image+0x' || true
+            # cdb names a frame from the public pdb it fetched, or, if the
+            # fetch failed, from the DLL's exports alone (its `lm` line says
+            # "export symbols" where it says "pdb symbols": both seen on
+            # fc-win, the second with the server unreachable), which is
+            # said as "no symbols fetched"; so is a frame cdb named nothing for.
             grep -o 'STACK137FRAMES [0-9]* [A-Za-z0-9_.-]*\.[dD][lL][lL]+0x[0-9a-f]*' "$f" | awk '{print $3}' | sort -u | while read -r frame; do
               dll=${frame%%+*}
-              [ -x "$cdb" ] && [ -f "/c/Windows/System32/$dll" ] || continue
-              "$cdb" -z "C:/Windows/System32/$dll" -y "srv*$RUNNER_TEMP/sym*https://msdl.microsoft.com/download/symbols" \
-                -c "ln ${dll%.*}+${frame#*+}; q" 2>&1 | grep '^(' | sed "s|^|$frame: |" || true
+              if [ ! -x "$cdb" ]; then echo "$frame: no cdb on this runner: not named"; continue; fi
+              if [ ! -f "/c/Windows/System32/$dll" ]; then echo "$frame: no C:/Windows/System32/$dll on this runner: not named"; continue; fi
+              out=$("$cdb" -z "C:/Windows/System32/$dll" -y "srv*$RUNNER_TEMP/sym*https://msdl.microsoft.com/download/symbols" \
+                -c ".reload /f; lm v m ${dll%.*}; ln ${dll%.*}+${frame#*+}; q" 2>&1) || true
+              named=$(printf '%s\n' "$out" | grep '^(' | sed "s|^|$frame: |")
+              if [ -z "$named" ]; then
+                echo "$frame: no symbols fetched: cdb named nothing"
+              elif printf '%s\n' "$out" | grep -q '(pdb symbols)'; then
+                printf '%s\n' "$named"
+              else
+                printf '%s\n' "$named"
+                echo "$frame: no symbols fetched: the name above is the nearest export's"
+              fi
             done
           done
       - name: Keep the executables of a stack that could not grow

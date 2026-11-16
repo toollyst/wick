@@ -1600,10 +1600,11 @@ fn stack_137_frames() {
 /// One STACK137FRAMES line: frame `i` at `a`, as an offset in this
 /// executable (its base `own`), else in the module it lies in, else bare.
 fn say_frame(i: usize, a: usize, own: usize) {
+    let mut name = [0u8; 64];
     if a >= own && a - own < 64 << 20 {
         say_at_the_limit(format_args!("STACK137FRAMES {i} image+{:#x}", a - own));
-    } else if let Some((at, name)) = module_of(a) {
-        say_at_the_limit(format_args!("STACK137FRAMES {i} {}+{:#x} ({a:#x})", Ascii(name), a - at));
+    } else if let Some((at, len)) = module_of(a, &mut name) {
+        say_at_the_limit(format_args!("STACK137FRAMES {i} {}+{:#x} ({a:#x})", Ascii(&name[..len]), a - at));
     } else {
         say_at_the_limit(format_args!("STACK137FRAMES {i} {a:#x}"));
     }
@@ -1618,13 +1619,45 @@ pub(crate) fn say_frame_for_test(i: usize, a: usize) {
     say_frame(i, a, core::ptr::addr_of!(__ImageBase) as usize);
 }
 
-/// The module an address lies in, for STACK137FRAMES: its base and the name
-/// its export directory gives (`WinHvPlatform.dll`, `ntdll.dll`), read from
-/// the image's headers in memory: `VirtualQuery`'s allocation base of an
-/// image mapping (`MEM_IMAGE`) is the module's base, and no loader call is
-/// made, so no loader lock is taken on the 137 path. `None` for an address
-/// in no image, or an image with no export directory.
-fn module_of(a: usize) -> Option<(usize, &'static [u8])> {
+/// Whether every page of `[at, at + n)` is committed and readable (not
+/// `PAGE_NOACCESS`, execute-only or a guard page), each page asked of
+/// `VirtualQuery` once; no allocation.
+fn readable(at: usize, n: usize) -> bool {
+    let Some(end) = at.checked_add(n) else {
+        return false;
+    };
+    let mut p = at - at % PAGE;
+    while p < end {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(p as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0
+            || mbi.State != MEM_COMMIT
+            || mbi.Protect & 0xee == 0
+            || mbi.Protect & 0x100 != 0
+        {
+            return false;
+        }
+        p += PAGE;
+    }
+    true
+}
+
+/// The module an address lies in, for STACK137FRAMES: its base, and the
+/// name its export directory gives (`WinHvPlatform.dll`, `ntdll.dll`)
+/// copied into `name` (its length returned), read from the image's headers
+/// in memory: `VirtualQuery`'s allocation base of an image mapping
+/// (`MEM_IMAGE`) is the module's base, and no loader call is made, so no
+/// loader lock is taken on the 137 path, and nothing is allocated. A
+/// `MEM_IMAGE` view is any `SEC_IMAGE` mapping, not only a module the
+/// loader checked, so every offset the headers give is bounded before it
+/// is followed: each read lies below the image's `SizeOfImage` (the
+/// optional header's, at 56) by checked arithmetic, and on pages that are
+/// committed and readable ([`readable`]); a name is read up to 64 bytes or
+/// the image's end. `None` for an address in no image, an image with no
+/// export directory, or headers that point outside it
+/// (`test_a_frame_in_a_damaged_image_is_given_bare`).
+fn module_of(a: usize, name: &mut [u8; 64]) -> Option<(usize, usize)> {
     // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
     let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: as above.
@@ -1634,28 +1667,54 @@ fn module_of(a: usize) -> Option<(usize, &'static [u8])> {
         return None;
     }
     let base = mbi.AllocationBase as usize;
-    // SAFETY: the headers of an image mapped in this process, read in
-    // place: `IMAGE_DOS_HEADER.e_lfanew` (0x3c), the PE signature, the
-    // optional header's magic (0x20b, PE32+) and its export directory
-    // (data directory 0, at 112 in a PE32+ optional header), then
-    // `IMAGE_EXPORT_DIRECTORY.Name` (12), an RVA of a NUL-terminated name.
-    unsafe {
-        let rd = |at: usize| core::ptr::read_unaligned(at as *const u32) as usize;
-        if core::ptr::read_unaligned(base as *const u16) != 0x5a4d {
-            return None;
-        }
-        let nt = base + rd(base + 0x3c);
-        if rd(nt) != 0x4550 || core::ptr::read_unaligned((nt + 24) as *const u16) != 0x20b {
-            return None;
-        }
-        let exports = rd(nt + 24 + 112);
-        if exports == 0 {
-            return None;
-        }
-        let name = base + rd(base + exports + 12);
-        let len = (0..64).take_while(|&i| *((name + i) as *const u8) != 0).count();
-        Some((base, core::slice::from_raw_parts(name as *const u8, len)))
+    // The layout read: `IMAGE_DOS_HEADER.e_lfanew` (0x3c); at it the PE
+    // signature (4), the file header (20) and the optional header, whose
+    // magic (0x20b, PE32+), `SizeOfImage` (56) and export directory (data
+    // directory 0, at 112) are read; then `IMAGE_EXPORT_DIRECTORY.Name`
+    // (12), the RVA of a NUL-terminated name.
+    const OPT: usize = 24;
+    const HEADERS: usize = OPT + 112 + 8;
+    let rd = |at: usize| -> u32 {
+        // SAFETY: `at` lies in pages `readable` found committed and readable.
+        unsafe { core::ptr::read_unaligned(at as *const u32) }
+    };
+    if !readable(base, 0x40) {
+        return None;
     }
+    // SAFETY: the image's first page, readable.
+    if unsafe { core::ptr::read_unaligned(base as *const u16) } != 0x5a4d {
+        return None;
+    }
+    let lfanew = rd(base + 0x3c) as usize;
+    let nt = base.checked_add(lfanew)?;
+    if !readable(nt, HEADERS) || rd(nt) != 0x4550 {
+        return None;
+    }
+    // SAFETY: the optional header, readable.
+    if unsafe { core::ptr::read_unaligned((nt + OPT) as *const u16) } != 0x20b {
+        return None;
+    }
+    let size = rd(nt + OPT + 56) as usize;
+    if lfanew.checked_add(HEADERS)? > size {
+        return None;
+    }
+    let exports = rd(nt + OPT + 112) as usize;
+    if exports == 0 || exports.checked_add(16)? > size || !readable(base + exports, 16) {
+        return None;
+    }
+    let at = rd(base + exports + 12) as usize;
+    if at >= size {
+        return None;
+    }
+    let n = (size - at).min(name.len());
+    if !readable(base + at, n) {
+        return None;
+    }
+    // SAFETY: `n` bytes below the image's end, on readable pages.
+    let src = unsafe { core::slice::from_raw_parts((base + at) as *const u8, n) };
+    let len = src.iter().position(|&b| b == 0).unwrap_or(n);
+    name[..len].copy_from_slice(&src[..len]);
+    Some((base, len))
 }
 
 /// ASCII shown without allocating (a byte that is not printable as `?`).

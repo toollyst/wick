@@ -3366,7 +3366,6 @@ mod tests {
     /// directory's RVA past the image, or its name's RVA past the image,
     /// the frame is the bare address. Each child then says it went on.
     #[test]
-    #[ignore = "until module_of bounds what it reads"]
     fn test_a_frame_in_a_damaged_image_is_given_bare() {
         for (case, want) in [("control", Some("damaged.dll+0x1010")), ("exports", None), ("name", None)] {
             let (code, text, _) = run_child_watched("damaged_image_child", &[("WICK_TEST_IMAGE", case)]);
