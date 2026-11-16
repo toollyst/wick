@@ -640,6 +640,29 @@ fn file_under(addr: u64) -> bool {
 
 /// Whether any page of `[start, end)`, part of a private file mapping, has
 /// been copied (written, and so private), as `mincore` reports it.
+///
+/// XNU's `mincore` (xnu-12377.1.9 bsd/kern/kern_mman.c :1641 to :1646) sets
+/// `MINCORE_COPIED` (bsd/sys/mman.h :235) for a page the VM query found
+/// copied, and `MINCORE_ANONYMOUS` (:236) for one it found outside a file's
+/// object. The query (osfmk/vm/vm_map.c `vm_map_page_range_info_internal`)
+/// looks the page up in the entry's top object, then down its shadow chain
+/// (:20966 to :21007), and stops at the first object that holds the page,
+/// resident or compressed (`VM_PAGE_QUERY_PAGE_PAGED_OUT`, :20978 to
+/// :20981), or at the chain's end. It reports the page copied when it
+/// stopped in the top object and that object has a shadow, and external
+/// when the object it stopped in is not an internal one (:21019 to :21025).
+/// So:
+/// - a written page of a private file mapping, resident, compressed or
+///   swapped, is in the top object, an internal one shadowing the file:
+///   `MINCORE_COPIED | MINCORE_ANONYMOUS`;
+/// - a page never written, resident in the file's cache or not, is found in
+///   the file's object or nowhere, and the walk ends there, with no shadow
+///   below it: neither flag.
+///
+/// A page with either flag is taken as copied. Each flag alone tells the
+/// cases of `test_madvise_dontneed_of_a_private_file_mapping_with_copied_pages_is_einval`
+/// apart (none, one and every page copied; it passes with either read
+/// alone, and fails with neither).
 fn copied(start: u64, end: u64) -> bool {
     const MINCORE_COPIED: u8 = 0x40;
     const MINCORE_ANONYMOUS: u8 = 0x80;
