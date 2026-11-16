@@ -1577,8 +1577,11 @@ fn this_threads_description(out: &mut [u16]) -> usize {
 /// step names them so). A VMM's last lines then say where its stack had
 /// to grow at the limit (the stack reclaim's step 3 and the stack
 /// pre-commit are decided from them), where Linux's OOM kill prints the
-/// task's memory, not its stack. Written without allocating, in 256 bytes
-/// of stack, on the 137 path only.
+/// task's memory, not its stack. A frame in another module is named with
+/// its offset in it ([`module_of`]: CI run 43823078930's `vcpu-runner` died
+/// ten frames deep in a system DLL that `WHvRunVirtualProcessor` called,
+/// which the line could not name). Written without allocating, in 256
+/// bytes of stack, on the 137 path only.
 #[inline(never)]
 fn stack_137_frames() {
     unsafe extern "C" {
@@ -1593,9 +1596,64 @@ fn stack_137_frames() {
         let a = *f as usize;
         if a >= base && a - base < 64 << 20 {
             say_at_the_limit(format_args!("STACK137FRAMES {i} image+{:#x}", a - base));
+        } else if let Some((at, name)) = module_of(a) {
+            say_at_the_limit(format_args!("STACK137FRAMES {i} {}+{:#x} ({a:#x})", Ascii(name), a - at));
         } else {
             say_at_the_limit(format_args!("STACK137FRAMES {i} {a:#x}"));
         }
+    }
+}
+
+/// The module an address lies in, for STACK137FRAMES: its base and the name
+/// its export directory gives (`WinHvPlatform.dll`, `ntdll.dll`), read from
+/// the image's headers in memory: `VirtualQuery`'s allocation base of an
+/// image mapping (`MEM_IMAGE`) is the module's base, and no loader call is
+/// made, so no loader lock is taken on the 137 path. `None` for an address
+/// in no image, or an image with no export directory.
+fn module_of(a: usize) -> Option<(usize, &'static [u8])> {
+    // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { VirtualQuery(a as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0
+        || mbi.Type != windows_sys::Win32::System::Memory::MEM_IMAGE
+    {
+        return None;
+    }
+    let base = mbi.AllocationBase as usize;
+    // SAFETY: the headers of an image mapped in this process, read in
+    // place: `IMAGE_DOS_HEADER.e_lfanew` (0x3c), the PE signature, the
+    // optional header's magic (0x20b, PE32+) and its export directory
+    // (data directory 0, at 112 in a PE32+ optional header), then
+    // `IMAGE_EXPORT_DIRECTORY.Name` (12), an RVA of a NUL-terminated name.
+    unsafe {
+        let rd = |at: usize| core::ptr::read_unaligned(at as *const u32) as usize;
+        if core::ptr::read_unaligned(base as *const u16) != 0x5a4d {
+            return None;
+        }
+        let nt = base + rd(base + 0x3c);
+        if rd(nt) != 0x4550 || core::ptr::read_unaligned((nt + 24) as *const u16) != 0x20b {
+            return None;
+        }
+        let exports = rd(nt + 24 + 112);
+        if exports == 0 {
+            return None;
+        }
+        let name = base + rd(base + exports + 12);
+        let len = (0..64).take_while(|&i| *((name + i) as *const u8) != 0).count();
+        Some((base, core::slice::from_raw_parts(name as *const u8, len)))
+    }
+}
+
+/// ASCII shown without allocating (a byte that is not printable as `?`).
+struct Ascii<'a>(&'a [u8]);
+
+impl core::fmt::Display for Ascii<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::fmt::Write;
+        for &b in self.0 {
+            f.write_char(if b.is_ascii_graphic() { char::from(b) } else { '?' })?;
+        }
+        Ok(())
     }
 }
 

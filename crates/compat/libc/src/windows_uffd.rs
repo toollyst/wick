@@ -3343,7 +3343,6 @@ mod tests {
     /// as bare addresses (randomised per boot), so it could not be named
     /// after the run.
     #[test]
-    #[ignore = "until STACK137FRAMES names the module of a frame"]
     fn test_the_frames_of_a_stack_that_could_not_grow_name_their_modules() {
         let (code, text) = run_child("stack_at_the_limit_rust_child", Some(96 << 20));
         assert_eq!(code, Some(137), "{text}");

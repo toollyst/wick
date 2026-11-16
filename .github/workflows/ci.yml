@@ -2021,10 +2021,11 @@ jobs:
       # A process the stack filter ended with 137 (its stack could not grow
       # at the job's limit: MOVEUNDERVCPU's vCPU thread in runs 43800980377
       # and 43808974288) printed its return addresses (STACK137FRAMES, as
-      # offsets in its executable): named here with cdb against the test
-      # executable the run's "Running" line names and its pdb, and both kept
-      # as an artifact for a debugger elsewhere. Only prints; it fails
-      # nothing.
+      # offsets in its executable, or in the system DLL a frame is in):
+      # named here with cdb against the test executable the run's "Running"
+      # line names and its pdb, and a DLL's against the runner's own copy and
+      # Microsoft's public symbols; the executable and pdb are kept as an
+      # artifact for a debugger elsewhere. Only prints; it fails nothing.
       - name: Name the frames of a stack that could not grow
         if: (success() || failure()) && steps.setup.outcome == 'success'
         working-directory: lib/firecracker
@@ -2045,7 +2046,16 @@ jobs:
             else
               echo "no cdb on this runner: the executable and its pdb are in the whp-frames artifact"
             fi
-            grep 'STACK137FRAMES [0-9]* 0x' "$f" || true
+            # A frame in a system DLL is printed as <dll>+<offset>
+            # (windows_mm::module_of): named with cdb against this host's
+            # own copy of that DLL and Microsoft's public symbols.
+            grep 'STACK137FRAMES' "$f" | grep -v ' image+0x' || true
+            grep -o 'STACK137FRAMES [0-9]* [A-Za-z0-9_.-]*\.[dD][lL][lL]+0x[0-9a-f]*' "$f" | awk '{print $3}' | sort -u | while read -r frame; do
+              dll=${frame%%+*}
+              [ -x "$cdb" ] && [ -f "/c/Windows/System32/$dll" ] || continue
+              "$cdb" -z "C:/Windows/System32/$dll" -y "srv*$RUNNER_TEMP/sym*https://msdl.microsoft.com/download/symbols" \
+                -c "ln ${dll%.*}+${frame#*+}; q" 2>&1 | grep '^(' | sed "s|^|$frame: |" || true
+            done
           done
       - name: Keep the executables of a stack that could not grow
         if: (success() || failure()) && steps.setup.outcome == 'success'
