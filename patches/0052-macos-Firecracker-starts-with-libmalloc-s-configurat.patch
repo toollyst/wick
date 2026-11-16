@@ -21,6 +21,7 @@ The binary's unit tests share the same initializer:
 - test_another_value_is_refused
 - test_starting_again_keeps_arguments_environment_and_descriptors
 - test_a_failed_start_again_ends_firecracker_naming_why
+- test_a_start_whose_executable_is_unlinked_or_replaced_meanwhile
 
 The first four read libmalloc's own report (MallocReportConfig) and
 fail with the initializer left out. The fourth compares the arguments,
@@ -28,16 +29,20 @@ the environment and the descriptors of a run that started again with
 one that did not (a helper test, ignored, prints them in a child). The
 fifth finds by bisection an environment that leaves the second exec
 over kern.argmax (E2BIG) and checks the exit code and the message. The
-last two fail with the exec's failure ignored or the environment's
-order changed. Linux and Windows are unchanged.
+fourth and fifth fail with the exec's failure ignored or the
+environment's order changed. The sixth holds a start before its first
+instruction (POSIX_SPAWN_START_SUSPENDED), unlinks or replaces the copy
+it runs, resumes it, and checks that it ends naming why and that the
+other file never runs; it fails with the device and inode comparison
+removed. Linux and Windows are unchanged.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/firecracker/src/main.rs | 318 ++++++++++++++++++++++++++++++++++++
- 1 file changed, 318 insertions(+)
+ src/firecracker/src/main.rs | 438 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 438 insertions(+)
 
 diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
-index 8c3feb840496e9ea0e64ca8a40d9d598d264b2ce..fb71dde13da4c18806fe7747a0e02c3dc58aac6f 100644
+index 8c3feb840496e9ea0e64ca8a40d9d598d264b2ce..061c534907dd806305040d51c337ad9887a522c0 100644
 --- a/src/firecracker/src/main.rs
 +++ b/src/firecracker/src/main.rs
 @@ -112,6 +112,19 @@ impl From<MainError> for FcExitCode {
@@ -60,7 +65,7 @@ index 8c3feb840496e9ea0e64ca8a40d9d598d264b2ce..fb71dde13da4c18806fe7747a0e02c3d
  fn main() -> ExitCode {
      let result = main_exec();
      if let Err(err) = result {
-@@ -823,3 +836,308 @@ mod wick_version_tests {
+@@ -823,3 +836,428 @@ mod wick_version_tests {
          assert!(version >= semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap());
      }
  }
@@ -292,7 +297,9 @@ index 8c3feb840496e9ea0e64ca8a40d9d598d264b2ce..fb71dde13da4c18806fe7747a0e02c3d
 +        );
 +
 +        // The same descriptors as a run that did not start again, and the
-+        // inherited one still on the same file.
++        // inherited one still on the same file. (A descriptor its launcher
++        // marked FD_CLOEXEC never reaches the first image: the exec that
++        // starts Firecracker closes it, so the second exec has none to lose.)
 +        let fds = |out: &str| -> Vec<String> {
 +            lines(out, "fd ")
 +                .iter()
@@ -308,6 +315,124 @@ index 8c3feb840496e9ea0e64ca8a40d9d598d264b2ce..fb71dde13da4c18806fe7747a0e02c3d
 +            stdout.lines().any(|l| l == format!("fd 9 {ino}")),
 +            "{stdout}"
 +        );
++    }
++
++    /// Starts a copy of this binary at `path` (with `--list`, without
++    /// MALLOC_ENV's variables) held before its first instruction
++    /// (POSIX_SPAWN_START_SUSPENDED: xnu's exec_mach_imgact stops the process,
++    /// p_stat SSTOP), runs `between`, resumes it with SIGCONT and returns its
++    /// exit status, standard output and standard error.
++    fn held_start(path: &std::path::Path, between: impl FnOnce()) -> (i32, String, String) {
++        use std::ffi::CString;
++        use std::os::unix::ffi::OsStrExt;
++
++        let dir = path.parent().unwrap();
++        let (out_path, err_path) = (dir.join("stdout"), dir.join("stderr"));
++        let c = |p: &std::path::Path| CString::new(p.as_os_str().as_bytes()).unwrap();
++        let (prog, out_c, err_c) = (c(path), c(&out_path), c(&err_path));
++        let list = CString::new("--list").unwrap();
++        let argv = [prog.as_ptr(), list.as_ptr(), std::ptr::null()];
++        let envp = [std::ptr::null::<libc::c_char>()];
++        // SAFETY: attributes and file actions initialised before use and
++        // destroyed after; NUL-terminated strings and NULL-terminated arrays
++        // that live across the call.
++        let pid = unsafe {
++            let mut attr: libc::posix_spawnattr_t = std::ptr::null_mut();
++            assert_eq!(libc::posix_spawnattr_init(&mut attr), 0);
++            let flags = libc::c_short::try_from(libc::POSIX_SPAWN_START_SUSPENDED).unwrap();
++            assert_eq!(libc::posix_spawnattr_setflags(&mut attr, flags), 0);
++            let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
++            assert_eq!(libc::posix_spawn_file_actions_init(&mut actions), 0);
++            for (fd, file) in [(1, &out_c), (2, &err_c)] {
++                let mode = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
++                assert_eq!(
++                    libc::posix_spawn_file_actions_addopen(
++                        &mut actions,
++                        fd,
++                        file.as_ptr(),
++                        mode,
++                        0o600
++                    ),
++                    0
++                );
++            }
++            let mut pid = 0;
++            let r = libc::posix_spawn(
++                &mut pid,
++                prog.as_ptr(),
++                &actions,
++                &attr,
++                argv.as_ptr().cast(),
++                envp.as_ptr().cast(),
++            );
++            libc::posix_spawn_file_actions_destroy(&mut actions);
++            libc::posix_spawnattr_destroy(&mut attr);
++            assert_eq!(r, 0, "{}", std::io::Error::from_raw_os_error(r));
++            pid
++        };
++        between();
++        let mut status = 0;
++        // SAFETY: our own child.
++        unsafe {
++            assert_eq!(libc::kill(pid, libc::SIGCONT), 0);
++            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
++        }
++        assert!(libc::WIFEXITED(status), "status {status:#x}");
++        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap();
++        (libc::WEXITSTATUS(status), read(&out_path), read(&err_path))
++    }
++
++    #[test]
++    fn test_a_start_whose_executable_is_unlinked_or_replaced_meanwhile() {
++        // The second exec takes the path the kernel gives for the running
++        // image (proc_pidpath); macOS has no exec by descriptor (xnu's
++        // syscalls.master has execve, __mac_execve and posix_spawn, each of a
++        // path). An unlinked executable leaves no path, and a file renamed over
++        // it is not the running image's file (device and inode): either way
++        // Firecracker ends naming why, and nothing else runs (SECURITY.md,
++        // Heap).
++        // Removed when the test ends, also when it fails.
++        struct Dir(std::path::PathBuf);
++        impl Drop for Dir {
++            fn drop(&mut self) {
++                let _ = std::fs::remove_dir_all(&self.0);
++            }
++        }
++        let dir =
++            Dir(std::env::temp_dir().join(format!("wick-malloc-held-{}", std::process::id())));
++        std::fs::create_dir_all(&dir.0).unwrap();
++        let path = dir.0.join("firecracker");
++
++        std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
++        let (code, out, err) = held_start(&path, || std::fs::remove_file(&path).unwrap());
++        assert_eq!(
++            (code, out.as_str(), err.as_str()),
++            (
++                vmm::FcExitCode::GenericError as i32,
++                "",
++                "Error: Firecracker could not find its executable to start with libmalloc's \
++                 configuration: No such file or directory (os error 2)\n"
++            )
++        );
++
++        std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
++        let other = dir.0.join("other");
++        std::fs::write(&other, "#!/bin/sh\necho \"another file ran with $*\"\n").unwrap();
++        std::fs::set_permissions(&other, std::os::unix::fs::PermissionsExt::from_mode(0o755))
++            .unwrap();
++        let (code, out, err) = held_start(&path, || std::fs::rename(&other, &path).unwrap());
++        let shown = std::fs::canonicalize(&path).unwrap();
++        assert_eq!(code, vmm::FcExitCode::GenericError as i32, "{err}");
++        assert!(
++            err.starts_with(&format!(
++                "Error: Firecracker could not start again with libmalloc's configuration: the \
++                 executable at {} is no longer the one started (device ",
++                shown.display()
++            )) && err.ends_with("; start it again\n"),
++            "{err}"
++        );
++        // The other file did not run.
++        assert_eq!(out, "");
 +    }
 +
 +    #[test]

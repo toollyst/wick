@@ -151,8 +151,21 @@ again. A variable set to another value is refused, naming the value needed (exit
 code), and a failed exec ends Firecracker with exit 1 and `Error: Firecracker could not start again with libmalloc's
 configuration (exec of PATH): ERROR` on standard error, before any of its own code
 (`test_a_failed_start_again_ends_firecracker_naming_why`: an environment that leaves the second exec over
-`kern.argmax`, E2BIG): it never runs without them. Anyone who could replace the executable between the two starts
-could already replace it before the first; a jailed Firecracker, which runs a root-owned copy, never starts again.
+`kern.argmax`, E2BIG): it never runs without them.
+
+The file the second exec runs is the one at the running image's path (`proc_pidpath`), and macOS has no exec of a
+descriptor (xnu's bsd/kern/syscalls.master: `execve`, `__mac_execve` and `posix_spawn` each take a path). So before
+the exec Firecracker compares the device and inode of the file at that path with those of the file its code is mapped
+from, which the kernel reports whatever that file's name is now (`proc_pidinfo` `PROC_PIDREGIONPATHINFO`, xnu
+bsd/kern/proc_info.c). A file renamed over the path since the start (an upgrade in place, a rebuild) ends Firecracker
+with exit 1 and `... the executable at PATH is no longer the one started (...); start it again`, and an unlinked one
+with `could not find its executable` (`proc_pidpath` finds no path); failing to read either side ends it too, and the
+other file never runs (`test_a_start_whose_executable_is_unlinked_or_replaced_meanwhile`: a start held before its
+first instruction, `POSIX_SPAWN_START_SUSPENDED`, while the file is replaced or unlinked; with the comparison removed
+the other file runs and the test fails). What is left is the few instructions between the comparison and `execve`: a
+rename over the path inside them runs the new file. Making it needs write access to the executable's directory, which
+already lets one replace the binary before any start; a jailed Firecracker, which runs a root-owned copy with the
+variables set by the jailer, never starts again.
 
 What it gives up, on libmalloc-812 (macOS 27), which runs its xzone allocator by default on Apple silicon
 (malloc_config.c, `_malloc_should_enable_xzone`): `MallocMaxMagazines=1` also makes the pointer buckets one instead

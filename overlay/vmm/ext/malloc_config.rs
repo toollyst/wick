@@ -33,7 +33,9 @@
 //! Firecracker never execs again. A variable of [`MALLOC_ENV`] set to another
 //! value is refused, loudly: Firecracker would otherwise run over its budget,
 //! or silently drop the value given. A failed exec ends Firecracker, loudly:
-//! it never runs without [`MALLOC_ENV`].
+//! it never runs without [`MALLOC_ENV`]. So does a file at its executable's
+//! path that is no longer the one it started from (renamed over it since):
+//! Firecracker never starts another file in its place.
 
 use std::ffi::{CStr, CString};
 
@@ -143,6 +145,19 @@ pub fn before_main() {
         );
     };
 
+    // The path names the file this process started from, or the exec would
+    // run another: macOS has no exec of a descriptor (xnu's syscalls.master:
+    // execve, __mac_execve and posix_spawn each take a path), so a file renamed
+    // over the path since the start must be refused here.
+    if let Err(why) = same_file_as_running(&path[..=len]) {
+        fail(
+            &format!(
+                "Error: Firecracker could not start again with libmalloc's configuration: {why}\n"
+            ),
+            vmm_exit::GENERIC_ERROR,
+        );
+    }
+
     let mut envp: Vec<*const libc::c_char> = entries.iter().map(|entry| entry.as_ptr()).collect();
     envp.extend(added.iter().map(|entry| entry.as_ptr()));
     envp.push(std::ptr::null());
@@ -158,6 +173,96 @@ pub fn before_main() {
         ),
         vmm_exit::GENERIC_ERROR,
     );
+}
+
+/// `struct proc_regionwithpathinfo` (sys/proc_info.h), which `libc` lacks.
+#[repr(C)]
+struct RegionWithPathInfo {
+    pri_protection: u32,
+    pri_max_protection: u32,
+    pri_inheritance: u32,
+    pri_flags: u32,
+    pri_offset: u64,
+    pri_behavior: u32,
+    pri_user_wired_count: u32,
+    pri_user_tag: u32,
+    pri_pages_resident: u32,
+    pri_pages_shared_now_private: u32,
+    pri_pages_swapped_out: u32,
+    pri_pages_dirtied: u32,
+    pri_ref_count: u32,
+    pri_shadow_depth: u32,
+    pri_share_mode: u32,
+    pri_private_pages_resident: u32,
+    pri_shared_pages_resident: u32,
+    pri_obj_id: u32,
+    pri_depth: u32,
+    pri_address: u64,
+    pri_size: u64,
+    prp_vip: libc::vnode_info_path,
+}
+
+/// The SDK's sizeof(struct proc_regionwithpathinfo), which proc_pidinfo checks.
+const REGION_WITH_PATH_INFO_SIZE: libc::c_int = 1272;
+const _: () =
+    assert!(std::mem::size_of::<RegionWithPathInfo>() == REGION_WITH_PATH_INFO_SIZE as usize);
+
+/// `PROC_PIDREGIONPATHINFO` (sys/proc_info.h).
+const PROC_PIDREGIONPATHINFO: libc::c_int = 8;
+
+/// Whether the file at `path` (NUL-terminated) is the one this process runs
+/// from: its device and inode against those of the file mapped at this
+/// function's address, which the kernel reports whatever the file's name is
+/// now (proc_pidinfo PROC_PIDREGIONPATHINFO, xnu bsd/kern/proc_info.c). Every
+/// failure to find either is an error too.
+fn same_file_as_running(path: &[u8]) -> Result<(), String> {
+    let shown = String::from_utf8_lossy(&path[..path.len() - 1]).into_owned();
+    let address = same_file_as_running as fn(&[u8]) -> Result<(), String> as usize as u64;
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut region: RegionWithPathInfo = unsafe { std::mem::zeroed() };
+    let size = REGION_WITH_PATH_INFO_SIZE;
+    // SAFETY: a buffer of the size given.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            PROC_PIDREGIONPATHINFO,
+            address,
+            (&raw mut region).cast(),
+            size,
+        )
+    };
+    if got != size {
+        return Err(format!(
+            "it could not identify the file it runs from: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let start = region.pri_address;
+    if !(start <= address && address - start < region.pri_size) {
+        return Err(format!(
+            "it could not identify the file it runs from: the region found ({start:#x}, {:#x} bytes) does not hold \
+             its code ({address:#x})",
+            region.pri_size
+        ));
+    }
+    let running = &region.prp_vip.vip_vi.vi_stat;
+    // SAFETY: plain data; all zeroes is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a stat of our own.
+    if unsafe { libc::stat(path.as_ptr().cast(), &mut st) } != 0 {
+        return Err(format!(
+            "it could not identify the executable at {shown}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if (st.st_dev.cast_unsigned(), st.st_ino) != (running.vst_dev, running.vst_ino) {
+        return Err(format!(
+            "the executable at {shown} is no longer the one started (device {}, inode {} against {}, {}); \
+             start it again",
+            st.st_dev, st.st_ino, running.vst_dev, running.vst_ino
+        ));
+    }
+    Ok(())
 }
 
 /// The entries of a NULL-terminated environment.
