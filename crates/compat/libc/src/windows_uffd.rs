@@ -2776,7 +2776,6 @@ mod tests {
     /// 43790310601, did not); the ID is the one Rust's own overflow line
     /// gives.
     #[test]
-    #[ignore = "until the next commit"]
     fn test_the_line_of_a_stack_that_could_not_grow_names_its_thread() {
         let (code, text) = run_child("stack_at_the_limit_rust_child", Some(96 << 20));
         assert_eq!(code, Some(137), "{text}");

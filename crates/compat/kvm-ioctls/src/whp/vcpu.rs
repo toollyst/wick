@@ -8361,11 +8361,16 @@ mod fpu_tests {
         let mailbox = move |i: u64| unsafe { &*((at + (MAILBOX + 8 * i) as usize) as *const AtomicU64) };
         // The chunk filled with zeros: the guest's first value.
         assert_eq!(libc::wick_uffd::zeropage(ctx, chunk, CHUNK, true), Ok(CHUNK));
-        let runner = std::thread::spawn(move || {
-            let mut vcpu = vcpu;
-            let mut reads = 0;
-            one_run(&mut vcpu, &[], &mut reads)
-        });
+        // Named, so that a line of a stack that could not grow says which
+        // thread it was (the test's own is the libtest thread named after it).
+        let runner = std::thread::Builder::new()
+            .name("vcpu-runner".into())
+            .spawn(move || {
+                let mut vcpu = vcpu;
+                let mut reads = 0;
+                one_run(&mut vcpu, &[], &mut reads)
+            })
+            .unwrap();
         let passes = |n: u64| {
             let from = mailbox(1).load(Ordering::SeqCst);
             let asked = std::time::Instant::now();

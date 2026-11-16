@@ -1484,6 +1484,48 @@ fn this_threads_stack() -> (usize, usize, usize) {
     (limit, reserve, guarantee as usize)
 }
 
+/// The calling thread's description (`GetThreadDescription`; Rust sets it
+/// to a thread's name), copied into `out`, cut at its length: its length,
+/// 0 for none. The system's copy is allocated (`LocalAlloc`) and freed here;
+/// at the memory limit [`stack_filter`] has given back [`RESCUE`] first.
+fn this_threads_description(out: &mut [u16]) -> usize {
+    let mut desc: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: the calling thread's pseudo handle and an out-pointer.
+    let hr = unsafe {
+        windows_sys::Win32::System::Threading::GetThreadDescription(
+            windows_sys::Win32::System::Threading::GetCurrentThread(),
+            &mut desc,
+        )
+    };
+    if hr < 0 || desc.is_null() {
+        return 0;
+    }
+    let mut n = 0;
+    // SAFETY: the system's NUL-terminated string, read up to its NUL or
+    // `out`'s length.
+    while n < out.len() && unsafe { *desc.add(n) } != 0 {
+        out[n] = unsafe { *desc.add(n) };
+        n += 1;
+    }
+    // SAFETY: frees the system's copy, as GetThreadDescription's
+    // documentation asks (LocalFree).
+    unsafe { windows_sys::Win32::Foundation::LocalFree(desc.cast()) };
+    n
+}
+
+/// UTF-16 shown without allocating (a character that is not valid as `?`).
+struct Utf16<'a>(&'a [u16]);
+
+impl core::fmt::Display for Utf16<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::fmt::Write;
+        for c in char::decode_utf16(self.0.iter().copied()) {
+            f.write_char(c.unwrap_or('?'))?;
+        }
+        Ok(())
+    }
+}
+
 /// A thread's stack that could not grow because the job's memory limit (or
 /// the host's commit limit) refused its next page ends the VMM as the
 /// limit's other ends do (exit 137, [`out_of_memory`]), where it would end
@@ -1519,11 +1561,16 @@ unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::
                 // SAFETY: frees the block set aside for this.
                 unsafe { VirtualFree(rescue as *mut c_void, 0, MEM_RELEASE) };
             }
+            let mut name = [0u16; 64];
+            let len = this_threads_description(&mut name);
             say_at_the_limit(format_args!(
                 "wick: a thread's stack could not grow: the memory limit (the jail's memory.max, or the host's commit \
-                 limit) refused its next page with {} KiB of its reserve left (its guarantee {guarantee} bytes); the VMM \
-                 ends, as the cgroup OOM killer ends it on Linux (exit {OOM_EXIT}), not as a stack overflow",
-                left >> 10
+                 limit) refused its next page with {} KiB of its reserve left (thread {} \"{}\", its guarantee {guarantee} \
+                 bytes); the VMM ends, as the cgroup OOM killer ends it on Linux (exit {OOM_EXIT}), not as a stack overflow",
+                left >> 10,
+                // SAFETY: plain call.
+                unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+                Utf16(&name[..len])
             ));
             // SAFETY: ends this process at once, as SIGKILL does.
             unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), OOM_EXIT) };
