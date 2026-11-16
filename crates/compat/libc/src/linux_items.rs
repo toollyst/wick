@@ -169,9 +169,18 @@ fn tell_guest(start: u64, len: u64, replaced: bool) {
 /// `mmap` with the Linux flags above.
 ///
 /// - `MAP_HUGETLB` with `MAP_ANONYMOUS`, or a huge page memfd
-///   ([`hugetlb_file`]) with any flags: [`mmap_huge`]; `MAP_HUGETLB` with
+///   ([`shm_object`]) with any flags: [`mmap_huge`]; `MAP_HUGETLB` with
 ///   another file: `EINVAL`, as Linux (`ksys_mmap_pgoff`); the `MAP_HUGE_*`
 ///   size bits alone mean nothing, as on Linux;
+/// - a memfd of the compatibility `memfd` crate (a POSIX shared memory
+///   object, [`shm_object`]) without `MAP_SHARED`: `EINVAL`, before
+///   anything is changed. Linux maps it, as any file, copy-on-write; macOS
+///   maps such an object only shared (xnu-12377.1.9 bsd/kern/posix_shm.c
+///   `pshm_mmap` :763 to :765), and a copy of it, as macOS's private file
+///   mappings are (see [`memfd_create`]), would not follow the object until
+///   its own write as Linux's mapping does.
+///   Firecracker maps its memfds shared only (`memfd_backed`, `IovDeque`);
+///   `test_a_private_mapping_of_a_shared_memory_object_is_refused`;
 /// - `MAP_POPULATE`: the range is prefaulted after mapping (`MADV_WILLNEED`
 ///   and a read of every page when it is readable);
 /// - `MAP_FIXED`: what the range holds of guest memory is unmapped from the
@@ -200,12 +209,22 @@ pub unsafe fn mmap(
             // SAFETY: the caller's contract.
             return mapped(addr, len, prot, flags, unsafe { mmap_huge(addr, len, prot, flags, -1, 0) });
         }
-    } else if hugetlb_file(fd) {
-        // SAFETY: the caller's contract.
-        return mapped(addr, len, prot, flags, unsafe { mmap_huge(addr, len, prot, flags, fd, offset) });
-    } else if flags & MAP_HUGETLB != 0 {
-        set_errno(libc::EINVAL);
-        return libc::MAP_FAILED;
+    } else {
+        let shm = shm_object(fd);
+        if shm.is_some() && flags & libc::MAP_SHARED == 0 {
+            // Before anything is changed: a MAP_FIXED one leaves the range,
+            // its registrations and the guest's view of it as they were.
+            set_errno(libc::EINVAL);
+            return libc::MAP_FAILED;
+        }
+        if shm == Some(true) {
+            // SAFETY: the caller's contract.
+            return mapped(addr, len, prot, flags, unsafe { mmap_huge(addr, len, prot, flags, fd, offset) });
+        }
+        if flags & MAP_HUGETLB != 0 {
+            set_errno(libc::EINVAL);
+            return libc::MAP_FAILED;
+        }
     }
     if flags & libc::MAP_FIXED != 0 && !huge_cut_allowed(addr as u64, len as u64) {
         set_errno(libc::EINVAL);
@@ -264,7 +283,7 @@ fn mapped(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int, ptr: *mut c
 
 /// `mmap` of a huge page mapping as Firecracker sees Linux's hugetlb ones:
 /// anonymous memory with `MAP_HUGETLB` (`fd` -1), or a huge page memfd
-/// ([`hugetlb_file`]; hugetlbfs files map huge with or without the flag).
+/// ([`shm_object`]; hugetlbfs files map huge with or without the flag).
 ///
 /// macOS gives user space no superpage on Apple silicon: `mach_vm_allocate`
 /// and `mmap` with `VM_FLAGS_SUPERPAGE_SIZE_2MB` or `_ANY` fail with
@@ -443,13 +462,17 @@ fn io_errno() -> c_int {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
 }
 
-/// Whether `fd` is a huge page memfd: the compatibility `memfd` crate makes
-/// one as a POSIX shared memory object named `/fcmH.<pid>.<n>`, and the
-/// object keeps its name after `shm_unlink` and through `dup` (measured;
-/// `proc_pidfdinfo` with `PROC_PIDFDPSHMINFO`, which the narrowed sandbox
-/// allows as `proc_info`). An object's `fstat` tells nothing (device and
-/// inode 0, measured), so the name is the mark.
-pub(crate) fn hugetlb_file(fd: c_int) -> bool {
+/// Whether `fd` is a POSIX shared memory object, as the compatibility
+/// `memfd` crate makes a memfd (`Some`), and then whether it is a huge page
+/// memfd: one named `/fcmH.<pid>.<n>`; the object keeps its name after
+/// `shm_unlink` and through `dup` (measured; `proc_pidfdinfo` with
+/// `PROC_PIDFDPSHMINFO`, which the narrowed sandbox allows as `proc_info`).
+/// An object's `fstat` tells nothing (device and inode 0, measured), so the
+/// name is the mark. `None` for any other descriptor or none.
+fn shm_object(fd: c_int) -> Option<bool> {
+    if fd < 0 {
+        return None;
+    }
     // struct pshm_fdinfo: 1192 bytes, pshminfo.pshm_name at 168 (measured).
     const PROC_PIDFDPSHMINFO: c_int = 5;
     const SIZE: usize = 1192;
@@ -465,7 +488,7 @@ pub(crate) fn hugetlb_file(fd: c_int) -> bool {
             SIZE as c_int,
         )
     };
-    n as usize == SIZE && info[NAME_AT..].starts_with(crate::HUGE_MEMFD_PREFIX.as_bytes())
+    (n as usize == SIZE).then(|| info[NAME_AT..].starts_with(crate::HUGE_MEMFD_PREFIX.as_bytes()))
 }
 
 /// `munmap`, with hugetlb's rule: a range that touches a huge page mapping
@@ -1541,6 +1564,21 @@ pub unsafe fn sendfile64(out_fd: c_int, in_fd: c_int, offset: *mut off64_t, coun
 /// Other flags (`MFD_HUGETLB` and its sizes, `MFD_NOEXEC_SEAL`, ...) ask for
 /// what macOS cannot give and fail with `EINVAL`.
 ///
+/// A private mapping of it, as of any file, keeps its own writes from the
+/// file, as on Linux, but is a copy of the file made at `mmap`: a page the
+/// file changes later reads as it was, whether the mapping had read it or
+/// not. Linux maps the file's own page until the mapping writes it (v6.12
+/// mm/memory.c `do_fault`: a read takes `do_read_fault` :5431, a write
+/// `do_cow_fault` :5433), so there the change shows. macOS maps a file
+/// without `MAP_SHARED` with copy (xnu-12377.1.9 bsd/kern/kern_mman.c :880
+/// to :882, `vm_map_enter_mem_object_control` :928): the mapping keeps the
+/// file's contents as they were at `mmap`
+/// (`test_a_private_file_mapping_is_a_copy_made_at_mmap`). Firecracker maps a
+/// snapshot's memory file so (`snapshot_file`), and its users must not
+/// change that file while the VM runs (docs/snapshotting/snapshot-support.md:
+/// it "must be considered immutable", a change "leads to undefined
+/// behavior").
+///
 /// # Safety
 /// `name` must be a valid C string (it is not used).
 pub unsafe fn memfd_create(_name: *const core::ffi::c_char, flags: core::ffi::c_uint) -> c_int {
@@ -1878,12 +1916,12 @@ mod tests {
         let huge_fd = shm(&format!("{}{pid}.t1", crate::HUGE_MEMFD_PREFIX), 2 * HUGE_PAGE as off_t);
         let odd_fd = shm(&format!("{}{pid}.t2", crate::HUGE_MEMFD_PREFIX), HUGE_PAGE as off_t + 16384);
         let plain_fd = shm(&format!("/fcm.{pid}.t3"), 2 * HUGE_PAGE as off_t);
-        assert!(hugetlb_file(huge_fd) && hugetlb_file(odd_fd) && !hugetlb_file(plain_fd));
+        assert_eq!([huge_fd, odd_fd, plain_fd].map(shm_object), [Some(true), Some(true), Some(false)]);
         let path = std::env::temp_dir().join(format!("wick-hugetlb-file-{pid}"));
         let tmp = std::fs::File::create(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         tmp.set_len(2 * HUGE_PAGE).unwrap();
-        assert!(!hugetlb_file(tmp.as_raw_fd()));
+        assert_eq!(shm_object(tmp.as_raw_fd()), None);
         // SAFETY: mappings of the objects above, unmapped below.
         unsafe {
             for flags in [libc::MAP_SHARED, libc::MAP_SHARED | MAP_HUGETLB | MAP_HUGE_2MB] {
@@ -2306,27 +2344,60 @@ mod tests {
     /// mapping or not; other mappings are not. Every mapping, `MAP_FIXED` or
     /// not, `munmap` and `mprotect` is reported to the protection hook after
     /// it returned, and a discard, which changes no vma on Linux, is not.
-    #[test]
-    fn test_replaced_pages_are_reported_to_the_guest_hooks() {
+    /// Recording guest hooks ([`crate::wick_guest::set_hooks`]), set by the
+    /// tests that read them, always the same functions. The hooks are the
+    /// process's: other tests' calls come here too, some of them earlier at
+    /// the addresses a test's mapping now has, so each call is kept with the
+    /// thread that made it, and read back by [`hook_calls`].
+    mod hooks {
         use std::sync::Mutex;
         use std::thread::ThreadId;
-        // The hooks are the process's: other tests' replacements come here
-        // too, some of them earlier at the addresses this mapping now has, so
-        // each call is kept with the thread that made it.
         /// A replace hook's call: the thread, the range, before, anew.
-        type Call = (ThreadId, u64, u64, bool, bool);
-        static CALLS: Mutex<std::vec::Vec<Call>> = Mutex::new(std::vec::Vec::new());
-        static PROTECTED: Mutex<std::vec::Vec<(ThreadId, u64, u64, bool)>> = Mutex::new(std::vec::Vec::new());
+        type Replaced = (ThreadId, u64, u64, bool, bool);
+        /// A protection hook's call: the thread, the range, replaced.
+        type Protected = (ThreadId, u64, u64, bool);
+        pub(super) static REPLACED: Mutex<std::vec::Vec<Replaced>> = Mutex::new(std::vec::Vec::new());
+        pub(super) static PROTECTED: Mutex<std::vec::Vec<Protected>> = Mutex::new(std::vec::Vec::new());
         fn stage2(_: u64, _: u64, _: bool) {}
         fn replace(start: u64, len: u64, before: bool, anew: bool) -> bool {
-            CALLS.lock().unwrap().push((std::thread::current().id(), start, len, before, anew));
+            REPLACED.lock().unwrap().push((std::thread::current().id(), start, len, before, anew));
             true
         }
         fn protected(start: u64, len: u64, replaced: bool) {
             PROTECTED.lock().unwrap().push((std::thread::current().id(), start, len, replaced));
         }
-        crate::wick_guest::set_hooks(crate::wick_guest::Hooks { stage2, replace, protected });
-        assert!(crate::wick_guest::hooked());
+        pub(super) fn record() {
+            crate::wick_guest::set_hooks(crate::wick_guest::Hooks { stage2, replace, protected });
+            assert!(crate::wick_guest::hooked());
+        }
+    }
+
+    /// This thread's calls of the recording hooks ([`hooks`]) for ranges that
+    /// start in `[start, end)`: the replace hook's (start, len, before,
+    /// anew), and the protection hook's (start, len, replaced).
+    #[allow(clippy::type_complexity)]
+    fn hook_calls(start: u64, end: u64) -> (std::vec::Vec<(u64, u64, bool, bool)>, std::vec::Vec<(u64, u64, bool)>) {
+        let me = std::thread::current().id();
+        let replaced = hooks::REPLACED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&(t, s, _, _, _)| t == me && s >= start && s < end)
+            .map(|&(_, s, l, b, n)| (s, l, b, n))
+            .collect();
+        let protected = hooks::PROTECTED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&(t, s, _, _)| t == me && s >= start && s < end)
+            .map(|&(_, s, l, r)| (s, l, r))
+            .collect();
+        (replaced, protected)
+    }
+
+    #[test]
+    fn test_replaced_pages_are_reported_to_the_guest_hooks() {
+        hooks::record();
         const LEN: usize = 1 << 20;
         // SAFETY: a fresh mapping; not fixed, so not a replacement.
         let p = unsafe {
@@ -2341,25 +2412,8 @@ mod tests {
         };
         assert_ne!(p, libc::MAP_FAILED);
         let (start, half) = (p as u64, (LEN / 2) as u64);
-        let me = std::thread::current().id();
-        let calls = || -> std::vec::Vec<(u64, u64, bool, bool)> {
-            CALLS
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|&&(t, s, _, _, _)| t == me && s >= start && s < start + LEN as u64)
-                .map(|&(_, s, l, b, n)| (s, l, b, n))
-                .collect()
-        };
-        let protected = || -> std::vec::Vec<(u64, u64, bool)> {
-            PROTECTED
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|&&(t, s, _, _)| t == me && s >= start && s < start + LEN as u64)
-                .map(|&(_, s, l, r)| (s, l, r))
-                .collect()
-        };
+        let calls = || hook_calls(start, start + LEN as u64).0;
+        let protected = || hook_calls(start, start + LEN as u64).1;
         assert!(calls().is_empty());
         assert_eq!(protected(), [(start, LEN as u64, true)], "the new mapping");
         // SAFETY: inside the mapping.
@@ -2409,6 +2463,137 @@ mod tests {
         assert!(fd >= 0);
         // SAFETY: a fresh descriptor.
         unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) }
+    }
+
+    /// A private mapping of a POSIX shared memory object (a memfd of the
+    /// compatibility `memfd` crate, plain or huge page) is `EINVAL` before
+    /// anything is changed ([`mmap`]): nothing is mapped, and a `MAP_FIXED`
+    /// one leaves the range's contents, its userfaultfd registration and the
+    /// guest's view of it (no hook is called) as they were. The object's
+    /// shared mapping is made as before.
+    #[test]
+    fn test_a_private_mapping_of_a_shared_memory_object_is_refused() {
+        hooks::record();
+        let shm = |name: &str| {
+            let cname = std::ffi::CString::new(name).unwrap();
+            // SAFETY: a NUL-terminated name; the object is unlinked at once.
+            let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600 as libc::c_uint) };
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            // SAFETY: as above; sizes the object.
+            unsafe {
+                libc::shm_unlink(cname.as_ptr());
+                assert_eq!(libc::ftruncate(fd, 2 * HUGE_PAGE as off_t), 0, "{}", std::io::Error::last_os_error());
+            }
+            fd
+        };
+        let pid = std::process::id();
+        let plain = shm(&format!("/fcm.{pid}.p1"));
+        let huge = shm(&format!("{}{pid}.p2", crate::HUGE_MEMFD_PREFIX));
+        const LEN: usize = 1 << 20;
+        const RW: c_int = libc::PROT_READ | libc::PROT_WRITE;
+        let errno = || std::io::Error::last_os_error().raw_os_error();
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        // Private anonymous memory: its first half written, its second
+        // registered with a userfaultfd (missing).
+        // SAFETY: a fresh mapping.
+        let p = unsafe { mmap(core::ptr::null_mut(), LEN, RW, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
+        assert_ne!(p, libc::MAP_FAILED);
+        let (start, end) = (p as u64, p as u64 + LEN as u64);
+        // SAFETY: the first half of the mapping.
+        unsafe { core::ptr::write_bytes(p.cast::<u8>(), 0x5a, LEN / 2) };
+        let (ctx, user) = crate::wick_uffd::create(0, false, true).unwrap();
+        crate::wick_uffd::register(ctx, start + LEN as u64 / 2, LEN as u64 / 2).unwrap();
+        let before = hook_calls(start, end);
+        for (what, fd) in [("plain", plain), ("huge page", huge)] {
+            for flags in [libc::MAP_PRIVATE, libc::MAP_PRIVATE | libc::MAP_FIXED] {
+                let at = if flags & libc::MAP_FIXED != 0 { p } else { core::ptr::null_mut() };
+                // SAFETY: refused; were it not, a mapping over our own.
+                let r = unsafe { mmap(at, LEN, RW, flags, fd, 0) };
+                assert_eq!((r, errno()), (libc::MAP_FAILED, Some(libc::EINVAL)), "{what}, flags {flags:#x}");
+            }
+        }
+        assert_eq!(hook_calls(start, end), before, "a guest hook was called");
+        // SAFETY: inside the mapping.
+        let kept = unsafe { (*p.cast::<u8>(), *p.cast::<u8>().add(LEN / 2 - 1)) };
+        assert_eq!(kept, (0x5a, 0x5a), "the written half");
+        let missing = [start + LEN as u64 / 2, end - page].map(crate::wick_uffd::is_missing);
+        assert_eq!(missing, [true, true], "the registered half");
+        // SAFETY: a fresh shared mapping of the object, unmapped below.
+        let q = unsafe { mmap(core::ptr::null_mut(), page as usize, RW, libc::MAP_SHARED, plain, 0) };
+        assert_ne!(q, libc::MAP_FAILED, "{:?}", errno());
+        // SAFETY: our own mappings and descriptors.
+        unsafe {
+            assert_eq!(munmap(q, page as usize), 0);
+            crate::wick_uffd::unregister(ctx, start + LEN as u64 / 2, LEN as u64 / 2).unwrap();
+            assert_eq!(munmap(p, LEN), 0);
+            for fd in [user, plain, huge] {
+                libc::close(fd);
+            }
+        }
+    }
+
+    /// A private mapping of a file keeps its own writes from the file, as on
+    /// Linux, and is a copy of the file made at `mmap` ([`memfd_create`]): a
+    /// page the file changes later, by `pwrite` or through a shared mapping,
+    /// reads as it was, whether the mapping had read it or not, where Linux
+    /// reads the change until the mapping writes the page.
+    #[test]
+    fn test_a_private_file_mapping_is_a_copy_made_at_mmap() {
+        use std::os::unix::fs::FileExt;
+        const RW: c_int = libc::PROT_READ | libc::PROT_WRITE;
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let len = 4 * page;
+        let file = std::fs::File::from(memfd_file());
+        for how in ["pwrite", "a shared mapping"] {
+            file.write_all_at(&vec![0x11; len], 0).unwrap();
+            // SAFETY: fresh mappings of the file, unmapped below.
+            let (shared, private) = unsafe {
+                (
+                    mmap(core::ptr::null_mut(), len, RW, libc::MAP_SHARED, file.as_raw_fd(), 0).cast::<u8>(),
+                    mmap(core::ptr::null_mut(), len, RW, libc::MAP_PRIVATE, file.as_raw_fd(), 0).cast::<u8>(),
+                )
+            };
+            assert!(shared != libc::MAP_FAILED.cast() && private != libc::MAP_FAILED.cast());
+            let change = |at: usize, byte: u8| {
+                if how == "pwrite" {
+                    file.write_all_at(&[byte], at as u64).unwrap();
+                } else {
+                    // SAFETY: inside the shared mapping.
+                    unsafe { shared.add(at).write_volatile(byte) };
+                }
+            };
+            let in_file = |at: usize| {
+                let mut b = [0u8];
+                file.read_exact_at(&mut b, at as u64).unwrap();
+                b[0]
+            };
+            // SAFETY: inside the private mapping.
+            let read = |at: usize| unsafe { private.add(at).read_volatile() };
+            // A page not accessed yet: Linux reads 0x22.
+            change(0, 0x22);
+            assert_eq!(read(0), 0x11, "{how}: a page changed in the file before any access");
+            // A page read, then changed: Linux reads 0x33.
+            assert_eq!(read(page), 0x11);
+            change(page, 0x33);
+            assert_eq!(read(page), 0x11, "{how}: a page read, then changed in the file");
+            // A page written, then changed: each keeps its own, as on Linux.
+            // SAFETY: inside the private mapping.
+            unsafe { private.add(2 * page).write_volatile(0x55) };
+            change(2 * page, 0x44);
+            let written = (read(2 * page), in_file(2 * page), in_file(2 * page + 1));
+            assert_eq!(written, (0x55, 0x44, 0x11), "{how}: a page written, then changed in the file");
+            // The mapping's write never reaches the file, as on Linux.
+            // SAFETY: inside the private mapping.
+            unsafe { private.add(3 * page + 1).write_volatile(0x66) };
+            assert_eq!(in_file(3 * page + 1), 0x11, "{how}: the mapping's write");
+            // SAFETY: our own mappings.
+            unsafe {
+                assert_eq!(munmap(shared.cast(), len), 0);
+                assert_eq!(munmap(private.cast(), len), 0);
+            }
+        }
     }
 
     #[test]

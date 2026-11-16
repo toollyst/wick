@@ -282,6 +282,16 @@ has the per-control details and results.
     :1624), but lets a waiter in between blocks of it when the call may block (mmu.c `stage2_apply_range` :56 to
     :80, `cond_resched_rwlock_write` :76; a block is 32 MiB with 16 KiB pages, 1 GiB with 4 KiB). Here a vCPU's fault
     waits for the whole call: about 4 ms for an `mprotect` of 1 GiB and 30 ms for its `munmap` (above).
+  - A private mapping of a file is a copy of the file made at `mmap` (XNU maps a file without `MAP_SHARED` with
+    copy, bsd/kern/kern_mman.c :880 to :882): a later change to the file never reaches a page the mapping has not
+    written, where on Linux it does until the mapping writes the page (mm/memory.c, v6.12, `do_read_fault` :5431,
+    `do_cow_fault` :5433); the mapping's own writes stay out of the file on both
+    (`test_a_private_file_mapping_is_a_copy_made_at_mmap`). Firecracker maps a snapshot's memory file so, and
+    upstream calls a change to that file while the VM runs undefined behaviour
+    (lib/firecracker/docs/snapshotting/snapshot-support.md, "must be considered immutable"): the case lost is one
+    upstream excludes, and here the guest is the more isolated from the file. A memfd (a shared memory object)
+    maps shared only; its private mapping is `EINVAL` with nothing changed
+    (`test_a_private_mapping_of_a_shared_memory_object_is_refused`, docs/PORTING.md row 10).
   As Linux already before: a guest store to a read-only memory slot exits as MMIO, also with the slot's memory
   `PROT_READ` (`test_a_store_to_a_read_only_slot_is_still_mmio`). Firecracker reached none of the cases above, as read from the
   code: it changes the protection of guest memory only outside a live slot (virtio-mem's `update_slot`,

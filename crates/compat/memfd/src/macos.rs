@@ -14,6 +14,16 @@
 //! a huge page and a size that is not whole huge pages (which hugetlbfs
 //! refuses at `ftruncate`; here it is caught at the mapping). Other huge
 //! page sizes have no pool here (`ENODEV`, as Linux without one).
+//!
+//! An object maps shared only. Linux maps a memfd private copy-on-write, as
+//! any file. macOS refuses a shared memory object's mapping without
+//! `MAP_SHARED` (xnu-12377.1.9 bsd/kern/posix_shm.c `pshm_mmap` :763 to
+//! :765), and a copy of it would not follow the object until its own write
+//! as Linux's mapping does. So the compatibility `libc`'s `mmap` refuses a
+//! private mapping of one with `EINVAL` before it changes anything
+//! (`test_a_private_mapping_of_a_shared_memory_object_is_refused`).
+//! Firecracker maps its memfds shared only (`memfd_backed` in
+//! vstate/memory.rs, `IovDeque`).
 
 use std::ffi::CString;
 use std::fs::File;
