@@ -3354,6 +3354,119 @@ mod tests {
         }
     }
 
+    /// A frame in an image whose headers point outside it is given as a
+    /// bare address, and the lines after it are written: the module's name
+    /// is looked up in the headers of any `SEC_IMAGE` view
+    /// (`windows_mm::module_of`), not only a module the loader checked, on
+    /// the path that writes a process's last lines (STACK137FRAMES, then
+    /// its 137), so an offset the headers give that leads outside the image
+    /// must not be followed. A hand-made PE32+ image (one section holding an
+    /// export directory and its name) mapped `SEC_IMAGE`, a child per case:
+    /// as made, the frame is named (`damaged.dll+0x1010`); its export
+    /// directory's RVA past the image, or its name's RVA past the image,
+    /// the frame is the bare address. Each child then says it went on.
+    #[test]
+    #[ignore = "until module_of bounds what it reads"]
+    fn test_a_frame_in_a_damaged_image_is_given_bare() {
+        for (case, want) in [("control", Some("damaged.dll+0x1010")), ("exports", None), ("name", None)] {
+            let (code, text, _) = run_child_watched("damaged_image_child", &[("WICK_TEST_IMAGE", case)]);
+            let line = text.lines().find(|l| l.starts_with("STACK137FRAMES 0 ")).unwrap_or_default();
+            assert!(text.contains(&std::format!("DAMAGED {case}: after the frame")), "{case}: {code:?}: {text}");
+            assert_eq!(code, Some(0), "{case}: {text}");
+            match want {
+                Some(w) => assert!(line.starts_with(&std::format!("STACK137FRAMES 0 {w} (0x")), "{case}: {line}\n{text}"),
+                None => assert!(line.len() > 19 && line["STACK137FRAMES 0 0x".len()..].chars().all(|c| c.is_ascii_hexdigit()), "{case}: {line}\n{text}"),
+            }
+        }
+    }
+
+    /// A PE32+ image of 0x2000 bytes, made by hand: its headers, and a
+    /// section at 0x1000 holding an export directory whose name,
+    /// "damaged.dll", is at 0x1100; `case` "exports" points the export
+    /// directory past the image, "name" the name.
+    fn damaged_image(case: &str) -> std::vec::Vec<u8> {
+        let mut b = std::vec![0u8; 0x400];
+        let put16 = |b: &mut [u8], at: usize, v: u16| b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        b[0..2].copy_from_slice(b"MZ");
+        put32(&mut b, 0x3c, 0x40);
+        b[0x40..0x44].copy_from_slice(b"PE\0\0");
+        // The file header.
+        put16(&mut b, 0x44, 0x8664);
+        put16(&mut b, 0x46, 1);
+        put16(&mut b, 0x54, 0xf0);
+        put16(&mut b, 0x56, 0x2022);
+        // The optional header (PE32+).
+        let o = 0x58;
+        put16(&mut b, o, 0x20b);
+        put32(&mut b, o + 4, 0x200);
+        put32(&mut b, o + 20, 0x1000);
+        b[o + 24..o + 32].copy_from_slice(&0x1_8000_0000u64.to_le_bytes());
+        put32(&mut b, o + 32, 0x1000);
+        put32(&mut b, o + 36, 0x200);
+        put16(&mut b, o + 40, 6);
+        put16(&mut b, o + 48, 6);
+        put32(&mut b, o + 56, 0x2000);
+        put32(&mut b, o + 60, 0x200);
+        put16(&mut b, o + 68, 3);
+        put16(&mut b, o + 70, 0x160);
+        b[o + 72..o + 80].copy_from_slice(&0x10_0000u64.to_le_bytes());
+        b[o + 80..o + 88].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[o + 88..o + 96].copy_from_slice(&0x10_0000u64.to_le_bytes());
+        b[o + 96..o + 104].copy_from_slice(&0x1000u64.to_le_bytes());
+        put32(&mut b, o + 108, 16);
+        put32(&mut b, o + 112, if case == "exports" { 0x10_0000 } else { 0x1000 });
+        put32(&mut b, o + 116, 40);
+        // The section header.
+        let s = o + 0xf0;
+        b[s..s + 8].copy_from_slice(b".edata\0\0");
+        put32(&mut b, s + 8, 0x1000);
+        put32(&mut b, s + 12, 0x1000);
+        put32(&mut b, s + 16, 0x200);
+        put32(&mut b, s + 20, 0x200);
+        put32(&mut b, s + 36, 0x4000_0040);
+        // The export directory at RVA 0x1000 (file 0x200), its name at 0x1100.
+        put32(&mut b, 0x200 + 12, if case == "name" { 0x20_0000 } else { 0x1100 });
+        b[0x300..0x30c].copy_from_slice(b"damaged.dll\0");
+        b
+    }
+
+    #[test]
+    #[ignore = "run by test_a_frame_in_a_damaged_image_is_given_bare"]
+    fn damaged_image_child() {
+        use std::os::windows::io::AsRawHandle;
+        let case = std::env::var("WICK_TEST_IMAGE").unwrap();
+        let path = std::env::temp_dir().join(std::format!("wick-damaged-{}-{case}.dll", std::process::id()));
+        std::fs::write(&path, damaged_image(&case)).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: an image section of our file, read-only.
+        let section = unsafe {
+            windows_sys::Win32::System::Memory::CreateFileMappingW(
+                file.as_raw_handle(),
+                ptr::null(),
+                windows_sys::Win32::System::Memory::PAGE_READONLY | windows_sys::Win32::System::Memory::SEC_IMAGE,
+                0,
+                0,
+                ptr::null(),
+            )
+        };
+        assert!(!section.is_null(), "SEC_IMAGE refused the hand-made image: {}", io::Error::last_os_error());
+        // SAFETY: maps the section, anywhere.
+        let view = unsafe { windows_sys::Win32::System::Memory::MapViewOfFile(section, windows_sys::Win32::System::Memory::FILE_MAP_READ, 0, 0, 0) };
+        assert!(!view.Value.is_null(), "the image's view: {}", io::Error::last_os_error());
+        let at = view.Value as usize;
+        std::println!("DAMAGED {case}: mapped at {at:#x}");
+        crate::windows_mm::say_frame_for_test(0, at + 0x1010);
+        std::println!("DAMAGED {case}: after the frame");
+        // SAFETY: our view and section.
+        unsafe {
+            windows_sys::Win32::System::Memory::UnmapViewOfFile(view);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn stack_at_the_limit(kind: Kind) {
         lazy_memory_is_mapped();
         make_the_slack_region();

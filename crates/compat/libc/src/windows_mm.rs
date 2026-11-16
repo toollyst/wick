@@ -1593,15 +1593,29 @@ fn stack_137_frames() {
     // The linker's symbol for this image's base (its address only).
     let base = core::ptr::addr_of!(__ImageBase) as usize;
     for (i, f) in frames[..usize::from(n)].iter().enumerate() {
-        let a = *f as usize;
-        if a >= base && a - base < 64 << 20 {
-            say_at_the_limit(format_args!("STACK137FRAMES {i} image+{:#x}", a - base));
-        } else if let Some((at, name)) = module_of(a) {
-            say_at_the_limit(format_args!("STACK137FRAMES {i} {}+{:#x} ({a:#x})", Ascii(name), a - at));
-        } else {
-            say_at_the_limit(format_args!("STACK137FRAMES {i} {a:#x}"));
-        }
+        say_frame(i, *f as usize, base);
     }
+}
+
+/// One STACK137FRAMES line: frame `i` at `a`, as an offset in this
+/// executable (its base `own`), else in the module it lies in, else bare.
+fn say_frame(i: usize, a: usize, own: usize) {
+    if a >= own && a - own < 64 << 20 {
+        say_at_the_limit(format_args!("STACK137FRAMES {i} image+{:#x}", a - own));
+    } else if let Some((at, name)) = module_of(a) {
+        say_at_the_limit(format_args!("STACK137FRAMES {i} {}+{:#x} ({a:#x})", Ascii(name), a - at));
+    } else {
+        say_at_the_limit(format_args!("STACK137FRAMES {i} {a:#x}"));
+    }
+}
+
+/// Tests: [`say_frame`] for `a`, this executable's frames given as such.
+#[cfg(test)]
+pub(crate) fn say_frame_for_test(i: usize, a: usize) {
+    unsafe extern "C" {
+        static __ImageBase: u8;
+    }
+    say_frame(i, a, core::ptr::addr_of!(__ImageBase) as usize);
 }
 
 /// The module an address lies in, for STACK137FRAMES: its base and the name
