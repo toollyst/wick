@@ -1564,6 +1564,11 @@ jobs:
           # one, steady and in transition, by the phase they began and ended
           # in. Only the calls made with nothing else are asserted.
           alone whp::vcpu::fpu_tests::test_state_calls_against_time_suspension_on_record
+          # The legacy local APIC get and set through the backend's own
+          # path while another thread holds the VM with its time suspended
+          # in a loop (LEGACYGATE line): none refused. To fail here first:
+          # TIMEGET found them refused when they overlap the Suspend call.
+          alone whp::vcpu::fpu_tests::test_legacy_apic_exchanges_wait_for_a_suspension_of_time
           # Which WHP call it is that commits a vCPU thread's stack: every
           # call a thread makes, with the stack committed before and after
           # it (STACKCALL lines), for what a booting Linux guest does and

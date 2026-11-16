@@ -13353,6 +13353,74 @@ mod fpu_tests {
         assert!(failed_control.is_empty(), "a get was refused with nothing else made: {failed_control:?}");
     }
 
+    /// The legacy local APIC get and set, through the backend's own path
+    /// (`lapic_page`, `put_lapic_page`), on vCPU 0 (run to an exit first)
+    /// and vCPU 1 (never run), while another thread holds the VM with its
+    /// time suspended in a loop, through the backend's own hold
+    /// (`with_time_stopped`, as a guest's TSC write makes it): none is
+    /// refused. Without the partition's state gate WHP refuses the two calls
+    /// when they overlap the `WHvSuspendPartitionTime` call (TIMEGET), which
+    /// is how x2storm's vCPU 3 ended. LEGACYGATE line: the holds, gets and
+    /// sets made, and the refusals.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_legacy_apic_exchanges_wait_for_a_suspension_of_time() {
+        use std::sync::atomic::{AtomicBool, AtomicU8};
+        use std::time::{Duration, Instant};
+        let (vm, mut zero, m) = mmio_guest(&[0xE6, 0x80, 0xEB, 0xFC]);
+        let one = vm.create_vcpu(1).unwrap();
+        let first = super::super::ffi::quietly(|| match zero.run() {
+            Ok(VcpuExit::IoOut(0x80, _)) => "out 0x80".to_string(),
+            Ok(e) => format!("{e:?}"),
+            Err(e) => format!("errno {}", e.errno()),
+        });
+        assert_eq!(first, "out 0x80", "vCPU 0's guest");
+        let inner = zero.shared.inner.clone();
+        let stop = AtomicBool::new(false);
+        let (mut gets, mut sets) = (0u64, 0u64);
+        let mut refused: Vec<String> = Vec::new();
+        let holds = std::thread::scope(|s| {
+            let holder = s.spawn(|| {
+                let flag = AtomicU8::new(0);
+                let mut n = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    inner.with_time_stopped(&flag, || Ok(())).expect("the hold was given up").expect("the hold failed");
+                    n += 1;
+                }
+                n
+            });
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_millis(1500) {
+                for v in [&zero, &one] {
+                    match super::super::ffi::quietly(|| v.lapic_page()) {
+                        Ok((page, size)) => {
+                            gets += 1;
+                            match super::super::ffi::quietly(|| v.put_lapic_page(&page, size)) {
+                                Ok(()) => sets += 1,
+                                Err(_) => refused.push(super::super::ffi::LAST_FAILURE.with(|l| l.borrow().clone()).unwrap_or_default()),
+                            }
+                        }
+                        Err(_) => refused.push(super::super::ffi::LAST_FAILURE.with(|l| l.borrow().clone()).unwrap_or_default()),
+                    }
+                }
+            }
+            stop.store(true, Ordering::SeqCst);
+            holder.join().unwrap()
+        });
+        eprintln!(
+            "LEGACYGATE {holds} holds with time suspended; {gets} legacy gets and {sets} sets made meanwhile; {} refused{}",
+            refused.len(),
+            refused.first().map_or(String::new(), |l| format!(", the first: {l}"))
+        );
+        drop(one);
+        drop(zero);
+        drop(vm);
+        // SAFETY: the test's memory, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        assert!(holds >= 100 && gets >= 100, "too few holds ({holds}) or gets ({gets}) to overlap");
+        assert!(refused.is_empty(), "{} legacy exchanges refused, the first: {}", refused.len(), refused[0]);
+    }
+
     /// What WHP answers a VP's state calls made while the partition's time
     /// is suspended, or while it is being suspended or resumed (TIMEGET
     /// lines). CANCELGET found the legacy interrupt controller state get and

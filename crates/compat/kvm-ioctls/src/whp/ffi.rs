@@ -51,6 +51,15 @@ pub(crate) fn quietly<T>(f: impl FnOnce() -> T) -> T {
 /// names neither the call nor the register (an `os error 87` is any
 /// `E_INVALIDARG` and every `WHV_E_*`), and Firecracker logs only that.
 pub(crate) fn hr_of(call: &str, hres: i32, detail: impl FnOnce() -> String) -> Result<()> {
+    #[cfg(test)]
+    if hres != S_OK {
+        let line = format!("whp: {call}({}) failed: HRESULT {:#010x}", detail(), hres.cast_unsigned());
+        if !QUIET.get() {
+            report(log::Level::Error, &line);
+        }
+        LAST_FAILURE.with(|l| *l.borrow_mut() = Some(line));
+        return hr(hres);
+    }
     if hres != S_OK && !QUIET.get() {
         report(
             log::Level::Error,
@@ -58,6 +67,13 @@ pub(crate) fn hr_of(call: &str, hres: i32, detail: impl FnOnce() -> String) -> R
         );
     }
     hr(hres)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the line of this thread's last failed call ([`hr_of`]),
+    /// reported or not.
+    pub(crate) static LAST_FAILURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Reports what the backend found wrong: on standard error, the only output
