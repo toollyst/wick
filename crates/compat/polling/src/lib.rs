@@ -3,17 +3,15 @@
 
 //! `polling` 3.11.0 for wick.
 //!
-//! - Linux, macOS: the upstream crate, re-exported as is (nothing of wick's
-//!   uses it there).
+//! - Linux, macOS: empty, with no dependency (nothing of wick's uses it
+//!   there, and a re-export would add polling's features to the crates both
+//!   share with upstream's build, rustix's among them).
 //! - Windows: the upstream source with one change to its waitable sources
 //!   (`PollerIocpExt::add_waitable`, which wick's epoll uses for eventfds,
 //!   pipes, the console and nested instances): a removal returns once the
 //!   thread pool no longer waits on the handle nor runs a callback for it, so
 //!   that the handle may be closed, as Linux's `EPOLL_CTL_DEL` leaves nothing
 //!   behind (tools/gen-windows-sources-polling.py says what upstream did).
-
-#[cfg(not(windows))]
-pub use upstream::*;
 
 #[cfg(windows)]
 // Upstream code: lints capped as cargo caps them for upstream crates.

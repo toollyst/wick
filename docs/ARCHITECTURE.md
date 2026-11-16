@@ -76,7 +76,8 @@ firecracker binary, vmm   (upstream source + patches/)
                     the original crate
             Windows: the same API on Win32 (kvm-ioctls → Windows Hypervisor Platform)
         polling (by path from the Windows vmm-sys-util) → crates/compat/polling
-            Linux, macOS: re-exports polling 3.11.0 (nothing of wick's uses it there)
+            Linux, macOS: empty, with no dependency (nothing of wick's uses it there,
+                and a build compiles upstream's units with upstream's features)
             Windows: polling 3.11.0's source, its waitable removal fixed (below)
 ```
 

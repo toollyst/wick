@@ -7,8 +7,11 @@ wick's Windows vmm-sys-util takes polling 3.11.0 from crates/compat/polling,
 whose waitable removal returns once the thread pool no longer waits on the
 handle, where the crates.io one returned at once and a wait could be left on
 a handle its owner then closed (STATUS_THREADPOOL_HANDLE_EXCEPTION). The
-crate is a workspace member and re-exports the crates.io polling on Linux
-and macOS, so both entries are locked; no new crate from crates.io.
+crate is a workspace member; on Linux and macOS it is empty and depends on
+nothing. It names the crates.io polling for no target (cfg(any())), as the
+source tools/gen-windows-sources.sh generates from, so both entries are
+locked and neither adds a unit or a feature to a Linux or macOS build; no
+new crate from crates.io.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
