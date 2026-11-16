@@ -229,20 +229,33 @@ static REGISTERED: AtomicUsize = AtomicUsize::new(0);
 /// inside (the window's change is the system call alone).
 static LOCK: Mutex<()> = Mutex::new(());
 
-/// Takes [`LOCK`]. Under `cfg(test)`, a caller that finds it held first
-/// counts itself in `tests::LOCK_WAITS`, so that a test can tell, with no
-/// timing, that a thread waits for it.
+/// Takes [`LOCK`], and counts it in [`CHANGES`]. Under `cfg(test)`, a
+/// caller that finds it held first counts itself in `tests::LOCK_WAITS`, so
+/// that a test can tell, with no timing, that a thread waits for it.
 fn lock() -> std::sync::MutexGuard<'static, ()> {
     #[cfg(test)]
     match LOCK.try_lock() {
-        Ok(guard) => return guard,
-        Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+        Ok(guard) => {
+            CHANGES.fetch_add(1, Ordering::SeqCst);
+            return guard;
+        }
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            CHANGES.fetch_add(1, Ordering::SeqCst);
+            return e.into_inner();
+        }
         Err(std::sync::TryLockError::WouldBlock) => {
             tests::LOCK_WAITS.fetch_add(1, Ordering::SeqCst);
         }
     }
-    LOCK.lock().unwrap()
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    CHANGES.fetch_add(1, Ordering::SeqCst);
+    guard
 }
+/// How many times [`LOCK`] was taken: every change of a registered range
+/// (a fill, a discard, an unregister, a release, a protection change, an
+/// unmapping) is made under it, so a fault that finds this count unchanged
+/// since its last retry finds the ranges as they were then ([`may_retry`]).
+static CHANGES: AtomicU64 = AtomicU64::new(0);
 /// Changes of memory under way without [`LOCK`]: an `munmap`, `MAP_FIXED`
 /// mapping, `mprotect` or discard that found no registered range in reach
 /// ([`unlocked_change`]).
@@ -637,6 +650,8 @@ fn post(ctx: usize, record: [u64; 4]) {
 /// woken. Returns false if `addr` is not a missing registered page.
 /// Async-signal-safe.
 pub fn fault(addr: u64, write: bool) -> bool {
+    #[cfg(test)]
+    tests::fault_hook(addr);
     let Some((range, page)) = find(addr) else {
         return false;
     };
@@ -702,30 +717,156 @@ fn wake_where(which: impl Fn(usize, u64) -> bool) {
     }
 }
 
+/// Whether an access to `addr` that faulted would now go through: the
+/// host's protection of its page allows the access, and, when the page is
+/// in a registered range, it is not missing and its asked protection allows
+/// it too ([`asked_allows`]; a missing page keeps `PROT_NONE`, so the host's
+/// protection refuses every access to it). The host's protection of a
+/// present registered page is the asked one: a fill sets it
+/// ([`protect_as_asked`] in [`fill`]), and [`protecting`] changes it and
+/// records the same protection as asked, under [`LOCK`]; XNU's widening of
+/// a write protection without read (bsd/kern/kern_mman.c, `mprotect` :1251
+/// to :1253) gives a host protection that allows a read, which the asked
+/// one allows as well ("write implies read", [`asked_allows`]). A page
+/// whose mapping a call outside this library replaced may hold another
+/// protection; the host's is the one read here.
+///
+/// Not as Linux: an address in no registered range whose page refused the
+/// access when it faulted, and whose protection came to allow it before
+/// this handler read it (an `mprotect` by another thread, this library's or
+/// the system's), is retried, where Linux decides at the fault and delivers
+/// the signal; the handler cannot tell it from a page an unregister freed
+/// meanwhile. Before this rule it went to the previous handler.
+///
+/// Async-signal-safe: one `mach_vm_region`, a Mach message whose reply port
+/// is the thread's own (xnu-12377.1.9 libsyscall/mach/mig_reply_port.c
+/// `mig_get_reply_port` :64 to :77: no allocation, no lock; a thread's
+/// first one is made by `mach_port_construct`). Firecracker's run-phase
+/// sandbox profile allows each (overlay/vmm/ext/sandbox.rs: `mach_vm_region`
+/// in `MIG_ROUTINES`, `mach_msg2_trap` and
+/// `_kernelrpc_mach_port_construct_trap` in `MACH_TRAPS`); a refused call
+/// would leave the fault to the previous handler, as before this rule.
+fn resolved(addr: u64, access: Access) -> bool {
+    if find(addr).is_some() && (is_missing(addr) || !asked_allows(addr, access)) {
+        return false;
+    }
+    const VM_REGION_BASIC_INFO_64: c_int = 9;
+    let (mut at, mut size, mut object) = (addr, 0u64, 0);
+    let mut info = [0 as c_int; 16];
+    let mut count = 9u32;
+    // SAFETY: valid output buffers, `info` larger than the flavor's 9 words.
+    let kr = unsafe {
+        mach_vm_region(mach_task_self_, &mut at, &mut size, VM_REGION_BASIC_INFO_64, info.as_mut_ptr(), &mut count, &mut object)
+    };
+    let need = match access {
+        Access::Exec => libc::PROT_EXEC,
+        Access::Write => libc::PROT_WRITE,
+        Access::Read => libc::PROT_READ,
+    };
+    // vm_region_basic_info_64 starts with the current protection.
+    kr == 0 && at <= addr && addr - at < size && info[0] & need == need
+}
+
+/// A thread's retries of one address ([`may_retry`]).
+struct Retry {
+    thread: AtomicU64,
+    addr: AtomicU64,
+    /// [`CHANGES`] at the last retry.
+    changes: AtomicU64,
+    count: AtomicU64,
+}
+
+/// Retries by thread, at [`retry_index`]; a thread that shares an entry
+/// with another resets its count, and the other's.
+static RETRIES: [Retry; 64] = [const {
+    Retry {
+        thread: AtomicU64::new(0),
+        addr: AtomicU64::new(0),
+        changes: AtomicU64::new(0),
+        count: AtomicU64::new(0),
+    }
+}; 64];
+
+/// The retries of one address by one thread with no change of the ranges
+/// in between ([`CHANGES`]) that [`on_signal`] makes before it hands the
+/// fault to the previous handler. A retry of a resolved fault goes through,
+/// or faults on a page that changed since (missing again: a change under
+/// [`LOCK`]); a second retry with nothing changed would be the same fault
+/// again.
+const RETRY_BOUND: u64 = 2;
+
+/// The entry of [`RETRIES`] for thread `me` (its `pthread_self`): the high
+/// bits of a multiplicative mix. A `pthread_t` lies at the top of its
+/// thread's stack mapping, so two threads' values differ by multiples of
+/// the page, and their low bits are equal: `(me >> 4) % 64` put 16 live
+/// threads in one entry (measured, macOS 27.2: every one in entry 0), the
+/// mix in 16 (`test_live_threads_spread_over_the_retry_entries`).
+fn retry_index(me: u64) -> usize {
+    (me.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % RETRIES.len()
+}
+
+/// Whether the calling thread may retry its access to `addr` once more:
+/// false after [`RETRY_BOUND`] retries of it with no change of the ranges
+/// in between. So a wrong reading of [`resolved`] ends as the fault it is,
+/// handed to the previous handler, while nothing changes; while other
+/// threads change the ranges ([`CHANGES`] moves at every fill, discard or
+/// unregister), it is retried again after each change, for as long as they
+/// go on, and ends when they stop. A fault [`resolved`] reads wrongly (a
+/// SIGBUS on a mapping whose protection allows the access: a file mapping
+/// past its end, a pager's error) is thus retried twice after each fill
+/// during an on-demand restore, where before this rule, and on Linux, it
+/// ended at once. Async-signal-safe.
+fn may_retry(addr: u64) -> bool {
+    // SAFETY: reads the calling thread's own identifier.
+    let me = unsafe { libc::pthread_self() } as u64;
+    let r = &RETRIES[retry_index(me)];
+    let changes = CHANGES.load(Ordering::SeqCst);
+    let count = if r.thread.load(Ordering::Relaxed) == me
+        && r.addr.load(Ordering::Relaxed) == addr
+        && r.changes.load(Ordering::Relaxed) == changes
+    {
+        r.count.load(Ordering::Relaxed) + 1
+    } else {
+        r.thread.store(me, Ordering::Relaxed);
+        r.addr.store(addr, Ordering::Relaxed);
+        r.changes.store(changes, Ordering::Relaxed);
+        1
+    };
+    r.count.store(count, Ordering::Relaxed);
+    count <= RETRY_BOUND
+}
+
 extern "C" fn on_signal(sig: c_int, info: *mut libc::siginfo_t, uctx: *mut libc::c_void) {
     // SAFETY: the kernel passes a valid siginfo.
     let addr = unsafe { (*info).si_addr } as u64;
-    if is_missing(addr) {
-        // ESR from the thread state: uc_mcontext (offset 48) -> __es.__esr (offset 8).
-        // SAFETY: the Darwin arm64 ucontext and mcontext layout.
-        let esr = unsafe {
-            let mcontext = *(uctx.cast::<u8>().add(48).cast::<*const u8>());
-            *(mcontext.add(8).cast::<u32>())
-        };
-        let ec = esr >> 26;
-        let write = (ec == 0x24 || ec == 0x25) && esr & (1 << 6) != 0;
-        // An instruction abort (EC 0x20 from EL0, 0x21 from EL1).
-        let access = match (ec, write) {
-            (0x20 | 0x21, _) => Access::Exec,
-            (_, true) => Access::Write,
-            (_, false) => Access::Read,
-        };
-        // An access the asked protection refuses is the process's own
-        // fault, as on Linux: on to the previous handler.
-        if asked_allows(addr, access) && fault(addr, write) {
-            // Retry the access.
-            return;
-        }
+    #[cfg(test)]
+    tests::signal_hook(addr);
+    // ESR from the thread state: uc_mcontext (offset 48) -> __es.__esr (offset 8).
+    // SAFETY: the Darwin arm64 ucontext and mcontext layout.
+    let esr = unsafe {
+        let mcontext = *(uctx.cast::<u8>().add(48).cast::<*const u8>());
+        *(mcontext.add(8).cast::<u32>())
+    };
+    let ec = esr >> 26;
+    let write = (ec == 0x24 || ec == 0x25) && esr & (1 << 6) != 0;
+    // An instruction abort (EC 0x20 from EL0, 0x21 from EL1).
+    let access = match (ec, write) {
+        (0x20 | 0x21, _) => Access::Exec,
+        (_, true) => Access::Write,
+        (_, false) => Access::Read,
+    };
+    // An access the asked protection refuses is the process's own fault, as
+    // on Linux: on to the previous handler.
+    if is_missing(addr) && asked_allows(addr, access) && fault(addr, write) {
+        // Retry the access.
+        return;
+    }
+    // A page that was missing when the access faulted and was filled or
+    // unregistered before this handler read it (or before `fault` did):
+    // retried, as Linux's fault finds the page present, or the vma no
+    // longer registered, and maps it.
+    if resolved(addr, access) && may_retry(addr) {
+        return;
     }
     let old = if sig == libc::SIGBUS {
         &OLD_SIGBUS
@@ -2518,6 +2659,40 @@ mod tests {
         }
     }
 
+    /// What [`on_signal`] calls first ([`HOOK_IN_FAULT`] false), or
+    /// [`fault`] first (true), for an access to the page at
+    /// [`SIGNAL_HOOK_AT`] (once: the address is cleared): a test's change
+    /// of that page between the fault and the handler's, or `fault`'s,
+    /// reading of it.
+    static SIGNAL_HOOK_AT: AtomicU64 = AtomicU64::new(0);
+    static SIGNAL_HOOK: AtomicUsize = AtomicUsize::new(0);
+    static HOOK_IN_FAULT: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn signal_hook(addr: u64) {
+        if !HOOK_IN_FAULT.load(Ordering::SeqCst) {
+            run_hook(addr);
+        }
+    }
+
+    pub(super) fn fault_hook(addr: u64) {
+        if HOOK_IN_FAULT.load(Ordering::SeqCst) {
+            run_hook(addr);
+        }
+    }
+
+    fn run_hook(addr: u64) {
+        let at = SIGNAL_HOOK_AT.load(Ordering::SeqCst);
+        if at != 0
+            && addr >= at
+            && addr < at + test_page_size()
+            && SIGNAL_HOOK_AT.compare_exchange(at, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        {
+            // SAFETY: set by the test from a `fn()`.
+            let hook: fn() = unsafe { core::mem::transmute(SIGNAL_HOOK.load(Ordering::SeqCst)) };
+            hook();
+        }
+    }
+
     /// Waits until `done`, failing after 10 s (a guard, not a measure: each
     /// condition is one the waited-for thread sets).
     fn until(what: &str, done: impl Fn() -> bool) {
@@ -2717,6 +2892,238 @@ mod tests {
             // SAFETY: descriptors of the test.
             unsafe { libc::close(fd) };
         }
+    }
+
+    /// The previous handler of this process's SIGBUS and SIGSEGV, in the
+    /// resolved-fault tests (installed before [`init`] saves it): records
+    /// the address and makes its page readable and writable, so the access
+    /// goes through when it returns.
+    static CHAINED: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn previous_handler(_: c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        // SAFETY: the kernel passes a valid siginfo.
+        let addr = unsafe { (*info).si_addr } as u64;
+        CHAINED.store(addr, Ordering::SeqCst);
+        let ps = test_page_size();
+        // SAFETY: the test's page; raw, not the compatibility mprotect.
+        unsafe { libc::mprotect((addr - addr % ps) as *mut _, ps as usize, libc::PROT_READ | libc::PROT_WRITE) };
+    }
+
+    fn install_previous_handler() {
+        for sig in [libc::SIGBUS, libc::SIGSEGV] {
+            // SAFETY: installs the test's handler.
+            unsafe {
+                let mut act: libc::sigaction = core::mem::zeroed();
+                act.sa_sigaction = previous_handler as *const () as usize;
+                act.sa_flags = libc::SA_SIGINFO;
+                libc::sigemptyset(&mut act.sa_mask);
+                assert_eq!(libc::sigaction(sig, &act, ptr::null_mut()), 0);
+            }
+        }
+    }
+
+    /// The userfaultfd the signal hooks below act with.
+    static HOOK_CTX: AtomicUsize = AtomicUsize::new(0);
+    /// The page the signal hooks below act on.
+    static HOOK_PAGE: AtomicU64 = AtomicU64::new(0);
+
+    fn fill_hook() {
+        let page = std::vec![0x77u8; test_page_size() as usize];
+        let at = HOOK_PAGE.load(Ordering::SeqCst);
+        // SAFETY: `page` holds a page.
+        let r = unsafe { copy(HOOK_CTX.load(Ordering::SeqCst), page.as_ptr(), at, test_page_size(), true) };
+        assert_eq!(r, Ok(test_page_size()));
+    }
+
+    fn unregister_hook() {
+        let at = HOOK_PAGE.load(Ordering::SeqCst);
+        assert_eq!(unregister(HOOK_CTX.load(Ordering::SeqCst), at, test_page_size()), Ok(()));
+    }
+
+    /// A change of the page's protection by a call outside this library
+    /// (the system's own `mprotect`), to read and write.
+    fn raw_writable_hook() {
+        let at = HOOK_PAGE.load(Ordering::SeqCst);
+        // SAFETY: the test's page.
+        unsafe { libc::mprotect(at as *mut _, test_page_size() as usize, libc::PROT_READ | libc::PROT_WRITE) };
+    }
+
+    /// A resolved-fault case: what, the hook, the pages registered, the
+    /// page accessed, the byte the read then gives.
+    type ResolvedCase = (&'static str, fn(), u64, u64, u8);
+
+    /// An access to a missing page whose fill, or whose unregister, completed
+    /// between the fault and the handler's reading of the page (a hook at
+    /// [`on_signal`]'s start makes the change there), or between the
+    /// handler's reading and [`fault`]'s own (a hook at `fault`'s start,
+    /// after `on_signal` read the page missing), is retried, as Linux's fault
+    /// finds the page present, or no longer registered, and maps it: the
+    /// read gives the filled page, or zeros, and the previous handler is
+    /// not called. Before, the handler found the page not missing and
+    /// handed the fault on (for Firecracker, its SIGSEGV handler, which
+    /// ends the VMM). The unregister is of one page of two (the range
+    /// lives on) and of a whole range (it is freed). An access the asked
+    /// protection refuses (a store to a page registered after a
+    /// compatibility `mprotect` to `PROT_READ`, filled) still goes to the
+    /// previous handler, also when a call outside this library made the
+    /// page writable between the fault and the handler's reading of it
+    /// (the asked protection decides for a registered page).
+    #[test]
+    fn test_a_fault_resolved_before_its_handler_reads_the_page_is_retried() {
+        if !in_own_process("wick_uffd::tests::test_a_fault_resolved_before_its_handler_reads_the_page_is_retried") {
+            return;
+        }
+        install_previous_handler();
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        HOOK_CTX.store(ctx, Ordering::SeqCst);
+        let cases: [ResolvedCase; 3] = [
+            ("filled", fill_hook, 2, 0, 0x77),
+            ("one page unregistered", unregister_hook, 2, 1, 0),
+            ("the range unregistered", unregister_hook, 1, 0, 0),
+        ];
+        // Every case is run, and the failures told together.
+        let mut failures = Vec::new();
+        for in_fault in [false, true] {
+            HOOK_IN_FAULT.store(in_fault, Ordering::SeqCst);
+            let place = if in_fault { "in fault()" } else { "at the handler's start" };
+            for (what, hook, pages, at, want) in cases {
+                let mem = map(pages);
+                register(ctx, mem, pages * ps).unwrap();
+                let page = mem + at * ps;
+                HOOK_PAGE.store(page, Ordering::SeqCst);
+                SIGNAL_HOOK.store(hook as usize, Ordering::SeqCst);
+                SIGNAL_HOOK_AT.store(page, Ordering::SeqCst);
+                CHAINED.store(0, Ordering::SeqCst);
+                // SAFETY: registered memory; the hook resolves the fault.
+                let got = unsafe { ptr::read_volatile(page as *const u8) };
+                if SIGNAL_HOOK_AT.load(Ordering::SeqCst) != 0 {
+                    failures.push(std::format!("{what} {place}: the hook did not run"));
+                }
+                if CHAINED.load(Ordering::SeqCst) != 0 {
+                    failures.push(std::format!("{what} {place}: the fault went to the previous handler"));
+                }
+                if got != want {
+                    failures.push(std::format!("{what} {place}: read {got:#x}, not {want:#x}"));
+                }
+                let _ = unregister(ctx, mem, pages * ps);
+            }
+        }
+        HOOK_IN_FAULT.store(false, Ordering::SeqCst);
+        assert!(failures.is_empty(), "{failures:#?}");
+        // Refused by the asked protection: on to the previous handler.
+        let mem = map(1);
+        register(ctx, mem, ps).unwrap();
+        // SAFETY: the test's registered page.
+        assert_eq!(unsafe { crate::linux_items::mprotect(mem as *mut _, ps as usize, libc::PROT_READ) }, 0);
+        let page = std::vec![0x55u8; ps as usize];
+        // SAFETY: `page` holds a page.
+        assert_eq!(unsafe { copy(ctx, page.as_ptr(), mem, ps, true) }, Ok(ps));
+        for raw in [false, true] {
+            // SAFETY: the test's page, back to the protection asked.
+            unsafe { libc::mprotect(mem as *mut _, ps as usize, libc::PROT_READ) };
+            if raw {
+                HOOK_PAGE.store(mem, Ordering::SeqCst);
+                SIGNAL_HOOK.store(raw_writable_hook as fn() as usize, Ordering::SeqCst);
+                SIGNAL_HOOK_AT.store(mem, Ordering::SeqCst);
+            }
+            CHAINED.store(0, Ordering::SeqCst);
+            // SAFETY: the store faults; the previous handler makes the page writable.
+            unsafe { ptr::write_volatile(mem as *mut u8, 1) };
+            let what = if raw { "made writable outside this library meanwhile" } else { "as it is" };
+            assert_eq!(CHAINED.load(Ordering::SeqCst), mem, "a store the asked protection refuses, {what}, was not handed on");
+        }
+        let _ = unregister(ctx, mem, ps);
+        close(&[user]);
+    }
+
+    /// The retries of one address by one thread with no change of the
+    /// ranges in between are bounded ([`RETRY_BOUND`]): then the fault goes
+    /// to the previous handler. A change under [`LOCK`], or another address,
+    /// starts the count again.
+    #[test]
+    fn test_retries_of_a_fault_with_nothing_changed_are_bounded() {
+        // A private address no other test's fault uses; LOCK not taken in
+        // between, unless by another test (which only starts the count
+        // again, so the bound is checked with the lock held).
+        let addr = 0x10;
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tries: std::vec::Vec<bool> = (0..RETRY_BOUND + 1).map(|_| may_retry(addr)).collect();
+        let mut want = std::vec![true; RETRY_BOUND as usize];
+        want.push(false);
+        assert_eq!(tries, want);
+        CHANGES.fetch_add(1, Ordering::SeqCst);
+        assert!(may_retry(addr), "the same address after a change");
+        assert!(may_retry(addr + 1), "another address");
+    }
+
+    /// Live threads land in different entries of [`RETRIES`]
+    /// ([`retry_index`]): 16 threads alive at once take at least 8 entries.
+    /// With the index of `pthread_self`'s low bits they took one.
+    #[test]
+    fn test_live_threads_spread_over_the_retry_entries() {
+        const N: usize = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let threads: Vec<_> = (0..N)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    // SAFETY: the calling thread's own identifier.
+                    let index = retry_index(unsafe { libc::pthread_self() } as u64);
+                    // All alive at once: no identifier reused.
+                    barrier.wait();
+                    index
+                })
+            })
+            .collect();
+        let mut entries: Vec<usize> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        entries.sort_unstable();
+        entries.dedup();
+        assert!(entries.len() >= N / 2, "{N} live threads in {} retry entries: {entries:?}", entries.len());
+    }
+
+    /// Two threads in different entries of [`RETRIES`] keep their own
+    /// counts: one's retry between the other's does not start the other's
+    /// count again.
+    #[test]
+    fn test_threads_in_different_retry_entries_keep_their_counts() {
+        use std::sync::mpsc::channel;
+        // CHANGES does not move while the lock is held.
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (to_a, a_gets) = channel::<()>();
+        let (from_a, a_said) = channel::<(usize, Vec<bool>)>();
+        let a = std::thread::spawn(move || {
+            // SAFETY: the calling thread's own identifier.
+            let index = retry_index(unsafe { libc::pthread_self() } as u64);
+            let first = std::vec![may_retry(0x20), may_retry(0x20)];
+            from_a.send((index, first)).unwrap();
+            a_gets.recv().unwrap();
+            from_a.send((index, std::vec![may_retry(0x20)])).unwrap();
+        });
+        let (index_a, first) = a_said.recv().unwrap();
+        assert_eq!(first, [true, true]);
+        // Another live thread in another entry retries meanwhile.
+        let mut tried = 0;
+        loop {
+            let b = std::thread::spawn(move || {
+                // SAFETY: the calling thread's own identifier.
+                let index = retry_index(unsafe { libc::pthread_self() } as u64);
+                // Only from another entry: one in the first thread's entry
+                // would start its count again by design.
+                (index != index_a).then(|| may_retry(0x30))
+            });
+            // A thread that ended may leave its identifier to the next.
+            if let Some(retried) = b.join().unwrap() {
+                assert!(retried);
+                break;
+            }
+            tried += 1;
+            assert!(tried < 64, "no thread in an entry other than {index_a}");
+        }
+        to_a.send(()).unwrap();
+        let (_, last) = a_said.recv().unwrap();
+        assert_eq!(last, [false], "the first thread's count was started again by the other's retry");
+        a.join().unwrap();
     }
 
     #[test]

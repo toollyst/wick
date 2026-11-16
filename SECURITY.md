@@ -531,6 +531,25 @@ has the per-control details and results.
   lazy) that its protection allows now, every other violation going on at once as before. Both orders of first use
   pass, and so does the mirror, the page resolved between the userfaultfd's step and the resolve
   (`test_a_host_access_that_faulted_on_a_released_page_resolved_meanwhile_runs_again`; 20348 and 26100).
+- **macOS: a host thread's fault on a missing page that a fill or an unregister resolved before the handler read it
+  ended the process** (from 6c4320c5, the macOS userfaultfd's start, to the commit that brought `may_retry`). The
+  userfaultfd's SIGBUS and SIGSEGV handler handled a fault only while the page read as missing. A fill and an
+  unregister make the page accessible first and then clear its bits, so a thread whose access faulted before that
+  and whose handler read the page after was handed to the previous handler, Firecracker's, which ends the VMM; Linux's
+  fault there finds the page present, or the vma no longer registered, and maps it. Found by reading the code;
+  reaching it needs two VMM threads touching one missing page at once, not measured in a VM. Now such an access is
+  retried when the page's host protection allows it and, for a registered page, its asked protection does too
+  (`test_a_fault_resolved_before_its_handler_reads_the_page_is_retried`: the fill and both unregisters, completed
+  by a hook between the fault and the handler's read, or between the handler's read and `fault`'s own, and a store
+  the asked protection refuses still handed on). The retries of one address by one thread are bounded at two while
+  nothing changes (`test_retries_of_a_fault_with_nothing_changed_are_bounded`; threads keep their own counts,
+  `test_live_threads_spread_over_the_retry_entries`, `test_threads_in_different_retry_entries_keep_their_counts`);
+  while other threads change the ranges, the count starts again after each change. So a fault the rule reads wrongly
+  (a SIGBUS on a mapping whose protection allows the access: a file mapping past its end, a pager's error) is
+  retried twice after each fill for as long as fills go on, during an on-demand restore, and ends when they stop,
+  where before, and on Linux, it ended at once. Not as Linux either: an address in no registered range whose
+  protection came to allow the access between the fault and the handler's read (an `mprotect` on another thread)
+  is retried, where Linux delivers the signal; the handler cannot tell it from a page an unregister freed.
 
 ## Not at parity yet
 
