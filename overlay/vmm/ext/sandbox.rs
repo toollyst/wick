@@ -950,7 +950,10 @@ mod macos {
     /// (`/fcm.<pid>.u<n>`, `libc::wick_uffd`, opened twice and unlinked at
     /// once). Another name is a denial (the default
     /// rule): on Linux a memfd has no name another process could
-    /// open.
+    /// open. Here each has its name for a moment, while it is made, in
+    /// which a process of the same uid that is not under this profile can
+    /// open it (SECURITY.md, "macOS: a memfd and a waiter mirror have a name
+    /// while they are made").
     fn shm_rule(pid: u32) -> String {
         format!(
             "(allow ipc-posix-shm* (ipc-posix-name-prefix \"/fcm.{pid}.\") \
