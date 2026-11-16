@@ -922,7 +922,19 @@ jobs:
             "HypervisorPlatform: not read ($($_.Exception.Message))"
           }
           if (Test-Path "$env:SystemRoot\System32\WinHvPlatform.dll") { "WinHvPlatform.dll: present" } else { "WinHvPlatform.dll: absent" }
-      - run: tools/setup.sh
+      # A failed fetch of upstream is said as what it is in one line: an
+      # outage of github.com's upstream repository, not a wick failure (run
+      # 43783880314: "The requested URL returned error: 503"). No retry.
+      - name: Set up upstream and the patch series
+        id: setup
+        run: |
+          set +e
+          tools/setup.sh 2>&1 | tee "$RUNNER_TEMP/setup.log"
+          status=${PIPESTATUS[0]}
+          if ((status != 0)) && grep -q "cannot fetch tag" "$RUNNER_TEMP/setup.log"; then
+            echo "::error::upstream fetch failed: infrastructure, not a wick failure (tools/setup.sh could not fetch upstream's tag; the steps that need it are skipped)"
+          fi
+          exit "$status"
       # Upstream tests put sockets and files under /tmp, which Windows
       # resolves to \tmp on the current drive.
       - name: Create \tmp on the working drive
@@ -956,19 +968,23 @@ jobs:
       # failed crate test keeps the job red and no longer skips the build,
       # the kit and so windows-guest, which needs the kit. Runs 43521200989
       # and 43524342863 (one failed crate test each) built no kit and booted
-      # no guest.
+      # no guest. But none runs once the setup has failed (no upstream, no
+      # series: nothing to build or test), and the steps that run the
+      # release firecracker.exe none once its build has failed: the first
+      # cause stays the one red step (run 43783880314: setup's fetch of
+      # upstream failed, a 503, and some 100 later errors buried it).
       # The boot test's own helpers (serial-console protocol, vsock, network
       # switch) against stand-ins, in Windows PowerShell 5.1 as users run it.
       # Its boot stages run on the WHP PC, with its guest image.
       - name: Boot test harness self-test
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -SelfTest
       # Upstream's integration tests need WHP (tools/windows/integration-tests.ps1
       # runs them on Windows hardware); their harness's AF_UNIX sockets,
       # network host side and host tools run here.
       - name: Integration test harness (without a VM)
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         run: |
           # upstream's pin (tools/devctr/poetry.lock)
           python -m pip install --quiet psutil==6.1.1
@@ -980,34 +996,35 @@ jobs:
       # aws-lc-sys assembles its x86_64 code with NASM in release builds
       # (built from source rather than with its prebuilt objects).
       - name: Install NASM
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         shell: pwsh
         run: |
           choco install nasm -y --no-progress
           "$env:ProgramFiles\NASM" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Build firecracker (WHP backend)
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
+        id: build
         working-directory: lib/firecracker
         run: cargo build --locked -p firecracker --release
       - name: Smoke-test the binary
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         working-directory: lib/firecracker
         run: build/cargo_target/release/firecracker.exe --version
       # The Linux and macOS jobs' check, through the harness's AF_UNIX
       # sockets: Windows has no /dev/nitro_enclaves either, and the start is
       # refused with Windows' error for the missing path (os error 3).
       - name: Nitro Enclave refused without the device
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         run: python -I tools/windows/enclave-refusal-test.py lib/firecracker/build/cargo_target/release/firecracker.exe
       # The boot test's diff stage merges snapshots with it.
       - name: Build snapshot-editor
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         working-directory: lib/firecracker
         run: cargo build --locked -p snapshot-editor --release
       # Upstream's other tools, which its integration tests run
       # (tools/windows/integration-tests.ps1).
       - name: Build rebase-snap, cpu-template-helper, seccompiler
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         working-directory: lib/firecracker
         run: cargo build --locked -p rebase-snap -p cpu-template-helper -p seccompiler --release
       # The two rebase tools' tests. The five skipped write their diff file
@@ -1016,7 +1033,7 @@ jobs:
       # than copy its zeros over the base (patches/0036), so these fail
       # with that refusal.
       - name: rebase-snap and snapshot-editor tests
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         working-directory: lib/firecracker
         run: |
           cargo test --locked -p rebase-snap -p snapshot-editor -- --exact \
@@ -1028,14 +1045,14 @@ jobs:
       # Upstream's jailer with the Windows backend (overlay/jailer/platform):
       # its tests (tokens, job limits) and the binary.
       - name: Jailer tests and build
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         working-directory: lib/firecracker
         run: |
           cargo test --locked -p jailer
           cargo build --locked -p jailer --release
       # The boot test's uffd stage serves a snapshot's pages with it.
       - name: Build the uffd page fault handler example
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         working-directory: lib/firecracker
         run: cargo build --locked -p firecracker --example uffd_on_demand_handler --release
       # The boot test's vhost-user stage serves a drive with it. The target
@@ -1043,7 +1060,7 @@ jobs:
       # the linker as ..\..\, which on a PC took link.exe past 260
       # characters (LNK1104).
       - name: Build the vhost-user-blk test backend
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         working-directory: tools/vhost-user-blk
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/lib/firecracker/build/vhost-user-blk
@@ -1051,7 +1068,7 @@ jobs:
       # The host capability probe (tools/windows/winprobe.c), built with the
       # same MSVC toolchain the binary uses.
       - name: Build winprobe
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         shell: pwsh
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
@@ -1061,7 +1078,7 @@ jobs:
       # runs on a PC without Rust (tools/windows/jailer-test.ps1 uses the
       # built jail-probe.exe next to it).
       - name: Build the probes
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         run: |
           rustc --edition 2021 -O -o tools/windows/jail-probe.exe tools/windows/jail-probe.rs
           # The operator's tool for a parent cgroup, and its own tests (how
@@ -1078,7 +1095,7 @@ jobs:
       # the kit's product binaries are left as they are; kvm-ioctls named by
       # its package id, as the whp-trace build names it.
       - name: Build the x2APIC record Firecracker
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         working-directory: lib/firecracker
         run: |
           kvm=$(cargo pkgid --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml)
@@ -1093,7 +1110,7 @@ jobs:
       # the upload, so it replaces only the copy on the runner. The check
       # fails the job if the uploaded binary is not the gdb build.
       - name: Build firecracker with the gdb feature
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         working-directory: lib/firecracker
         run: |
           cargo build --locked -p firecracker --features gdb
@@ -1103,7 +1120,7 @@ jobs:
       # of kvm-ioctls (whp-trace, whp-x2apic-record), and the x2APIC record
       # build is one, which shows the check finds its line.
       - name: No record-only feature in the kit's product binaries
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         run: |
           r=lib/firecracker/build/cargo_target/release
           tools/check-record-features.sh "$r/firecracker.exe" "$r/jailer.exe" "$r/snapshot-editor.exe" "$r/rebase-snap.exe" \
@@ -1112,7 +1129,7 @@ jobs:
       # For validation on Windows hardware with WHP (tools/windows/boot-test.ps1,
       # jailer-test.ps1): everything the stages need, at the paths they look in.
       - name: Upload Windows binaries
-        if: success() || failure()
+        if: (success() || failure()) && steps.build.outcome == 'success'
         id: kit
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -1149,7 +1166,7 @@ jobs:
       # passes, as test_vcpu_dump_cpu_config did in run 43302372278) fails the
       # job without costing the jailer's tests and build or the kit.
       - name: Unit tests against their listed differences
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         run: python -I tools/windows/check-unit-tests.py --out "$RUNNER_TEMP/unit" --summary "$GITHUB_STEP_SUMMARY"
       - name: Upload the unit tests' output
         if: always()
@@ -1184,7 +1201,7 @@ jobs:
       # so a WHP result never costs the PC its kit; it runs whatever the
       # steps before gave.
       - name: WHP tests on the runner
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         working-directory: lib/firecracker
         run: |
           k=../../crates/compat/kvm-ioctls/Cargo.toml
@@ -1767,7 +1784,7 @@ jobs:
       # runner without a console cannot cost the kit; run alone here, after
       # the upload, and must pass.
       - name: Standard input on a console
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         working-directory: lib/firecracker
         run: |
           cargo test --locked --manifest-path ../../crates/compat/os/Cargo.toml -- \
@@ -1805,7 +1822,11 @@ jobs:
       WBT: ${{ github.workspace }}\wbt
       WJT: ${{ github.workspace }}\wjt
     steps:
+      # The kit of this commit: without it no step below has anything to
+      # run, so those that run after a failure (success() || failure())
+      # run only once it is here.
       - name: The kit of this commit
+        id: kit
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: wick-windows-x86_64-${{ github.sha }}
@@ -1842,7 +1863,7 @@ jobs:
       # RESTORED or REFUSED with Firecracker's error, and it fails only on
       # what is neither.
       - name: boot-test.ps1 linux-snapshot
-        if: success() || failure()
+        if: (success() || failure()) && steps.kit.outcome == 'success'
         run: |
           Get-Content "$env:RUNNER_TEMP\linux-snapshot\linux-x86_64.txt" -ErrorAction SilentlyContinue
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage linux-snapshot `
@@ -1861,7 +1882,7 @@ jobs:
       # only where its own look at the processor finds no AMD one, once,
       # as a notice; on an AMD runner 3 is a failure.
       - name: boot-test.ps1 x2apic
-        if: success() || failure()
+        if: (success() || failure()) && steps.kit.outcome == 'success'
         run: |
           $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
           Write-Host "the runner's processor: $($cpu.Manufacturer), $($cpu.Name.Trim())"
@@ -1879,7 +1900,7 @@ jobs:
       # The guest files are the boot test's (-Assets). pidns, bindlink,
       # sections and hugepages have steps of their own.
       - name: jailer-test.ps1
-        if: success() || failure()
+        if: (success() || failure()) && steps.kit.outcome == 'success'
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir $env:WJT -Assets $env:WBT `
             -Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,daemonize,handles,handoff,netns,netguest,api,isolation,boot,limits,memory,cpu,uffd,vhost-user
@@ -1891,7 +1912,7 @@ jobs:
       # (page cache) are allowed. Its own step, with its own work directory,
       # so that its result reads apart from the other stages'.
       - name: jailer-test.ps1 sections
-        if: success() || failure()
+        if: (success() || failure()) && steps.kit.outcome == 'success'
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir "$env:WJT-sections" -Assets $env:WBT -Stage sections
           $code = $LASTEXITCODE
@@ -1901,7 +1922,7 @@ jobs:
       # script runs in a console of its own, as in a PowerShell window, and
       # its output is the summary it writes.
       - name: jailer-test.ps1 pidns, in a console of its own
-        if: success() || failure()
+        if: (success() || failure()) && steps.kit.outcome == 'success'
         run: |
           $p = Start-Process powershell -PassThru -Wait -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
             'tools\windows\jailer-test.ps1', '-WorkDir', "$env:WJT-pidns", '-Assets', $env:WBT, '-Stage', 'pidns')
@@ -1916,7 +1937,7 @@ jobs:
       # exactly that line and left no drive, and says so; anything else
       # fails it. With the DLL the stage's result is the step's.
       - name: jailer-test.ps1 bindlink
-        if: success() || failure()
+        if: (success() || failure()) && steps.kit.outcome == 'success'
         run: |
           Get-Item "$env:SystemRoot\System32\bindlink.dll", "$env:SystemRoot\System32\bindfltapi.dll" -ErrorAction SilentlyContinue |
             Format-Table Name, Length, @{ n = 'Version'; e = { $_.VersionInfo.FileVersion } }
@@ -1943,7 +1964,7 @@ jobs:
       # set up, the step fails saying which part, and the stages stay the
       # PC's.
       - name: hugepages stages, in a logon that holds Lock pages in memory
-        if: success() || failure()
+        if: (success() || failure()) && steps.kit.outcome == 'success'
         run: |
           $ErrorActionPreference = 'Stop'
           $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -1998,7 +2019,7 @@ jobs:
       # package pinned by its file and checksum, its dependencies from the
       # image's MSYS2. The Firecracker is the kit's gdb build (the debug one).
       - name: boot-test.ps1 gdb
-        if: success() || failure()
+        if: (success() || failure()) && steps.kit.outcome == 'success'
         run: |
           $ErrorActionPreference = 'Stop'
           $name = 'mingw-w64-ucrt-x86_64-gdb-multiarch-18.1-3-any.pkg.tar.zst'
