@@ -17,7 +17,10 @@ that ended before its tests did (an abort, a fast fail, a stack overflow)
 is named with the test it ended in and its exit code: the tests after that
 one did not run, which is not the same as their not being there (run
 43392627996 reported seven listed tests as "no such test" when vmm's
-process had ended in test_vcpu_save_state_events).
+process had ended in test_vcpu_save_state_events). Results are read per
+test binary, checked against the counts of its "test result:" line, as a
+test that runs its binary again as a child has the child's lines in the
+same output (results_of).
 
 Each package's output is kept in DIR (default: a temporary directory) as
 <package>.log.
@@ -57,6 +60,80 @@ RESULT = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored)\b")
 # after, so a name with something else behind it is where the process ended.
 STARTED = re.compile(r"^test (.+?) \.\.\. (?!ok\b|FAILED\b|ignored\b)")
 DIED = re.compile(r"process didn't exit successfully: .*\((exit code: [^)]*|signal: [^)]*)\)")
+# cargo's line before each test binary's output.
+SECTION = re.compile(r"^\s+(Running|Doc-tests) ")
+SUMMARY = re.compile(r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;")
+
+
+def results_of(output):
+    """{test: ok|FAILED|ignored} of `output`, and a line for each test
+    binary whose results it could not tell.
+
+    A test that runs its own test binary again as a child (the API process,
+    the sandbox's and the jail's children) has the child's libtest write to
+    the same output, between the parent's "test <name> ... " and its result:
+    in CI run 43881982686 the child's "test ...::api_process_child ... ok"
+    came after the parent's "... ignored" line for that name, and the
+    parent's own result for the test that ran the child, which libtest
+    writes after "... ", was in no line. So, in each binary's section: the
+    first result of a name is the parent's (a child's comes after the
+    parent began); a name in the parent's list of failures, the one just
+    before its "test result:" line, failed, whatever line said otherwise; a
+    test the parent began with no result of its own passed, when that and
+    the rest add up to the counts of the parent's "test result:" line. If
+    they do not, the section is named: its results cannot be told from
+    what was written.
+    """
+    results = {}
+    unknown = []
+    sections = [[]]
+    for line in output.splitlines():
+        if SECTION.match(line):
+            sections.append([])
+        sections[-1].append(line)
+    for lines in sections:
+        found = {}
+        begun = []
+        for line in lines:
+            m = RESULT.match(line)
+            if m:
+                found.setdefault(m.group(1).removesuffix(" - should panic"), m.group(2))
+                continue
+            m = STARTED.match(line)
+            if m:
+                begun.append(m.group(1).removesuffix(" - should panic"))
+        last = max((i for i, line in enumerate(lines) if SUMMARY.match(line)), default=None)
+        if last is not None:
+            # The parent's failures: "failures:", then one indented name a
+            # line, then a blank line, just before its summary.
+            names = []
+            i = last - 1
+            while i >= 0 and not lines[i].strip():
+                i -= 1
+            while i >= 0 and lines[i].startswith("    ") and lines[i].strip():
+                names.append(lines[i].strip())
+                i -= 1
+            if i >= 0 and lines[i].strip() == "failures:":
+                for name in names:
+                    found[name] = "FAILED"
+            for name in begun:
+                found.setdefault(name, "ok")
+            passed, failed, ignored = (int(x) for x in SUMMARY.match(lines[last]).groups())
+            n = {"ok": 0, "FAILED": 0, "ignored": 0}
+            for r in found.values():
+                n[r] += 1
+            if (n["ok"], n["FAILED"], n["ignored"]) != (passed, failed, ignored):
+                head = next((line.strip() for line in lines if SECTION.match(line)), "the first test binary")
+                unknown.append(
+                    f"{head}: libtest counted {passed} passed, {failed} failed, {ignored} ignored, "
+                    f"its lines {n['ok']}, {n['FAILED']}, {n['ignored']}"
+                )
+        for name, r in found.items():
+            # The same name in two test binaries of a package: a failure
+            # in either is the test's result.
+            if results.get(name) != "FAILED":
+                results[name] = r
+    return results, unknown
 
 
 def died(output):
@@ -96,6 +173,32 @@ def selftest():
     )
     assert died(failed) == [], died(failed)
     assert died("test a::ok ... ok\n") == []
+    # CI run 43881982686's vmm: a child's line for a name the parent
+    # listed as ignored, and the parent's result for the test that ran the
+    # child in no line.
+    child = (
+        "     Running unittests src\\lib.rs (vmm-0b.exe)\n\nrunning 3 tests\n"
+        "test a::api_child ... ignored, run by test_serves as the API process\n"
+        "test a::test_serves ... \nrunning 1 test\n"
+        "test a::api_child ... ok\n"
+        "test a::z ... ok\n\n"
+        "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.00s\n"
+    )
+    assert results_of(child) == ({"a::api_child": "ignored", "a::test_serves": "ok", "a::z": "ok"}, []), results_of(child)
+    # A test that runs itself as its child: the child's "ok" is the only
+    # line of the name, and the parent's FAILED is in its failures list.
+    itself = (
+        "     Running unittests src\\lib.rs (vmm-0b.exe)\n\nrunning 2 tests\n"
+        "test a::test_t ... \nrunning 1 test\ntest a::test_t ... ok\n\n"
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.10s\n\n"
+        "test a::z ... ok\n\nfailures:\n\n---- a::test_t stdout ----\nthe child said ok\n\n"
+        "failures:\n    a::test_t\n\n"
+        "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n"
+    )
+    assert results_of(itself) == ({"a::test_t": "FAILED", "a::z": "ok"}, []), results_of(itself)
+    # Lines that do not add up to the counts: the section is named.
+    lost = "     Running tests\\x.rs (x-1.exe)\n\nrunning 2 tests\ntest b::y ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored;\n"
+    assert results_of(lost)[1] == ["Running tests\\x.rs (x-1.exe): libtest counted 2 passed, 0 failed, 0 ignored, its lines 1, 0, 0"], results_of(lost)
     print("check-unit-tests: selftest ok")
 
 
@@ -142,20 +245,12 @@ def run(package, args, out_dir):
             check=False,
         )
     output = log.read_bytes().decode("utf-8", errors="replace")
-    results = {}
-    for line in output.splitlines():
-        m = RESULT.match(line)
-        if m:
-            name = m.group(1).removesuffix(" - should panic")
-            # The same name in two test binaries of a package: a failure
-            # in either is the test's result.
-            if results.get(name) != "FAILED":
-                results[name] = m.group(2)
+    results, unknown = results_of(output)
     built = "error: could not compile" not in output and "error[E" not in output
     # libtest could not write its report (it says "listing" for any run):
     # results it did not print are lost, so the run cannot be compared.
     cut = "error: io error when listing tests" in output
-    return results, built, proc.returncode, cut, died(output)
+    return results, built, proc.returncode, cut, died(output), unknown
 
 
 def main():
@@ -175,12 +270,13 @@ def main():
     problems = []
     counts = []
     for package, args in RUNS:
-        results, built, code, cut, ended = run(package, args, out_dir)
+        results, built, code, cut, ended, unknown = run(package, args, out_dir)
         if not built:
             problems.append(f"{package}: did not build (see {out_dir / (package + '.log')})")
             continue
         if cut:
             problems.append(f"{package}: libtest's output was cut short, results lost (see {out_dir / (package + '.log')})")
+        problems += [f"{package}: {u} (see {out_dir / (package + '.log')})" for u in unknown]
         for test, how in ended:
             where = f"in {test}" if test else "before a test began"
             problems.append(
