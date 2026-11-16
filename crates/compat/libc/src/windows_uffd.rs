@@ -2128,6 +2128,11 @@ mod tests {
         let unplugged = mem + slot_len;
         mprotect_of(unplugged, slot_len, crate::PROT_NONE).expect("protect(true) of an unplugged slot");
         let read_through_the_handler = |addr: u64, fill: u8| {
+            // Missing and inaccessible, so the read faults to the handler
+            // (a page a call opened would read zeros, with no event to
+            // serve: this test would wait for it instead of failing).
+            assert!(is_missing(addr), "{addr:#x} is not missing");
+            assert!(!host_readable(addr), "{addr:#x} is missing but accessible: a read would see zeros");
             let reader = std::thread::spawn(move || {
                 // SAFETY: registered memory; the read waits for the fill.
                 unsafe { core::ptr::read_volatile(addr as *const u8) }
@@ -2284,6 +2289,163 @@ mod tests {
     #[ignore = "run by test_a_registered_page_its_protection_denies_is_no_userfault"]
     fn denied_write_child() {
         denied_access(crate::PROT_READ, true);
+    }
+
+    /// The state and protection of the page at `addr` (`VirtualQuery`):
+    /// `None` for a page not committed, else its protection.
+    fn committed_protection(addr: u64) -> Option<u32> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        assert_ne!(unsafe { VirtualQuery(addr as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) }, 0);
+        (mbi.State == MEM_COMMIT).then_some(mbi.Protect)
+    }
+
+    /// Whether the host can read the page at `addr` without a fault: a
+    /// committed page whose protection allows a read.
+    fn host_readable(addr: u64) -> bool {
+        matches!(committed_protection(addr), Some(p) if p == PAGE_READONLY || p == PAGE_READWRITE)
+    }
+
+    /// Registered memory of both kinds the backend has: an ordinary
+    /// mapping (its missing pages `PAGE_NOACCESS`) and a `MAP_NORESERVE` one
+    /// (a reserved section, its missing pages not committed), each with its
+    /// userfaultfd; `f(kind, ctx, user, mem)` for each, 64 KiB registered.
+    fn on_both_kinds(mut f: impl FnMut(&str, usize, c_int, u64)) {
+        for (kind, mem) in [("ordinary", map(64 << 10)), ("reserved", map_noreserve(64 << 10))] {
+            let (ctx, user) = create(0, false, true).unwrap();
+            register(ctx, mem, 64 << 10).unwrap();
+            f(kind, ctx, user, mem);
+        }
+    }
+
+    /// The protection asked of a missing page is the one it has once
+    /// filled: by a copy, by a zero page, and after a discard made it
+    /// missing again and a copy filled it, as Linux's pages take their
+    /// vma's protection (the macOS backend's test of the same name); while
+    /// missing it stays inaccessible to the host, so an access is still a
+    /// userfault.
+    #[test]
+    fn test_a_filled_page_takes_the_protection_asked_while_it_was_missing() {
+        on_both_kinds(|kind, ctx, user, mem| {
+            mprotect_of(mem, 2 * PAGE, crate::PROT_READ).unwrap();
+            assert!(is_missing(mem) && !host_readable(mem), "{kind}: a missing page became accessible");
+            let data = std::vec![0x5au8; PAGE as usize];
+            // SAFETY: `data` holds a page.
+            assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, PAGE, true) }, Ok(PAGE));
+            assert_eq!(committed_protection(mem), Some(PAGE_READONLY), "{kind}: copy");
+            assert_eq!(zeropage(ctx, mem + PAGE, PAGE, true), Ok(PAGE));
+            assert_eq!(committed_protection(mem + PAGE), Some(PAGE_READONLY), "{kind}: zeropage");
+            // SAFETY: registered memory of the test's.
+            assert_eq!(unsafe { crate::madvise(mem as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+            assert!(is_missing(mem) && !host_readable(mem), "{kind}: discarded, the page is accessible");
+            // SAFETY: `data` holds a page.
+            assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, PAGE, true) }, Ok(PAGE));
+            assert_eq!(committed_protection(mem), Some(PAGE_READONLY), "{kind}: copy after a discard");
+            // SAFETY: filled and readable.
+            assert_eq!(unsafe { core::ptr::read_volatile(mem as *const u8) }, 0x5a);
+            release(ctx, user);
+        });
+    }
+
+    /// A virtio-mem slot unplugged and plugged again after a restore through
+    /// a userfaultfd, as Firecracker does it: a filled page made `PROT_NONE`
+    /// (unplugged) or `PROT_READ`, then discarded (devices/virtio/mem
+    /// `update_slot` before `discard_range`), then made read-write; the
+    /// handler's next fill there lands, as on Linux, where the discard leaves
+    /// the pages missing in their vma (the macOS backend's test of the same
+    /// name, where the fill's alias had taken the page's protection and the
+    /// process died by SIGBUS). Here the fill writes through the range's
+    /// alias, a view of its own whose protection `mprotect` of the guest's
+    /// view does not change; a fill made before the plug lands too and the
+    /// page takes the protection asked.
+    #[test]
+    fn test_a_slot_unplugged_and_plugged_again_is_filled_through_its_alias() {
+        for closed in [crate::PROT_NONE, crate::PROT_READ] {
+            on_both_kinds(|kind, ctx, user, mem| {
+                let data = std::vec![0x5au8; PAGE as usize];
+                for p in 0..2 {
+                    // SAFETY: `data` holds a page.
+                    assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem + p * PAGE, PAGE, true) }, Ok(PAGE));
+                }
+                mprotect_of(mem, 2 * PAGE, closed).unwrap();
+                // SAFETY: registered memory of the test's.
+                assert_eq!(unsafe { crate::madvise(mem as *mut c_void, 2 * PAGE as usize, crate::MADV_DONTNEED) }, 0);
+                assert!(is_missing(mem) && is_missing(mem + PAGE), "{kind} {closed}: not missing after the discard");
+                // The second page filled while still closed.
+                let other = std::vec![0x6bu8; PAGE as usize];
+                // SAFETY: `other` holds a page.
+                assert_eq!(unsafe { copy(ctx, other.as_ptr(), mem + PAGE, PAGE, true) }, Ok(PAGE), "{kind} {closed}: a fill while closed");
+                mprotect_of(mem, 2 * PAGE, crate::PROT_READ | crate::PROT_WRITE).unwrap();
+                // SAFETY: `data` holds a page.
+                assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, PAGE, true) }, Ok(PAGE), "{kind} {closed}: a fill after the plug");
+                // SAFETY: filled just now, read-write.
+                assert_eq!(unsafe { core::ptr::read_volatile(mem as *const u8) }, 0x5a, "{kind} {closed}");
+                // SAFETY: as above.
+                assert_eq!(unsafe { core::ptr::read_volatile((mem + PAGE) as *const u8) }, 0x6b, "{kind} {closed}");
+                assert_eq!(committed_protection(mem), Some(PAGE_READWRITE), "{kind} {closed}");
+                assert_eq!(committed_protection(mem + PAGE), Some(PAGE_READWRITE), "{kind} {closed}");
+                // SAFETY: filled and writable.
+                unsafe { core::ptr::write_volatile((mem + PAGE) as *mut u8, 1) };
+                release(ctx, user);
+            });
+        }
+        // A whole chunk of a reserved section discarded: it gets a new
+        // section, mapped anew in the guest's view and the alias
+        // (`windows_mm::uffd_swap_chunk`).
+        let chunk = crate::windows_mm::UFFD_CHUNK as u64;
+        let (ctx, user) = create(0, false, true).unwrap();
+        let mem = map_noreserve(2 * chunk as usize);
+        register(ctx, mem, 2 * chunk).unwrap();
+        let slot = mem + chunk;
+        let data = std::vec![0x5au8; PAGE as usize];
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), slot, PAGE, true) }, Ok(PAGE));
+        mprotect_of(slot, chunk, crate::PROT_NONE).unwrap();
+        // SAFETY: registered memory of the test's.
+        assert_eq!(unsafe { crate::madvise(slot as *mut c_void, chunk as usize, crate::MADV_DONTNEED) }, 0);
+        assert!(is_missing(slot), "a discarded chunk's page is not missing");
+        mprotect_of(slot, chunk, crate::PROT_READ | crate::PROT_WRITE).unwrap();
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(ctx, data.as_ptr(), slot, PAGE, true) }, Ok(PAGE), "a fill after a whole chunk was discarded");
+        // SAFETY: filled just now, read-write.
+        assert_eq!(unsafe { core::ptr::read_volatile(slot as *const u8) }, 0x5a);
+        assert_eq!(committed_protection(slot), Some(PAGE_READWRITE));
+        release(ctx, user);
+    }
+
+    /// Unregistered, a missing page gets the protection asked of it, as a
+    /// Linux page has its vma's once no userfaultfd has it (the macOS
+    /// backend's test of the same name): in a reserved section at its first
+    /// access, which a read-only page allows, reading zeros.
+    #[test]
+    fn test_an_unregistered_page_takes_the_protection_asked_while_it_was_missing() {
+        on_both_kinds(|kind, ctx, user, mem| {
+            mprotect_of(mem, PAGE, crate::PROT_READ).unwrap();
+            assert!(!host_readable(mem), "{kind}: a missing page is accessible");
+            assert_eq!(unregister(ctx, mem, 64 << 10), Ok(()));
+            // SAFETY: unregistered memory the protection lets the host read.
+            assert_eq!(unsafe { core::ptr::read_volatile(mem as *const u8) }, 0, "{kind}");
+            assert_eq!(committed_protection(mem), Some(PAGE_READONLY), "{kind}");
+            release(ctx, user);
+        });
+    }
+
+    /// Released with its userfaultfd, a missing page gets the protection
+    /// asked of it, as a Linux page has its vma's once the userfaultfd is
+    /// gone (fs/userfaultfd.c `userfaultfd_release` clears each vma's
+    /// userfaultfd flags only; the macOS backend's test of the same name).
+    #[test]
+    fn test_a_released_page_takes_the_protection_asked_while_it_was_missing() {
+        on_both_kinds(|kind, ctx, user, mem| {
+            mprotect_of(mem, PAGE, crate::PROT_READ).unwrap();
+            assert!(!host_readable(mem), "{kind}: a missing page is accessible");
+            release(ctx, user);
+            // SAFETY: released memory the protection lets the host read.
+            assert_eq!(unsafe { core::ptr::read_volatile(mem as *const u8) }, 0, "{kind}");
+            assert_eq!(committed_protection(mem), Some(PAGE_READONLY), "{kind}");
+        });
     }
 
     #[test]
