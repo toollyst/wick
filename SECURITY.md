@@ -210,8 +210,13 @@ upstream Firecracker and its jailer.
   that their owner may write, the sandbox's outer bound, so that a lock file it made goes with its device; it removes
   only one its own open made (`O_CREAT|O_EXCL`), the one its lock is on, by its identity, never one that was there,
   whatever its mode (`test_the_creator_makes_a_name_nobody_made`, `test_a_creator_leaves_an_operators_lock_file`,
-  `test_a_jail_reaches_only_lock_files_in_its_network`). A killed creator's lock file stays, nobody's, as its
-  endpoints do (`test_a_killed_creators_lock_file_stays_and_is_nobodys`).
+  `test_a_jail_reaches_only_lock_files_in_its_network`). A lock file a creator made can stay after it, nobody's, two
+  ways: the creator was killed, as its endpoints stay
+  (`test_a_killed_creators_lock_file_stays_and_is_nobodys`), or, in an ordinary run, another creator's open locked
+  the new file first: xnu makes the file and then locks it (bsd/vfs/vfs_syscalls.c open1), so the maker fails busy
+  and never holds it, and the one that holds it found it, did not make it, and leaves it at its drop
+  (`test_creators_racing_a_lock_files_removal_never_both_hold_it`). Either way a user's open of the name is still
+  refused for want of the switch's socket, and the next creator opens the file as it is and leaves it.
 - **macOS jailer: a root supervisor per jail, for the freezer.** macOS has no cgroup freezer, so every jail gets a
   supervisor: a fork of the jailer made just before the exec, which stays root (`pid_suspend` needs root), in a
   session of its own, chrooted to `/var/empty`, with only its standard descriptors (standard error is

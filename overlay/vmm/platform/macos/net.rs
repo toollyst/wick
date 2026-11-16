@@ -367,9 +367,11 @@ fn is_busy(err: &TapError) -> bool {
 /// makes it, 0644 (O_CREAT|O_EXCL: only a file its own open made is its),
 /// and removes it when the device goes, as a TAP root made without
 /// TUNSETPERSIST goes at its close; a lock file that was there it leaves,
-/// whatever its mode, and a killed creator's stays: the next opener takes
-/// it as it is, and a user's open of the name is still refused for want of
-/// the switch's socket.
+/// whatever its mode. A creator's file stays, nobody's, when the creator
+/// was killed, and when another creator's open locked it first (xnu makes
+/// the file, then locks it: the maker fails busy, and the holder found it,
+/// not made): the next opener takes it as it is, and a user's open of the
+/// name is still refused for want of the switch's socket.
 struct IfaceLock {
     fd: OwnedFd,
     /// The network's descriptor in a jail, where `path` is relative.
