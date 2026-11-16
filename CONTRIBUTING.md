@@ -189,9 +189,14 @@ A sentence about a test's run (it has not run, or it passed, failed or ran
 in run N; a test is a unit test's or upstream pytest function's backquoted
 name, an alias, or a scenario stage such as `boot-test net`) is checked against `docs/evidence/runs.tsv`, which only
 `tools/ci-results.py collect RUN_ID` writes, from the run's `results-<job>`
-artifacts (`gh`, read-only; `--from DIR` for a PC run's results.tsv). It
-keeps only the rows of the tests the documents name, so the commit that
-first names a test in a run claim, or cites a run, also collects that run.
+artifacts (`gh`, read-only; `--from DIR` for a PC run's results.tsv). What
+it keeps is bounded by what is cited: a run's rows are those of the tests a
+document sentence names together with that run's id, and the newest run
+collected keeps also every test a "not run" claim names, as it is the run
+that answers them; collecting a newer run shrinks the one before to its
+cited rows (it never removes a cited one). So the commit that cites a run
+collects it, and a sentence citing an older run names only tests that run
+kept.
 Artifacts last 14 days: a run older than that can no longer be collected,
 and a document cannot cite it (the rows already collected stay, checked
 against the hash collect recorded in `docs/evidence/runs-index.tsv`). The

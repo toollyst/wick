@@ -575,9 +575,32 @@ def check_run_claims(root, repo, documents, evidence_since=None):
     return errors, warnings
 
 
+def cited_and_claimed(docs, aliases, grammar):
+    """({run: subjects a sentence names with that run's id}, the subjects of
+    every "not run" claim: those a newer run answers. A historical claim names
+    its run, so it is in the first.)"""
+    cited, claimed = {}, set()
+    for text in docs:
+        for _, sentence, _ in sentences("", text):
+            subs = subjects(sentence, aliases)
+            if not subs:
+                continue
+            for rid in RUN_ID.findall(sentence):
+                cited.setdefault(rid, set()).update(subs)
+            if any(p.search(sentence) for p in grammar["not-run"]):
+                claimed |= subs
+    return cited, claimed
+
+
 def collect(root, run, inputs, docs):
-    """Adds run's rows (from its results-* files) to the evidence, filtered
-    to the names the documents mention, and its line to the index."""
+    """Adds run's rows (from its results-* files) to the evidence and its line
+    to the index. What is kept is bounded by what is cited: a run's rows are
+    those of the subjects a document sentence names together with that run's
+    id, and the newest run collected (the index's last line) keeps also the
+    subjects of every "not run" claim, since it is the run that answers them. When a newer run is collected, the one before it shrinks to
+    its cited rows, and its rows_sha256 is written anew (a hand edit of the
+    rows still fails it; inputs_sha256 stays the hash of the results files
+    the run's rows came from)."""
     texts = []
     new = []
     for p in inputs:
@@ -599,14 +622,25 @@ def collect(root, run, inputs, docs):
         raise SystemExit("collect: the evidence does not check: " + "; ".join(errors))
     if run in runs:
         raise SystemExit(f"collect: run {run} is in the evidence already")
-    names = doc_subjects(docs, new + old)
+    docs = list(docs)
+    aliases = {r["alias"] for r in new + old if r["alias"]}
+    cited, claimed = cited_and_claimed(docs, aliases, load_grammar(root))
+    names = cited.get(run, set()) | claimed
     keep = [r for r in new if any(row_is(r, s) for s in names)]
-    allrows = old + keep
     ev, idx = root / EVIDENCE, root / INDEX
-    ev.parent.mkdir(parents=True, exist_ok=True)
-    body = "".join(run_block(allrows, r) for r in sorted({x["run"] for x in allrows}, key=int))
-    ev.write_text(HEADER + "\n" + "\t".join(COLUMNS) + "\n" + body, encoding="utf-8")
     lines = idx.read_text(encoding="utf-8").splitlines() if idx.is_file() else ["\t".join(INDEX_COLUMNS)]
+    # The newest run before this one shrinks to its cited rows.
+    if len(lines) > 1:
+        prev = lines[-1].split("\t")[0]
+        old = [r for r in old if r["run"] != prev or any(row_is(r, s) for s in cited.get(prev, ()))]
+        f = lines[-1].split("\t")
+        f[2] = sha256(run_block(old, prev))
+        lines[-1] = "\t".join(f)
+    allrows = old + keep
+    ev.parent.mkdir(parents=True, exist_ok=True)
+    order = [line.split("\t")[0] for line in lines[1:]] + [run]
+    body = "".join(run_block(allrows, r) for r in order if any(x["run"] == r for x in allrows))
+    ev.write_text(HEADER + "\n" + "\t".join(COLUMNS) + "\n" + body, encoding="utf-8")
     lines.append("\t".join((run, commits.pop(), sha256(run_block(allrows, run)),
                             sha256(b"".join(sorted(texts))))))
     idx.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -789,6 +823,30 @@ def claims_selftest(expect):
         errors, _ = check_run_claims(repo, repo, {"s.md": STAGE_DOC}, 43688550565)
         expect("stages and pytest tests", [e[:len(w)] for e, w in zip(errors, STAGE_ERRORS)] + errors[3:],
                STAGE_ERRORS)
+        # What collect keeps is bounded by what is cited: a run keeps the rows
+        # a sentence names with its id, and the newest run also those of the
+        # status claims; collecting a newer run shrinks the one before to its
+        # cited rows, and never removes one of them.
+        bound = {"c.md": "`test_cited` failed in run 43900000001.\n`test_claimed` has not run yet.\n"}
+
+        def one(run, names):
+            out = repo / f"results-{run}.tsv"
+            ctx = (run, after, "macos", "macOS 26.7.2 25G332", "Apple M2 Pro (Virtual)")
+            write_rows(out, ctx, "wick", "unit", [("c", f"t::{n}", "fail", "") for n in names])
+            return out
+
+        kept, _ = collect(repo, "43900000001", [one("43900000001", ["test_cited", "test_claimed", "test_other"])],
+                          bound.values())
+        expect("the newest run keeps cited and claimed rows", kept, 2)
+        kept, _ = collect(repo, "43900000002", [one("43900000002", ["test_cited", "test_claimed"])], bound.values())
+        rows, _, errs = load_evidence(repo)
+        expect("the run before shrinks to its cited rows",
+               sorted(r["name"] for r in rows if r["run"] == "43900000001"), ["t::test_cited"])
+        expect("the newest keeps the claimed row", (kept, sorted(r["name"] for r in rows if r["run"] == "43900000002")),
+               (1, ["t::test_claimed"]))
+        expect("the shrunk evidence checks", errs, [])
+        errors, _ = check_run_claims(repo, repo, {"c.md": bound["c.md"].splitlines()[0]}, 43688550565)
+        expect("a cited row answers its claim after the shrink", errors, [])
         # A row edited by hand fails its run's hash.
         ev = repo / EVIDENCE
         ev.write_text(ev.read_text().replace("\tfail\t", "\tpass\t"))
@@ -860,7 +918,10 @@ def main():
                      help="a failure the job expects, with the job's own evidence for it")
     val = sub.add_parser("validate")
     val.add_argument("files", nargs="+")
-    col = sub.add_parser("collect", help="add a run's results to docs/evidence (the only writer)")
+    collect_rule = ("add a run's results to docs/evidence (the only writer); a run keeps the rows a document "
+                    "sentence cites with its id, the newest run also those of every \"not run\" claim, and the run "
+                    "before it shrinks to its cited rows")
+    col = sub.add_parser("collect", help=collect_rule, description=collect_rule)
     col.add_argument("run")
     col.add_argument("--from", dest="src", metavar="DIR",
                      help="the run's results-* files already here (a PC run's results.tsv); default: download "
