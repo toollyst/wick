@@ -5,6 +5,7 @@
 already writes.
 
     tools/ci-results.py add READER INPUT... --out FILE [--suite S] [--tree T] [--kind K] [--alias NAME=SHORT]...
+                            [--xfail NAME=REASON]...
     tools/ci-results.py validate FILE...
     tools/ci-results.py --selftest
 
@@ -29,6 +30,12 @@ name, alias, result, detail. result is pass, fail, skip, xfail or crash. A
 test the run did not execute has no row: there is no "not run" value, so
 nothing can claim it. Inside a field, a tab, a newline and a backslash are
 written \\t, \\n and \\\\. One run, commit, job, host and cpu per file.
+
+A stage or test the job expects to fail on its host (the vmnet stage on a
+runner without Hypervisor.framework) is `--xfail NAME=REASON`: its `fail`
+row becomes `xfail`, its detail starting `expected: REASON`. REASON is the
+job's own evidence (the line it printed), not a remark. A NAME with no row,
+or whose row did not fail, is an error: the expectation was wrong.
 
 The run's context comes from the environment: WICK_RESULTS_RUN (default
 GITHUB_RUN_ID), WICK_RESULTS_COMMIT (default GITHUB_SHA), WICK_RESULTS_JOB
@@ -222,6 +229,26 @@ def context():
         raise SystemExit("ci-results: no job: set WICK_RESULTS_JOB")
     host, cpu = host_and_cpu()
     return run, commit, job, host, cpu
+
+
+def expect_failures(rows, xfails):
+    """`rows` with the failures `xfails` ({name: reason}) expects as
+    `xfail`; an expected failure with no row, or a row that did not fail,
+    stops with the reason."""
+    seen = set()
+    out = []
+    for suite, name, result, detail in rows:
+        if name in xfails:
+            seen.add(name)
+            if result != "fail":
+                raise SystemExit(f"ci-results: {name} was to fail ({xfails[name]}) and is {result}")
+            detail = f"expected: {xfails[name]}" + (f" | {detail.strip()}" if detail.strip() else "")
+            result = "xfail"
+        out.append((suite, name, result, detail))
+    missing = sorted(set(xfails) - seen)
+    if missing:
+        raise SystemExit(f"ci-results: no result for {', '.join(missing)}, which --xfail expects to fail")
+    return out
 
 
 def write_rows(out, ctx, tree, kind, rows, aliases=None):
@@ -575,6 +602,22 @@ def selftest():
                                                "FAIL: dead owner: want taken, screen kept\nnoise\n")}
     expect("lines", got, {"live owner": "pass", "dead owner": "fail"})
 
+    # An expected failure: macos-15-root-vmnet's vmnet stage, which fails on
+    # a runner without Hypervisor.framework (CI run 43800980377).
+    vmnet = [("tools/macos/boot-test.py", "vmnet", "fail", "the API's first answer: GET / -> 500"),
+             ("tools/macos/boot-test.py", "other", "pass", "")]
+    why = "kern.hv_support: no such oid (a kernel without HYPERVISOR)"
+    got = expect_failures(vmnet, {"vmnet": why})
+    expect("xfail", got[0], ("tools/macos/boot-test.py", "vmnet", "xfail", f"expected: {why} | the API's first answer: "
+                                                                           "GET / -> 500"))
+    expect("xfail leaves the rest", got[1], vmnet[1])
+    for case, rows, names in (("passed", [vmnet[1]], {"other": why}), ("no row", vmnet, {"vmnet": why, "gone": why})):
+        try:
+            expect_failures(rows, names)
+            fails.append(f"xfail {case}: no error")
+        except SystemExit:
+            pass
+
     # The format: what add writes validates; what breaks it does not.
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "results.tsv"
@@ -718,6 +761,8 @@ def main():
     add.add_argument("--kind", choices=sorted(KINDS))
     add.add_argument("--alias", action="append", default=[], metavar="NAME=SHORT",
                      help="the short name the docs use for a test (MOVEUNDERVCPU)")
+    add.add_argument("--xfail", action="append", default=[], metavar="NAME=REASON",
+                     help="a failure the job expects, with the job's own evidence for it")
     val = sub.add_parser("validate")
     val.add_argument("files", nargs="+")
     col = sub.add_parser("collect", help="add a run's results to docs/evidence (the only writer)")
@@ -742,14 +787,21 @@ def main():
         if not sep or not name or not short:
             ap.error(f"--alias {a_!r}: NAME=SHORT")
         aliases[name] = short
-    ctx = context()
-    total = 0
+    xfails = {}
+    for x in a.xfail:
+        name, sep, reason = x.partition("=")
+        if not sep or not name or not reason.strip():
+            ap.error(f"--xfail {x!r}: NAME=REASON")
+        xfails[name] = reason.strip()
+    rows = []
     for p in a.inputs:
         if not Path(p).is_file():
             raise SystemExit(f"ci-results: {p}: no such file (a step that did not run writes none; "
                              "run this step only when it did)")
-        total += write_rows(a.out, ctx, a.tree, a.kind or DEFAULT_KIND[a.reader], READERS[a.reader](p, a.suite),
-                            aliases)
+        rows.append(READERS[a.reader](p, a.suite))
+    flat = expect_failures([r for rs in rows for r in rs], xfails)
+    ctx = context()
+    total = write_rows(a.out, ctx, a.tree, a.kind or DEFAULT_KIND[a.reader], flat, aliases)
     print(f"ci-results: {total} rows from {len(a.inputs)} file(s) into {a.out}")
     return 0
 

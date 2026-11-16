@@ -804,6 +804,7 @@ jobs:
       - uses: ./.github/actions/upstream
       - run: tools/setup.sh
       - name: boot-test.sh's vmnet stage as root, before macOS 26
+        id: vmnet
         run: |
           sudo python3 --version
           set +e
@@ -822,17 +823,20 @@ jobs:
           uname -m
           uname -v
           if hv=$(sysctl -n kern.hv_support 2>/dev/null); then
-            echo "kern.hv_support: $hv"
+            hvline="kern.hv_support: $hv"
           else
-            echo "kern.hv_support: no such oid (a kernel without HYPERVISOR)"
+            hvline="kern.hv_support: no such oid (a kernel without HYPERVISOR)"
             hv=0
           fi
+          echo "$hvline"
           echo "kern.hv_vmm_present: $(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 'no such oid')"
           if [ "$hv" = 0 ]; then
             # Expected: no Hypervisor.framework, so no VM: the stage fails,
             # and Firecracker says why and exits with its own code (the
             # build's error, patches/0050), not with a panic of its API thread.
             echo "expected: the vmnet stage fails here (no Hypervisor.framework on this runner)"
+            # Its results row says so, with this line as the reason.
+            echo "xfail=vmnet=$hvline" >> "$GITHUB_OUTPUT"
             if [ "$rc" = 0 ] || ! grep -q "^FAIL  vmnet: " "$out/summary.txt"; then
               echo "the vmnet stage did not fail as it must without Hypervisor.framework (exit $rc)"
               exit 1
@@ -872,12 +876,16 @@ jobs:
         if: always() && !cancelled()
         env:
           WICK_RESULTS_JOB: macos-15-root-vmnet
+          # The stage's expected failure, with the stage step's own
+          # kern.hv_support line (empty where the stage must pass).
+          XFAIL: ${{ steps.vmnet.outputs.xfail }}
         run: |
           # The newest run: its directory is named by its time, the glob sorted.
           d=""
           for x in build/boot-test/*/vmnet; do d="$x"; done
           if [ -n "$d" ] && [ -f "$d/summary.txt" ]; then
-            python3 -I tools/ci-results.py add summary "$d/summary.txt" --suite tools/macos/boot-test.py --out "$RUNNER_TEMP/results.tsv"
+            python3 -I tools/ci-results.py add summary "$d/summary.txt" --suite tools/macos/boot-test.py \
+              --out "$RUNNER_TEMP/results.tsv" ${XFAIL:+--xfail "$XFAIL"}
           fi
           r="$RUNNER_TEMP/results.tsv"
           if [ -f "$r" ]; then python3 -I tools/ci-results.py validate "$r"; else echo "no results: no test step wrote its output"; fi
