@@ -530,9 +530,19 @@ fn refuse(name: &str, why: fmt::Arguments<'_>) -> TapError {
 /// running microVM (upstream's filter has no geteuid), and a device
 /// hot-plugged into one looks the directory up
 /// (`test_a_bare_name_hotplugged_without_a_network_opens`).
+///
+/// In the crate's own tests only, [`TEST_ENDPOINT_DIR`] names another
+/// directory: tools/macos/check-unit-tests.py gives each test binary an empty
+/// one and fails on what is left in it but the files listed in
+/// tools/macos/unit-test-litter.txt (two of upstream's tests leak their
+/// devices), so that no run fills the user's directory and new litter fails.
 pub fn user_endpoint_dir() -> io::Result<PathBuf> {
     static DIR: std::sync::OnceLock<Result<PathBuf, i32>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
+        #[cfg(test)]
+        if let Some(dir) = std::env::var_os(TEST_ENDPOINT_DIR) {
+            return Ok(PathBuf::from(dir));
+        }
         let mut buf = vec![0u8; usize::try_from(libc::PATH_MAX).unwrap()];
         // SAFETY: confstr into a buffer of the given size.
         let len = unsafe { libc::confstr(CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr().cast(), buf.len()) };
@@ -545,6 +555,11 @@ pub fn user_endpoint_dir() -> io::Result<PathBuf> {
     .clone()
     .map_err(io::Error::from_raw_os_error)
 }
+
+/// The variable that names the user's directory of endpoints in the crate's
+/// own tests ([`user_endpoint_dir`]).
+#[cfg(test)]
+pub const TEST_ENDPOINT_DIR: &str = "WICK_TEST_ENDPOINT_DIR";
 
 /// Finds the user's directory of endpoints ([`user_endpoint_dir`]), and
 /// makes it and this instance's in it ([`endpoint_dir`]) if `make` (the

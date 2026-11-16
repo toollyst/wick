@@ -1,0 +1,18 @@
+# Files a crate's unit tests leave in the endpoint directory that
+# tools/macos/check-unit-tests.py gives each test binary (WICK_TEST_ENDPOINT_DIR,
+# read by vmm's own tests only: overlay/vmm/platform/macos/net.rs), each with
+# the test that leaves it. The check fails on a file left that is not listed
+# here, and on a listed one that is no longer left.
+#
+#   <crate> <path relative to the endpoint directory> <test>
+#
+# Upstream's test_read_tap_fail_event_handler and test_tx_tap_failure
+# (src/vmm/src/devices/virtio/net/device.rs) close their device's descriptor
+# and then std::mem::forget their TestHelper ("dropping th would double close
+# the tap fd"), so the device's drop, which removes its endpoint and its lock
+# file, never runs. Each takes the lowest free number of `net-device%d`
+# (test_utils.rs, default_net); with one test thread they run in this order.
+vmm net-device0.lock devices::virtio::net::device::tests::test_read_tap_fail_event_handler
+vmm anonymous-instance/net-device0 devices::virtio::net::device::tests::test_read_tap_fail_event_handler
+vmm net-device1.lock devices::virtio::net::device::tests::test_tx_tap_failure
+vmm anonymous-instance/net-device1 devices::virtio::net::device::tests::test_tx_tap_failure

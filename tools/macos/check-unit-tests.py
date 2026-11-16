@@ -9,8 +9,15 @@ limit), and the check fails on:
   - a failure the list does not name;
   - a listed test that passes (or is ignored, or did not run);
   - a listed name that is not a test of its crate;
-  - a test binary that does not finish in time, or does not build.
-So nothing goes unrun silently, and the list cannot rot.
+  - a test binary that does not finish in time, or does not build;
+  - a file a crate's tests leave in their endpoint directory that
+    tools/macos/unit-test-litter.txt does not list, or a listed one they no
+    longer leave. Each test binary is given an empty directory of its own
+    for the endpoints of interfaces named without `/` (WICK_TEST_ENDPOINT_DIR,
+    which only vmm's own tests read: overlay/vmm/platform/macos/net.rs), in
+    place of the user's, and it is removed after the binary has run.
+So nothing goes unrun silently, nothing is left behind unnoticed, and the
+lists cannot rot.
 
     python3 -I tools/macos/check-unit-tests.py [--crate NAME ...] [--out DIR] [--summary FILE]
 
@@ -34,12 +41,17 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORKSPACE = os.path.join(ROOT, "lib", "firecracker")
 DIFFERENCES = os.path.join(ROOT, "tools", "macos", "unit-test-differences.txt")
+LITTER = os.path.join(ROOT, "tools", "macos", "unit-test-litter.txt")
+# What vmm's tests read for their endpoint directory (net.rs, TEST_ENDPOINT_DIR).
+ENDPOINT_DIR_ENV = "WICK_TEST_ENDPOINT_DIR"
 KINDS = {"no-hvf", "linux-path", "error-text", "bug"}
 # Seconds a test binary may take (the longest, vmm --lib, takes about 6
 # minutes on an M1 Pro).
@@ -90,6 +102,35 @@ def read_differences(path):
     return entries, errors
 
 
+def read_litter(path):
+    """{crate: {path: test}} of the files a crate's tests are known to leave
+    in their endpoint directory, and the errors of the file itself."""
+    entries, errors = {}, []
+    with open(path) as f:
+        for n, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) != 3 or parts[1].startswith("/") or ".." in parts[1].split("/"):
+                errors.append(f"{path}:{n}: not '<crate> <relative path> <test>': {line}")
+                continue
+            crate, rel, test = parts
+            if rel in entries.setdefault(crate, {}):
+                errors.append(f"{path}:{n}: listed twice: {crate} {rel}")
+            entries[crate][rel] = test
+    return entries, errors
+
+
+def left_files(directory):
+    """The paths, relative to `directory`, of what is in it but directories."""
+    out = set()
+    for dirpath, dirnames, filenames in os.walk(directory):
+        for name in filenames + [d for d in dirnames if os.path.islink(os.path.join(dirpath, d))]:
+            out.add(os.path.relpath(os.path.join(dirpath, name), directory))
+    return out
+
+
 def build(args):
     """The test executables cargo builds for `args`, each with its package's
     directory, or the build's error."""
@@ -136,12 +177,13 @@ def listed(exe, cwd, env, ignored=False):
     return {line[: -len(": test")] for line in out.splitlines() if line.endswith(": test")}
 
 
-def run(exe, cwd, env):
+def run(exe, cwd, env, endpoints):
     """(failed names, output), or (None, why) if it did not finish. Run as
-    `cargo test` runs it: in its package's directory."""
+    `cargo test` runs it: in its package's directory, with `endpoints` its
+    endpoint directory."""
     try:
-        p = subprocess.run([exe, "--test-threads=1"], cwd=cwd, env=env, capture_output=True, text=True,
-                           timeout=BINARY_LIMIT)
+        p = subprocess.run([exe, "--test-threads=1"], cwd=cwd, env=dict(env, **{ENDPOINT_DIR_ENV: endpoints}),
+                           capture_output=True, text=True, timeout=BINARY_LIMIT)
     except subprocess.TimeoutExpired:
         return None, f"did not finish in {BINARY_LIMIT} s"
     out = p.stdout + p.stderr
@@ -173,6 +215,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--crate", action="append", help="only these crates (names as in the list)")
     ap.add_argument("--differences", default=DIFFERENCES)
+    ap.add_argument("--litter", default=LITTER)
     ap.add_argument("--out", type=pathlib.Path, help="where each crate's output and every test's result are kept")
     ap.add_argument("--summary", type=pathlib.Path, help="append a Markdown summary here")
     a = ap.parse_args()
@@ -181,7 +224,12 @@ def main():
     rows = []
     counts = []
     entries, errors = read_differences(a.differences)
+    litter, litter_errors = read_litter(a.litter)
+    errors += litter_errors
     all_crates = crates()
+    for crate in litter:
+        if crate not in all_crates:
+            errors.append(f"{a.litter}: crate {crate} is not one this check runs")
     for crate, test in entries:
         if crate not in all_crates:
             errors.append(f"listed crate {crate} is not one this check runs ({', '.join(all_crates)})")
@@ -196,15 +244,24 @@ def main():
         if exes is None:
             errors.append(f"{crate}: the tests do not build:\n    " + "\n    ".join(err))
             continue
-        names, failed, ignored, outputs = set(), set(), set(), {}
+        names, failed, ignored, outputs, left = set(), set(), set(), {}, set()
         log = []
+        finished = True
         for exe, cwd in exes:
             exe_env = package_env(env, cwd)
             names |= listed(exe, cwd, exe_env)
             ignored |= listed(exe, cwd, exe_env, ignored=True)
-            f, out = run(exe, cwd, exe_env)
+            # Short, as the user's (firecracker-net) is: a socket's path must
+            # fit sun_path (104 bytes).
+            endpoints = tempfile.mkdtemp(prefix="fcnet")
+            try:
+                f, out = run(exe, cwd, exe_env, endpoints)
+                left |= left_files(endpoints)
+            finally:
+                shutil.rmtree(endpoints, ignore_errors=True)
             log.append(f"==== {os.path.basename(exe)} (in {cwd})\n{out}\n")
             if f is None:
+                finished = False
                 errors.append(f"{crate}: {os.path.basename(exe)} {out}")
                 continue
             failed |= f
@@ -237,6 +294,14 @@ def main():
         for test in sorted((want & names) - failed):
             why = "is ignored" if test in ignored else "passes"
             errors.append(f"{crate}: listed {test} ({entries[(crate, test)]}) {why}")
+        known = litter.get(crate, {})
+        for rel in sorted(left - set(known)):
+            shown = os.path.relpath(a.litter, ROOT)
+            errors.append(f"{crate}: its tests left {rel} in their endpoint directory "
+                          f"({a.litter if shown.startswith('..') else shown} does not list it)")
+        if finished:
+            for rel in sorted(set(known) - left):
+                errors.append(f"{crate}: listed litter {rel} ({known[rel]}) was not left")
         ran = names - ignored
         totals["pass"] += len(ran - failed)
         totals["listed"] += len(failed & want)

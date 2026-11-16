@@ -270,7 +270,13 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   `tools/macos/unit-test-differences.txt` does not list with its reason, on a
   listed test that passes, and on a listed name that is not a test. A test
   that creates a VM is listed `no-hvf`; `tools/macos/test.sh` runs it on a
-  Mac, signed, in a process of its own. With `--out DIR` it keeps each
+  Mac, signed, in a process of its own. Each test binary gets an empty
+  directory of its own for the endpoints of interfaces named without `/`
+  (`WICK_TEST_ENDPOINT_DIR`, read by vmm's own tests only) in place of the
+  user's `firecracker-net`, removed after it: the check fails on a file left
+  there that `tools/macos/unit-test-litter.txt` does not list with the test
+  that leaves it (two of upstream's net tests `mem::forget` their devices), and
+  on a listed one no longer left. With `--out DIR` it keeps each
   crate's output and every test's result by name (`tests.tsv`); CI's `macos`
   job uploads them as the `macos-unit-tests` artifact.
 - On Windows, `tools/windows/check-unit-tests.py` runs every package's unit
