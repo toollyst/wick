@@ -2679,6 +2679,110 @@ mod tests {
         close(&[ua, ub]);
     }
 
+    /// Pages unregistered from the middle of a range are in no registration,
+    /// and another userfaultfd registers them, as Linux's unregister splits
+    /// the vma and clears the middle one's context (fs/userfaultfd.c, v6.12,
+    /// `userfaultfd_unregister` :1413, `userfaultfd_clear_vma` at :1522;
+    /// `userfaultfd_register` :1239 refuses only a vma another context has,
+    /// :1364 to :1366): each part then faults to
+    /// its own userfaultfd and is filled only through it (a fill through the
+    /// other is `ENOENT`, mm/userfaultfd.c `validate_dst_vma` :23 to :37).
+    /// Here the first userfaultfd's range keeps the middle until all of it is
+    /// unregistered, so the second's register is `EBUSY`.
+    #[test]
+    #[ignore = "fails until a range is cut at an unregister (docs/ARCHITECTURE.md, the UFFDIO_UNREGISTER row: not yet)"]
+    fn test_a_partial_unregister_frees_that_part_for_another_userfaultfd() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let (b, ub) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(3);
+        register(a, mem, 3 * ps).unwrap();
+        assert_eq!(unregister(a, mem + ps, ps), Ok(()));
+        let taken = register(b, mem + ps, ps);
+        assert!(taken.is_ok(), "the unregistered middle is refused to another userfaultfd: {taken:?}");
+        assert!(is_missing(mem) && is_missing(mem + ps) && is_missing(mem + 2 * ps));
+        // A fault in the middle goes to b, not to a.
+        let reader = std::thread::spawn(move || {
+            // SAFETY: registered memory; the read waits for b's fill.
+            unsafe { ptr::read_volatile((mem + ps) as *const u8) }
+        });
+        assert!(readable(ub), "no fault event on the middle's userfaultfd");
+        let mut rec = [0u8; proto::RECORD];
+        assert!(read_full(ub, &mut rec));
+        assert_eq!(words(&rec)[..2], [proto::EVENT_PAGEFAULT, mem + ps]);
+        let mut p = libc::pollfd { fd: ua, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one pollfd.
+        assert_eq!(unsafe { libc::poll(&mut p, 1, 0) }, 0, "the other userfaultfd got the middle's fault");
+        let page = |v: u8| std::vec![v; ps as usize];
+        let (one, two, three) = (page(1), page(2), page(3));
+        // SAFETY: each source holds a page.
+        unsafe {
+            assert_eq!(copy(a, two.as_ptr(), mem + ps, ps, true), Err((libc::ENOENT, 0)), "a filled b's page");
+            assert_eq!(copy(b, two.as_ptr(), mem + ps, ps, true), Ok(ps));
+            assert_eq!(copy(b, one.as_ptr(), mem, ps, true), Err((libc::ENOENT, 0)), "b filled a's page");
+            assert_eq!(copy(a, one.as_ptr(), mem, ps, true), Ok(ps));
+            assert_eq!(copy(a, three.as_ptr(), mem + 2 * ps, ps, true), Ok(ps));
+        }
+        assert_eq!(reader.join().unwrap(), 2);
+        // SAFETY: filled above.
+        unsafe {
+            assert_eq!(ptr::read_volatile(mem as *const u8), 1);
+            assert_eq!(ptr::read_volatile((mem + 2 * ps) as *const u8), 3);
+        }
+        assert_eq!(unregister(a, mem, 3 * ps), Ok(()));
+        close(&[ua, ub]);
+    }
+
+    /// The same userfaultfd registers its own range again: what it has stays
+    /// as it is (a filled page keeps its contents), as Linux's register
+    /// refuses only another context's vma (fs/userfaultfd.c, v6.12, :1364 to
+    /// :1366) and skips one this context already has (mm/userfaultfd.c
+    /// `userfaultfd_register_range` :1851 to :1853). A control for the split,
+    /// which must keep it.
+    #[test]
+    fn test_the_same_userfaultfd_registers_its_range_again() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(2);
+        register(a, mem, 2 * ps).unwrap();
+        let data = std::vec![0x5au8; ps as usize];
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        let again = register(a, mem, 2 * ps);
+        assert!(again.is_ok(), "{again:?}");
+        assert!(!is_missing(mem) && is_missing(mem + ps));
+        // SAFETY: filled above.
+        assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0x5a);
+        assert_eq!(unregister(a, mem, 2 * ps), Ok(()));
+        close(&[ua]);
+    }
+
+    /// Part of a mapping is registered, the rest left as it is, as Linux's
+    /// register splits the vma at the range's edges (mm/userfaultfd.c, v6.12,
+    /// `userfaultfd_register_range` :1825, `vma_modify_flags_uffd` at :1860).
+    /// A control for the split, which must keep it.
+    #[test]
+    fn test_part_of_a_mapping_is_registered() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(4);
+        // SAFETY: the first page of the mapping, before the register; the
+        // last is left untouched, so that registered it would be missing.
+        unsafe { ptr::write_volatile(mem as *mut u8, 7) };
+        register(a, mem + ps, 2 * ps).unwrap();
+        assert!(is_missing(mem + ps) && is_missing(mem + 2 * ps));
+        assert!(!is_missing(mem) && !is_missing(mem + 3 * ps), "pages outside the range were registered");
+        // SAFETY: the pages outside the range, ordinary memory still.
+        unsafe {
+            assert_eq!(ptr::read_volatile(mem as *const u8), 7);
+            assert_eq!(ptr::read_volatile((mem + 3 * ps) as *const u8), 0);
+            ptr::write_volatile((mem + 3 * ps) as *mut u8, 8);
+        }
+        assert_eq!(zeropage(a, mem + ps, 2 * ps, true), Ok(2 * ps));
+        assert_eq!(unregister(a, mem + ps, 2 * ps), Ok(()));
+        close(&[ua]);
+    }
+
     /// The register a race test runs inside a change of memory: its
     /// userfaultfd and range, taken by the first change that runs without
     /// the lock.
