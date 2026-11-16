@@ -212,7 +212,7 @@ when they name every CPU and memory node; a limit macOS does not have, such as `
 processes; each jail's own `--cgroup` limits apply). Networking inside a jail is a Unix datagram endpoint, since the sandbox denies IP networking, and the
 jailed Firecracker is not root, which vmnet's bridged mode (and every mode before macOS 26) needs; vmnet-shared
 and vmnet-host on macOS 26 need no root, and a jailed Firecracker starts them (`jailer-test vmnet`; a jailed guest
-on one has not been run yet); with `--netns` vmnet is refused. The endpoint is in
+on one, `jailer-test vmnet-guest`, is written, not yet run); with `--netns` vmnet is refused. The endpoint is in
 the jail's network: `--netns DIR` names a directory you made, the network (a jail without `--netns` has no
 interfaces but vmnet's, and a path name is refused in a jail). Each jail given it has a directory of its
 own inside, `DIR/<id>/`, made by the jailer, where the endpoint of an interface `<name>` is made: `DIR/<id>/<name>`.

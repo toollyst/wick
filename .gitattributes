@@ -1,1 +1,3 @@
 tools/guest-health.txt text eol=lf
+# Cuts of real CI logs: trailing whitespace in them is data (tools/ci-results.py --selftest).
+tools/ci-results-fixtures/** -whitespace
