@@ -3,3 +3,5 @@ tools/guest-health.txt text eol=lf
 tools/ci-results-fixtures/** -whitespace
 # Rows collect writes: a field left empty (a detail, an alias) at a line's end is a trailing tab, data.
 docs/evidence/*.tsv -whitespace
+# Patches tools/patches.sh export writes: an empty context line of a hunk is a single space, the patch format.
+patches/*.patch -whitespace
