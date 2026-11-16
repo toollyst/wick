@@ -141,7 +141,9 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
-      - run: tools/setup.sh
+      - name: Set up upstream and the patch series
+        id: setup
+        run: tools/setup.sh
       - name: Host
         run: |
           uname -a
@@ -159,7 +161,7 @@ jobs:
           tools/linux/compare-unit-tests.py "$RUNNER_TEMP/unit/upstream" "$RUNNER_TEMP/unit/wick" \
             --summary "$GITHUB_STEP_SUMMARY"
       - name: Upload logs
-        if: always()
+        if: always() && steps.setup.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-unit-tests-${{ runner.arch }}
@@ -183,7 +185,9 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
-      - run: tools/setup.sh
+      - name: Set up upstream and the patch series
+        id: setup
+        run: tools/setup.sh
       - name: Give the runner user /dev/kvm
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
@@ -278,7 +282,7 @@ jobs:
           if-no-files-found: error
           retention-days: 90
       - name: Upload logs
-        if: always()
+        if: always() && steps.setup.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-boot-test
@@ -303,7 +307,9 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
-      - run: tools/setup.sh
+      - name: Set up upstream and the patch series
+        id: setup
+        run: tools/setup.sh
       - name: Host
         run: |
           uname -a
@@ -312,6 +318,7 @@ jobs:
           free -g
           df -h /
       - name: Select the tests
+        id: select
         run: |
           if [[ "$SUITE" == full ]]; then
             tests="integration_tests/functional integration_tests/security"
@@ -325,18 +332,22 @@ jobs:
           fi
           echo "TESTS=-n 4 --dist worksteal $tests" >>"$GITHUB_ENV"
           echo "$SUITE: $tests"
+      # The steps after plain upstream's run still run when it has failed,
+      # so that one failure does not hide the rest, but never after a failed
+      # checkout or setup (steps.setup: skipped or failed) or a failed choice
+      # of tests, whose cause they would bury under failures of their own.
       # $TESTS is split into pytest's arguments on purpose.
       - name: Integration tests, plain upstream
         run: |
           # shellcheck disable=SC2086
           tools/linux/integration-tests.sh upstream "$RUNNER_TEMP/it/upstream" $TESTS
       - name: Integration tests, wick
-        if: always()
+        if: (success() || failure()) && steps.setup.outcome == 'success' && steps.select.outcome == 'success'
         run: |
           # shellcheck disable=SC2086
           tools/linux/integration-tests.sh wick "$RUNNER_TEMP/it/wick" $TESTS
       - name: Compare wick with upstream
-        if: always()
+        if: (success() || failure()) && steps.setup.outcome == 'success' && steps.select.outcome == 'success'
         run: |
           tools/linux/compare-integration-tests.py "$RUNNER_TEMP/it/upstream" "$RUNNER_TEMP/it/wick" \
             --summary "$GITHUB_STEP_SUMMARY"
@@ -356,7 +367,7 @@ jobs:
       # names an anonymous mapping "[anon]", which the classifier now
       # reads (its selftest runs first).
       - name: VMM memory by kind of mapping (informational)
-        if: success() || failure()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         continue-on-error: true
         run: |
           python3 -I tools/linux/integration/wick_memdiag.py selftest
@@ -375,10 +386,10 @@ jobs:
             "$RUNNER_TEMP/it/memdiag/memory-peaks.jsonl" | tee -a "$GITHUB_STEP_SUMMARY"
       # Upstream's release.sh, which the tests build with, has no --locked.
       - name: The build kept Cargo.lock
-        if: always()
+        if: (success() || failure()) && steps.setup.outcome == 'success'
         run: git -C lib/firecracker diff --exit-code -- Cargo.lock
       - name: Upload logs
-        if: always()
+        if: always() && steps.setup.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-integration-tests-${{ env.SUITE }}
@@ -596,7 +607,7 @@ jobs:
           python3 -I tools/macos/check-unit-tests.py --out "$RUNNER_TEMP/unit" --summary "$GITHUB_STEP_SUMMARY"
       # Every test's result by name (tests.tsv) and each crate's output.
       - name: Upload the unit tests' output
-        if: always()
+        if: always() && steps.build.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-unit-tests
@@ -617,7 +628,7 @@ jobs:
       # unverified, so an empty result there proves nothing. It prints and
       # never decides the job.
       - name: Terminal allocation reports
-        if: failure()
+        if: failure() && steps.build.outcome == 'success'
         run: |
           /usr/bin/log show --last 30m --style compact \
             --predicate 'process == "kernel" AND (eventMessage CONTAINS "max_retries" OR eventMessage CONTAINS "ptmx_max")' || true
@@ -813,20 +824,20 @@ jobs:
       # a denial killed, but should have had none, is named only here: the
       # kill leaves it no way to print the call.
       - name: Sandbox reports
-        if: failure()
+        if: failure() && steps.build.outcome == 'success'
         run: |
           /usr/bin/log show --last 20m --style compact --predicate 'sender == "Sandbox"' |
             grep -E 'Sandbox: vmm-[0-9a-f]+\(' | grep -v ' allow ' || true
       # Why a test's terminal could not be opened: the macos job's step of the
       # same name says what it looks for, and that an empty result proves nothing.
       - name: Terminal allocation reports
-        if: failure()
+        if: failure() && steps.build.outcome == 'success'
         run: |
           /usr/bin/log show --last 30m --style compact \
             --predicate 'process == "kernel" AND (eventMessage CONTAINS "max_retries" OR eventMessage CONTAINS "ptmx_max")' || true
       # A watchdog's samples with the loaded images, for symbolising by hand.
       - name: Upload the watchdog's samples
-        if: failure()
+        if: failure() && steps.build.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-seatbelt-watchdog-${{ matrix.runner }}
