@@ -1037,7 +1037,9 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     #[allow(clippy::cast_possible_truncation)]
     crate::windows_mm::uffd_protections(start as usize, len as usize, &mut resident);
     let (alias, reserved) = crate::windows_mm::uffd_alias(start as usize, len as usize, &resident).map_err(|e| undo(errno_err(e)))?;
-    if !reserved {
+    if reserved {
+        crate::windows_mm::released_alias(record, alias);
+    } else {
         // Its missing pages are zeroed and opened at their release.
         crate::windows_mm::released_unreserve(record);
     }
@@ -1398,10 +1400,15 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
     let end = start.saturating_add(len);
     let mut done = Vec::new();
     if let Some(_unlocked) = unlocked_change(|| touches(start, end)) {
-        return discard(&mut done);
+        let ret = discard(&mut done);
+        // Released ranges' pages, no registration in reach.
+        released_discard(&done, |_| false);
+        return ret;
     }
     let _guard = lock();
     let ret = discard(&mut done);
+    // Released ranges' pages: those no registration tracks.
+    released_discard(&done, |p| find(p).is_some_and(|(r, page)| Range::test(&r.tracked, page)));
     for r in RANGES.iter() {
         let s = r.start.load(Ordering::Acquire);
         let e = r.end.load(Ordering::Acquire);
@@ -1467,6 +1474,18 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
     ret
 }
 
+/// The pieces a discard made (`done`) where they are released ranges'
+/// pages, those `registered` does not track: closed and pending again in
+/// their records, or a chunk discarded whole given a new section
+/// (`windows_mm::released_discard`), so that they read as zeros, as
+/// Linux's anonymous memory does after `MADV_DONTNEED` or `MADV_FREE`.
+fn released_discard(done: &[(u64, u64)], registered: impl Fn(u64) -> bool) {
+    for &(a, b) in done {
+        #[allow(clippy::cast_possible_truncation)]
+        crate::windows_mm::released_discard(a as usize, (b - a) as usize, |p| registered(p as u64));
+    }
+}
+
 /// Releases userfaultfd `ctx`: its ranges become ordinary memory and every
 /// waiter is woken, as when Linux releases a userfaultfd.
 fn destroy(ctx: usize) {
@@ -1504,9 +1523,9 @@ fn destroy(ctx: usize) {
 }
 
 /// Frees the slot of range `r` (under [`LOCK`]), whose missing pages, if
-/// any, were released: its alias is unmapped or handed to the views that
-/// still have discarded pages to zero through it (`uffd_unalias`), and its
-/// record ends (`released_end`). Its waiters are not woken here.
+/// any, were released: its alias is handed to its chunks' views, which zero
+/// pending pages through it, or unmapped (`uffd_unalias`), and its record
+/// ends (`released_end`). Its waiters are not woken here.
 fn free_range(r: &Range) {
     let (s, e) = (r.start.load(Ordering::Acquire), r.end.load(Ordering::Acquire));
     r.start.store(0, Ordering::SeqCst);
@@ -1520,10 +1539,10 @@ fn give_back(r: &Range, s: u64, e: u64) {
     let alias = r.alias.swap(0, Ordering::AcqRel);
     let reserved = r.reserved.load(Ordering::Acquire);
     if alias != 0 {
-        // Kept with the mapping while its discarded pages are still to be
-        // zeroed through it (pending in its record).
+        // A reserved range's kept with its chunks' views, through which
+        // their pending pages are zeroed.
         #[allow(clippy::cast_possible_truncation)]
-        crate::windows_mm::uffd_unalias(s as usize, (e - s) as usize, alias as usize, reserved);
+        crate::windows_mm::uffd_unalias(s as usize, (e - s) as usize, alias as usize, reserved, reserved.then(|| r.record.load(Ordering::Acquire)));
     }
     if reserved {
         crate::windows_mm::released_end(r.record.load(Ordering::Acquire));
@@ -5587,49 +5606,268 @@ mod tests {
         }
     }
 
-    /// A `MADV_DONTNEED` of a released chunk's pages (registered, then
-    /// unregistered) reads zeros after, as Linux's anonymous memory does
-    /// once its userfaultfd is gone (mm/madvise.c `MADV_DONTNEED` zaps the
-    /// pages): two pages across the split, then the whole second chunk.
-    /// Here the pages keep their data, a defect from before review B1 (one
-    /// view a chunk: PROBEDISCARD "reserved true madvise 0 byte after
-    /// 0x11"), not made by it: SECURITY.md, Not at parity yet.
+    /// The pages of `[at, at + len)` mincore gives as resident.
+    fn resident(at: u64, len: u64) -> std::vec::Vec<u8> {
+        let mut v = std::vec![0u8; (len / PAGE) as usize];
+        // SAFETY: `v` has a byte a page.
+        assert_eq!(unsafe { crate::mincore(at as *mut c_void, len as usize, v.as_mut_ptr()) }, 0);
+        v
+    }
+
+    /// A new anonymous private mapping of `len` bytes, every page written
+    /// with `fill`, registered with a new userfaultfd and unregistered from
+    /// `[from, to)` (offsets): a released range there.
+    fn released_of(len: u64, fill: u8, from: u64, to: u64) -> (u64, c_int, usize) {
+        // SAFETY: a new anonymous mapping, written whole.
+        let mem = unsafe {
+            let m = crate::mmap(ptr::null_mut(), len as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0);
+            assert_ne!(m, crate::MAP_FAILED);
+            ptr::write_bytes(m.cast::<u8>(), fill, len as usize);
+            m as u64
+        };
+        let (ctx, user) = create(0, false, true).unwrap();
+        register(ctx, mem, len).unwrap();
+        assert!(range_of_view(mem as usize).is_some_and(|(r, _)| r.reserved.load(Ordering::Acquire)), "not a chunked range");
+        if to > from {
+            unregister(ctx, mem + from, to - from).unwrap();
+        }
+        (mem, user, ctx)
+    }
+
+    /// A `MADV_DONTNEED` or `MADV_FREE` of a released chunk's pages
+    /// (registered, then unregistered) reads zeros after, as Linux's
+    /// anonymous memory does once its userfaultfd is gone (mm/madvise.c
+    /// zaps the pages; `MADV_FREE` may keep them until reclaim, and zeros
+    /// are one of its outcomes). Before this, a defect from before a
+    /// chunk's two views: the pages kept their data (PROBEDISCARD
+    /// "reserved true madvise 0 byte after 0x11", the one-view tree).
+    /// Each case:
+    /// - two pages across the split, `MADV_DONTNEED`: zeros, a page made
+    ///   read-only before it read-only after (its first access resolves
+    ///   it), a write after it kept; the chunk's commit and charge kept,
+    ///   as a registered partial discard keeps them, and its mincore the
+    ///   same as a registered discard's of the same pages;
+    /// - the same with `MADV_FREE`;
+    /// - a whole chunk: zeros, and its commit and its charge given back
+    ///   (measured before and after: 2 MiB and 0), as a registered chunk
+    ///   discarded whole gives them back;
+    /// - one call over a released chunk and a registered one: the released
+    ///   chunk's pages read zeros, the registered chunk's are missing;
+    /// - a reader of a page while it is discarded sees each word as it was
+    ///   or zero, nothing else;
+    /// - the control: an anonymous `MAP_SHARED` mapping's pages keep their
+    ///   data, as Linux's shmem does.
     #[test]
-    #[ignore = "fails until a released chunk's discard is made (SECURITY.md, Not at parity yet: MADV_DONTNEED of a released userfaultfd chunk keeps its data)"]
     fn test_a_discard_of_a_released_chunk_reads_zeros() {
         let half = crate::windows_mm::chunk_half(CHUNK as usize) as u64;
-        let len = 2 * CHUNK;
-        // SAFETY: a new anonymous mapping.
-        let mem = unsafe {
-            crate::mmap(ptr::null_mut(), len as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0)
-        };
-        assert_ne!(mem, crate::MAP_FAILED);
-        let mem = mem as u64;
         let byte = |at: u64| {
             // SAFETY: mapped memory of ours.
             unsafe { ptr::read_volatile(at as *const u8) }
         };
-        let pages = [half - PAGE, half, CHUNK + PAGE, CHUNK + half];
-        for p in pages {
-            // SAFETY: mapped memory of ours.
-            unsafe { ptr::write_volatile((mem + p) as *mut u8, 0x11) };
-        }
-        let (ctx, user) = create(0, false, true).unwrap();
-        register(ctx, mem, len).unwrap();
-        assert!(range_of_view(mem as usize).is_some_and(|(r, _)| r.reserved.load(Ordering::Acquire)), "not a chunked range");
-        unregister(ctx, mem, len).unwrap();
-        // SAFETY: two pages of ours across the split, then our second chunk.
+        let madvise = |at: u64, len: u64, advice: c_int| {
+            // SAFETY: our mapping.
+            unsafe { crate::madvise(at as *mut c_void, len as usize, advice) }
+        };
+        let charged = |view: u64| crate::windows_mm::charged(view as usize).unwrap_or(0) as u64;
+        // A registered range of one chunk, two pages across its split
+        // discarded: what a registered partial discard leaves.
+        let (reg, reg_user, _) = released_of(CHUNK, 0x11, 0, 0);
+        // Read first, so that the pages are resident (in the working set).
+        assert_eq!((byte(reg + half - PAGE), byte(reg + half)), (0x11, 0x11));
+        let reg_charge = charged(reg);
+        assert_eq!(madvise(reg + half - PAGE, 2 * PAGE, crate::MADV_DONTNEED), 0);
+        assert!(is_missing(reg + half - PAGE) && is_missing(reg + half));
+        let (reg_resident, reg_after) = (resident(reg + half - PAGE, 2 * PAGE), charged(reg));
+        std::eprintln!("RELDISCARD registered partial: charge {reg_charge:#x} -> {reg_after:#x}, mincore {reg_resident:?}");
+        // Released, three chunks.
+        let (mem, user, _) = released_of(3 * CHUNK, 0x11, 0, 3 * CHUNK);
+        // Partial, MADV_DONTNEED, a page read-only.
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::mprotect((mem + half) as *mut c_void, PAGE as usize, crate::PROT_READ) }, 0);
+        let (commit, charge) = (committed(mem, CHUNK), charged(mem));
+        assert_eq!((byte(mem + half - PAGE), byte(mem + half)), (0x11, 0x11));
+        assert_eq!(resident(mem + half - PAGE, 2 * PAGE), [1, 1], "the pages resident before the discard");
+        assert_eq!(madvise(mem + half - PAGE, 2 * PAGE, crate::MADV_DONTNEED), 0);
+        let rel_resident = resident(mem + half - PAGE, 2 * PAGE);
+        let (commit_after, charge_after) = (committed(mem, CHUNK), charged(mem));
+        std::eprintln!(
+            "RELDISCARD released partial: commit {commit:#x} -> {commit_after:#x}, charge {charge:#x} -> {charge_after:#x}, mincore {rel_resident:?}"
+        );
+        assert_eq!((byte(mem + half - PAGE), byte(mem + half), byte(mem + half + PAGE)), (0, 0, 0x11), "MADV_DONTNEED across the split");
+        assert_eq!(states(mem + half, PAGE)[0].1, PAGE_READONLY, "the page read-only before the discard, after its first access");
+        // SAFETY: mapped memory of ours, writable.
+        unsafe { ptr::write_volatile((mem + half - PAGE) as *mut u8, 0x22) };
+        assert_eq!(byte(mem + half - PAGE), 0x22, "a write after the discard");
+        assert_eq!((commit_after, charge_after), (commit, charge), "a partial discard keeps its commit and charge, as a registered one");
+        assert_eq!(rel_resident, reg_resident, "mincore of the discarded pages against a registered discard's");
+        assert_eq!(charge, reg_charge);
+        // Partial, MADV_FREE.
+        assert_eq!(madvise(mem + CHUNK + half - PAGE, 2 * PAGE, crate::MADV_FREE), 0);
+        assert_eq!((byte(mem + CHUNK + half - PAGE), byte(mem + CHUNK + half)), (0, 0), "MADV_FREE across the split");
+        // Whole, the third chunk.
+        let whole = mem + 2 * CHUNK;
+        let (commit, charge) = (committed(whole, CHUNK), charged(whole));
+        assert_eq!(madvise(whole, CHUNK, crate::MADV_DONTNEED), 0);
+        let (commit_after, charge_after) = (committed(whole, CHUNK), charged(whole));
+        std::eprintln!("RELDISCARD released whole chunk: commit {commit:#x} -> {commit_after:#x}, charge {charge:#x} -> {charge_after:#x}");
+        assert_eq!((commit, charge), (CHUNK, CHUNK), "the chunk before");
+        assert_eq!((commit_after, charge_after), (0, 0), "a whole chunk's commit and charge, given back");
+        assert_eq!((byte(whole + PAGE), byte(whole + half)), (0, 0), "the whole chunk");
+        assert_eq!(committed(whole, CHUNK), 2 * PAGE, "the reads committed their pages");
+        // A reader while a page is discarded: each word as it was, or zero.
+        let page = mem + CHUNK + PAGE;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut seen = (0u64, 0u64, 0u64);
+                while !stop.load(Ordering::Relaxed) {
+                    for w in 0..PAGE / 8 {
+                        // SAFETY: mapped memory of ours.
+                        match unsafe { ptr::read_volatile((page + w * 8) as *const u64) } {
+                            0x1111_1111_1111_1111 => seen.0 += 1,
+                            0 => seen.1 += 1,
+                            _ => seen.2 += 1,
+                        }
+                    }
+                }
+                seen
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(madvise(page, PAGE, crate::MADV_DONTNEED), 0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stop.store(true, Ordering::Relaxed);
+        let seen = reader.join().unwrap();
+        std::eprintln!("RELDISCARD a reader during the discard: words as they were {}, zero {}, other {}", seen.0, seen.1, seen.2);
+        assert_eq!(seen.2, 0, "a word neither as it was nor zero");
+        assert!(seen.1 > 0, "the reader saw no zero after the discard");
+        // SAFETY: our mappings, whole; closes the user ends.
         unsafe {
-            assert_eq!(crate::madvise((mem + half - PAGE) as *mut c_void, 2 * PAGE as usize, crate::MADV_DONTNEED), 0);
-            assert_eq!(crate::madvise((mem + CHUNK) as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED), 0);
+            assert_eq!(crate::munmap(mem as *mut c_void, 3 * CHUNK as usize), 0);
+            assert_eq!(crate::munmap(reg as *mut c_void, CHUNK as usize), 0);
+            ws::closesocket(sock(user));
+            ws::closesocket(sock(reg_user));
         }
-        let read: std::vec::Vec<u8> = pages.iter().map(|&p| byte(mem + p)).collect();
-        // SAFETY: our mapping, whole; closes the user end.
+        // One call over a released chunk and a registered one.
+        let (mixed, mixed_user, _) = released_of(2 * CHUNK, 0x11, 0, CHUNK);
+        assert_eq!(madvise(mixed + PAGE, 2 * CHUNK - 2 * PAGE, crate::MADV_DONTNEED), 0);
+        assert_eq!(byte(mixed + half), 0, "the released chunk's page");
+        assert!(is_missing(mixed + CHUNK + half), "the registered chunk's page is missing");
+        // SAFETY: our mapping; closes the user end.
         unsafe {
-            assert_eq!(crate::munmap(mem as *mut c_void, len as usize), 0);
+            assert_eq!(crate::munmap(mixed as *mut c_void, 2 * CHUNK as usize), 0);
+            ws::closesocket(sock(mixed_user));
+        }
+        // The control: shared memory keeps its pages.
+        // SAFETY: a new anonymous shared mapping, written.
+        let shared = unsafe {
+            let m = crate::mmap(ptr::null_mut(), CHUNK as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_SHARED | crate::MAP_ANONYMOUS, -1, 0);
+            assert_ne!(m, crate::MAP_FAILED);
+            ptr::write_bytes(m.cast::<u8>(), 0x33, CHUNK as usize);
+            m as u64
+        };
+        assert_eq!(madvise(shared, CHUNK, crate::MADV_DONTNEED), 0);
+        assert_eq!((byte(shared), byte(shared + half)), (0x33, 0x33), "MAP_SHARED keeps its data");
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::munmap(shared as *mut c_void, CHUNK as usize) }, 0);
+    }
+
+    /// The page [`touch_released_page`] reads, once (0: none).
+    static TOUCH_AT: AtomicU64 = AtomicU64::new(0);
+
+    /// A first access to the page at [`TOUCH_AT`] from another thread, as a
+    /// vCPU's, resolving it (committed and charged), waited for.
+    fn touch_released_page() {
+        let at = TOUCH_AT.swap(0, Ordering::SeqCst);
+        if at != 0 {
+            // SAFETY: a page of a released range of the test's.
+            std::thread::spawn(move || unsafe { ptr::read_volatile(at as *const u8) }).join().unwrap();
+        }
+    }
+
+    /// A page of a released chunk discarded whole that a first access on
+    /// another thread resolves as the discard ends keeps its charge: the
+    /// chunk's charge is given back under the records' lock, which the
+    /// resolve takes, so the resolve comes after it and charges its page
+    /// again (`windows_mm::released_swap`). Given back after the locks were
+    /// dropped, it decommitted the page's charge with the rest: a committed
+    /// section page with none ("committed 0x1000, charged 0x0" on 20348
+    /// with the charge given back so). The access is made by
+    /// `windows_mm::AFTER_RELEASED_DISCARD_LOCKS`.
+    #[test]
+    fn test_a_page_resolved_as_its_released_chunk_is_discarded_keeps_its_charge() {
+        let (mem, user, _) = released_of(CHUNK, 0x11, 0, CHUNK);
+        let charged = |view: u64| crate::windows_mm::charged(view as usize).unwrap_or(0) as u64;
+        assert_eq!(charged(mem), CHUNK);
+        TOUCH_AT.store(mem + PAGE, Ordering::SeqCst);
+        *crate::windows_mm::AFTER_RELEASED_DISCARD_LOCKS.lock().unwrap() = Some(touch_released_page);
+        // SAFETY: our mapping, released.
+        let d = unsafe { crate::madvise(mem as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED) };
+        *crate::windows_mm::AFTER_RELEASED_DISCARD_LOCKS.lock().unwrap() = None;
+        assert_eq!(d, 0);
+        assert_eq!(TOUCH_AT.load(Ordering::SeqCst), 0, "the hook did not run");
+        let (commit, charge) = (committed(mem, CHUNK), charged(mem));
+        std::eprintln!("RELDISCARD a page resolved as its chunk's discard ended: committed {commit:#x}, charged {charge:#x}");
+        // SAFETY: our mapping; closes the user end.
+        unsafe {
+            assert_eq!(crate::munmap(mem as *mut c_void, CHUNK as usize), 0);
             ws::closesocket(sock(user));
         }
-        assert_eq!(read, [0, 0, 0, 0], "the discarded pages of a released chunk: across the split, then the whole second chunk");
+        assert_eq!((commit, charge), (PAGE, PAGE), "the resolved page's commit and its charge");
+    }
+
+    /// RELALIAS, a record: what a released 1 GiB range keeps of its alias.
+    /// A `MAP_NORESERVE` range registered, a page filled in each chunk
+    /// through the alias (UFFDIO_COPY, so that the alias's page tables
+    /// exist), then unregistered whole: the process's private commit
+    /// (PrivateUsage, which counts the page tables) before and after the
+    /// unregister, three rounds; then the same with no page filled, three
+    /// rounds. Since the released discard a released
+    /// chunk keeps its alias's views (`windows_mm::uffd_unalias`); before,
+    /// a range with no stale page dropped them at the release.
+    #[test]
+    #[ignore = "a record: run alone on Windows with --ignored --nocapture"]
+    fn test_what_a_released_range_keeps_of_its_alias_on_record() {
+        let len = 512 * CHUNK;
+        for round in 0..6 {
+            let fills = round < 3;
+            // SAFETY: a new anonymous mapping, committed at first touch.
+            let mem = unsafe {
+                crate::mmap(
+                    ptr::null_mut(),
+                    len as usize,
+                    crate::PROT_READ | crate::PROT_WRITE,
+                    crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(mem, crate::MAP_FAILED);
+            let mem = mem as u64;
+            let (ctx, user) = create(0, false, true).unwrap();
+            register(ctx, mem, len).unwrap();
+            let src = [0x5au8; PAGE as usize];
+            for c in (0..512).filter(|_| fills) {
+                // SAFETY: `src` holds a page.
+                assert_eq!(unsafe { copy(ctx, src.as_ptr(), mem + c * CHUNK + PAGE, PAGE, false) }, Ok(PAGE));
+            }
+            let before = private_commit();
+            unregister(ctx, mem, len).unwrap();
+            let after = private_commit();
+            std::eprintln!(
+                "RELALIAS round {round}, {}: private commit {} KiB before the unregister, {} after ({:+} KiB)",
+                if fills { "a page filled in each chunk" } else { "nothing filled" },
+                before >> 10,
+                after >> 10,
+                (after as i64 - before as i64) / 1024
+            );
+            // SAFETY: our mapping; closes the user end.
+            unsafe {
+                assert_eq!(crate::munmap(mem as *mut c_void, len as usize), 0);
+                ws::closesocket(sock(user));
+            }
+        }
     }
 
     /// A released chunk never filled, on a 2 MiB boundary and advised

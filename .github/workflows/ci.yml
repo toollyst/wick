@@ -1899,6 +1899,10 @@ jobs:
           # chunk.
           alone wick_uffd::tests::test_what_a_chunks_view_swap_costs_on_record
           alone wick_uffd::tests::test_a_chunks_views_cost_on_record
+          # RELALIAS: the private commit a released 1 GiB range keeps of its
+          # alias at the unregister, its 512 chunks each filled through it
+          # and none filled.
+          alone wick_uffd::tests::test_what_a_released_range_keeps_of_its_alias_on_record
           # FILTERREC: how an unhandled exception on a thread pool's thread
           # ends by the child's error mode (0, 2, and 3 as this runner gives
           # its children): a stack overflow at the reserve's end and an

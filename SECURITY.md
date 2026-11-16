@@ -531,16 +531,6 @@ upstream Firecracker and its jailer.
   error 1455" (`test_a_move_whose_guest_view_room_is_taken_is_made`, ignored citing this entry: it ended so on both
   hosts). Linux has no such step: its reclaim frees pages in place. Fix in progress: the chunk's two views are mapped
   (above); swapping them one at a time, so that the other keeps the region's page table, is next.
-- **Windows: a `MADV_DONTNEED` of a released userfaultfd range's pages keeps their data.** A range registered and
-  then unregistered, or whose userfaultfd was released, is anonymous private memory again on Linux, and a
-  `MADV_DONTNEED` there zaps its pages, which read as zeros at the next touch (mm/madvise.c). Here a released range's
-  chunks are still views of their sections, and a discard of a view's pages keeps them, as for a shared mapping, while
-  the userfaultfd side, which discards a registered range's pages, no longer holds the range: the pages read their
-  old data. A balloon's inflation or free page report after a userfaultfd's release would leave the guest's freed
-  pages' contents in place (`test_a_discard_of_a_released_chunk_reads_zeros`, ignored citing this entry). Not made by
-  the chunk's two views: the same with one view a chunk ("PROBEDISCARD reserved true madvise 0 byte after 0x11", a
-  probe on the tree before them, Windows Server 2022 20348). Fix next: a released chunk discarded whole gets a new
-  section, its commit given back; a part of one is zeroed in place.
 - **Without the jailer, the VMM runs as the user who started it** on macOS and Windows: an escape from the VM and
   then the VMM lands as that user (files are then not limited, as on Linux without the jailer).
 - **macOS jailer: no namespaces in the kernel.** macOS has no network or PID namespaces (XNU's system calls,

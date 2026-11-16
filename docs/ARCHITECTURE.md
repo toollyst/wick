@@ -431,6 +431,14 @@ semantics on Win32. The details are in the comments of each
     resolved and run its access again (`test_released_records_reused_under_touching_threads`). So a register is
     refused while 64 registrations' memory is still mapped, registered or released
     (`test_released_records_past_the_table_refuse_a_register`, `test_release_then_munmap_frees_the_record`).
+  - **A discard of released pages makes them pending again** (`released_discard`, from `wick_uffd::discarding`
+    for the pages no registration tracks): a chunk discarded whole gets a new reserved section in its views and
+    its alias's, its commit and charge given back under `RELEASED`'s lock once its pages are pending, so a page
+    a first access resolves meanwhile is charged again after it
+    (`test_a_page_resolved_as_its_released_chunk_is_discarded_keeps_its_charge`); a part is closed, pending
+    with the protection it had, its content dropped through the alias, and zeroed there at its next access. So a
+    record keeps its bitmaps until it is freed (3 bits a page), and its alias is set at the register and kept by
+    every released chunk's view until the view goes (`uffd_unalias`).
   - **Readers: every decision about a record is taken under `RELEASED`'s lock.** The access path finds the record
     holding the page, tests its bits, resolves the page and clears its bit in one critical section, so no reader
     holds a record across its reuse; taking, freeing, the release's flips, `munmap`'s and `mprotect`'s changes are
@@ -438,8 +446,8 @@ semantics on Win32. The details are in the comments of each
     lets an access that cannot concern a record skip the lock. It gives no false "none" for a page that matters:
     the release publishes its record before `destroy` wakes the threads waiting on the range's missing pages, which
     run their access again and find it.
-  - **Lock order:** the userfaultfd's `LOCK`, the region table, `RELEASED`, `CHARGES`. The release does not take the
-    region table: `mprotect` and `munmap` ask `released_overlaps` for a view a record holds.
+  - **Lock order:** the userfaultfd's `LOCK`, the region table, `RELEASED`, `OWED`, `CHARGES`. The release does
+    not take the region table: `mprotect` and `munmap` ask `released_overlaps` for a view a record holds.
   - A released chunk is not a candidate of the reclaim at the memory limit, so its discarded pages keep their charge
     until each is touched or unmapped, where Linux freed them at the discard (the `memory.max` row of
     docs/COMPATIBILITY.md).

@@ -75,7 +75,7 @@ use windows_sys::Win32::System::Memory::{
     PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS,
     PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
     PrefetchVirtualMemory, UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect,
-    VirtualQuery, WIN32_MEMORY_RANGE_ENTRY,
+    VirtualQuery, WIN32_MEMORY_RANGE_ENTRY, DiscardVirtualMemory,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     PSAPI_WORKING_SET_EX_INFORMATION, QueryWorkingSetEx,
@@ -3933,6 +3933,14 @@ pub(crate) fn uffd_swap_chunk(view: usize, len: usize, alias: usize) -> bool {
     }
     forget_owed(view, len);
     drop(t);
+    // Given back after the table's lock, with no page of the new section
+    // committed between: the caller (`wick_uffd::discarding`) holds the
+    // userfaultfd ranges' lock, which every fill of a page of a registered
+    // range takes (UFFDIO_COPY, UFFDIO_ZEROPAGE, the unregister that would
+    // make its pages released), and every page of the chunk is missing, so
+    // a first access waits for the handler's fill rather than committing
+    // one (as [`released_swap`]'s pending pages would; it gives the charge
+    // back under the records' lock for that).
     uncharge(view, len);
     true
 }
@@ -4625,7 +4633,7 @@ enum RecordState {
     Free,
     /// Its registration lives (pages an unregister released may be pending).
     Reserved,
-    /// Its registration is released; freed once no page is pending.
+    /// Its registration is released; freed once its views are gone.
     Released,
 }
 
@@ -4672,16 +4680,36 @@ impl Record {
         }
     }
 
-    /// The page at `addr` is no longer pending; a released record with
-    /// none left gives its bitmaps back (no reader holds them outside the
-    /// lock), and holds its span until its views go.
+    /// The page at `addr` is no longer pending. The record keeps its
+    /// bitmaps until it is freed, for a discard of its released pages to
+    /// make them pending again ([`released_discard`]): 3 bits a page, 96
+    /// KiB a GiB, while the registration's memory is mapped.
     fn resolved(&mut self, addr: usize) {
         if self.get(PENDING, addr) {
             self.put(PENDING, addr, false);
             self.left -= 1;
-            if self.left == 0 && self.state == RecordState::Released {
-                self.bits = None;
-            }
+        }
+    }
+
+    /// The page at `addr` is pending again, to be resolved with
+    /// protection `prot`.
+    fn pend(&mut self, addr: usize, prot: PAGE_PROTECTION_FLAGS) {
+        self.set_prot(addr, prot);
+        self.pend_as_set(addr);
+    }
+
+    /// The protection the page at `addr` takes when it is resolved.
+    fn set_prot(&mut self, addr: usize, prot: PAGE_PROTECTION_FLAGS) {
+        self.put(NOREAD, addr, prot == PAGE_NOACCESS);
+        self.put(NOWRITE, addr, !matches!(prot, PAGE_READWRITE | PAGE_EXECUTE_READWRITE));
+    }
+
+    /// The page at `addr` is pending again, with the protection its bits
+    /// hold.
+    fn pend_as_set(&mut self, addr: usize) {
+        if !self.get(PENDING, addr) {
+            self.put(PENDING, addr, true);
+            self.left += 1;
         }
     }
 
@@ -4744,27 +4772,26 @@ pub(crate) fn released_pend(i: usize, alias: usize, s: usize, len: usize, prot: 
     let r = &mut records[i];
     r.alias = alias;
     for at in (s..e).step_by(PAGE) {
-        if !r.get(PENDING, at) {
-            r.put(PENDING, at, true);
-            r.left += 1;
-        }
-        let p = prot(at);
-        r.put(NOREAD, at, p == PAGE_NOACCESS);
-        r.put(NOWRITE, at, p != PAGE_READWRITE);
+        r.pend(at, prot(at));
     }
 }
 
-/// The registration of record `i` is released: the record gives its
-/// bitmaps back once none of its pages is pending, and is freed once its
-/// views are gone ([`released_view_gone`]).
+/// The alias of record `i`'s registration (`uffd_alias`), through which
+/// its pending committed pages are zeroed: set at the register, so that a
+/// discard of pages unregistered while the range lives
+/// ([`released_discard`]) has it as a release's has.
+pub(crate) fn released_alias(i: usize, alias: usize) {
+    RELEASED.lock().unwrap()[i].alias = alias;
+}
+
+/// The registration of record `i` is released: the record is freed once
+/// its views are gone ([`released_view_gone`]).
 pub(crate) fn released_end(i: usize) {
     let mut records = RELEASED.lock().unwrap();
     let r = &mut records[i];
     r.state = RecordState::Released;
     if r.views == 0 {
         r.free();
-    } else if r.left == 0 {
-        r.bits = None;
     }
 }
 
@@ -5067,6 +5094,182 @@ fn released_prefault(addr: usize, len: usize) {
     }
 }
 
+/// `MADV_DONTNEED` or `MADV_FREE` of `[s, s + len)` (whole pages) where it
+/// is a released userfaultfd range's: the pages a record holds and no
+/// registration tracks (`registered`), in a chunk's views
+/// ([`wick_uffd::discarding`], after the plain discard, which keeps a
+/// view's pages). On Linux that memory is anonymous private memory again,
+/// whose discarded pages read as zeros at their next touch (mm/madvise.c);
+/// here they are the record's pending pages again, as a registered
+/// discard makes its pages missing:
+/// - a chunk discarded whole gets a new, empty reserved section in its
+///   views and its alias's ([`released_swap`]), its commit and charge
+///   given back, as a registered chunk's ([`uffd_swap_chunk`]) and as
+///   Linux frees the pages; every page of it pending, each committed at
+///   its first access with the protection it had;
+/// - a part of a chunk is closed (`PAGE_NOACCESS`, a region at a time,
+///   which stays in one view), pending with the protection it had, and its
+///   content dropped through the alias (`DiscardVirtualMemory`): its first
+///   access zeroes it through the alias and opens it
+///   ([`released_resolve`]). Its commit and charge stay until the chunk
+///   is discarded whole or unmapped, as a registered partial discard's
+///   (a section's page cannot be decommitted: SECTREC-h).
+///
+/// Under the region table's lock and the records', which a first access
+/// resolving a released page holds from its check of the page to its
+/// protection: a page is not closed under a resolve, and an access meets
+/// the page open with its old data, or closed and then pending, which its
+/// resolve gives as zeros, as a Linux access meets the page before the zap
+/// or the zero page after it. A page `PROT_NONE` gave no access stays so.
+pub(crate) fn released_discard(s: usize, len: usize, registered: impl Fn(usize) -> bool) {
+    if RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let e = s.saturating_add(len);
+    {
+        let t = table().lock().unwrap();
+        for b in overlapping(&t, s, e) {
+            let r = &t[&b];
+            if !is_chunk(&r.kind) {
+                continue;
+            }
+            let (n, whole) = (r.len, s <= b && b + r.len <= e && r.holes.is_empty() && !r.lazy);
+            let parts = mapped_parts(r, b, s.max(b), e.min(b + r.len));
+            let mut records = RELEASED.lock().unwrap();
+            let Some(rec) = records.iter_mut().find(|x| x.holds(b) && x.alias != 0) else {
+                continue;
+            };
+            let alias = rec.alias + (b - rec.start);
+            if whole && (b..b + n).step_by(PAGE).all(|p| !registered(p)) && released_swap(rec, b, n, alias) {
+                continue;
+            }
+            for (a, z) in parts {
+                released_close(rec, b, alias, a, z, &registered);
+            }
+        }
+    }
+    #[cfg(test)]
+    if let Some(hook) = *AFTER_RELEASED_DISCARD_LOCKS.lock().unwrap() {
+        hook();
+    }
+}
+
+/// Run by [`released_discard`] once it has dropped its locks: for a test
+/// of a page resolved then ([`released_swap`]'s charge, given back before).
+#[cfg(test)]
+pub(crate) static AFTER_RELEASED_DISCARD_LOCKS: Mutex<Option<fn()>> = Mutex::new(None);
+
+/// [`released_discard`] of the chunk at `view` (`len` bytes, its alias at
+/// `alias`) discarded whole: a new reserved section in its alias's views
+/// and then its own ([`swap_views`], as [`uffd_swap_chunk`]), every page
+/// of it pending in `rec`, with the protection it had (read before the
+/// views go, into its bits only: they are read for a pending page alone),
+/// and then its charge given back ([`uncharge`]) and its owed pages
+/// forgotten ([`forget_owed`]), as [`uffd_swap_chunk`]'s.
+/// `false`, nothing changed but those bits, if no section can be made or
+/// the alias's first view's unmap is refused; a failure once a view is
+/// unmapped ends the VMM, named ([`out_of_memory`]).
+///
+/// The charge is given back under the records' lock, the caller's, once
+/// every page is pending: a first access to a page of the chunk on
+/// another thread resolves it under that lock ([`released_resolve`]), so
+/// it comes after and charges its page again. Given back after the lock,
+/// it decommitted the charge of a page resolved between (a committed
+/// section page with none; test_a_page_resolved_as_its_released_chunk_is
+/// _discarded_keeps_its_charge). Locks: the table's, then the records',
+/// then [`OWED`]'s ([`forget_owed`]) and [`CHARGES`]' ([`uncharge`]), each
+/// alone; nothing takes the records' lock while it holds either of those.
+fn released_swap(rec: &mut Record, view: usize, len: usize, alias: usize) -> bool {
+    let Some(section) = reserved_section(len) else {
+        return false;
+    };
+    let mut at = view;
+    while at < view + len {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        let run = if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            // No answer for the rest of our own chunk's views (which a
+            // query of mapped memory of ours does not give): its protection
+            // is not read, so its open pages keep the bits they have, and
+            // `mbi` (zeroed: no MEM_COMMIT) records none below. They are
+            // pending after the swap all the same, as the rest.
+            view + len - at
+        } else {
+            (mbi.BaseAddress as usize + mbi.RegionSize).min(view + len) - at
+        };
+        if mbi.State == MEM_COMMIT {
+            for p in (at..at + run).step_by(PAGE) {
+                if !rec.get(PENDING, p) {
+                    rec.set_prot(p, mbi.Protect);
+                }
+            }
+        }
+        at += run;
+    }
+    match unmap_alias(alias, len) {
+        Some(true) => {}
+        Some(false) => return false,
+        // SAFETY: plain call.
+        None => out_of_memory(view, unsafe { GetLastError() }),
+    }
+    if !swap_views(&section, view, alias, len, 2) {
+        // SAFETY: plain call.
+        out_of_memory(view, unsafe { GetLastError() });
+    }
+    for p in (view..view + len).step_by(PAGE) {
+        rec.pend_as_set(p);
+    }
+    forget_owed(view, len);
+    uncharge(view, len);
+    true
+}
+
+/// [`released_discard`] of `[a, z)`, a mapped part of the chunk at `view`
+/// (its alias at `alias`): each run of committed pages `rec` has open and
+/// no registration tracks is closed, pending with the protection it had,
+/// and its content dropped through the alias. Windows refusing to close
+/// a run of our own view, the page would keep its data while pending: the
+/// VMM ends, named.
+fn released_close(rec: &mut Record, view: usize, alias: usize, a: usize, z: usize, registered: &impl Fn(usize) -> bool) {
+    let mut at = a;
+    while at < z {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            return;
+        }
+        let end = (mbi.BaseAddress as usize + mbi.RegionSize).min(z);
+        let mut p = at;
+        while mbi.State == MEM_COMMIT && p < end {
+            if registered(p) || rec.get(PENDING, p) {
+                p += PAGE;
+                continue;
+            }
+            let q = (p..end).step_by(PAGE).find(|&q| registered(q) || rec.get(PENDING, q)).unwrap_or(end);
+            if !protect(p, q - p, PAGE_NOACCESS) {
+                // SAFETY: plain call.
+                let err = unsafe { GetLastError() };
+                say_at_the_limit(format_args!(
+                    "wick: guest memory: released userfaultfd pages at {p:#x} ({:#x} bytes) could not be closed for their \
+                     discard (error {err}): the VMM aborts",
+                    q - p
+                ));
+                std::process::abort();
+            }
+            for x in (p..q).step_by(PAGE) {
+                rec.pend(x, mbi.Protect);
+            }
+            // SAFETY: the alias of those pages, closed now in the view; its
+            // content goes, as each is zeroed at its next access.
+            unsafe { DiscardVirtualMemory((alias + (p - view)) as *mut c_void, q - p) };
+            p = q;
+        }
+        at = end;
+    }
+}
+
 /// The view at `base` (`len` bytes, `kind`) is going: its pages out of
 /// the records, then the alias it was handed, if any, unmapped.
 fn unalias(base: usize, len: usize, kind: &Kind) {
@@ -5082,23 +5285,36 @@ fn unalias(base: usize, len: usize, kind: &Kind) {
 }
 
 /// A userfaultfd range `[start, start + len)` is released, its alias at
-/// `alias` ([`uffd_alias`]) no longer the userfaultfd's: handed to the view
-/// if the view has discarded pages still to zero (pending and committed in
-/// its record), which keeps it until it goes, else unmapped now.
+/// `alias` ([`uffd_alias`]) no longer the userfaultfd's: in a reserved
+/// section, each chunk's alias handed to its view, which keeps it until it
+/// goes: a discarded page still to zero (pending and committed in its
+/// record) is zeroed through it, and so is a page a discard after the
+/// release makes pending again ([`released_discard`]), whose chunk, if
+/// discarded whole, gets a new section in both ([`released_swap`]). It
+/// costs address space only (the section's pages are the view's). Else
+/// unmapped now, and the view keeps no alias if it has no page to zero.
 /// `reserved`: the alias is a chunk's views per [`UFFD_CHUNK`]
-/// ([`chunk_views`]), else one view.
-pub(crate) fn uffd_unalias(start: usize, len: usize, alias: usize, reserved: bool) {
+/// ([`chunk_views`]), else one view; `record`, a reserved range's record,
+/// which zeroes its pages through the alias.
+pub(crate) fn uffd_unalias(start: usize, len: usize, alias: usize, reserved: bool, record: Option<usize>) {
     let step = if reserved { UFFD_CHUNK } else { len };
     let mut guard = table().lock().unwrap();
     let t: &mut Table = &mut guard;
+    if let Some(i) = record {
+        RELEASED.lock().unwrap()[i].alias = alias;
+    }
     for o in (0..len).step_by(step) {
         let n = step.min(len - o);
-        if released_has_stale(start + o, n) {
-            if let Some(Kind::View { alias: kept @ None, .. }) =
-                t.get_mut(&(start + o)).filter(|r| r.len == n).map(|r| &mut r.kind)
-            {
-                *kept = Some(alias + o);
-                continue;
+        // A chunk view at the range's address is the range's own: no other
+        // registration overlaps it while it lives (`EBUSY`), and a view
+        // mapped over it since is no userfaultfd chunk.
+        if let Some(r) = t.get_mut(&(start + o)).filter(|r| r.len == n) {
+            let chunk = is_chunk(&r.kind);
+            if (reserved && chunk) || released_has_stale(start + o, n) {
+                if let Kind::View { alias: kept @ None, .. } = &mut r.kind {
+                    *kept = Some(alias + o);
+                    continue;
+                }
             }
         }
         if reserved {
