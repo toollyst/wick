@@ -407,6 +407,33 @@ mod tests {
         assert!(bad.is_empty(), "locks taken without the stack probe:\n{}", bad.join("\n"));
     }
 
+    /// Taking a lock commits no stack beyond what its own frames use, as
+    /// the product takes them: a thread with only a few pages of its stack
+    /// committed, at the job's limit, must not need a new stack page to
+    /// take one. The probe that committed [`PROBE`] bytes first did, and
+    /// the limit refused it: in CI run 43800980377 (Windows Server 2025
+    /// 26100) a userfaultfd's thread, taking its ranges' lock to release
+    /// them, ended the VMM with 137 at the limit after the fill had been
+    /// refused (`test_a_fill_at_the_limit_reclaims_partly_discarded_chunks`),
+    /// where without the probe it needed no new page. On a new thread, its
+    /// stack as it starts (8 KiB committed on record: STACKEND), the TEB's
+    /// StackLimit is the same while the lock is held as before it was taken.
+    #[test]
+    #[ignore = "until the next commit"]
+    fn test_a_lock_commits_no_stack_before_it_is_taken() {
+        static L: ProbedMutex<u32> = ProbedMutex::new("a lock taken on a shallow stack", 0);
+        let (before, held) = std::thread::spawn(|| {
+            let before = stack_limit();
+            let g = L.lock().unwrap();
+            let held = stack_limit();
+            drop(g);
+            (before, held)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(held, before, "taking the lock committed {} B of stack", before - held);
+    }
+
 
     /// A guard's probe commits [`PROBE`] bytes below its caller, and a lock
     /// held while its code uses the stack within them commits nothing more;
