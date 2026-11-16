@@ -25,8 +25,10 @@ harness (wick_macos) reads it as upstream's tests would read a Firecracker:
   another, every walk of the regions finds the 64 MiB as one mapping (a
   walk is one proc_pidinfo call per region, so a replacement between two
   calls is taken again, not read as a split);
-- after the helper replaces the 64 MiB with fresh pages (mmap MAP_FIXED, as
-  wick's MADV_DONTNEED of private memory does), both readings fall by them;
+- after the helper writes every page again (the baseline, read after the
+  punch and the churn, which grow the helper outside the 64 MiB) and then
+  replaces the 64 MiB with fresh pages (mmap MAP_FIXED, as wick's
+  MADV_DONTNEED of private memory does), both readings fall by them;
 - a shared mapping over their last MiB is a mapping apart.
 
 With --wait-compressed, the helper first waits, up to SECONDS, for the host
@@ -78,6 +80,12 @@ for line in sys.stdin:
     if line.strip() == "replace":
         new = lib.mmap(addr, SIZE, PROT, FLAGS | 0x10, -1, 0)  # MAP_FIXED
         print("replaced" if new == addr else f"mmap failed {ctypes.get_errno()}", flush=True)
+    elif line.strip() == "rewrite":
+        # Every page written again, as at the start.
+        for off in range(0, SIZE, page):
+            for i in range(0, page // 8, 64):
+                buf[(off // 8) + i] = off * 0x9E3779B97F4A7C15 % (1 << 64) + i
+        print("rewritten", flush=True)
     elif line.strip() == "punch":
         # Fresh pages over one MiB in the middle, as a balloon's discard of
         # guest memory: a piece of no pages among written ones.
@@ -170,28 +178,6 @@ def main():
                   f"{len(maps)} mappings")
             return info, rss, region
 
-        info, rss, region = readings("written")
-        check("written: psutil's RSS is the resident size", proc.memory_info().rss == info["resident"],
-              f"{proc.memory_info().rss >> 10} KiB")
-        check("written: the 64 MiB are held", region is not None and region.rss >= SIZE,
-              f"mapping rss {region.rss >> 10 if region else None} KiB")
-        if args.wait_compressed:
-            deadline = time.monotonic() + args.wait_compressed
-            while w._task_vm_info(helper.pid)["compressed"] < SIZE // 2 and time.monotonic() < deadline:  # pylint: disable=protected-access
-                time.sleep(5)
-            cinfo, crss, cregion = readings("compressed")
-            check("compressed: the host compressed at least half of the 64 MiB", cinfo["compressed"] >= SIZE // 2,
-                  f"{cinfo['compressed'] >> 10} KiB compressed after up to {args.wait_compressed} s")
-            cmaps = w.memory_maps(proc, grouped=False)
-            check("compressed: the mappings' compressed pages are the ledger's",
-                  abs(sum(m.swapped for m in cmaps) - cinfo["compressed"]) <= 4 * MIB,
-                  f"mappings {sum(m.swapped for m in cmaps) >> 10} KiB (the 64 MiB's "
-                  f"{cregion.swapped >> 10 if cregion else None}), ledger {cinfo['compressed'] >> 10} KiB")
-            check("compressed: get_resident_memory still counts the 64 MiB", crss >= SIZE // 1024,
-                  f"{crss} KiB (resident {cinfo['resident'] >> 10})")
-            check("compressed: the mapping's rss still counts the 64 MiB", cregion is not None and cregion.rss >= SIZE,
-                  f"{cregion.rss >> 10 if cregion else None} KiB")
-            rss, info, region = crss, cinfo, cregion
         helper.stdin.write("punch\n")
         helper.stdin.flush()
         check("punch: the helper mapped fresh pages over a MiB in the middle", helper.stdout.readline().strip() == "punched",
@@ -217,10 +203,45 @@ def main():
         helper.stdout.readline()
         check("churn: every walk while pieces are replaced finds the 64 MiB as one mapping",
               walks > 0 and not bad, f"{len(bad)} of {walks} walks split it; the first: {bad[0] if bad else None}")
+        # Every page written again: the punch and the churn left pieces of
+        # no pages, and the churn's import and thread grew the helper outside
+        # the 64 MiB (by 704 to 880 KiB here, 1040 KiB on CI run 43906845908's
+        # runner), so the baseline is read after them and only the
+        # replacement lies between it and the "replaced" reading.
+        helper.stdin.write("rewrite\n")
+        helper.stdin.flush()
+        check("rewrite: the helper wrote every page of the 64 MiB again", helper.stdout.readline().strip() == "rewritten",
+              "")
+        info, rss, region = readings("written")
+        check("written: psutil's RSS is the resident size", proc.memory_info().rss == info["resident"],
+              f"{proc.memory_info().rss >> 10} KiB")
+        check("written: the 64 MiB are held", region is not None and region.rss >= SIZE,
+              f"mapping rss {region.rss >> 10 if region else None} KiB")
+        if args.wait_compressed:
+            deadline = time.monotonic() + args.wait_compressed
+            while w._task_vm_info(helper.pid)["compressed"] < SIZE // 2 and time.monotonic() < deadline:  # pylint: disable=protected-access
+                time.sleep(5)
+            cinfo, crss, cregion = readings("compressed")
+            check("compressed: the host compressed at least half of the 64 MiB", cinfo["compressed"] >= SIZE // 2,
+                  f"{cinfo['compressed'] >> 10} KiB compressed after up to {args.wait_compressed} s")
+            cmaps = w.memory_maps(proc, grouped=False)
+            check("compressed: the mappings' compressed pages are the ledger's",
+                  abs(sum(m.swapped for m in cmaps) - cinfo["compressed"]) <= 4 * MIB,
+                  f"mappings {sum(m.swapped for m in cmaps) >> 10} KiB (the 64 MiB's "
+                  f"{cregion.swapped >> 10 if cregion else None}), ledger {cinfo['compressed'] >> 10} KiB")
+            check("compressed: get_resident_memory still counts the 64 MiB", crss >= SIZE // 1024,
+                  f"{crss} KiB (resident {cinfo['resident'] >> 10})")
+            check("compressed: the mapping's rss still counts the 64 MiB", cregion is not None and cregion.rss >= SIZE,
+                  f"{cregion.rss >> 10 if cregion else None} KiB")
+            rss, info, region = crss, cinfo, cregion
         helper.stdin.write("replace\n")
         helper.stdin.flush()
         check("replace: the helper mapped fresh pages", helper.stdout.readline().strip() == "replaced", "mmap MAP_FIXED")
         rinfo, rrss, rregion = readings("replaced")
+        # The MiB of slack is for the helper's own allocations around the
+        # replacement (its stdin line, its reply); with the baseline read
+        # after the churn, 20 runs here grew it by 0 KiB and fell by exactly
+        # the 64 MiB.
         check("replaced: get_resident_memory fell by the 64 MiB", rss - rrss >= SIZE // 1024 - 1024,
               f"{rss} -> {rrss} KiB")
         check("replaced: the 64 MiB's compressed pages left the ledger with them",
