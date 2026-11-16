@@ -324,7 +324,9 @@ second apart before the stage fails, and the failure adds what the two states ho
 `stuck-<n>-vm-state.txt`, snapshot-editor's `info-vmstate vm-state`): how far the VM clock and
 the guest TSC moved, and for each vCPU its RIP and whether it moved, RFLAGS.IF, `mp_state`, its
 local APIC timer (LVT, initial and current count, divide) and the highest vector pending (IRR) and
-in service (ISR). That tells a stopped clock from a lost interrupt or an AP that never started
+in service (ISR), read 16 bytes a word as `KVM_GET_LAPIC` gives them in KVM's layout (before it did,
+one from 128 to 159 was reported 96 lower and any other from 32 up was missed: docs/COMPATIBILITY.md,
+the Interrupt controller row). That tells a stopped clock from a lost interrupt or an AP that never started
 (every stage on CI's AMD EPYC 9V45 runner stopped so, run 43435331370). The host line
 (`host.txt`, and the run's first lines) names WHP's processor vendor, features, XSAVE features
 and processor and interrupt clock frequencies.

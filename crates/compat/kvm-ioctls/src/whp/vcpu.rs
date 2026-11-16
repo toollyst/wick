@@ -45,6 +45,79 @@ use super::{emulate, err, pvclock, regs, Handle, IoEventAddress, Result, VcpuExi
 const LAPIC_PAGE: usize = 4096;
 /// Size of `kvm_lapic_state` (`KVM_APIC_REG_SIZE`).
 const LAPIC_REGS: usize = 1024;
+
+/// The ISR, TMR and IRR: eight words of 32 vectors each, from these
+/// offsets. KVM's page has each word in a register of its own, 16 bytes
+/// apart (Linux v6.1 arch/x86/kvm/lapic.h `REG_POS`), as the processor's
+/// does; the page WHP's `WHvGetVirtualProcessorInterruptControllerState`
+/// gives, which Learn calls legacy, has them 4 bytes apart from the same
+/// offsets (the IRR and ISR so on the PC at step 17g, 0xe1 at 0x21c and
+/// 0x11c; the TMR so by the same rule, which LAPICLAYOUT records) and no
+/// PPR (Learn, `WHvGetVirtualProcessorInterruptControllerState2`).
+const LAPIC_VECTOR_ARRAYS: [usize; 3] = [0x100, 0x180, 0x200];
+/// The PPR's and TPR's offsets.
+const LAPIC_PPR: usize = 0xa0;
+const LAPIC_TPR: usize = 0x80;
+
+fn lapic_word(regs: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(regs[at..at + 4].try_into().unwrap())
+}
+
+/// WHP's legacy layout of the first KiB of the local APIC page to KVM's
+/// (`kvm_lapic_state`): each ISR, TMR and IRR word moved to its own
+/// register, the rest of each register zero, as KVM's are; and the PPR
+/// computed as KVM computes it, from the TPR and the highest vector in
+/// service (lapic.c `__apic_update_ppr`). Every other register is at its
+/// architectural offset in both.
+fn legacy_to_kvm(regs: &mut [u8; LAPIC_REGS]) {
+    for base in LAPIC_VECTOR_ARRAYS {
+        let words: [u32; 8] = std::array::from_fn(|w| lapic_word(regs, base + 4 * w));
+        regs[base..base + 0x80].fill(0);
+        for (w, word) in words.into_iter().enumerate() {
+            regs[base + 16 * w..base + 16 * w + 4].copy_from_slice(&word.to_le_bytes());
+        }
+    }
+    let tpr = lapic_word(regs, LAPIC_TPR);
+    let isrv = (0..8u32)
+        .rev()
+        .find_map(|w| {
+            let word = lapic_word(regs, LAPIC_VECTOR_ARRAYS[0] + 16 * w as usize);
+            (word != 0).then(|| w * 32 + 31 - word.leading_zeros())
+        })
+        .unwrap_or(0);
+    let ppr = if tpr & 0xf0 >= isrv & 0xf0 { tpr & 0xff } else { isrv & 0xf0 };
+    regs[LAPIC_PPR..LAPIC_PPR + 4].copy_from_slice(&ppr.to_le_bytes());
+}
+
+/// KVM's layout (`kvm_lapic_state`) into WHP's legacy page `page`, read
+/// from WHP just before: every register as given but the PPR, which stays
+/// WHP's, and the ISR, TMR and IRR, whose words go 4 bytes apart, the
+/// rest of WHP's bytes from those offsets to the next array kept.
+fn kvm_to_legacy(regs: &[u8; LAPIC_REGS], page: &mut [u8; LAPIC_PAGE]) {
+    let kept: Vec<(usize, [u8; 0x80])> =
+        LAPIC_VECTOR_ARRAYS.iter().map(|&base| (base, page[base..base + 0x80].try_into().unwrap())).collect();
+    let ppr: [u8; 4] = page[LAPIC_PPR..LAPIC_PPR + 4].try_into().unwrap();
+    page[..LAPIC_REGS].copy_from_slice(regs);
+    page[LAPIC_PPR..LAPIC_PPR + 4].copy_from_slice(&ppr);
+    for (base, whp) in kept {
+        page[base..base + 0x80].copy_from_slice(&whp);
+        for w in 0..8 {
+            page[base + 4 * w..base + 4 * w + 4].copy_from_slice(&regs[base + 16 * w..base + 16 * w + 4]);
+        }
+    }
+}
+
+/// Whether a `kvm_lapic_state` is in WHP's legacy layout, as this
+/// backend's `KVM_GET_LAPIC` gave it before it gave KVM's: a byte other
+/// than zero in bytes 4 to 15 of an ISR, TMR or IRR register, where WHP's
+/// layout has its words 1 to 3 and 5 to 7 and KVM's has nothing (its
+/// page is zeroed and each of those registers written 4 bytes at a time:
+/// lapic.c `kvm_create_lapic`, `kvm_lapic_set_vector`). A legacy state with
+/// vectors only in words 0 and 4 (0 to 31, 128 to 159) has none and is
+/// taken as KVM's, which reads word 4 as word 1 (32 to 63).
+fn in_legacy_layout(regs: &[u8; LAPIC_REGS]) -> bool {
+    LAPIC_VECTOR_ARRAYS.iter().any(|&base| (base..base + 0x80).any(|o| o % 16 >= 4 && regs[o] != 0))
+}
 /// Longest a vCPU that WHP reported halted waits before it re-enters the
 /// guest: WHP's local APIC timer fires inside the hypervisor without telling
 /// the run loop, so the wait is bounded (see the `X64Halt` exit).
@@ -1559,9 +1632,11 @@ impl VcpuFd {
 
     // ---- LAPIC ----
 
-    /// The xAPIC state WHP exchanges: the architectural 4 KiB register page
-    /// (each register at its MMIO offset, 16 bytes apart), of which
-    /// `kvm_lapic_state` is the first KiB, the part that holds registers.
+    /// The xAPIC state WHP exchanges: the 4 KiB register page, each register
+    /// at its MMIO offset, 16 bytes apart, but the ISR, TMR and IRR, whose
+    /// words are 4 bytes apart, and with no PPR ([`LAPIC_VECTOR_ARRAYS`]);
+    /// `kvm_lapic_state` is its first KiB, the part that holds registers,
+    /// in KVM's layout ([`legacy_to_kvm`]).
     fn lapic_page(&self) -> Result<(Box<[u8; LAPIC_PAGE]>, u32)> {
         let mut page = Box::new([0u8; LAPIC_PAGE]);
         let mut written = 0u32;
@@ -1593,16 +1668,25 @@ impl VcpuFd {
     /// Firecracker does not (`kvm_apic_state_fixup`, Linux v6.1
     /// arch/x86/kvm/lapic.c 2692-2730); WHP's page holds the 32-bit ID as
     /// it is (X2E0REC c).
+    ///
+    /// The IRR, ISR and TMR are given in KVM's layout, each of their eight
+    /// words in a register of its own, 16 bytes apart (Linux v6.1
+    /// arch/x86/kvm/lapic.h `REG_POS`), and the PPR as KVM computes it,
+    /// where WHP's page has the words 4 bytes apart and no PPR
+    /// ([`legacy_to_kvm`]).
     pub fn get_lapic(&self) -> Result<kvm_lapic_state> {
         let (mut page, _) = self.lapic_page()?;
         if self.register(whv::WHvX64RegisterApicBase)? & tscdeadline::APIC_BASE_EXTD != 0 {
             let id = u32::from_le_bytes(page[0x20..0x24].try_into().unwrap());
             page[0x20..0x24].copy_from_slice(&(id << 24).to_le_bytes());
         }
+        let mut regs = [0u8; LAPIC_REGS];
+        regs.copy_from_slice(&page[..LAPIC_REGS]);
+        legacy_to_kvm(&mut regs);
         let mut state = kvm_lapic_state {
             regs: [0; LAPIC_REGS],
         };
-        for (dst, src) in state.regs.iter_mut().zip(page.iter()) {
+        for (dst, src) in state.regs.iter_mut().zip(regs.iter()) {
             *dst = *src as std::os::raw::c_char;
         }
         Ok(state)
@@ -1625,10 +1709,31 @@ impl VcpuFd {
     /// restore, before it resumes. The run loop sets the page only for a
     /// held LVT timer write, with every requester held off
     /// ([`Self::write_x2apic_lvtt`]).
+    ///
+    /// The IRR, ISR and TMR are taken in KVM's layout and given to WHP in
+    /// its own ([`kvm_to_legacy`]); the PPR is not taken, as KVM computes
+    /// its own (lapic.c `kvm_apic_set_state`, `apic_update_ppr`). A state
+    /// in WHP's layout, which `KVM_GET_LAPIC` gave before (a snapshot made
+    /// by an earlier build), is told by those words' bytes 4 to 15, which
+    /// KVM's layout never has ([`in_legacy_layout`]), and taken as it is.
     pub fn set_lapic(&self, klapic: &kvm_lapic_state) -> Result<()> {
         let (mut page, size) = self.lapic_page()?;
-        for (dst, src) in page.iter_mut().zip(klapic.regs.iter()) {
-            *dst = *src as u8;
+        let regs: [u8; LAPIC_REGS] = std::array::from_fn(|i| klapic.regs[i] as u8);
+        if in_legacy_layout(&regs) {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                super::ffi::report(
+                    log::Level::Info,
+                    &format!(
+                        "whp: vCPU {}'s KVM_SET_LAPIC state has its IRR, ISR and TMR in the layout an earlier build's \
+                         KVM_GET_LAPIC gave (WHP's, 4 bytes a word: a snapshot made by it), not KVM's; taken as it is",
+                        self.vp()
+                    ),
+                );
+            }
+            page[..LAPIC_REGS].copy_from_slice(&regs);
+        } else {
+            kvm_to_legacy(&regs, &mut page);
         }
         if self.register(whv::WHvX64RegisterApicBase)? & tscdeadline::APIC_BASE_EXTD != 0 {
             let id = u32::from_le_bytes(page[0x20..0x24].try_into().unwrap()) >> 24;
@@ -13674,6 +13779,105 @@ mod fpu_tests {
 
 #[cfg(test)]
 mod lapic_format_tests {
+    use super::{LAPIC_PAGE, LAPIC_PPR, LAPIC_REGS, in_legacy_layout, kvm_to_legacy, lapic_word, legacy_to_kvm};
+
+    fn put(b: &mut [u8], at: usize, v: u32) {
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// WHP's legacy page with 0xe1 in service, 0x63 requested and level
+    /// triggered, 0x41 requested, TPR `tpr`, and bytes of its own past the
+    /// packed words (0x140, 0x1c4, 0x250) and in the PPR.
+    fn legacy(tpr: u32) -> [u8; LAPIC_PAGE] {
+        let mut p = [0u8; LAPIC_PAGE];
+        put(&mut p, 0x80, tpr);
+        put(&mut p, 0xa0, 0xdead);
+        put(&mut p, 0x100 + 4 * 7, 1 << 1);
+        put(&mut p, 0x180 + 4 * 3, 1 << 3);
+        put(&mut p, 0x200 + 4 * 3, 1 << 3);
+        put(&mut p, 0x200 + 4 * 2, 1 << 1);
+        put(&mut p, 0x320, 0x1_00ec);
+        put(&mut p, 0x350, 0x700);
+        put(&mut p, 0x140, 0x55);
+        put(&mut p, 0x1c4, 0x66);
+        put(&mut p, 0x250, 0x77);
+        p
+    }
+
+    fn first_kib(p: &[u8; LAPIC_PAGE]) -> [u8; LAPIC_REGS] {
+        p[..LAPIC_REGS].try_into().unwrap()
+    }
+
+    // KVM's layout (Linux v6.1 lapic.h REG_POS: word w of an array at
+    // base + 16 w) and PPR (lapic.c __apic_update_ppr), every other
+    // register where it was.
+    #[test]
+    fn test_kvm_lapic_state_has_kvms_words_and_ppr() {
+        let mut r = first_kib(&legacy(0x20));
+        legacy_to_kvm(&mut r);
+        assert_eq!(lapic_word(&r, 0x170), 1 << 1, "ISR 0xe1");
+        assert_eq!(lapic_word(&r, 0x1b0), 1 << 3, "TMR 0x63");
+        assert_eq!(lapic_word(&r, 0x230), 1 << 3, "IRR 0x63");
+        assert_eq!(lapic_word(&r, 0x220), 1 << 1, "IRR 0x41");
+        for base in [0x100, 0x180, 0x200] {
+            for w in 0..8 {
+                assert!(r[base + 16 * w + 4..base + 16 * w + 16].iter().all(|&b| b == 0), "{base:#x} word {w}: bytes 4-15");
+            }
+        }
+        assert_eq!(lapic_word(&r, 0xa0), 0xe0, "PPR: 0xe1's class over the TPR's");
+        assert_eq!((lapic_word(&r, 0x80), lapic_word(&r, 0x320), lapic_word(&r, 0x350)), (0x20, 0x1_00ec, 0x700));
+        let mut r = first_kib(&legacy(0xf5));
+        legacy_to_kvm(&mut r);
+        assert_eq!(lapic_word(&r, 0xa0), 0xf5, "PPR: the TPR, whose class is higher");
+        let mut none = [0u8; LAPIC_REGS];
+        put(&mut none, 0x80, 0x37);
+        legacy_to_kvm(&mut none);
+        assert_eq!(lapic_word(&none, 0xa0), 0x37, "PPR: the TPR, nothing in service");
+    }
+
+    // KVM_SET_LAPIC of what KVM_GET_LAPIC gave leaves WHP's page as it
+    // was, its PPR and its bytes past the packed words too.
+    #[test]
+    fn test_kvm_lapic_state_round_trips_to_whps_page() {
+        for tpr in [0, 0x20, 0xf5] {
+            let page = legacy(tpr);
+            let mut r = first_kib(&page);
+            legacy_to_kvm(&mut r);
+            let mut back = page;
+            back[..LAPIC_REGS].fill(0xEE);
+            back[LAPIC_PPR..LAPIC_PPR + 4].copy_from_slice(&page[LAPIC_PPR..LAPIC_PPR + 4]);
+            for base in [0x100, 0x180, 0x200] {
+                back[base..base + 0x80].copy_from_slice(&page[base..base + 0x80]);
+            }
+            kvm_to_legacy(&r, &mut back);
+            assert_eq!(back[..], page[..], "TPR {tpr:#x}");
+        }
+    }
+
+    // A state in KVM's layout (KVM's or this backend's) is taken as KVM's;
+    // one an earlier build gave, WHP's, is told by bytes 4 to 15 of its
+    // words, except one with vectors only in words 0 and 4.
+    #[test]
+    fn test_a_state_in_whps_layout_is_told_from_kvms() {
+        let mut kvm = first_kib(&legacy(0x20));
+        legacy_to_kvm(&mut kvm);
+        assert!(!in_legacy_layout(&kvm));
+        assert!(in_legacy_layout(&first_kib(&legacy(0x20))), "IRR words 2 and 3, ISR word 7");
+        let mut words_0_and_4 = [0u8; LAPIC_REGS];
+        put(&mut words_0_and_4, 0x200 + 4 * 4, 1);
+        assert!(!in_legacy_layout(&words_0_and_4), "vectors 128 to 159 only: taken as KVM's 32 to 63");
+        // A Linux guest's state from KVM: the timer's vector in service and
+        // requested; WHP's page gets it 4 bytes a word.
+        let mut linux = [0u8; LAPIC_REGS];
+        put(&mut linux, 0x170, 1 << 12);
+        put(&mut linux, 0x270, 1 << 12);
+        assert!(!in_legacy_layout(&linux));
+        let mut page = [0u8; LAPIC_PAGE];
+        kvm_to_legacy(&linux, &mut page);
+        assert_eq!((lapic_word(&page, 0x11c), lapic_word(&page, 0x21c)), (1 << 12, 1 << 12));
+        assert_eq!((lapic_word(&page, 0x170), lapic_word(&page, 0x270)), (0, 0), "WHP's bytes there kept: zero");
+    }
+
     #[test]
     fn test_the_x2apic_ldr_is_kvms() {
         // kvm_apic_calc_x2apic_ldr: cluster in 31:16, one bit of 16.
