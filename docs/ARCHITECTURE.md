@@ -176,20 +176,17 @@ sections: only the views `uffd_alias` made, or a move or swap put in their place
 `Kind::View`'s `uffd`; `test_a_shared_mapping_over_registered_memory_is_in_no_registration`) are in no registration. A fill of
 such a page is `ENOENT` with nothing filled, as is one whose destination holds an unregistered page (the last row);
 a waiter waits on its userfaultfd, whose wake (the range checked as Linux's `validate_range` checks it, against
-Windows' lowest and highest user addresses) or release ends the wait; a range with no page left registered is
-freed, by the unmapping or by an unregister of its last pages. A change in no registration and a register are
+Windows' lowest and highest user addresses) or release ends the wait; a range is freed once all of its memory is
+unmapped or mapped over. A change in no registration and a register are
 ordered by the two counts as on macOS (`unlocked_change`; the register waits on `WaitOnAddress`, without a lock, and
 no exception handler reaches it or any of the four changes); a register keeps each page's protection, as Linux's
 leaves the vma's, checks its range as Linux's `validate_range` does, and with nothing mapped in it is `ENOMEM` (nothing
 at or above its start) or `EINVAL` (the first mapping past its end), as Linux's (fs/userfaultfd.c v6.1 :1323 to
-:1330). Not as Linux on Windows (SECURITY.md, "Not at parity yet"): memory registered once is not
-registered again (`EINVAL`; before this was `EBUSY`, the slot kept: `test_memory_unregistered_whole_registers_again`),
-`MAP_FIXED` over part of a registered mapping is `EINVAL`, and a huge page mapping is not registered. Not yet, for the
-`UFFDIO_UNREGISTER` row: part of a mapping is not registered (`EINVAL`), the same userfaultfd's register of its own
-range again is `EBUSY`, and pages unregistered from a range's middle are `EBUSY` to another userfaultfd until all of
-the range is unregistered (`test_part_of_a_mapping_is_registered`,
-`test_the_same_userfaultfd_registers_its_range_again`,
-`test_a_partial_unregister_frees_that_part_for_another_userfaultfd`, each ignored until it passes).
+:1330). For the `UFFDIO_UNREGISTER` row, the same (`windows_uffd::Range`): each page has an owner, the userfaultfd it is registered with or none, a byte a page in place of the registered bit (256 KiB a GiB of 4 KiB pages, against 32 KiB before), so an unregister takes no slot and cannot fail for want of one; a range's slot is kept, with its alias and record, until all of its memory is unmapped or mapped over, so its pages register again, with any userfaultfd: unregistered whole, released with their userfaultfd, or unregistered from a range's middle (`test_a_ranges_slot_is_kept_until_its_memory_is_unmapped`, `test_memory_unregistered_whole_registers_again`, `test_pages_of_a_released_userfaultfd_register_again`, `test_a_partial_unregister_frees_that_part_for_another_userfaultfd`, `test_register_and_unregister_as_linux`, `test_more_scattered_unregisters_than_slots_all_succeed`). A page that left the registration while missing is missing again when registered again, its old content never shown (`test_a_page_pending_when_registered_again_is_missing_and_shows_nothing_old`, `test_a_swapped_chunk_registered_again_is_missing_and_filled`); a page touched since holds memory. A register with a page of another userfaultfd anywhere in its range is `EBUSY` with nothing changed (`test_a_register_ending_in_another_userfaultfds_page_changes_nothing`); the same userfaultfd's register of its own pages changes nothing (`test_the_same_userfaultfd_registers_its_range_again`); an unregister through any userfaultfd takes the pages and wakes each owner's waiters, as 6.12's (6.17 refuses it with `EINVAL`; `test_an_unregister_through_another_userfaultfd_wakes_and_takes_the_pages`); a fill must lie in the caller's pages (`test_a_fill_lies_in_one_userfaultfds_pages`); a discard's remove event goes to each owner for its pages, and a release takes only its own (`test_two_userfaultfds_in_one_slot_fill_discard_and_release_their_own`). Windows Server 2022 20348 and 2025 26100; each failed on the code before, but `test_a_register_ending_in_another_userfaultfds_page_changes_nothing`, whose check the code before made too. Not as Linux on Windows
+(SECURITY.md, "Not at parity yet"): part of a mapping is not registered (`EINVAL`;
+`test_part_of_a_mapping_is_registered`, ignored), `MAP_FIXED` over part of a registered mapping is `EINVAL`, a
+register that overlaps a registered range without lying inside it, or holds a page of it that was unmapped or mapped
+over, is `EBUSY`, and a huge page mapping is not registered.
 
 ## Hypervisors
 

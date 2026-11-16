@@ -5485,6 +5485,29 @@ pub(crate) fn released_pend(i: usize, alias: usize, s: usize, len: usize, prot: 
     }
 }
 
+/// Pages `[s, s + len)` of record `i`'s range are registered again
+/// (`wick_uffd::register` over a range whose slot was kept): `each(at,
+/// pending)` is called for each page in order, with the protection a page
+/// pending here would have taken at its resolution, or `None` for a page
+/// not pending (resident: resolved, or never missing); then the page is no
+/// longer pending. A pending page so goes back to its range missing, its
+/// commit and charge (a discarded one's) kept, and its content never shown:
+/// a fill writes all of it. `each` runs under [`RELEASED`]'s lock and must
+/// take no lock: the caller marks the page missing there, before it leaves
+/// the record, so that an access between finds it one or the other.
+/// Allocates nothing.
+pub(crate) fn released_take(i: usize, s: usize, len: usize, mut each: impl FnMut(usize, Option<PAGE_PROTECTION_FLAGS>)) {
+    let mut records = RELEASED.lock().unwrap();
+    let r = &mut records[i];
+    for at in (s..s + len).step_by(PAGE) {
+        let pending = (r.holds(at) && r.get(PENDING, at)).then(|| r.prot(at));
+        each(at, pending);
+        if pending.is_some() {
+            r.resolved(at);
+        }
+    }
+}
+
 /// The alias of record `i`'s registration (`uffd_alias`), through which
 /// its pending committed pages are zeroed: set at the register, so that a
 /// discard of pages unregistered while the range lives

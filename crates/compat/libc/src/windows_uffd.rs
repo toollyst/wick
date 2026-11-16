@@ -46,7 +46,7 @@
 
 use core::ffi::{c_int, c_void};
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::boxed::Box;
 use std::io;
 use std::sync::Once;
@@ -109,13 +109,26 @@ const MAX_RANGES: usize = 64;
 const MAX_CTX: usize = 16;
 const MAX_WAITERS: usize = 256;
 
-/// A registered range. Its bitmaps are never freed: the exception handler
-/// may be reading them.
+/// A registered range: one whole private mapping, made a section with an
+/// alias at its register, whose pages each belong to one userfaultfd or to
+/// none ([`Range::owner`]), as each of Linux's vmas has one context or none.
+/// The slot lives, with its alias and record, until every page of it is
+/// unmapped or mapped over ([`GONE`]), not only while a page is registered:
+/// pages unregistered from it, or released with their userfaultfd, register
+/// again through it, with any userfaultfd. Its bitmaps are never freed: the
+/// exception handler may be reading them.
+///
+/// The order every change keeps, for readers without [`LOCK`] (the
+/// exception handler's [`fault`], `is_missing`, `for_each_missing`): a page
+/// with no owner is never missing. A register sets the owner before the
+/// missing bit; an unregister, a release and an unmapping clear the missing
+/// bit before the owner. A reader reads the missing bit first and the owner
+/// after it ([`Range::missing_owner`]), so a missing page it acts on has
+/// the owner it reads.
 struct Range {
     /// 0: free.
     start: AtomicU64,
     end: AtomicU64,
-    ctx: AtomicUsize,
     /// Second view of `[start, end)`, always readable and writable.
     alias: AtomicU64,
     /// The section is reserved: missing pages that were never filled are
@@ -123,8 +136,10 @@ struct Range {
     reserved: AtomicBool,
     /// One bit per page: the page is missing.
     missing: AtomicPtr<AtomicU64>,
-    /// One bit per page: the page is registered (cleared by unregister).
-    tracked: AtomicPtr<AtomicU64>,
+    /// One byte per page: the userfaultfd it is registered with (an index
+    /// of [`CTXS`]), [`NONE`] (the range's memory, registered with none) or
+    /// [`GONE`] (unmapped or mapped over).
+    owner: AtomicPtr<AtomicU8>,
     /// One bit per page: its protection (`mprotect`) denies reads, and so
     /// every access (`PROT_NONE`).
     noread: AtomicPtr<AtomicU64>,
@@ -141,11 +156,10 @@ impl Range {
         Range {
             start: AtomicU64::new(0),
             end: AtomicU64::new(0),
-            ctx: AtomicUsize::new(0),
             alias: AtomicU64::new(0),
             reserved: AtomicBool::new(false),
             missing: AtomicPtr::new(ptr::null_mut()),
-            tracked: AtomicPtr::new(ptr::null_mut()),
+            owner: AtomicPtr::new(ptr::null_mut()),
             noread: AtomicPtr::new(ptr::null_mut()),
             nowrite: AtomicPtr::new(ptr::null_mut()),
             record: AtomicUsize::new(0),
@@ -209,6 +223,54 @@ impl Range {
             Self::bit(map, page).fetch_and(!mask, Ordering::SeqCst);
         }
     }
+
+    fn owner_byte(&self, page: u64) -> &AtomicU8 {
+        // SAFETY: the owner array covers every page of the range and is
+        // never freed.
+        unsafe { &*self.owner.load(Ordering::Acquire).add(page as usize) }
+    }
+
+    /// The userfaultfd `page` is registered with, if any.
+    fn owner(&self, page: u64) -> Option<usize> {
+        let o = self.owner_byte(page).load(Ordering::SeqCst);
+        (usize::from(o) < MAX_CTX).then_some(usize::from(o))
+    }
+
+    /// Whether `page` is registered with any userfaultfd.
+    fn owned(&self, page: u64) -> bool {
+        self.owner(page).is_some()
+    }
+
+    /// Whether `page` is no longer the range's memory ([`GONE`]).
+    fn gone(&self, page: u64) -> bool {
+        self.owner_byte(page).load(Ordering::SeqCst) == GONE
+    }
+
+    /// `page`'s owner becomes `ctx`'s index, [`NONE`] or [`GONE`]. Under
+    /// [`LOCK`], in the order the type's doc gives.
+    fn set_owner(&self, page: u64, owner: u8) {
+        self.owner_byte(page).store(owner, Ordering::SeqCst);
+    }
+
+    /// The owner of `page` if it is missing: the missing bit read first,
+    /// then the owner (the order the type's doc gives), so a page read as
+    /// missing here has the owner returned.
+    fn missing_owner(&self, page: u64) -> Option<usize> {
+        if Self::test(&self.missing, page) { self.owner(page) } else { None }
+    }
+}
+
+/// [`Range::owner`]: the range's memory, registered with no userfaultfd.
+const NONE: u8 = 0xFF;
+/// [`Range::owner`]: no longer the range's memory (unmapped, or mapped over).
+const GONE: u8 = 0xFE;
+
+/// `ctx`, an index of [`CTXS`], as an owner byte.
+fn owner_of(ctx: usize) -> u8 {
+    debug_assert!(ctx < MAX_CTX);
+    #[allow(clippy::cast_possible_truncation)]
+    let o = ctx as u8;
+    o
 }
 
 /// A userfaultfd: the kernel end of its socket pair (-1: free).
@@ -418,7 +480,7 @@ fn find(addr: u64) -> Option<(&'static Range, u64)> {
 /// Whether `addr` is in a registered page that is missing.
 pub fn is_missing(addr: u64) -> bool {
     match find(addr) {
-        Some((r, page)) => Range::test(&r.tracked, page) && Range::test(&r.missing, page),
+        Some((r, page)) => r.missing_owner(page).is_some(),
         None => false,
     }
 }
@@ -501,9 +563,9 @@ pub fn fault(addr: u64, write: bool) -> bool {
     let Some((range, page)) = find(addr) else {
         return false;
     };
-    if !Range::test(&range.tracked, page) || !Range::test(&range.missing, page) {
+    let Some(ctx) = range.missing_owner(page) else {
         return false;
-    }
+    };
     // An access its protection denies is the access fault, not a userfault:
     // Linux checks the vma's protection first (v6.1 arch/x86/mm/fault.c,
     // `do_user_addr_fault`: `access_error` at :1410, before
@@ -526,11 +588,12 @@ pub fn fault(addr: u64, write: bool) -> bool {
         // SAFETY: plain call.
         unsafe { Sleep(1) };
     };
-    let ctx = range.ctx.load(Ordering::Acquire);
     slot.ctx.store(ctx, Ordering::SeqCst);
     slot.woken.store(false, Ordering::SeqCst);
-    // Filled while the slot was claimed: no fault to report.
-    if Range::test(&range.missing, page) && Range::test(&range.tracked, page) {
+    // Filled, unregistered or registered again while the slot was claimed:
+    // no fault to report to `ctx` (an unregister wakes the waiters of each
+    // page's owner, [`unregister`]).
+    if range.missing_owner(page) == Some(ctx) {
         let flags = if write { proto::FLAG_WRITE } else { 0 };
         post(ctx, [proto::EVENT_PAGEFAULT, addr, flags, 0]);
         while !slot.woken.load(Ordering::SeqCst) {
@@ -611,7 +674,7 @@ pub(crate) fn with_registrations_still<T>(addr: u64, write: bool, f: impl FnOnce
     let _guard = lock();
     let resolvable = is_moving(addr)
         || find(addr).is_some_and(|(r, page)| {
-            Range::test(&r.tracked, page) && Range::test(&r.missing, page) && !r.denies(page, write)
+            r.missing_owner(page).is_some() && !r.denies(page, write)
         });
     f(resolvable)
 }
@@ -630,7 +693,7 @@ pub fn for_each_missing(start: u64, len: u64, mut f: impl FnMut(u64, u64)) {
     let mut addr = start - start % PAGE;
     while addr < end {
         let (missing, next) = match find(addr) {
-            Some((r, page)) => (Range::test(&r.tracked, page) && Range::test(&r.missing, page), addr + PAGE),
+            Some((r, page)) => (r.missing_owner(page).is_some(), addr + PAGE),
             // Unregistered memory holds no missing page: on to the next
             // range (a walk by pages over a span as large as a
             // `MADV_DONTNEED` may name would not end).
@@ -959,6 +1022,11 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
     Ok((index, user))
 }
 
+fn alloc_owners(pages: u64, owner: u8) -> *mut AtomicU8 {
+    let v: Vec<AtomicU8> = (0..pages).map(|_| AtomicU8::new(owner)).collect();
+    Box::into_raw(v.into_boxed_slice()).cast()
+}
+
 fn alloc_bitmap(pages: u64, on: bool) -> *mut AtomicU64 {
     let words = pages.div_ceil(64) as usize;
     let v: Vec<AtomicU64> = (0..words)
@@ -968,9 +1036,21 @@ fn alloc_bitmap(pages: u64, on: bool) -> *mut AtomicU64 {
 }
 
 /// Registers `[start, start + len)` (page aligned; one whole anonymous
-/// private mapping) with userfaultfd `ctx`. Pages that are not resident are
-/// missing from now on; each page keeps the protection `mprotect` gave it,
-/// as Linux's register leaves the vma's protection as it is.
+/// private mapping, or pages of a range already registered) with
+/// userfaultfd `ctx`. Pages that are not resident are missing from now on;
+/// each page keeps the protection `mprotect` gave it, as Linux's register
+/// leaves the vma's protection as it is.
+///
+/// Within a range already registered (its slot is kept until its memory is
+/// unmapped: [`Range`]), the pages no userfaultfd has, unregistered or
+/// released, are registered with `ctx` ([`register_again`]); every page is
+/// checked first, and a page another userfaultfd has makes it `EBUSY` with
+/// nothing changed, as Linux checks every vma before it changes one (v6.12
+/// fs/userfaultfd.c `userfaultfd_register`: `-EBUSY` at :1363 to :1366, in
+/// the loop that ends at :1375, before `userfaultfd_register_range`). A
+/// range that only overlaps a registered one, or holds a page of it that
+/// was unmapped or mapped over, is `EBUSY` too, where Linux registers the
+/// new vma (a stated difference: docs/COMPATIBILITY.md's uffd row).
 pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     // The range checked as Linux's register checks it (fs/userfaultfd.c,
     // v6.1, `validate_range` at :1309): page aligned, not empty, within the
@@ -1015,11 +1095,15 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         Some(at) if at >= end => return Err(errno_err(crate::EINVAL)),
         Some(_) => {}
     }
-    if RANGES.iter().any(|r| {
+    // Ranges do not overlap, so at most one holds any of it.
+    if let Some(r) = RANGES.iter().find(|r| {
         let s = r.start.load(Ordering::Acquire);
         s != 0 && start < r.end.load(Ordering::Acquire) && s < end
     }) {
-        return Err(errno_err(crate::EBUSY));
+        if start < r.start.load(Ordering::Acquire) || end > r.end.load(Ordering::Acquire) {
+            return Err(errno_err(crate::EBUSY));
+        }
+        return register_again(r, ctx, start, end);
     }
     let Some(range) = RANGES.iter().find(|r| r.start.load(Ordering::Acquire) == 0) else {
         return Err(errno_err(crate::ENOMEM));
@@ -1058,15 +1142,13 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     range.record.store(record, Ordering::Release);
     range.reserved.store(reserved, Ordering::Release);
     let missing = alloc_bitmap(pages, false);
-    let tracked = alloc_bitmap(pages, true);
+    let owner = alloc_owners(pages, owner_of(ctx));
     range.noread.store(alloc_bitmap(pages, false), Ordering::Release);
     range.nowrite.store(alloc_bitmap(pages, false), Ordering::Release);
     range.end.store(end, Ordering::Release);
-    range.ctx.store(ctx, Ordering::Release);
     range.alias.store(alias, Ordering::Release);
     range.missing.store(missing, Ordering::Release);
-    range.tracked.store(tracked, Ordering::Release);
-    // Trailing bits of the last word stay set in `tracked`; they are past `end`.
+    range.owner.store(owner, Ordering::Release);
     for page in 0..pages {
         let b = resident[page as usize];
         if b & 1 == 0 {
@@ -1114,54 +1196,150 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Registers again with `ctx` the pages of `[start, end)` that no
+/// userfaultfd has, inside range `r`, whose slot was kept ([`register`];
+/// under [`LOCK`]). Every page is checked before any changes: one another
+/// userfaultfd has, or no longer the range's memory ([`GONE`]), is `EBUSY`.
+/// A page `ctx` has already stays as it is, as Linux's register of a vma
+/// already registered with the same context and mode (v6.12
+/// mm/userfaultfd.c `userfaultfd_register_range` :1848 to :1853). Each other page gets `ctx` as its owner,
+/// then, if it is pending in the range's record (it was missing when it
+/// left: never filled, or discarded), it is missing again, still closed,
+/// with the protection the record kept for it, and leaves the record
+/// (`windows_mm::released_take`); a page not pending holds its memory and
+/// keeps the protection it has now. So a page unregistered while missing is
+/// missing again, as Linux's page that was never faulted in after the
+/// unregister, and a page touched since is not.
+fn register_again(r: &'static Range, ctx: usize, start: u64, end: u64) -> io::Result<()> {
+    let base = r.start.load(Ordering::Acquire);
+    let (first, last) = ((start - base) / PAGE, (end - base) / PAGE);
+    let mine = owner_of(ctx);
+    if (first..last).any(|page| {
+        let o = r.owner_byte(page).load(Ordering::SeqCst);
+        o != mine && o != NONE
+    }) {
+        return Err(errno_err(crate::EBUSY));
+    }
+    // The protection each page has now, for those not pending.
+    let mut prot = std::vec![0u8; (last - first) as usize];
+    #[allow(clippy::cast_possible_truncation)]
+    crate::windows_mm::uffd_protections(start as usize, (end - start) as usize, &mut prot);
+    let take = |page: u64, pending: Option<PAGE_PROTECTION_FLAGS>| {
+        if r.owner(page) == Some(ctx) {
+            return;
+        }
+        // The owner before the missing bit (the order [`Range`]'s doc gives).
+        r.set_owner(page, mine);
+        let (noread, nowrite) = match pending {
+            Some(p) => (p == PAGE_NOACCESS, p != PAGE_READWRITE),
+            None => {
+                let b = prot[(page - first) as usize];
+                (b & 2 != 0, b & 4 != 0)
+            }
+        };
+        Range::set(&r.noread, page, noread);
+        Range::set(&r.nowrite, page, nowrite);
+        if pending.is_some() {
+            Range::set(&r.missing, page, true);
+        }
+    };
+    if r.reserved.load(Ordering::Acquire) {
+        #[allow(clippy::cast_possible_truncation)]
+        crate::windows_mm::released_take(r.record.load(Ordering::Acquire), start as usize, (end - start) as usize, |at, pending| {
+            take((at as u64 - base) / PAGE, pending);
+        });
+    } else {
+        // Not on a reserved section: missing pages were zeroed and opened
+        // when they left ([`release_missing`]), so every page holds memory.
+        for page in first..last {
+            take(page, None);
+        }
+    }
+    Ok(())
+}
+
 /// The registered range holding all of `[start, start + len)`, which must be
-/// page aligned.
+/// page aligned, every page of it registered with `ctx`: else `ENOENT`, as
+/// Linux's fill finds its destination in one vma of the context
+/// (mm/userfaultfd.c, v6.12, `validate_dst_vma` :34, `uffd_mfill_lock`
+/// :113). Pages `ctx` registered again after an unregister are one with
+/// the rest, as Linux merges the vma of a register with its neighbours
+/// (`userfaultfd_register_range`, its `vma_modify_flags_uffd` at :1860).
 fn range_of(ctx: usize, start: u64, len: u64) -> Result<&'static Range, c_int> {
     if !start.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) || len == 0 {
         return Err(crate::EINVAL);
     }
-    let (range, _) = find(start).ok_or(crate::ENOENT)?;
-    if range.ctx.load(Ordering::Acquire) != ctx || start + len > range.end.load(Ordering::Acquire) {
+    let (range, first) = find(start).ok_or(crate::ENOENT)?;
+    if start + len > range.end.load(Ordering::Acquire) || (first..first + len / PAGE).any(|page| range.owner(page) != Some(ctx)) {
         return Err(crate::ENOENT);
     }
     Ok(range)
 }
 
-/// Unregisters `[start, start + len)`: its missing pages become ordinary
-/// (zero-filled) memory and their waiters are woken.
-pub fn unregister(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
+/// Unregisters `[start, start + len)`, as Linux 6.12's
+/// `userfaultfd_unregister` (fs/userfaultfd.c): the range is checked as
+/// `validate_range` checks it, and must hold a mapping (`EINVAL`, :1443 to
+/// :1447). Its registered pages, whichever userfaultfd has them (Linux 6.12
+/// does not ask: it skips only vmas with no context, :1500, and clears the
+/// rest, :1522), are in no registration after: missing ones become ordinary
+/// memory, pending in their range's record ([`release_missing`]), and the
+/// waiters of each page's owner in the range are woken (`wake_userfault` of
+/// each vma's context, :1509 to :1519). Memory not registered is left as it is. The
+/// range's slot is kept ([`Range`]), so its pages register again. Linux 6.17
+/// refuses with `EINVAL` an unregister through a context of a vma another
+/// context has (fs/userfaultfd.c, v6.17, :1475 to :1480); this is 6.12's.
+/// A release that fails (`EIO`: a protection that cannot be given) stops
+/// there: the pages before it are unregistered, the rest are as they were.
+pub fn unregister(_ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
+    validate_range(start, len)?;
+    let end = start + len;
     let _guard = lock();
-    let range = range_of(ctx, start, len)?;
-    let base = range.start.load(Ordering::Acquire);
-    let alias = range.alias.load(Ordering::Acquire);
-    // The missing runs, walked in place: a run is reported once the walk is
-    // past it, so its bits may change in the call.
+    match first_mapped_from(start) {
+        Some(at) if at < end => {}
+        _ => return Err(crate::EINVAL),
+    }
+    // The userfaultfds whose pages were taken, a bit each.
+    let mut owners = 0u32;
     let mut result = Ok(());
-    for_each_missing(start, len, |s, l| {
-        if result.is_err() {
-            return;
+    for r in RANGES.iter() {
+        let base = r.start.load(Ordering::Acquire);
+        let e = r.end.load(Ordering::Acquire);
+        if base == 0 || start >= e || base >= end || result.is_err() {
+            continue;
         }
-        // Missing pages may hold discarded data: zeros, as Linux gives.
-        result = release_missing(range, base, alias, s, l).map_err(|e| e.raw_os_error().unwrap_or(crate::EIO));
-        if result.is_ok() {
-            for page in (s - base) / PAGE..(s + l - base) / PAGE {
-                Range::set(&range.missing, page, false);
+        let (a, b) = (start.max(base), end.min(e));
+        let alias = r.alias.load(Ordering::Acquire);
+        // The missing runs, walked in place: a run is reported once the walk
+        // is past it, so its bits may change in the call. The missing bit is
+        // cleared before the owner (the order [`Range`]'s doc gives).
+        let mut stop = b;
+        for_each_missing(a, b - a, |x, l| {
+            if result.is_err() {
+                return;
+            }
+            // Missing pages may hold discarded data: zeros, as Linux gives.
+            result = release_missing(r, base, alias, x, l).map_err(|e| e.raw_os_error().unwrap_or(crate::EIO));
+            if result.is_ok() {
+                for page in (x - base) / PAGE..(x + l - base) / PAGE {
+                    Range::set(&r.missing, page, false);
+                }
+            } else {
+                stop = x;
+            }
+        });
+        for page in (a - base) / PAGE..(stop - base) / PAGE {
+            if let Some(o) = r.owner(page) {
+                owners |= 1 << o;
+                r.set_owner(page, NONE);
             }
         }
-    });
-    for page in (start - base) / PAGE..(start + len - base) / PAGE {
-        Range::set(&range.tracked, page, false);
     }
-    result?;
-    wake_ctx(ctx, start, len);
-    // No page left registered: the slot is freed, as Linux's vmas then have
-    // no userfaultfd (fs/userfaultfd.c, v6.1, `userfaultfd_unregister`
-    // :1654 to :1655), so the memory registers again, with this userfaultfd
-    // or another.
-    if !any_tracked(range) {
-        free_range(range);
+    for o in 0..MAX_CTX {
+        if owners & (1 << o) != 0 {
+            wake_ctx(o, start, len);
+        }
     }
-    Ok(())
+    result
 }
 
 /// Fills missing pages from `dst` on with `fill(alias_dst, len)`: stops at
@@ -1209,7 +1387,7 @@ fn fill(
     // has (v6.1 mm/userfaultfd.c, `find_dst_vma` :38 to :40, a range past
     // the vma's end, and :46 to :47, a vma with no userfaultfd; `-ENOENT`
     // set at :577 before it is called).
-    if (first..first + len / PAGE).any(|page| !Range::test(&range.tracked, page)) {
+    if (first..first + len / PAGE).any(|page| range.owner(page) != Some(ctx)) {
         return Err((crate::ENOENT, 0));
     }
     let pages = len / PAGE;
@@ -1225,7 +1403,7 @@ fn fill(
         let mut n = 0;
         while done + n < pages {
             let page = first + done + n;
-            if !Range::test(&range.tracked, page) || !Range::test(&range.missing, page) {
+            if range.owner(page) != Some(ctx) || !Range::test(&range.missing, page) {
                 break;
             }
             n += 1;
@@ -1361,7 +1539,7 @@ fn wait_and_move(ctx: usize, dst: u64, len: u64, waited: &mut Waited) -> Option<
     let guard = lock();
     let range = range_of(ctx, dst, len).ok()?;
     let first = (dst - range.start.load(Ordering::Acquire)) / PAGE;
-    if (first..first + len / PAGE).any(|page| !Range::test(&range.tracked, page)) {
+    if (first..first + len / PAGE).any(|page| range.owner(page) != Some(ctx)) {
         return None;
     }
     let mut r = Reclaimed::default();
@@ -1474,7 +1652,7 @@ fn mprotect_locked(start: u64, end: u64, read: bool, write: bool, wprot: PAGE_PR
         let mut at = a;
         while at <= b {
             let page = (at - s) / PAGE;
-            let tracked = at < b && Range::test(&r.tracked, page);
+            let tracked = at < b && r.owned(page);
             let holds = tracked && !Range::test(&r.missing, page);
             match (tracked, tracked_run) {
                 (true, None) => tracked_run = Some(at),
@@ -1544,7 +1722,7 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
     let _guard = lock();
     let ret = discard(&mut done);
     // Released ranges' pages: those no registration tracks.
-    released_discard(&done, |p| find(p).is_some_and(|(r, page)| Range::test(&r.tracked, page)));
+    released_discard(&done, |p| find(p).is_some_and(|(r, page)| r.owned(page)));
     for r in RANGES.iter() {
         let s = r.start.load(Ordering::Acquire);
         let e = r.end.load(Ordering::Acquire);
@@ -1552,14 +1730,12 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
             continue;
         }
         let alias = r.alias.load(Ordering::Acquire);
-        let ctx = r.ctx.load(Ordering::Acquire);
-        let remove = CTXS[ctx].features.load(Ordering::Acquire) & FEATURE_EVENT_REMOVE != 0;
         for &(a, b) in &done {
             // The range's whole pages inside the piece.
             let (first, last) = ((a.max(s) - s).div_ceil(PAGE), (b.min(e).max(s) - s) / PAGE);
             let mut any = false;
             for page in first..last {
-                if Range::test(&r.tracked, page) {
+                if r.owned(page) {
                     Range::set(&r.missing, page, true);
                     any = true;
                 }
@@ -1581,7 +1757,7 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
                     if c_end > last {
                         break;
                     }
-                    if (c..c_end).all(|p| Range::test(&r.tracked, p)) {
+                    if (c..c_end).all(|p| r.owned(p)) {
                         #[allow(clippy::cast_possible_truncation)]
                         crate::windows_mm::uffd_swap_chunk((s + c * PAGE) as usize, ((c_end - c) * PAGE) as usize, (alias + c * PAGE) as usize, (s as usize, e as usize));
                     }
@@ -1602,8 +1778,25 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
                 // until its chunk is discarded whole (`uffd_swap_chunk`, which
                 // gives both back) or unmapped.
             }));
-            if remove {
-                post(ctx, [proto::EVENT_REMOVE, from, to, 0]);
+            // A remove event for each run of pages of one owner, to that
+            // owner, as Linux posts one for each vma with a context
+            // (mm/madvise.c, v6.12, `madvise_dontneed_free` :894, which
+            // calls `userfaultfd_remove` for each vma); pages of no
+            // userfaultfd have none.
+            let mut run: Option<(u64, usize)> = None;
+            for page in first..=last {
+                let o = if page < last { r.owner(page) } else { None };
+                match (o, run) {
+                    (Some(c), Some((_, rc))) if c == rc => {}
+                    _ => {
+                        if let Some((p0, rc)) = run.take() {
+                            if CTXS[rc].features.load(Ordering::Acquire) & FEATURE_EVENT_REMOVE != 0 {
+                                post(rc, [proto::EVENT_REMOVE, s + p0 * PAGE, s + page * PAGE, 0]);
+                            }
+                        }
+                        run = o.map(|c| (page, c));
+                    }
+                }
             }
         }
     }
@@ -1622,27 +1815,47 @@ fn released_discard(done: &[(u64, u64)], registered: impl Fn(u64) -> bool) {
     }
 }
 
-/// Releases userfaultfd `ctx`: its ranges become ordinary memory and every
-/// waiter is woken, as when Linux releases a userfaultfd.
+/// Releases userfaultfd `ctx`: its pages become ordinary memory, other
+/// userfaultfds' pages in the same ranges stay theirs, and every waiter of
+/// `ctx` is woken, as when Linux releases a userfaultfd (fs/userfaultfd.c,
+/// v6.12, `userfaultfd_release` :856, through mm/userfaultfd.c
+/// `userfaultfd_release_all` :1899, which skips a vma of another context at
+/// :1922). The ranges' slots are kept ([`Range`]): their pages
+/// register again.
 fn destroy(ctx: usize) {
     let _guard = lock();
     for r in RANGES.iter() {
         let s = r.start.load(Ordering::Acquire);
-        if s == 0 || r.ctx.load(Ordering::Acquire) != ctx {
+        if s == 0 {
             continue;
         }
         let e = r.end.load(Ordering::Acquire);
         let alias = r.alias.load(Ordering::Acquire);
+        let pages = (e - s) / PAGE;
         // Walked in place (no list of the runs: this runs at the job's limit,
-        // `test_a_userfaultfd_released_at_the_limit_allocates_nothing`); a
-        // run is reported once the walk is past it.
-        for_each_missing(s, e - s, |a, l| {
-            let _ = release_missing(r, s, alias, a, l);
-            for page in (a - s) / PAGE..(a + l - s) / PAGE {
-                Range::set(&r.missing, page, false);
+        // `test_a_userfaultfd_released_at_the_limit_allocates_nothing`), a
+        // run of `ctx`'s missing pages at a time; the missing bit cleared
+        // before the owner (the order [`Range`]'s doc gives).
+        let mut run: Option<u64> = None;
+        for page in 0..=pages {
+            let mine = page < pages && r.missing_owner(page) == Some(ctx);
+            match (mine, run) {
+                (true, None) => run = Some(page),
+                (false, Some(f)) => {
+                    let _ = release_missing(r, s, alias, s + f * PAGE, (page - f) * PAGE);
+                    for p in f..page {
+                        Range::set(&r.missing, p, false);
+                    }
+                    run = None;
+                }
+                _ => {}
             }
-        });
-        free_range(r);
+        }
+        for page in 0..pages {
+            if r.owner(page) == Some(ctx) {
+                r.set_owner(page, NONE);
+            }
+        }
     }
     // The record's pages are published before the waiters wake: a thread
     // that faulted on a missing page runs its access again and finds it
@@ -1658,10 +1871,11 @@ fn destroy(ctx: usize) {
     }
 }
 
-/// Frees the slot of range `r` (under [`LOCK`]), whose missing pages, if
-/// any, were released: its alias is handed to its chunks' views, which zero
-/// pending pages through it, or unmapped (`uffd_unalias`), and its record
-/// ends (`released_end`). Its waiters are not woken here.
+/// Frees the slot of range `r` (under [`LOCK`]), none of whose pages is
+/// the range's memory any more ([`GONE`]): its alias is handed to its
+/// chunks' views, which zero pending pages through it, or unmapped
+/// (`uffd_unalias`), and its record ends (`released_end`). Its waiters are
+/// not woken here.
 fn free_range(r: &Range) {
     let (s, e) = (r.start.load(Ordering::Acquire), r.end.load(Ordering::Acquire));
     r.start.store(0, Ordering::SeqCst);
@@ -1685,21 +1899,17 @@ fn give_back(r: &Range, s: u64, e: u64) {
     }
 }
 
-/// Whether any page of range `r` is registered (its `tracked` bit; the bits
-/// of the last word past the range's end are set and are not pages).
-fn any_tracked(r: &Range) -> bool {
+/// Whether every page of range `r` is unmapped or mapped over ([`GONE`]).
+fn all_gone(r: &Range) -> bool {
     let pages = (r.end.load(Ordering::Acquire) - r.start.load(Ordering::Acquire)) / PAGE;
-    let map = r.tracked.load(Ordering::Acquire);
-    let full = pages / 64;
-    // SAFETY: the bitmap covers every page of the range and is never freed.
-    (0..full).any(|w| unsafe { &*map.add(w as usize) }.load(Ordering::SeqCst) != 0)
-        || (full * 64..pages).any(|page| Range::test(&r.tracked, page))
+    (0..pages).all(|page| r.gone(page))
 }
 
 /// The pages of `[from, end)` (page aligned) that are no longer the memory
 /// a range registered there (`windows_mm::uffd_pages_gone`: unmapped, or
-/// mapped over) leave their range, which is freed if no page is left
-/// registered ([`free_range`]); the rest stays as it was. Under [`LOCK`].
+/// mapped over) leave their range ([`GONE`]), which is freed once none of
+/// its pages is its memory ([`free_range`]); the rest stays as it was.
+/// Under [`LOCK`].
 fn untrack_gone(from: u64, end: u64) {
     for r in RANGES.iter() {
         let s = r.start.load(Ordering::SeqCst);
@@ -1711,11 +1921,13 @@ fn untrack_gone(from: u64, end: u64) {
         #[allow(clippy::cast_possible_truncation)]
         crate::windows_mm::uffd_pages_gone(from.max(s) as usize, end.min(e) as usize, |at| {
             let page = (at as u64 - s) / PAGE;
-            Range::set(&r.tracked, page, false);
+            // The missing bit before the owner (the order [`Range`]'s doc
+            // gives).
             Range::set(&r.missing, page, false);
+            r.set_owner(page, GONE);
             any = true;
         });
-        if any && !any_tracked(r) {
+        if any && all_gone(r) {
             free_range(r);
         }
     }
@@ -2357,7 +2569,7 @@ fn find_candidates(out: &mut Vec<Candidate>) {
         let pages = (e - s) / PAGE;
         for c in (0..pages).step_by(chunk as usize) {
             let c_end = (c + chunk).min(pages);
-            if !(c..c_end).all(|p| Range::test(&r.tracked, p)) {
+            if !(c..c_end).all(|p| r.owned(p)) {
                 continue;
             }
             // A move maps the new section's view read-write: a live page
@@ -8757,13 +8969,14 @@ mod tests {
         let (ctx, user) = create(0, false, true).unwrap();
         let mem = map(64 * 1024);
         assert_eq!(register(ctx, mem + 1, PAGE).unwrap_err().raw_os_error(), Some(crate::EINVAL));
-        // Not as Linux, which registers both (`test_part_of_a_mapping_is_registered`
-        // and `test_the_same_userfaultfd_registers_its_range_again`, ignored
-        // until they do): part of a mapping is `EINVAL`, and the same range
-        // registered again `EBUSY`.
+        // Not as Linux, which registers it (`test_part_of_a_mapping_is_registered`,
+        // ignored until it does): part of a mapping is `EINVAL`. The same
+        // range registered again with the same userfaultfd is a success that
+        // changes nothing, as Linux's (v6.12 mm/userfaultfd.c
+        // `userfaultfd_register_range` :1848 to :1853).
         assert_eq!(register(ctx, mem, PAGE).unwrap_err().raw_os_error(), Some(crate::EINVAL));
         register(ctx, mem, 64 * 1024).unwrap();
-        assert_eq!(register(ctx, mem, 64 * 1024).unwrap_err().raw_os_error(), Some(crate::EBUSY));
+        register(ctx, mem, 64 * 1024).unwrap();
         // A wake checks the range only (fs/userfaultfd.c, v6.1,
         // `userfaultfd_wake` :1673 to :1700, `validate_range` :1247 to
         // :1265): memory in no registration is woken as any.
@@ -9702,7 +9915,6 @@ mod tests {
     /// refuses only a vma another userfaultfd has, fs/userfaultfd.c :1363 to
     /// :1366), and a fill lands in the new memory.
     #[test]
-    #[ignore = "fails until memory a userfaultfd registered once registers again on Windows (SECURITY.md, Not at parity yet)"]
     fn test_memory_replaced_while_registered_registers_anew() {
         replace_cases("replaced_registers_anew_child");
     }
@@ -9749,7 +9961,6 @@ mod tests {
     /// mm/userfaultfd.c `validate_dst_vma` :23 to :37). The macOS backend's
     /// test of the same name. For both kinds.
     #[test]
-    #[ignore = "fails until a range is cut at an unregister on Windows (docs/ARCHITECTURE.md, the Windows paragraph under Memory calls on registered memory: not yet)"]
     fn test_a_partial_unregister_frees_that_part_for_another_userfaultfd() {
         for kind in MEM_KINDS {
             let (a, ua) = create(0, false, true).unwrap();
@@ -9796,7 +10007,6 @@ mod tests {
     /// `userfaultfd_register_range` :1851 to :1853). The macOS backend's test
     /// of the same name. For both kinds.
     #[test]
-    #[ignore = "fails until a userfaultfd registers its own range again on Windows (docs/ARCHITECTURE.md, the Windows paragraph under Memory calls on registered memory: not yet)"]
     fn test_the_same_userfaultfd_registers_its_range_again() {
         for kind in MEM_KINDS {
             let (a, ua) = create(0, false, true).unwrap();
@@ -9903,21 +10113,29 @@ mod tests {
         }
     }
 
-    /// An unregister of a range's last registered pages frees its slot,
-    /// as Linux's unregister leaves no vma with the context
-    /// (fs/userfaultfd.c, v6.1, `userfaultfd_unregister` :1654 to :1655):
-    /// unregistered in two parts, the slot stays after the first and is
-    /// gone after the second. For both kinds.
+    /// A range's slot is kept, with no page registered, until its memory is
+    /// unmapped ([`Range`]): unregistered whole, its pages are in no
+    /// registration (not missing, a fill `ENOENT`) and the slot is still
+    /// there, so that they register again; unmapped, the slot is freed. On
+    /// Linux the vma is kept with no context after the unregister
+    /// (fs/userfaultfd.c, v6.12, `userfaultfd_clear_vma` at :1522), and goes
+    /// at the unmap. Before, the slot went at the unregister, and the
+    /// memory, a section's views from then on, could not register again.
+    /// For both kinds.
     #[test]
-    fn test_an_unregister_of_a_ranges_last_pages_frees_its_slot() {
+    fn test_a_ranges_slot_is_kept_until_its_memory_is_unmapped() {
         for kind in MEM_KINDS {
             let (a, ua) = create(0, false, true).unwrap();
             let mem = map_of(kind);
             register(a, mem, UNMAP_LEN).unwrap();
             assert_eq!(unregister(a, mem, PAGE), Ok(()), "{kind}");
-            assert!(find(mem + PAGE).is_some(), "{kind}: the slot freed with pages still registered");
             assert_eq!(unregister(a, mem + PAGE, UNMAP_LEN - PAGE), Ok(()), "{kind}");
-            assert!(find(mem).is_none() && find(mem + PAGE).is_none(), "{kind}: the slot is still held");
+            assert!(find(mem).is_some() && find(mem + UNMAP_LEN - PAGE).is_some(), "{kind}: the slot went with its last registered page");
+            assert!(!is_missing(mem) && !is_missing(mem + PAGE), "{kind}: an unregistered page is missing");
+            // SAFETY: a page.
+            assert_eq!(unsafe { copy(a, page_of(1).as_ptr(), mem + PAGE, PAGE, true) }, Err((crate::ENOENT, 0)), "{kind}");
+            assert_eq!(munmap_of(mem, UNMAP_LEN), 0, "{kind}");
+            assert!(find(mem).is_none() && find(mem + PAGE).is_none(), "{kind}: the slot is still held after the unmap");
             release(a, ua);
         }
     }
@@ -9929,7 +10147,6 @@ mod tests {
     /// userfaultfd has, which `userfaultfd_register` takes (:1363 to :1366
     /// refuse only a vma another userfaultfd has). For both kinds.
     #[test]
-    #[ignore = "fails until memory a userfaultfd registered once registers again on Windows (SECURITY.md, Not at parity yet)"]
     fn test_memory_unregistered_whole_registers_again() {
         let mut c = Checks::new();
         for kind in MEM_KINDS {
@@ -11173,6 +11390,294 @@ mod tests {
         unsafe { ws::closesocket(sock(user)) };
     }
 
+    /// The next event on `user` within 10 s: its first three words.
+    fn next_event(user: c_int) -> Option<[u64; 3]> {
+        if !event_within(user, 10_000) {
+            return None;
+        }
+        let mut rec = [0u8; proto::RECORD];
+        recv_all(user, &mut rec).then(|| {
+            let w = words(&rec);
+            [w[0], w[1], w[2]]
+        })
+    }
+
+    /// Register and unregister as Linux's, with an owner a page (the macOS
+    /// backend's test of the same name): registered again, and further,
+    /// what the userfaultfd has stays as it is (mm/userfaultfd.c, v6.12,
+    /// `userfaultfd_register_range` :1848 to :1853); another userfaultfd's
+    /// register over its pages is `EBUSY` (fs/userfaultfd.c :1363 to
+    /// :1366); an unregister through either takes the pages (6.12, :1500,
+    /// :1522); a page no userfaultfd has registers with any. For both kinds.
+    /// A range not on a reserved section (no lazy-memory handler) has its
+    /// missing pages zeroed and opened when they leave a registration, so
+    /// they hold memory and are not missing when registered again; on a
+    /// reserved section, the product's, they are.
+    #[test]
+    fn test_register_and_unregister_as_linux() {
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let (b, ub) = create(0, false, true).unwrap();
+            let mem = map_pages(kind, 3);
+            register(a, mem, 3 * PAGE).unwrap();
+            let reserved = find(mem).unwrap().0.reserved.load(Ordering::Acquire);
+            assert_eq!(zeropage(a, mem, PAGE, true), Ok(PAGE), "{kind}");
+            register(a, mem, 3 * PAGE).unwrap();
+            assert!(!is_missing(mem) && is_missing(mem + PAGE) && is_missing(mem + 2 * PAGE), "{kind}");
+            for (start, len) in [(mem + 2 * PAGE, PAGE), (mem, 3 * PAGE)] {
+                assert_eq!(register(b, start, len).unwrap_err().raw_os_error(), Some(crate::EBUSY), "{kind}");
+            }
+            assert!(is_missing(mem + PAGE) && is_missing(mem + 2 * PAGE), "{kind}: a refused register changed a page");
+            assert_eq!(unregister(b, mem + PAGE, PAGE), Ok(()), "{kind}");
+            assert!(!is_missing(mem + PAGE), "{kind}");
+            register(b, mem + PAGE, PAGE).unwrap();
+            assert_eq!(is_missing(mem + PAGE), reserved, "{kind}: b's page registered again");
+            assert!(is_missing(mem + 2 * PAGE), "{kind}");
+            assert_eq!(zeropage(a, mem + PAGE, PAGE, true), Err((crate::ENOENT, 0)), "{kind}");
+            assert_eq!(unregister(b, mem + PAGE, PAGE), Ok(()), "{kind}");
+            register(a, mem, 3 * PAGE).unwrap();
+            assert!(!is_missing(mem) && is_missing(mem + 2 * PAGE), "{kind}");
+            assert_eq!(unregister(a, mem, 3 * PAGE), Ok(()), "{kind}");
+            register(b, mem, 3 * PAGE).unwrap();
+            assert!(!is_missing(mem) && is_missing(mem + 2 * PAGE) == reserved, "{kind}");
+            if reserved {
+                assert_eq!(zeropage(b, mem + PAGE, 2 * PAGE, true), Ok(2 * PAGE), "{kind}");
+            }
+            assert_eq!(zeropage(a, mem + PAGE, PAGE, true), Err((crate::ENOENT, 0)), "{kind}");
+            assert_eq!(unregister(b, mem, 3 * PAGE), Ok(()), "{kind}");
+            release(a, ua);
+            release(b, ub);
+            assert_eq!(munmap_of(mem, 3 * PAGE), 0);
+        }
+    }
+
+    /// A register whose range ends in a page another userfaultfd has is
+    /// `EBUSY` and changes nothing before it: Linux checks every vma of the
+    /// range before it registers one (fs/userfaultfd.c, v6.12,
+    /// `userfaultfd_register`: `EBUSY` at :1363 to :1366, in the loop that
+    /// ends at :1375, before `userfaultfd_register_range` at :1378). The
+    /// macOS backend's test of the same name. For both kinds.
+    #[test]
+    fn test_a_register_ending_in_another_userfaultfds_page_changes_nothing() {
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let (b, ub) = create(0, false, true).unwrap();
+            let mem = map_pages(kind, 3);
+            register(a, mem, 3 * PAGE).unwrap();
+            assert_eq!(unregister(a, mem, 2 * PAGE), Ok(()), "{kind}");
+            assert_eq!(register(b, mem, 3 * PAGE).unwrap_err().raw_os_error(), Some(crate::EBUSY), "{kind}");
+            assert!(!is_missing(mem) && !is_missing(mem + PAGE) && is_missing(mem + 2 * PAGE), "{kind}");
+            assert_eq!(zeropage(b, mem, PAGE, true), Err((crate::ENOENT, 0)), "{kind}");
+            assert_eq!(zeropage(b, mem + 2 * PAGE, PAGE, true), Err((crate::ENOENT, 0)), "{kind}");
+            // SAFETY: unregistered memory, accessible as before the register.
+            unsafe {
+                ptr::write_volatile(mem as *mut u8, 4);
+                assert_eq!(ptr::read_volatile(mem as *const u8), 4, "{kind}");
+            }
+            assert_eq!(zeropage(a, mem + 2 * PAGE, PAGE, true), Ok(PAGE), "{kind}");
+            release(a, ua);
+            release(b, ub);
+            assert_eq!(munmap_of(mem, 3 * PAGE), 0);
+        }
+    }
+
+    /// Two userfaultfds' pages in one slot, each part as Linux's own vma:
+    /// each fills only its pages, a discard posts each part's remove event
+    /// to its userfaultfd (Linux's walk calls `userfaultfd_remove` per vma,
+    /// mm/madvise.c, v6.12, :894), and the release of one takes only its
+    /// pages (fs/userfaultfd.c `userfaultfd_release` :856, through
+    /// mm/userfaultfd.c `userfaultfd_release_all` :1899, which skips another
+    /// context's vma at :1922), the slot living on for the other's. The macOS
+    /// backend's test of the same name. For both kinds.
+    #[test]
+    fn test_two_userfaultfds_in_one_slot_fill_discard_and_release_their_own() {
+        for kind in MEM_KINDS {
+            let slots = || RANGES.iter().filter(|r| r.start.load(Ordering::Acquire) != 0).count();
+            let (a, ua) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+            let (b, ub) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+            let mem = map_pages(kind, 4);
+            register(a, mem, 4 * PAGE).unwrap();
+            let used = slots();
+            assert_eq!(unregister(a, mem + 2 * PAGE, 2 * PAGE), Ok(()), "{kind}");
+            register(b, mem + 2 * PAGE, 2 * PAGE).unwrap();
+            assert_eq!(slots(), used, "{kind}: the second userfaultfd's pages took a slot");
+            assert_eq!(zeropage(a, mem + 2 * PAGE, PAGE, true), Err((crate::ENOENT, 0)), "{kind}");
+            assert_eq!(zeropage(b, mem, PAGE, true), Err((crate::ENOENT, 0)), "{kind}");
+            assert_eq!(zeropage(a, mem, PAGE, true), Ok(PAGE), "{kind}");
+            assert_eq!(zeropage(b, mem + 2 * PAGE, PAGE, true), Ok(PAGE), "{kind}");
+            // SAFETY: the test's mapping.
+            assert_eq!(unsafe { crate::madvise(mem as *mut c_void, 4 * PAGE as usize, crate::MADV_DONTNEED) }, 0, "{kind}");
+            assert_eq!(next_event(ua), Some([proto::EVENT_REMOVE, mem, mem + 2 * PAGE]), "{kind}: the first part's remove event");
+            assert_eq!(next_event(ub), Some([proto::EVENT_REMOVE, mem + 2 * PAGE, mem + 4 * PAGE]), "{kind}: the second part's");
+            assert!(!event_within(ua, 0) && !event_within(ub, 0), "{kind}: a second event");
+            assert!((0..4).all(|p| is_missing(mem + p * PAGE)), "{kind}");
+            release(a, ua);
+            assert!(!is_missing(mem) && !is_missing(mem + PAGE) && is_missing(mem + 2 * PAGE) && is_missing(mem + 3 * PAGE), "{kind}");
+            assert_eq!(slots(), used, "{kind}: the slot went with the first userfaultfd");
+            // SAFETY: released, so ordinary memory: a zero page.
+            assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0, "{kind}");
+            assert_eq!(zeropage(b, mem, PAGE, true), Err((crate::ENOENT, 0)), "{kind}");
+            assert_eq!(zeropage(b, mem + 2 * PAGE, 2 * PAGE, true), Ok(2 * PAGE), "{kind}");
+            release(b, ub);
+            assert_eq!(slots(), used, "{kind}: the slot went before its memory");
+            assert_eq!(munmap_of(mem, 4 * PAGE), 0);
+            assert_eq!(slots(), used - 1, "{kind}: the slot outlived its memory");
+        }
+    }
+
+    /// A fill must lie in pages of the caller only: across the boundary
+    /// between two userfaultfds' pages it is `ENOENT` with nothing filled,
+    /// as Linux's destination must be one vma of the caller's
+    /// (mm/userfaultfd.c, v6.12, `validate_dst_vma` :23 to :37). Across
+    /// pages the same userfaultfd unregistered and registered again it is
+    /// one call, as over Linux's vma merged again at the register
+    /// (`userfaultfd_register_range`, `vma_modify_flags_uffd` at :1860). The
+    /// macOS backend's test of the same name, on a reserved range (an
+    /// ordinary one's pages hold memory once they leave a registration).
+    #[test]
+    fn test_a_fill_lies_in_one_userfaultfds_pages() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let (b, ub) = create(0, false, true).unwrap();
+        let mem = map_pages("reserved", 4);
+        register(a, mem, 4 * PAGE).unwrap();
+        assert_eq!(unregister(a, mem + PAGE, PAGE), Ok(()));
+        register(a, mem + PAGE, PAGE).unwrap();
+        assert_eq!(zeropage(a, mem, 2 * PAGE, true), Ok(2 * PAGE));
+        assert_eq!(unregister(a, mem + 3 * PAGE, PAGE), Ok(()));
+        register(b, mem + 3 * PAGE, PAGE).unwrap();
+        assert_eq!(zeropage(a, mem + 2 * PAGE, 2 * PAGE, true), Err((crate::ENOENT, 0)));
+        assert_eq!(zeropage(b, mem + 2 * PAGE, 2 * PAGE, true), Err((crate::ENOENT, 0)));
+        assert!(is_missing(mem + 2 * PAGE) && is_missing(mem + 3 * PAGE), "a refused fill filled");
+        assert_eq!(zeropage(a, mem + 2 * PAGE, PAGE, true), Ok(PAGE));
+        assert_eq!(zeropage(b, mem + 3 * PAGE, PAGE, true), Ok(PAGE));
+        release(a, ua);
+        release(b, ub);
+        assert_eq!(munmap_of(mem, 4 * PAGE), 0);
+    }
+
+    /// An unregister made through another userfaultfd takes the pages, as
+    /// Linux 6.12's (fs/userfaultfd.c `userfaultfd_unregister` :1413) skips
+    /// only vmas with no context (:1500) and clears the rest (:1522), waking
+    /// each one's context's waiters (:1509 to :1519): a thread waiting on a
+    /// page of it runs again, the page is ordinary memory (zeros), and a
+    /// later fill through its userfaultfd is `ENOENT`. Linux 6.17 refuses
+    /// such an unregister with `EINVAL` (:1475 to :1480); wick follows 6.12.
+    /// The macOS backend's test of the same name. For both kinds.
+    #[test]
+    fn test_an_unregister_through_another_userfaultfd_wakes_and_takes_the_pages() {
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let (b, ub) = create(0, false, true).unwrap();
+            let mem = map_pages(kind, 1);
+            register(b, mem, PAGE).unwrap();
+            let reader = std::thread::spawn(move || {
+                // SAFETY: registered memory; the read waits for b's fill or a wake.
+                unsafe { ptr::read_volatile(mem as *const u8) }
+            });
+            assert_eq!(next_event(ub).map(|w| [w[0], w[1]]), Some([proto::EVENT_PAGEFAULT, mem]), "{kind}");
+            assert_eq!(unregister(a, mem, PAGE), Ok(()), "{kind}");
+            assert_eq!(reader.join().unwrap(), 0, "{kind}: the waiter's access did not go through");
+            assert!(!is_missing(mem), "{kind}");
+            assert_eq!(zeropage(b, mem, PAGE, true), Err((crate::ENOENT, 0)), "{kind}");
+            assert!(!event_within(ua, 0) && !event_within(ub, 0), "{kind}: an event after the unregister");
+            release(a, ua);
+            release(b, ub);
+            assert_eq!(munmap_of(mem, PAGE), 0);
+        }
+    }
+
+    /// A page unregistered while missing, then registered again, is missing
+    /// again and faults to its new userfaultfd, and no thread ever sees what
+    /// it held: one filled and discarded before the unregister (committed,
+    /// closed and charged, pending in its range's record), one never filled
+    /// (not committed). A page touched after the unregister (zeros) holds
+    /// memory and is not missing. As Linux's page that was never faulted in
+    /// between, and its zero page after a touch. On a reserved range, the
+    /// product's.
+    #[test]
+    fn test_a_page_pending_when_registered_again_is_missing_and_shows_nothing_old() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let (b, ub) = create(0, false, true).unwrap();
+        let mem = map_pages("reserved", 3);
+        register(a, mem, 3 * PAGE).unwrap();
+        // SAFETY: a page.
+        assert_eq!(unsafe { copy(a, page_of(0x5a).as_ptr(), mem, PAGE, true) }, Ok(PAGE));
+        // SAFETY: the test's mapping.
+        assert_eq!(unsafe { crate::madvise(mem as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        assert!(is_missing(mem));
+        assert_eq!(unregister(a, mem, 3 * PAGE), Ok(()));
+        // SAFETY: ordinary memory now: its first access reads zeros.
+        assert_eq!(unsafe { ptr::read_volatile((mem + 2 * PAGE) as *const u8) }, 0);
+        register(b, mem, 3 * PAGE).unwrap();
+        assert!(is_missing(mem) && is_missing(mem + PAGE), "a pending page is not missing again");
+        assert!(!is_missing(mem + 2 * PAGE), "a page touched after the unregister is missing");
+        for p in [0, 1] {
+            let at = mem + p * PAGE;
+            let reader = std::thread::spawn(move || {
+                // SAFETY: registered memory; the read waits for b's fill.
+                unsafe { ptr::read_volatile(at as *const u8) }
+            });
+            assert_eq!(next_event(ub).map(|w| [w[0], w[1]]), Some([proto::EVENT_PAGEFAULT, at]), "page {p}");
+            assert!(!event_within(ua, 0), "page {p}: the first userfaultfd got the fault");
+            // SAFETY: a page.
+            assert_eq!(unsafe { copy(b, page_of(0x77).as_ptr(), at, PAGE, true) }, Ok(PAGE), "page {p}");
+            assert_eq!(reader.join().unwrap(), 0x77, "page {p}");
+        }
+        release(a, ua);
+        release(b, ub);
+        assert_eq!(munmap_of(mem, 3 * PAGE), 0);
+    }
+
+    /// A whole chunk of a reserved range discarded (a new section in its
+    /// place, `windows_mm::uffd_swap_chunk`), unregistered and registered
+    /// again with another userfaultfd: its pages are missing in the new
+    /// section, and a fill lands in it through the same alias.
+    #[test]
+    fn test_a_swapped_chunk_registered_again_is_missing_and_filled() {
+        let chunk = crate::windows_mm::UFFD_CHUNK as u64;
+        let (a, ua) = create(0, false, true).unwrap();
+        let (b, ub) = create(0, false, true).unwrap();
+        let mem = map_noreserve(2 * chunk as usize);
+        register(a, mem, 2 * chunk).unwrap();
+        let slot = mem + chunk;
+        // SAFETY: a page.
+        assert_eq!(unsafe { copy(a, page_of(0x5a).as_ptr(), slot, PAGE, true) }, Ok(PAGE));
+        // SAFETY: registered memory of the test's.
+        assert_eq!(unsafe { crate::madvise(slot as *mut c_void, chunk as usize, crate::MADV_DONTNEED) }, 0);
+        assert_eq!(unregister(a, mem, 2 * chunk), Ok(()));
+        register(b, slot, chunk).unwrap();
+        assert!(is_missing(slot) && is_missing(slot + chunk - PAGE), "the swapped chunk's pages are not missing");
+        // SAFETY: a page.
+        assert_eq!(unsafe { copy(b, page_of(0x77).as_ptr(), slot, PAGE, true) }, Ok(PAGE));
+        // SAFETY: filled just now.
+        assert_eq!(unsafe { ptr::read_volatile(slot as *const u8) }, 0x77);
+        release(a, ua);
+        release(b, ub);
+        assert_eq!(munmap_of(mem, 2 * chunk), 0);
+    }
+
+    /// The pages of a released userfaultfd register again with another, as
+    /// Linux's release clears its vmas' context (fs/userfaultfd.c, v6.12,
+    /// `userfaultfd_release` :856): a page missing at the release is missing
+    /// again, one filled keeps its contents. On a reserved range.
+    #[test]
+    fn test_pages_of_a_released_userfaultfd_register_again() {
+        let (a, ua) = create(0, false, true).unwrap();
+        let (b, ub) = create(0, false, true).unwrap();
+        let mem = map_pages("reserved", 2);
+        register(a, mem, 2 * PAGE).unwrap();
+        // SAFETY: a page.
+        assert_eq!(unsafe { copy(a, page_of(0x5a).as_ptr(), mem, PAGE, true) }, Ok(PAGE));
+        release(a, ua);
+        register(b, mem, 2 * PAGE).unwrap();
+        assert!(!is_missing(mem) && is_missing(mem + PAGE));
+        // SAFETY: filled before the release, kept.
+        assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0x5a);
+        assert_eq!(zeropage(b, mem + PAGE, PAGE, true), Ok(PAGE));
+        release(b, ub);
+        assert_eq!(munmap_of(mem, 2 * PAGE), 0);
+    }
+
     /// More scattered partial unregisters of one registration than there are
     /// slots ([`MAX_RANGES`]) all succeed and take no slot, and the pages
     /// left registered fault and fill as before. Firecracker's on-demand
@@ -11182,9 +11687,9 @@ mod tests {
     /// scattered as a balloon's inflation leaves them
     /// (tests/integration_tests/functional/test_uffd.py :100 to :109); on
     /// Linux each is a vma split, up to `vm.max_map_count`. macOS's test
-    /// of the same name, without its register of an unregistered page by
-    /// another userfaultfd (`EBUSY` here until the owner byte a page). In a
-    /// process of its own, as it counts the process's slots.
+    /// of the same name, with its register of an unregistered page by
+    /// another userfaultfd. In a process of its own, as it counts the
+    /// process's slots.
     #[test]
     fn test_more_scattered_unregisters_than_slots_all_succeed() {
         let (code, text) = run_child("scattered_unregisters_child", None);
@@ -11224,9 +11729,22 @@ mod tests {
         assert_eq!(unsafe { copy(a, data.as_ptr(), last, PAGE, true) }, Ok(PAGE));
         assert_eq!(reader.join().unwrap(), 9);
         assert_eq!(zeropage(a, mem, PAGE, true), Ok(PAGE));
+        // Another userfaultfd registers an unregistered page, in the same
+        // slot, and its fill lands there; a's fill of it is ENOENT.
+        let (b, ub) = create(0, false, true).unwrap();
+        assert_eq!(register(b, mem + PAGE, PAGE).map_err(|e| e.raw_os_error()), Ok(()), "b's register of an unregistered page");
+        assert_eq!(slots(), used, "b's register took a slot");
+        assert_eq!(zeropage(a, mem + PAGE, PAGE, true), Err((crate::ENOENT, 0)));
+        assert_eq!(zeropage(b, mem + PAGE, PAGE, true), Ok(PAGE));
         assert_eq!(unregister(a, mem, pages * PAGE), Ok(()));
-        assert_eq!(slots(), used - 1, "the range outlived its last page");
-        // SAFETY: closes the user end.
-        unsafe { ws::closesocket(sock(ua)) };
+        // The slot is kept until the memory is unmapped ([`Range`]).
+        assert_eq!(slots(), used, "the slot went before its memory");
+        assert_eq!(munmap_of(mem, pages * PAGE), 0);
+        assert_eq!(slots(), used - 1, "the range outlived its memory");
+        // SAFETY: closes the user ends.
+        unsafe {
+            ws::closesocket(sock(ua));
+            ws::closesocket(sock(ub));
+        }
     }
 }

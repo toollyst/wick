@@ -1110,22 +1110,17 @@ upstream Firecracker and its jailer.
   both pages then, failed: "a resident page is missing"). Firecracker registers guest memory it has just mapped
   (src/vmm/src/persist.rs `guest_memory_from_uffd`: `memory::anonymous`, then `register` of each region), so no
   page of it is resident and closed then.
-- **Windows: memory a userfaultfd registered once is not registered again.** After its last registered pages are
-  unregistered or its userfaultfd is released, a register of the same memory is `EINVAL`, where Linux registers it
-  (the vma is ordinary anonymous memory again): the register takes private memory only, and the memory is now the
-  range's section views, a chunked range's with no section handle to map a new alias from
-  (`test_memory_unregistered_whole_registers_again`, `test_memory_replaced_while_registered_registers_anew`, ignored
-  citing this entry; memory mapped anew where a registration was registers and is filled, the second test's first
-  half). Before the unmap fix it was `EBUSY` for the same memory, the range's slot kept after its unregister (the
-  first test on main a33f5aba, Windows Server 2022 20348: "Err(Os { code: 170, kind: ResourceBusy, ... })" for both
-  userfaultfds and both kinds). Not registered either, as Linux registers it: part of a mapping (`EINVAL`), a
-  userfaultfd's own range again (`EBUSY`), and pages unregistered from a range's middle by another userfaultfd
-  (`EBUSY` until all of the range is unregistered) (`test_part_of_a_mapping_is_registered`,
-  `test_the_same_userfaultfd_registers_its_range_again`,
-  `test_a_partial_unregister_frees_that_part_for_another_userfaultfd`, ignored; the same lines before the fix).
-  `MAP_FIXED` over part of a registered mapping is `EINVAL`, where Linux maps it
-  (`test_a_page_mapped_over_and_registered_again_is_filled_in_the_new_memory`, ignored citing this entry).
-  Firecracker registers each region of its guest memory once, whole, and maps nothing over part of one.
+- **Windows: part of a mapping, and memory mapped over part of a registered one, are not registered.** A register
+  of part of a mapping is `EINVAL`, where Linux splits the vma (`test_part_of_a_mapping_is_registered`, ignored citing
+  this entry); `MAP_FIXED` over part of a registered mapping is `EINVAL`, where Linux maps it
+  (`test_a_page_mapped_over_and_registered_again_is_filled_in_the_new_memory`, ignored citing this entry); a register
+  that overlaps a registered range without lying inside it, or holds a page of it that was unmapped or mapped over,
+  is `EBUSY`, where Linux registers the new vma: the register takes a whole private mapping, and a range is one
+  section with its alias, kept until all of its memory is unmapped. Memory registered once registers again, with any
+  userfaultfd, after an unregister of any part of it or a release (an owner a page, the range's slot kept until its
+  memory is unmapped: the `mem_backend: Uffd` row of docs/COMPATIBILITY.md, `test_memory_unregistered_whole_registers_again`,
+  `test_memory_replaced_while_registered_registers_anew`; before, `EINVAL` on Windows Server 2022 20348 and 2025
+  26100). Firecracker registers each region of its guest memory once, whole, and maps nothing over part of one.
 - **macOS: a call Firecracker's own sandbox denies ends it by SIGKILL, not exit 148.** On Linux the seccomp trap's
   SIGSYS runs upstream's handler, which logs the bad system call, counts `seccomp.num_faults` and exits 148.
   Seatbelt has no action that traps the calling thread, and a signal the process can catch let the denying thread
