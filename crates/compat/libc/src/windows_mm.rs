@@ -1368,16 +1368,39 @@ pub(crate) fn say_at_the_limit(line: core::fmt::Arguments) {
 }
 
 fn out_of_memory(addr: usize, err: u32) -> ! {
+    end_at_the_limit(format_args!(
+        "wick: guest memory: committing the pages at {addr:#x} failed with error {err}: the memory limit \
+         (the jail's memory.max, or the host's commit limit) is reached; the VMM ends, as the cgroup OOM \
+         killer ends it on Linux (exit {OOM_EXIT})"
+    ))
+}
+
+/// Ends the VMM for a userfaultfd fill of `len` bytes at `dst` whose pages
+/// the memory limit still refuses after the reclaim (`wick_uffd::fill`), as
+/// Linux's memory cgroup kills the VMM at the copy it cannot charge: it
+/// reclaims, then calls its out-of-memory killer, which kills a task of the
+/// cgroup, and charges again; it returns `-ENOMEM` only when no task can be
+/// killed (v6.1 mm/memcontrol.c, `try_charge_memcg` :2714 to :2743, the
+/// killer's call at :2729), and a jailed VMM's cgroup holds the VMM. The
+/// line names the fill, so that it is told from a lazy touch's
+/// ([`out_of_memory`]).
+pub(crate) fn fill_out_of_memory(dst: u64, len: u64, err: u32) -> ! {
+    end_at_the_limit(format_args!(
+        "wick: userfaultfd: the fill of {len} bytes at {dst:#x} failed with error {err} after the reclaim: the \
+         memory limit (the jail's memory.max, or the host's commit limit) is reached; the VMM ends, as the \
+         cgroup OOM killer ends it on Linux at the copy it cannot charge (exit {OOM_EXIT})"
+    ))
+}
+
+/// Says `line` on standard error, allocating nothing, and ends the process
+/// with [`OOM_EXIT`], as the cgroup OOM killer's SIGKILL ends the VMM.
+fn end_at_the_limit(line: core::fmt::Arguments<'_>) -> ! {
     let rescue = RESCUE.swap(0, std::sync::atomic::Ordering::SeqCst);
     if rescue != 0 {
         // SAFETY: frees the block set aside for this.
         unsafe { VirtualFree(rescue as *mut c_void, 0, MEM_RELEASE) };
     }
-    say_at_the_limit(format_args!(
-        "wick: guest memory: committing the pages at {addr:#x} failed with error {err}: the memory limit \
-         (the jail's memory.max, or the host's commit limit) is reached; the VMM ends, as the cgroup OOM \
-         killer ends it on Linux (exit {OOM_EXIT})"
-    ));
+    say_at_the_limit(line);
     // SAFETY: ends this process at once, as SIGKILL does.
     unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), OOM_EXIT) };
     // TerminateProcess of this process does not return; were it to, no
@@ -3140,8 +3163,8 @@ fn spans_outside(s: usize, e: usize, done: &[(u64, u64)]) -> Vec<(usize, usize)>
 /// it is filled ([`uffd_commit`]), as Linux charges the page a
 /// `UFFDIO_COPY` allocates to the memory cgroup (v6.1 mm/userfaultfd.c,
 /// `mcopy_atomic_pte`: `mem_cgroup_charge` at :205; at the limit the memory
-/// cgroup kills the VMM, where a fill here is `ENOMEM`: SECURITY.md, "Not at
-/// parity yet").
+/// cgroup kills the VMM, as a fill here still refused after the reclaim
+/// ends it: [`fill_out_of_memory`]).
 /// Before, the whole section was committed here and charged to no job. A
 /// resident page is charged before the private page it is copied from is
 /// freed, so it counts twice for that moment.
@@ -3661,7 +3684,8 @@ const MOVE_ROOM: usize = 3 * PAGE;
 /// process holds (12 KiB at most). At most one chunk owes at a time:
 /// while one does, no other chunk is moved ([`uffd_move_chunk`]) and every
 /// userfaultfd commit first takes the owed charge again ([`uffd_commit`]),
-/// refused (`ENOMEM`, the reclaim then moving the owing chunk) if it cannot;
+/// refused if it cannot (the reclaim then moving the owing chunk, and the
+/// fill ending the VMM if it is refused still: `wick_uffd::fill`);
 /// the owing chunk's move, made, frees the pages. 0 for none. Taken after
 /// the table's lock and before [`CHARGES`].
 static OWED: ProbedMutex<[usize; MOVE_ROOM / PAGE]> = ProbedMutex::new("OWED", [0; MOVE_ROOM / PAGE]);

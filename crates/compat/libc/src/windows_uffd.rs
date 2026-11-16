@@ -55,7 +55,7 @@ use std::sync::Mutex;
 use crate::windows_stacklock::ProbedMutex;
 use std::vec::Vec;
 
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HANDLE};
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GetLastError, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
     self as ws, AF_UNIX, INVALID_SOCKET, POLLERR, POLLHUP, POLLRDNORM, SOCKET, SOCKET_ERROR,
     SOCK_STREAM, WSAPOLLFD, WSAPROTOCOL_INFOW, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
@@ -1190,15 +1190,28 @@ fn fill(
     // A reserved section's pages are committed, and charged, first; the job's
     // limit refuses the commit. Refused, dead pages are reclaimed first and the
     // commit made again, as Linux's memory cgroup reclaims before anything
-    // else (`reclaim_for_a_fill`); refused still, the fill is ENOMEM and the
-    // VMM goes on, where Linux's memory cgroup kills the VMM (SECURITY.md,
-    // "Not at parity yet").
+    // else (`reclaim_for_a_fill`); refused still, the VMM ends, named, as
+    // Linux's memory cgroup kills it at the copy it cannot charge
+    // (`windows_mm::fill_out_of_memory`).
     #[allow(clippy::cast_possible_truncation)]
-    if range.reserved.load(Ordering::Acquire)
-        && !crate::windows_mm::uffd_commit(dst as usize, bytes as usize)
-        && !(reclaim_for_a_fill(bytes as usize).freed > 0 && crate::windows_mm::uffd_commit(dst as usize, bytes as usize))
-    {
-        return Err((crate::ENOMEM, 0));
+    if range.reserved.load(Ordering::Acquire) && !crate::windows_mm::uffd_commit(dst as usize, bytes as usize) {
+        // SAFETY: plain call.
+        let mut err = unsafe { GetLastError() };
+        let made = reclaim_for_a_fill(bytes as usize).freed > 0 && {
+            let again = crate::windows_mm::uffd_commit(dst as usize, bytes as usize);
+            if !again {
+                // SAFETY: plain call.
+                err = unsafe { GetLastError() };
+            }
+            again
+        };
+        if !made {
+            #[cfg(test)]
+            if tests::REFUSED_FILL_IS_ENOMEM.load(Ordering::SeqCst) {
+                return Err((crate::ENOMEM, 0));
+            }
+            crate::windows_mm::fill_out_of_memory(dst, bytes, err);
+        }
     }
     fill((alias + (dst - base)) as *mut u8, bytes as usize);
     // Each page with the protection `mprotect` gave it (one filled while
@@ -2255,7 +2268,7 @@ fn reclaim_pass(need: usize, chunks: &[Candidate], mut skipped: Option<&mut Vec<
 /// passed over. Such a call may be in its prefault, waiting for a fill
 /// (`windows_mm::copying` counts it from before its prefault) that the
 /// handler sends only once this one is answered, so the wait would not end;
-/// the fill is refused instead (`ENOMEM`), as it was before.
+/// with no other room, the fill then ends the VMM ([`fill`]).
 fn reclaim_for_a_fill(need: usize) -> Reclaimed {
     ask_the_reclaimer(Ask::Fill(need))
 }
@@ -3128,12 +3141,16 @@ mod tests {
     }
 
     /// In a process whose job may commit 64 MiB, 256 MiB are registered and
-    /// filled 1 MiB at a time: a fill past the limit fails with `ENOMEM` and
-    /// the process goes on, where Linux's memory cgroup kills the VMM
-    /// (SECURITY.md, "Not at parity yet"). Before, the 256 MiB were
-    /// committed at the registration and no job charged them.
+    /// filled 1 MiB at a time: the fill the limit refuses after the reclaim
+    /// ends the process with 137 and a line naming the fill, as Linux's
+    /// memory cgroup kills the VMM at the copy it cannot charge
+    /// (`windows_mm::fill_out_of_memory`; measured on Linux 7.0: the VMM
+    /// SIGKILLed, no copy refused while it lived). Between 16 and 64 MiB are
+    /// filled first. Before, that fill was `ENOMEM` and the process went on;
+    /// before that, the 256 MiB were committed at the registration and no
+    /// job charged them.
     #[test]
-    fn test_a_fill_past_the_job_limit_fails_with_enomem() {
+    fn test_a_fill_past_the_job_limit_ends_the_vmm_with_137() {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -3172,12 +3189,22 @@ mod tests {
         unsafe { CloseHandle(job) };
         assert!(text.contains("running 1 test"), "the child {name} ran no test (status {}): {text}", out.status);
         assert!(text.contains("registered 256 MiB"), "the child did not register (status {}): {text}", out.status);
-        assert!(text.contains("refused with ENOMEM after"), "the job's limit did not hold: {text}");
-        assert!(text.contains("test result: ok. 1 passed"), "{text}");
+        let line = text.lines().find(|l| l.starts_with("wick: userfaultfd: the fill of 1048576 bytes at "));
+        assert!(line.is_some_and(|l| l.contains("after the reclaim") && l.contains("the VMM ends")), "no line for the fill: {text}");
+        std::eprintln!("{}", line.unwrap());
+        // The fill's address, against the mapping's: between 16 and 64 MiB in.
+        let at = |l: &str, key: &str| -> u64 {
+            let h = l.split(key).nth(1).unwrap().trim_start_matches("0x");
+            u64::from_str_radix(h.split(|c: char| !c.is_ascii_hexdigit()).next().unwrap(), 16).unwrap()
+        };
+        let mem = at(text.lines().find(|l| l.starts_with("registered 256 MiB at ")).unwrap(), "at ");
+        let dst = at(line.unwrap(), "bytes at ");
+        assert!((16 << 20..64 << 20).contains(&(dst - mem)), "the fill ended the process {} MiB in: {text}", (dst - mem) >> 20);
+        assert_eq!(out.status.code(), Some(137), "{text}");
     }
 
     #[test]
-    #[ignore = "run by test_a_fill_past_the_job_limit_fails_with_enomem in a job of its own"]
+    #[ignore = "run by test_a_fill_past_the_job_limit_ends_the_vmm_with_137 in a job of its own"]
     fn fill_limit_child() {
         std::thread::sleep(std::time::Duration::from_millis(300));
         let (ctx, user) = create(0, false, true).unwrap();
@@ -3198,7 +3225,7 @@ mod tests {
         assert_ne!(mem, crate::MAP_FAILED);
         let mem = mem as u64;
         register(ctx, mem, len).unwrap();
-        std::println!("registered 256 MiB");
+        std::println!("registered 256 MiB at {mem:#x}");
         let mib: u64 = 1 << 20;
         let mut done = 0;
         let refused = loop {
@@ -3208,13 +3235,8 @@ mod tests {
                 Err((e, n)) => break (e, n),
             }
         };
+        // Only if the process was not ended at the limit.
         std::println!("refused with {} after {} MiB", if refused.0 == crate::ENOMEM { "ENOMEM" } else { "another error" }, done >> 20);
-        assert_eq!(refused, (crate::ENOMEM, 0));
-        assert!((16 << 20..64 << 20).contains(&done), "{} MiB filled under a 64 MiB limit", done >> 20);
-        // The pages filled are there, the refused ones still missing.
-        // SAFETY: filled.
-        assert_eq!(unsafe { *(mem as *const u8) }, 0);
-        assert!(is_missing(mem + done));
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
@@ -3287,9 +3309,19 @@ mod tests {
         fill_to_the_limit_from(0)
     }
 
+    /// Set by the reclaim tests ([`fill_to_the_limit_from`]): a fill the
+    /// limit still refuses after the reclaim answers `ENOMEM` instead of
+    /// ending the process. These tests find the limit by filling to it and
+    /// then look at what the reclaim does there; the product's ending is
+    /// [`test_a_fill_past_the_job_limit_ends_the_vmm_with_137`]'s, which
+    /// leaves this off.
+    pub(crate) static REFUSED_FILL_IS_ENOMEM: AtomicBool = AtomicBool::new(false);
+
     /// [`fill_to_the_limit`], the fill begun `from` bytes in: the pages
-    /// before are never filled.
+    /// before are never filled. A fill refused at the limit is `ENOMEM`
+    /// in this process from here ([`REFUSED_FILL_IS_ENOMEM`]).
     fn fill_to_the_limit_from(from: u64) -> (usize, c_int, u64, u64) {
+        REFUSED_FILL_IS_ENOMEM.store(true, Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(300));
         make_the_slack_region();
         let (ctx, user) = create(0, false, true).unwrap();
@@ -4839,7 +4871,9 @@ mod tests {
     /// `try_to_free_mem_cgroup_pages` before `mem_cgroup_oom`; there the
     /// discarded pages were freed at the discard already). The live pages
     /// read back, the discarded ones are missing, and a fill past what the
-    /// dead pages gave back is still `ENOMEM`. Before, the fill was refused
+    /// dead pages gave back is still refused (`ENOMEM` in these tests,
+    /// [`REFUSED_FILL_IS_ENOMEM`]; the product ends the VMM there). Before,
+    /// the fill was refused
     /// with 8 MiB of dead pages charged. With no room left in the job
     /// ([`no_room_left`]): in CI run 43640510155 no move was made there, its
     /// map refused (`test_the_room_a_move_needs_on_record`).
@@ -5792,7 +5826,8 @@ mod tests {
 
     /// A fill at the job's limit allocates nothing: fills of a page each,
     /// from no room left, refused, reclaimed for and made, until one is
-    /// refused with `ENOMEM`, allocate nothing on the filling thread, the
+    /// refused (`ENOMEM` in these tests, [`REFUSED_FILL_IS_ENOMEM`]),
+    /// allocate nothing on the filling thread, the
     /// serve thread or the reclaimer, where a heap that must grow is refused
     /// there; Linux's fill takes only the page it fills and the page tables
     /// it needs (v6.1 mm/userfaultfd.c: `mcopy_atomic_pte`'s

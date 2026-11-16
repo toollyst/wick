@@ -230,8 +230,17 @@ has the per-control details and results.
   change left it (`test_a_register_racing_a_munmap_leaves_nothing_registered`,
   `test_a_register_racing_a_map_fixed_registers_the_new_memory`,
   `test_a_register_racing_an_mprotect_keeps_its_pages_missing`, `test_a_register_racing_a_discard_fills_the_new_pages`);
-  and a register keeps the protection `mprotect` gave each page, where before it mapped the memory read-write (as
-  read from the code).
+  before, per call, from the commit that brought its check without the userfaultfd's lock (whether the call's range
+  touched a registered range), a register of the same memory that started between that check and the call went on
+  beside it: a discard (`MADV_DONTNEED`, `MADV_FREE`), from b0dfb35b, the first Windows userfaultfd, already public
+  (`discarding`'s check and `madvise`'s `wick_uffd::active()`): the register took a page the discard then emptied for
+  resident, so it read zeros and was not missing; `mprotect`, from 5d08b98a, already public
+  (`mprotect_registered`'s `REGISTERED == 0`): the register's view put a page's protection back to read-write;
+  `munmap` and `mmap` with `MAP_FIXED` did not look at registrations at all before this fix (the defect above). With
+  the counts taken out, the race tests fail so: "the discarded page is not missing", "the protection asked: Some(4)"
+  (`PAGE_READWRITE`), "registered over memory that is gone (Ok(()))", "the new memory is not what was registered".
+  And a register keeps the protection `mprotect` gave each page, where before it mapped the memory read-write
+  (`test_a_register_keeps_the_protection_mprotect_gave`).
   Each of these tests fails under the mutation that takes its part of the fix out (docs/ARCHITECTURE.md, "Memory
   calls on registered memory"). What stays different is under "Not at parity yet".
 - **Windows: a thread pool could keep a jailed process running after one of its threads used up its stack**
@@ -365,21 +374,23 @@ has the per-control details and results.
 Until these are done, **do not run untrusted multi-tenant workloads on macOS or Windows hosts.** On Linux, wick is
 upstream Firecracker and its jailer.
 
-- **Windows: a userfaultfd fill past `memory.max` is refused with `ENOMEM` and the VMM goes on, where Linux kills the
-  VMM.** Measured on Linux 7.0.0-1017-gcp (Ubuntu 24.04, cgroup v2, the VMM's cgroup at memory.max 64M and
+- **Windows: the page tables of a userfaultfd fill are charged to the VMM's job, where Linux charges them to the
+  filling process's cgroup.** Measured on Linux 7.0.0-1017-gcp (Ubuntu 24.04, cgroup v2, the VMM's cgroup at memory.max 64M and
   memory.swap.max 0, a 64 GiB registered mapping filled by a handler process with `UFFDIO_COPY`, three runs of each
   case, the same each time): the copy the VMM's cgroup cannot charge sets off the cgroup's OOM killer, which kills
   the VMM with SIGKILL (`memory.events` `oom_kill` 1); with the handler in the VMM's cgroup it then kills the handler
   too (`oom_kill` 2), and with the handler in another cgroup the handler's next copy, the VMM gone, returns -1 with
   `ENOMEM`. While the VMM lives, no copy is refused. This is what v6.1's charge path does: it reclaims, then calls
   the OOM killer and charges again once a task was killed, and returns `-ENOMEM` only when no task can be killed
-  (mm/memcontrol.c, `try_charge_memcg` :2714 to :2743, `mem_cgroup_oom` :1891). Here a fill the job refuses after
-  the reclaim at the limit (`reclaim_for_a_fill`) returns `ENOMEM` to the handler and the VMM goes on
-  (`test_a_fill_past_the_job_limit_fails_with_enomem`). Also unlike Linux: the page table a fill needs is charged on
-  Linux to the filling process's cgroup, not the VMM's (with the handler in another cgroup the VMM was killed at
-  anon-rss 65628 kB and pgtables 65708 kB under the 64 MiB limit; with it in the VMM's, at 32816 kB and 32840 kB),
-  where here every page table of the VMM's memory is the VMM's own commit, in its job. Firecracker's handler is a
-  process of the operator's, which the jailer does not put in the VMM's cgroup.
+  (mm/memcontrol.c, `try_charge_memcg` :2714 to :2743, `mem_cgroup_oom` :1891). Here, the same now: a fill the job
+  still refuses after the reclaim at the limit (`reclaim_for_a_fill`) ends the VMM with 137 and a line naming the
+  fill, so the handler finds its socket closed (`test_a_fill_past_the_job_limit_ends_the_vmm_with_137`; before, the
+  handler got `ENOMEM` and the VMM went on). What stays different: the page table a fill needs is charged on Linux
+  to the filling process's cgroup, not the VMM's (with the handler in another cgroup the VMM was killed at anon-rss
+  65628 kB and pgtables 65708 kB under the 64 MiB limit; with it in the VMM's, at 32816 kB and 32840 kB), where here
+  every page table of the VMM's memory is the VMM's own commit, in its job, so the VMM reaches its limit sooner by
+  those tables. Firecracker's handler is a process of the operator's, which the jailer does not put in the VMM's
+  cgroup.
 - **Without the jailer, the VMM runs as the user who started it** on macOS and Windows: an escape from the VM and
   then the VMM lands as that user (files are then not limited, as on Linux without the jailer).
 - **macOS jailer: no namespaces in the kernel.** macOS has no network or PID namespaces (XNU's system calls,
@@ -557,9 +568,10 @@ upstream Firecracker and its jailer.
   (`test_shared_memory_past_the_job_limit_ends_the_process`, which passed in CI run 43521200989;
   `test_anonymous_shared_memory_is_charged_at_first_touch`, which passed in a process of its own in CI run 43524342863, b85b5a4, and each saved run since). A touched page so takes twice its size of host commit and once of memory.
   The userfaultfd restore's section is charged the same way: reserved at the registration, each page committed with
-  its charge when the handler fills it, and a fill past `memory.max` fails with `ENOMEM` and the VMM goes on
-  (`test_a_fill_past_the_job_limit_fails_with_enomem`, which passed in CI run 43534301411), where Linux's memory
-  cgroup kills the VMM ("Not at parity yet"). A 2 MiB chunk discarded whole with `MADV_DONTNEED` (free page reporting; the section is one
+  its charge when the handler fills it, and a fill that `memory.max` still refuses after the reclaim ends the VMM
+  with 137, as Linux's memory cgroup kills it at the copy it cannot charge
+  (`test_a_fill_past_the_job_limit_ends_the_vmm_with_137`; before, the fill was `ENOMEM` and the VMM went on: the
+  memory.max row). A 2 MiB chunk discarded whole with `MADV_DONTNEED` (free page reporting; the section is one
   per chunk) gets a new, empty section, so its commit and charge go
   (`test_a_wholly_discarded_chunk_gives_its_section_commit_back`, passed in CI run 43545368906, 305a806). A page discarded in a chunk not discarded whole
   (balloon inflation's scattered pages) keeps its section page committed (a SEC_RESERVE page cannot be decommitted)
