@@ -27,8 +27,10 @@
 //!   `PAGE_NOACCESS` one does; a fill commits it first, charged to the
 //!   job's memory limit, through the view at its address with no access
 //!   (`windows_mm::uffd_commit`), as Linux charges the page a `UFFDIO_COPY`
-//!   allocates (`ENOMEM` when refused). A page never filled becomes lazy
-//!   memory when it is unregistered (`windows_mm::uffd_lazy`).
+//!   allocates (`ENOMEM` when refused). A page missing when it leaves the
+//!   registration (unregistered, or the userfaultfd released) is resolved
+//!   at its first access: committed if never filled, zeroed if discarded
+//!   (its range's record, `windows_mm::released_pend`).
 //! - `madvise(MADV_DONTNEED)` on registered pages makes them missing again
 //!   and queues a remove event ([`discarding`]); their memory is discarded.
 //! - System calls that copy to or from missing pages fail on Windows
@@ -133,6 +135,9 @@ struct Range {
     /// One bit per page: its protection denies writes (`PROT_READ`, or
     /// `PROT_NONE`).
     nowrite: AtomicPtr<AtomicU64>,
+    /// The record its released pages go to, taken at the register
+    /// (`windows_mm::released_reserve`; a reserved section's only).
+    record: AtomicUsize,
 }
 
 impl Range {
@@ -147,6 +152,7 @@ impl Range {
             tracked: AtomicPtr::new(ptr::null_mut()),
             noread: AtomicPtr::new(ptr::null_mut()),
             nowrite: AtomicPtr::new(ptr::null_mut()),
+            record: AtomicUsize::new(0),
         }
     }
 
@@ -549,50 +555,30 @@ fn with_memory(range: &Range, addr: u64, len: u64, mut f: impl FnMut(u64, u64)) 
 }
 
 /// Missing pages `[s, s + len)` of `range`, whose alias is at `alias` and
-/// which starts at `base`, become ordinary memory: those with memory
-/// (filled once, then discarded) read zeros, as Linux gives: in a reserved
-/// section zeroed at their first access
-/// (`windows_mm::uffd_stale`), elsewhere zeroed and made accessible now;
-/// those never filled, in a reserved section, become lazy memory
-/// (`windows_mm::uffd_lazy`).
+/// which starts at `base`, become ordinary memory: in a reserved section
+/// they are pending in the range's record, each resolved at its first
+/// access (committed if never filled; zeroed through the alias if filled
+/// once and discarded, its commit and charge kept by `discarding`, as Linux
+/// gives a zapped page as zeros at its next touch), with the protection
+/// `mprotect` gave it, which stays with the memory as a vma's does on
+/// Linux; elsewhere zeroed and made accessible now. Allocates nothing (the
+/// release runs at the job's limit).
 fn release_missing(range: &Range, base: u64, alias: u64, s: u64, len: u64) -> io::Result<()> {
-    let mut at = s;
+    if range.reserved.load(Ordering::Acquire) {
+        #[allow(clippy::cast_possible_truncation)]
+        crate::windows_mm::released_pend(range.record.load(Ordering::Acquire), alias as usize, s as usize, len as usize, |at| {
+            range.prot((at as u64 - base) / PAGE)
+        });
+        return Ok(());
+    }
+    // SAFETY: the alias of registered memory.
+    unsafe { ptr::write_bytes((alias + (s - base)) as *mut u8, 0, len as usize) };
     let mut result = Ok(());
-    // Each run with memory, then the end; walked in place (the release runs
-    // at the job's limit, where a heap that must grow is refused).
-    let mut run = |a: u64, l: u64| {
-        if result.is_err() {
-            return;
+    range.by_prot(base, s, len, |r, n, prot| {
+        if result.is_ok() {
+            result = protect_as(r, n, prot);
         }
-        // Each with the protection `mprotect` gave it, which stays with the
-        // memory, as a vma's does on Linux.
-        if a > at {
-            #[allow(clippy::cast_possible_truncation)]
-            range.by_prot(base, at, a - at, |r, n, prot| crate::windows_mm::uffd_lazy(r as usize, n as usize, prot));
-        }
-        if l > 0 {
-            if range.reserved.load(Ordering::Acquire) {
-                // Discarded, its commit and charge kept (`discarding`): lazy,
-                // zeroed at its first access, as Linux gives a zapped page as
-                // zeros at its next touch.
-                #[allow(clippy::cast_possible_truncation)]
-                range.by_prot(base, a, l, |r, n, prot| {
-                    crate::windows_mm::uffd_stale(r as usize, n as usize, (alias + (r - base)) as usize, prot);
-                });
-            } else {
-                // SAFETY: the alias of registered memory.
-                unsafe { ptr::write_bytes((alias + (a - base)) as *mut u8, 0, l as usize) };
-                range.by_prot(base, a, l, |r, n, prot| {
-                    if result.is_ok() {
-                        result = protect_as(r, n, prot);
-                    }
-                });
-            }
-        }
-        at = a + l;
-    };
-    with_memory(range, s, len, &mut run);
-    run(s + len, 0);
+    });
     result
 }
 
@@ -787,19 +773,32 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     let Some(range) = RANGES.iter().find(|r| r.start.load(Ordering::Acquire) == 0) else {
         return Err(errno_err(crate::ENOMEM));
     };
+    // The record its released pages go to, with its bitmaps, taken now: the
+    // release runs at the job's limit and cannot fail.
+    #[allow(clippy::cast_possible_truncation)]
+    let record = crate::windows_mm::released_reserve(start as usize, len as usize).map_err(errno_err)?;
+    let undo = |e: io::Error| {
+        crate::windows_mm::released_unreserve(record);
+        e
+    };
     // The reclaim's working memory for every chunk registered with this one,
     // reserved now, so that a reclaim at the limit allocates nothing.
     let chunks = usize::try_from(len.div_ceil(crate::windows_mm::UFFD_CHUNK as u64)).unwrap_or(usize::MAX);
-    reserve_reclaim(registered_chunks().saturating_add(chunks))?;
+    reserve_reclaim(registered_chunks().saturating_add(chunks)).map_err(undo)?;
     let pages = len / PAGE;
     // Residency decides what is missing.
     let mut resident = std::vec![0u8; pages as usize];
     // SAFETY: `resident` has one byte per page of the range.
     if unsafe { crate::mincore(start as *mut _, len as usize, resident.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(undo(io::Error::last_os_error()));
     }
-    let (alias, reserved) = crate::windows_mm::uffd_alias(start as usize, len as usize, &resident).map_err(errno_err)?;
+    let (alias, reserved) = crate::windows_mm::uffd_alias(start as usize, len as usize, &resident).map_err(|e| undo(errno_err(e)))?;
+    if !reserved {
+        // Its missing pages are zeroed and opened at their release.
+        crate::windows_mm::released_unreserve(record);
+    }
     let alias = alias as u64;
+    range.record.store(record, Ordering::Release);
     range.reserved.store(reserved, Ordering::Release);
     let missing = alloc_bitmap(pages, false);
     let tracked = alloc_bitmap(pages, true);
@@ -1155,11 +1154,18 @@ fn destroy(ctx: usize) {
         r.start.store(0, Ordering::Release);
         REGISTERED.fetch_sub(1, Ordering::AcqRel);
         let alias = r.alias.swap(0, Ordering::AcqRel);
+        let reserved = r.reserved.load(Ordering::Acquire);
         if alias != 0 {
             // Kept with the mapping while its discarded pages are still to
-            // be zeroed through it (`windows_mm::uffd_stale`).
+            // be zeroed through it (pending in its record).
             #[allow(clippy::cast_possible_truncation)]
-            crate::windows_mm::uffd_unalias(s as usize, (e - s) as usize, alias as usize, r.reserved.load(Ordering::Acquire));
+            crate::windows_mm::uffd_unalias(s as usize, (e - s) as usize, alias as usize, reserved);
+        }
+        // The record's pages are published before the waiters wake: a
+        // thread that faulted on a missing page runs its access again and
+        // finds it pending there.
+        if reserved {
+            crate::windows_mm::released_end(r.record.load(Ordering::Acquire));
         }
         wake(s, e - s);
     }
@@ -2751,7 +2757,8 @@ mod tests {
         // takes them. The watch's frames and its record's lines are deeper
         // than the product's, and a thread whose committed stack ends just
         // below the product's path (the userfaultfd's serve thread in
-        // `destroy`, through `uffd_lazy` and the region table's search)
+        // `destroy`, through the release's lazy pages and the region
+        // table's search)
         // needed a new page for them, which the limit refused: 10 of 480
         // fills at the limit ended so with the watch (9 with 137, 1 with
         // STATUS_HEAP_CORRUPTION), 0 of 480 with the watch off for the whole
@@ -4477,7 +4484,6 @@ mod tests {
     /// (v6.1 fs/userfaultfd.c `userfaultfd_release`, 885-899). In a job of
     /// its own, with no room left ([`no_room_left`]).
     #[test]
-    #[ignore = "until the next commit"]
     fn test_a_userfaultfd_released_at_the_limit_allocates_nothing() {
         let (code, text) = run_child("release_allocations_child", Some(96 << 20));
         assert!(text.contains("room left before the reclaim: 0 KiB"), "{text}");
@@ -4794,26 +4800,25 @@ mod tests {
     }
 
     /// The released ranges' records are as many as the slots, one taken at
-    /// each register (design-released-ranges.md): with 64 ranges released
-    /// and their pending pages still mapped, a 65th register is refused with
-    /// `ENOMEM` and changes nothing, as Linux refuses a register whose vma
+    /// each register and held until the registration is released and its
+    /// memory unmapped (design-released-ranges.md): with 64 ranges released
+    /// and still mapped, a 65th register is refused with `ENOMEM` and
+    /// changes nothing, as Linux refuses a register whose vma
     /// split would pass `vm.max_map_count` (mm/mmap.c `split_vma`); their
     /// pages read as before. In a process of its own.
     #[test]
-    #[ignore = "until the released ranges' records"]
     fn test_released_records_past_the_table_refuse_a_register() {
         let (code, text) = run_child("released_table_child", None);
         assert!(text.contains("TABLE the 65th register: ENOMEM"), "{text}");
         assert_eq!(code, Some(0), "{text}");
     }
 
-    /// A record is freed when its last pending page is unmapped: with the
-    /// table full, an unmap of half of one released range (its discarded
-    /// page) keeps the record, and the register is still refused; an unmap
-    /// of the rest frees it, and the register is made. In a process of its
-    /// own.
+    /// A record is freed when the last of its released range is unmapped:
+    /// with the table full, an unmap of half of one released range (its
+    /// discarded page) keeps the record, and the register is still refused;
+    /// an unmap of the rest frees it, and the register is made. In a process
+    /// of its own.
     #[test]
-    #[ignore = "until the released ranges' records"]
     fn test_release_then_munmap_frees_the_record() {
         let (code, text) = run_child("released_table_child", None);
         assert!(text.contains("TABLE after half unmapped: ENOMEM"), "{text}");

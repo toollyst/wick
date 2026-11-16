@@ -439,9 +439,9 @@ enum Kind {
         file: Option<Arc<Owned>>,
         charge: Option<Arc<Charge>>,
         /// A released userfaultfd range's alias of the section, handed over
-        /// by [`uffd_unalias`] while the view has discarded pages
-        /// ([`STALE`]), which are zeroed through it at their first access;
-        /// unmapped with the view.
+        /// by [`uffd_unalias`] while the view has discarded pages pending in
+        /// its record ([`Record`]), which are zeroed through it at their
+        /// first access; unmapped with the view.
         alias: Option<usize>,
     },
     /// Anonymous private memory on large pages of `page` bytes
@@ -1202,6 +1202,10 @@ pub enum Access {
 }
 
 fn commit_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize>) {
+    // A released userfaultfd range's pending page ([`Record`]).
+    if let Some((access, range)) = released_access(addr, write) {
+        return (access, if access == Access::Committed { range } else { 0..0 });
+    }
     let found = {
         let l = LAZY.lock().unwrap();
         let i = l.partition_point(|&(s, _, _)| s <= addr);
@@ -1231,19 +1235,9 @@ fn commit_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize
     // huge zero page for a read fault there and allocates (and charges)
     // nothing until a write (mm/huge_memory.c `do_huge_pmd_anonymous_page`,
     // `use_zero_page`, on by default).
-    if let Some(mut access) = resolve_stale(page, prot) {
-        // Refused at the limit: dead pages reclaimed first, as Linux's
-        // memory cgroup reclaims before it refuses (`wick_uffd::reclaim_at_touch`).
-        if matches!(access, Access::Exhausted(_)) && crate::wick_uffd::reclaim_at_touch(PAGE).freed > 0 {
-            access = resolve_stale(page, prot).unwrap_or(Access::NotLazy);
-        }
-        let range = if access == Access::Committed { page..page + PAGE } else { 0..0 };
-        return (access, range);
-    }
     let grain = if write { lazy_grain(addr) } else { PAGE };
     let block = addr - addr % grain;
-    // Never a block over a discarded page, which is zeroed before it opens.
-    let whole = block >= s && block + grain <= s + n && stale_within(block, grain).is_empty();
+    let whole = block >= s && block + grain <= s + n;
     let (from, to) = if whole { (block, block + grain) } else { (page, page + PAGE) };
     if commit(from, to - from, prot, false) {
         return (Access::Committed, from..to);
@@ -1269,7 +1263,11 @@ fn commit_on_access(addr: usize, write: bool) -> (Access, core::ops::Range<usize
 /// reserved fails: measured, a guest kernel read into lazy memory). Linux
 /// faults the pages in as the call copies.
 pub(crate) fn prefault_lazy(addr: usize, len: usize) {
-    if len == 0 || LAZY.lock().unwrap().is_empty() {
+    if len == 0 {
+        return;
+    }
+    released_prefault(addr, len);
+    if LAZY.lock().unwrap().is_empty() {
         return;
     }
     let start = addr - addr % PAGE;
@@ -1298,19 +1296,6 @@ pub(crate) fn prefault_lazy(addr: usize, len: usize) {
             {
                 // SAFETY: plain call.
                 out_of_memory(at, unsafe { GetLastError() });
-            }
-            if mbi.State == MEM_COMMIT {
-                for (ss, sl) in stale_within(at, run) {
-                    for page in (ss..ss + sl).step_by(PAGE) {
-                        if let Some(Access::Exhausted(err)) = resolve_stale(page, prot) {
-                            if !(crate::wick_uffd::reclaim_at_touch(PAGE).freed > 0
-                                && resolve_stale(page, prot) == Some(Access::Committed))
-                            {
-                                out_of_memory(page, err);
-                            }
-                        }
-                    }
-                }
             }
             at += run;
         }
@@ -1705,7 +1690,10 @@ unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::
 fn protect_lazy(t: &mut Table, b: usize, s: usize, e: usize, wprot: PAGE_PROTECTION_FLAGS) -> bool {
     let r = t.get_mut(&b).unwrap();
     ranges_remove(&mut r.noaccess, s - b, e - s);
-    lazy_add(s, e - s, wprot);
+    // A released userfaultfd range's pages keep theirs in its record.
+    if !released_protect(s, e, wprot) {
+        lazy_add(s, e - s, wprot);
+    }
     let mut at = s;
     while at < e {
         // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
@@ -1717,13 +1705,16 @@ fn protect_lazy(t: &mut Table, b: usize, s: usize, e: usize, wprot: PAGE_PROTECT
         let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(e) - at;
         if mbi.State == MEM_COMMIT {
             // A discarded page stays closed until its first access zeroes
-            // it ([`STALE`]), which gives it the protection then asked for.
+            // it (pending in its record), which gives it the protection then
+            // asked for.
             let mut p = at;
-            for (ss, sl) in stale_within(at, run).into_iter().chain([(at + run, 0)]) {
-                if ss > p && !protect(p, ss - p, wprot) {
-                    return false;
+            for q in (at..at + run).step_by(PAGE).chain([at + run]) {
+                if q == at + run || released_is_pending(q) {
+                    if q > p && !protect(p, q - p, wprot) {
+                        return false;
+                    }
+                    p = q + PAGE;
                 }
-                p = ss + sl;
             }
         }
         at += run;
@@ -2587,12 +2578,12 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
                 lazy_remove(s, e - s);
             }
             Kind::View { .. } => {
-                if r.lazy {
+                if r.lazy || released_overlaps(s, e) {
                     // Its pages not committed fault already; the committed
                     // ones are made to (Windows protects no page that is only
                     // reserved). A discarded page's stays unopened.
                     lazy_remove(s, e - s);
-                    stale_remove(s, e - s);
+                    released_forget(s, e - s);
                     protect_committed(s, e, PAGE_NOACCESS);
                 } else {
                     protect(s, e - s, PAGE_NOACCESS);
@@ -2675,7 +2666,7 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
                 for (s, e) in spans_outside(rs, re, &registered) {
                     // Lazy memory stays lazy: its pages not committed get the
                     // protection when they are.
-                    if t[&b].lazy {
+                    if t[&b].lazy || released_overlaps(s, e) {
                         if !protect_lazy(&mut t, b, s, e, wprot) {
                             return fail(crate::EACCES, -1);
                         }
@@ -3512,121 +3503,380 @@ pub(crate) fn uffd_commit(s: usize, len: usize) -> bool {
 }
 
 
-/// Pages `[s, s + len)` of a userfaultfd range's reserved section that were
-/// discarded and become ordinary memory once the range is released, `alias`
-/// their address in its alias: lazy, each zeroed at its first access
-/// ([`STALE`]), as Linux gives a zapped page as zeros at its next touch; its
-/// charge, kept with its commit (`wick_uffd::discarding`), is made sure of
-/// then. Nothing is done unless a view of a mapping holds all of the pages.
-pub(crate) fn uffd_stale(s: usize, len: usize, alias: usize, prot: PAGE_PROTECTION_FLAGS) {
-    let mut t = table().lock().unwrap();
+/// A userfaultfd range's record of its released pages (design in
+/// agent-state, design-released-ranges.md): the pages that were missing when
+/// they left the registration (at its release, `wick_uffd::destroy`, or an
+/// unregister of them) and are still to be resolved at their first access:
+/// one never filled is not committed and is committed then, with the
+/// protection `mprotect` gave it; one discarded is committed, closed and
+/// still charged (`wick_uffd::discarding`), and is zeroed through the
+/// range's alias then and opened, as Linux gives a zapped page as zeros at
+/// its next touch. A record is taken at the register ([`released_reserve`])
+/// with its bitmaps, so that the release, which runs at the job's limit and
+/// cannot fail, allocates nothing and needs no new record: it sets bits.
+/// Linux's release clears each vma's flags in place (v6.1 fs/userfaultfd.c
+/// `userfaultfd_release`, 885-899) and the pages stay in its page tables.
+/// Every look at a record is made under [`RELEASED`]'s lock (a reader never
+/// holds a record across its reuse); [`RELEASED_LIVE`] is the only thing
+/// read without it, a hint that no record is in use.
+struct Record {
+    /// The registration's span; 0 when free.
+    start: usize,
+    end: usize,
+    state: RecordState,
+    /// Three bitmaps of a bit a page, one after another: pending, its
+    /// protection denies reads (`PROT_NONE`), denies writes.
+    bits: Option<std::boxed::Box<[u64]>>,
+    /// The range's alias: a pending committed page is zeroed through it.
+    alias: usize,
+    /// Pending pages.
+    left: usize,
+    /// The registration's views still mapped (one a [`UFFD_CHUNK`]): the
+    /// record is freed once it is released and none is (a thread that
+    /// faulted on a page another thread resolved meanwhile finds the record
+    /// still holding the page, and runs its access again).
+    views: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordState {
+    Free,
+    /// Its registration lives (pages an unregister released may be pending).
+    Reserved,
+    /// Its registration is released; freed once no page is pending.
+    Released,
+}
+
+const PENDING: usize = 0;
+const NOREAD: usize = 1;
+const NOWRITE: usize = 2;
+
+impl Record {
+    const FREE: Record = Record { start: 0, end: 0, state: RecordState::Free, bits: None, alias: 0, left: 0, views: 0 };
+
+    fn words(&self) -> usize {
+        ((self.end - self.start) / PAGE).div_ceil(64)
+    }
+
+    fn get(&self, map: usize, addr: usize) -> bool {
+        let page = (addr - self.start) / PAGE;
+        self.bits.as_ref().is_some_and(|b| b[map * self.words() + page / 64] & (1 << (page % 64)) != 0)
+    }
+
+    fn put(&mut self, map: usize, addr: usize, on: bool) {
+        let (page, words) = ((addr - self.start) / PAGE, self.words());
+        if let Some(b) = self.bits.as_mut() {
+            let w = &mut b[map * words + page / 64];
+            if on {
+                *w |= 1 << (page % 64);
+            } else {
+                *w &= !(1 << (page % 64));
+            }
+        }
+    }
+
+    fn holds(&self, addr: usize) -> bool {
+        self.state != RecordState::Free && self.start <= addr && addr < self.end
+    }
+
+    /// The protection the page at `addr` takes when it is resolved.
+    fn prot(&self, addr: usize) -> PAGE_PROTECTION_FLAGS {
+        if self.get(NOREAD, addr) {
+            PAGE_NOACCESS
+        } else if self.get(NOWRITE, addr) {
+            PAGE_READONLY
+        } else {
+            PAGE_READWRITE
+        }
+    }
+
+    /// The page at `addr` is no longer pending; a released record with
+    /// none left gives its bitmaps back (no reader holds them outside the
+    /// lock), and holds its span until its views go.
+    fn resolved(&mut self, addr: usize) {
+        if self.get(PENDING, addr) {
+            self.put(PENDING, addr, false);
+            self.left -= 1;
+            if self.left == 0 && self.state == RecordState::Released {
+                self.bits = None;
+            }
+        }
+    }
+
+    fn free(&mut self) {
+        *self = Record::FREE;
+        RELEASED_LIVE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The records, as many as the userfaultfd's ranges (`wick_uffd::MAX_RANGES`).
+/// Taken after the region table's lock and before [`CHARGES`].
+static RELEASED: ProbedMutex<[Record; 64]> = ProbedMutex::new("RELEASED", [const { Record::FREE }; 64]);
+/// The records not free: 0, and no access needs [`RELEASED`]'s lock.
+static RELEASED_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A record for a registration of `[start, start + len)`, taken with its
+/// bitmaps before the registration is made: its index, or `ENOMEM` with no
+/// record free or no memory for its bitmaps (the 65th registration whose
+/// earlier ranges' released pages are all still mapped; Linux refuses a
+/// register whose vma split would pass `vm.max_map_count`, mm/mmap.c
+/// `split_vma`).
+pub(crate) fn released_reserve(start: usize, len: usize) -> Result<usize, c_int> {
+    let words = (len / PAGE).div_ceil(64);
+    let mut bits = Vec::new();
+    bits.try_reserve_exact(3 * words).map_err(|_| crate::ENOMEM)?;
+    bits.resize(3 * words, 0u64);
+    let mut records = RELEASED.lock().unwrap();
+    let i = records.iter().position(|r| r.state == RecordState::Free).ok_or(crate::ENOMEM)?;
+    records[i] = Record {
+        start,
+        end: start + len,
+        state: RecordState::Reserved,
+        bits: Some(bits.into_boxed_slice()),
+        alias: 0,
+        left: 0,
+        views: len.div_ceil(UFFD_CHUNK),
+    };
+    RELEASED_LIVE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    Ok(i)
+}
+
+/// The registration record `i` was taken for was not made, or needs none
+/// (a range not on a reserved section): freed.
+pub(crate) fn released_unreserve(i: usize) {
+    let mut records = RELEASED.lock().unwrap();
+    if records[i].state != RecordState::Free {
+        records[i].free();
+    }
+}
+
+/// Pages `[s, s + len)` of the range of record `i` left the registration
+/// while missing: pending, each with the protection `prot` gives its
+/// address, `alias` the range's alias (`mprotect` and `munmap` ask the
+/// record about them: [`released_overlaps`]). Allocates nothing, and takes
+/// no other lock: the release runs at the job's limit, on the userfaultfd's
+/// serve thread, whose stack must not grow there.
+pub(crate) fn released_pend(i: usize, alias: usize, s: usize, len: usize, prot: impl Fn(usize) -> PAGE_PROTECTION_FLAGS) {
     let e = s + len;
-    for b in overlapping(&t, s, e) {
-        let r = t.get_mut(&b).unwrap();
-        let (a, z) = (s.max(b), e.min(b + r.len));
-        if matches!(r.kind, Kind::View { .. }) && a < z {
-            r.lazy = true;
-            lazy_add(a, z - a, prot);
-            STALE.lock().unwrap().insert(a, (z - a, alias + (a - s)));
-            STALE_SET.store(true, std::sync::atomic::Ordering::Release);
+    let mut records = RELEASED.lock().unwrap();
+    let r = &mut records[i];
+    r.alias = alias;
+    for at in (s..e).step_by(PAGE) {
+        if !r.get(PENDING, at) {
+            r.put(PENDING, at, true);
+            r.left += 1;
+        }
+        let p = prot(at);
+        r.put(NOREAD, at, p == PAGE_NOACCESS);
+        r.put(NOWRITE, at, p != PAGE_READWRITE);
+    }
+}
+
+/// The registration of record `i` is released: the record gives its
+/// bitmaps back once none of its pages is pending, and is freed once its
+/// views are gone ([`released_view_gone`]).
+pub(crate) fn released_end(i: usize) {
+    let mut records = RELEASED.lock().unwrap();
+    let r = &mut records[i];
+    r.state = RecordState::Released;
+    if r.views == 0 {
+        r.free();
+    } else if r.left == 0 {
+        r.bits = None;
+    }
+}
+
+/// The view `[base, base + len)` is going (unmapped, or mapped over): its
+/// pages are no longer pending, and a released record left with no view is
+/// freed. Before the view and its alias go.
+fn released_view_gone(base: usize, len: usize) {
+    if RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    released_forget(base, len);
+    let mut records = RELEASED.lock().unwrap();
+    if let Some(r) = records.iter_mut().find(|r| r.holds(base)) {
+        r.views = r.views.saturating_sub(1);
+        if r.views == 0 && r.state == RecordState::Released {
+            r.free();
         }
     }
 }
 
-/// Discarded pages of a released userfaultfd range ([`uffd_stale`]): start
-/// to `(len, the alias's address of start)`. Each is committed (a section's
-/// page cannot be decommitted: SECTREC-h), `PAGE_NOACCESS`, still charged
-/// (`wick_uffd::discarding` keeps a charge while its page's commit stays),
-/// and holds what the discard left, which
-/// `DiscardVirtualMemory` does not make zeros. Its first access, by a host
-/// thread or a vCPU (WHP keeps the host's protection, so a vCPU's access
-/// exits to [`wick_mm::commit_on_access`]), makes sure of its charge (a no-op
-/// for a page still charged), zeroes it through the
-/// alias while it is still closed, and opens it ([`resolve_stale`]): no
-/// thread or vCPU sees what was there. Taken after the table's lock and
-/// before [`CHARGES`].
-static STALE: ProbedMutex<BTreeMap<usize, (usize, usize)>> = ProbedMutex::new("STALE", BTreeMap::new());
-/// Whether [`STALE`] has any: the access path's one look at it otherwise.
-static STALE_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// The runs of `[s, s + len)` that are [`STALE`]. On the vectored exception
-/// handler's path ([`commit_on_access`]), where a panic ends the process
-/// (Rust aborts a panic that would unwind out of an `extern "system"`
-/// function): the run before `s`, which may end before it, is measured only
-/// once it is known to reach into `[s, e)` (`then`, not `then_some`, which
-/// works out `z - a` first: PC step 14f, a debug build aborted with "attempt
-/// to subtract with overflow" at the first access to a wholly discarded
-/// chunk).
-fn stale_within(s: usize, len: usize) -> Vec<(usize, usize)> {
-    if !STALE_SET.load(std::sync::atomic::Ordering::Acquire) {
-        return Vec::new();
+/// `[s, s + len)` is unmapped or mapped over: none of it is pending any
+/// longer. Before its view and alias go, so that no access resolves a page
+/// through an alias that is gone.
+fn released_forget(s: usize, len: usize) {
+    if RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
     }
     let e = s.saturating_add(len);
-    let m = STALE.lock().unwrap();
-    let first = m.range(..=s).next_back().map_or(s, |(b, _)| *b);
-    m.range(first..e)
-        .filter_map(|(&b, &(n, _))| {
-            let (a, z) = (s.max(b), e.min(b + n));
-            (a < z).then(|| (a, z - a))
-        })
-        .collect()
+    let mut records = RELEASED.lock().unwrap();
+    for r in records.iter_mut().filter(|r| r.state != RecordState::Free && r.start < e && s < r.end) {
+        for at in (s.max(r.start)..e.min(r.end)).step_by(PAGE) {
+            if r.left == 0 {
+                break;
+            }
+            r.resolved(at);
+        }
+    }
 }
 
-/// Takes `[s, s + len)` out of [`STALE`].
-fn stale_cut(m: &mut BTreeMap<usize, (usize, usize)>, s: usize, len: usize) {
+/// Whether a record holds a page of `[s, e)`: released memory, lazy where
+/// its pages are pending (`mprotect` keeps them so, `munmap` forgets them).
+fn released_overlaps(s: usize, e: usize) -> bool {
+    RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) != 0
+        && RELEASED.lock().unwrap().iter().any(|r| r.state != RecordState::Free && r.start < e && s < r.end)
+}
+
+/// Whether a pending page of `[s, s + len)` is committed: a discarded page
+/// still to be zeroed through the alias.
+fn released_has_stale(s: usize, len: usize) -> bool {
+    if RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
     let e = s.saturating_add(len);
-    let first = m.range(..=s).next_back().map_or(s, |(b, _)| *b);
-    let hit: Vec<(usize, usize, usize)> =
-        m.range(first..e).filter(|(&b, &(n, _))| b < e && s < b + n).map(|(&b, &(n, a))| (b, n, a)).collect();
-    for (b, n, a) in hit {
-        m.remove(&b);
-        if b < s {
-            m.insert(b, (s - b, a));
-        }
-        if e < b + n {
-            m.insert(e, (b + n - e, a + (e - b)));
-        }
-    }
-    STALE_SET.store(!m.is_empty(), std::sync::atomic::Ordering::Release);
+    let records = RELEASED.lock().unwrap();
+    records.iter().filter(|r| r.state != RecordState::Free && r.start < e && s < r.end).any(|r| {
+        (s.max(r.start)..e.min(r.end)).step_by(PAGE).any(|at| r.get(PENDING, at) && committed_page(at))
+    })
 }
 
-/// `[s, s + len)` is unmapped: none of it is [`STALE`] any longer.
-fn stale_remove(s: usize, len: usize) {
-    if STALE_SET.load(std::sync::atomic::Ordering::Acquire) {
-        stale_cut(&mut STALE.lock().unwrap(), s, len);
-    }
+fn committed_page(at: usize) -> bool {
+    // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let found = unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) };
+    found != 0 && mbi.State == MEM_COMMIT
 }
 
-/// The first access to `page` if it is [`STALE`]: charged, zeroed through
-/// the alias while still closed, then given `prot`. `None` if it is not.
-fn resolve_stale(page: usize, prot: PAGE_PROTECTION_FLAGS) -> Option<Access> {
-    if !STALE_SET.load(std::sync::atomic::Ordering::Acquire) {
+/// `mprotect` of `[s, e)` where a record holds it: the protection its
+/// pending pages take when resolved, set in place. Whether a record holds
+/// all of it (the caller then gives the protection to the pages that are
+/// committed and not pending, [`released_is_pending`]).
+fn released_protect(s: usize, e: usize, wprot: PAGE_PROTECTION_FLAGS) -> bool {
+    if RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    let mut records = RELEASED.lock().unwrap();
+    let Some(r) = records.iter_mut().find(|r| r.holds(s) && e <= r.end) else {
+        return false;
+    };
+    for at in (s..e).step_by(PAGE) {
+        r.put(NOREAD, at, wprot == PAGE_NOACCESS);
+        r.put(NOWRITE, at, !matches!(wprot, PAGE_READWRITE | PAGE_EXECUTE_READWRITE));
+    }
+    true
+}
+
+fn released_is_pending(at: usize) -> bool {
+    RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) != 0 && RELEASED.lock().unwrap().iter().any(|r| r.holds(at) && r.get(PENDING, at))
+}
+
+/// The first access to `addr` (a write if `write`) if a record has its
+/// page pending: resolved, and the range resolved; `None` if no record has
+/// it. A page never filled is committed with its protection (the
+/// `grain`'s block around it when all of it is pending and none of it is
+/// committed: `MADV_HUGEPAGE`, as [`commit_on_access`] for lazy memory); a
+/// discarded one is charged, zeroed through the alias while still closed,
+/// then given its protection. `PROT_NONE`, or a write the protection
+/// denies: [`Access::NotLazy`], the fault as on Linux. Refused (the job's
+/// limit): [`Access::Exhausted`], nothing changed, for the caller to
+/// reclaim and ask again. The bit is cleared once the page is open, under
+/// the lock, so a thread that faulted on it meanwhile finds it open.
+fn released_resolve(addr: usize, write: bool, grain: usize) -> Option<(Access, core::ops::Range<usize>)> {
+    let page = addr - addr % PAGE;
+    let mut records = RELEASED.lock().unwrap();
+    // Its record (a page is pending in one record at most: a span the
+    // records held before it was unmapped is forgotten in them).
+    let Some(r) = records.iter_mut().find(|r| r.holds(page) && r.get(PENDING, page)) else {
+        // Resolved by another thread while this one waited for the lock: the
+        // access runs again if the page allows it now.
+        let held = records.iter().any(|r| r.holds(page));
+        return (held && accessible(page, 1, write)).then(|| (Access::Committed, page..page + PAGE));
+    };
+    let prot = r.prot(page);
+    let writable = matches!(prot, PAGE_READWRITE | PAGE_EXECUTE_READWRITE);
+    if prot == PAGE_NOACCESS || (write && !writable) {
+        return Some((Access::NotLazy, 0..0));
+    }
+    if committed_page(page) {
+        if !charge(page, PAGE) {
+            // SAFETY: plain call.
+            return Some((Access::Exhausted(unsafe { GetLastError() }), 0..0));
+        }
+        // SAFETY: the alias of the page, mapped while a pending page of its
+        // chunk is committed (`uffd_unalias`; `released_forget` before it
+        // goes).
+        unsafe { std::ptr::write_bytes((r.alias + (page - r.start)) as *mut u8, 0, PAGE) };
+        if !protect(page, PAGE, prot) {
+            return Some((Access::NotLazy, 0..0));
+        }
+        touched_mark(page, PAGE, true);
+        r.resolved(page);
+        return Some((Access::Committed, page..page + PAGE));
+    }
+    let block = addr - addr % grain;
+    let whole = grain > PAGE
+        && block >= r.start
+        && block + grain <= r.end
+        && (block..block + grain).step_by(PAGE).all(|a| r.get(PENDING, a) && r.prot(a) == prot)
+        && reserved_only(block, block + grain);
+    let (from, to) = if whole { (block, block + grain) } else { (page, page + PAGE) };
+    if !commit(from, to - from, prot, false) {
+        // A huge page that cannot be charged falls back to a page, as
+        // Linux's does (mm/huge_memory.c, `THP_FAULT_FALLBACK_CHARGE`).
+        // SAFETY: plain call.
+        let err = unsafe { GetLastError() };
+        if to - from == PAGE || !commit(page, PAGE, prot, false) {
+            return Some((Access::Exhausted(err), 0..0));
+        }
+        r.resolved(page);
+        return Some((Access::Committed, page..page + PAGE));
+    }
+    for at in (from..to).step_by(PAGE) {
+        r.resolved(at);
+    }
+    Some((Access::Committed, from..to))
+}
+
+/// [`released_resolve`] with the reclaim asked once when refused, as a
+/// first touch of lazy memory reclaims before the VMM ends
+/// (`wick_uffd::reclaim_at_touch`).
+fn released_access(addr: usize, write: bool) -> Option<(Access, core::ops::Range<usize>)> {
+    if RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) == 0 {
         return None;
     }
-    let mut m = STALE.lock().unwrap();
-    let (&b, &(_, alias)) = m.range(..=page).next_back().filter(|(b, (n, _))| page < **b + n)?;
-    if !charge(page, PAGE) {
-        // SAFETY: plain call.
-        return Some(Access::Exhausted(unsafe { GetLastError() }));
+    let grain = if write { lazy_grain(addr) } else { PAGE };
+    let (access, range) = released_resolve(addr, write, grain)?;
+    if matches!(access, Access::Exhausted(_)) && crate::wick_uffd::reclaim_at_touch(PAGE).freed > 0 {
+        return Some(released_resolve(addr, write, PAGE).unwrap_or((Access::NotLazy, 0..0)));
     }
-    // SAFETY: the alias of the page: the userfaultfd's until it is released,
-    // then the view's ([`uffd_unalias`]), unmapped only once its pages are
-    // out of `STALE` (taken out under this lock, `unalias`).
-    unsafe { std::ptr::write_bytes((alias + (page - b)) as *mut u8, 0, PAGE) };
-    if !protect(page, PAGE, prot) {
-        // Unmapped meanwhile: the access faults, as on Linux.
-        return Some(Access::NotLazy);
+    Some((access, range))
+}
+
+/// The pending pages of `[addr, addr + len)`, resolved: a system call's
+/// buffer ([`prefault_lazy`]). Refused even after a reclaim: the VMM ends
+/// as at the limit ([`out_of_memory`]).
+fn released_prefault(addr: usize, len: usize) {
+    if RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
     }
-    stale_cut(&mut m, page, PAGE);
-    drop(m);
-    touched_mark(page, PAGE, true);
-    Some(Access::Committed)
+    let (s, e) = (addr - addr % PAGE, (addr + len).div_ceil(PAGE) * PAGE);
+    if !RELEASED.lock().unwrap().iter().any(|r| r.state != RecordState::Free && r.start < e && s < r.end) {
+        return;
+    }
+    for page in (s..e).step_by(PAGE) {
+        if let Some((Access::Exhausted(err), _)) = released_access(page, false) {
+            out_of_memory(page, err);
+        }
+    }
 }
 
 /// The view at `base` (`len` bytes, `kind`) is going: its pages out of
-/// [`STALE`], then the alias it was handed, if any, unmapped.
+/// the records, then the alias it was handed, if any, unmapped.
 fn unalias(base: usize, len: usize, kind: &Kind) {
-    stale_remove(base, len);
+    released_view_gone(base, len);
     if let Kind::View { alias: Some(alias), .. } = kind {
         // SAFETY: unmaps the alias view made by `uffd_alias`.
         unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: *alias as *mut c_void }, 0) };
@@ -3635,8 +3885,8 @@ fn unalias(base: usize, len: usize, kind: &Kind) {
 
 /// A userfaultfd range `[start, start + len)` is released, its alias at
 /// `alias` ([`uffd_alias`]) no longer the userfaultfd's: handed to the view
-/// if the view has discarded pages still to zero ([`STALE`]), which keeps it
-/// until it goes, else unmapped now.
+/// if the view has discarded pages still to zero (pending and committed in
+/// its record), which keeps it until it goes, else unmapped now.
 /// `reserved`: the alias is one view per [`UFFD_CHUNK`], else one view.
 pub(crate) fn uffd_unalias(start: usize, len: usize, alias: usize, reserved: bool) {
     let step = if reserved { UFFD_CHUNK } else { len };
@@ -3644,7 +3894,7 @@ pub(crate) fn uffd_unalias(start: usize, len: usize, alias: usize, reserved: boo
     let t: &mut Table = &mut guard;
     for o in (0..len).step_by(step) {
         let n = step.min(len - o);
-        if !stale_within(start + o, n).is_empty() {
+        if released_has_stale(start + o, n) {
             if let Some(Kind::View { alias: kept @ None, .. }) =
                 t.get_mut(&(start + o)).filter(|r| r.len == n).map(|r| &mut r.kind)
             {
@@ -3692,27 +3942,6 @@ pub(crate) fn for_each_committed_run(s: usize, len: usize, mut f: impl FnMut(usi
         at += run;
     }
 }
-
-/// Pages `[s, s + len)` of a userfaultfd range's reserved section that were
-/// never filled, once the range is unregistered: lazy, committed and
-/// charged at their first access, read or write, as the rest of an
-/// anonymous shared mapping ([`fill`]), and as Linux's shmem allocates an
-/// unregistered page at its fault.
-/// Nothing is done unless a view of a mapping holds all of the pages (one
-/// unmapped since is left alone).
-pub(crate) fn uffd_lazy(s: usize, len: usize, prot: PAGE_PROTECTION_FLAGS) {
-    let mut t = table().lock().unwrap();
-    let e = s + len;
-    for b in overlapping(&t, s, e) {
-        let r = t.get_mut(&b).unwrap();
-        let (a, z) = (s.max(b), e.min(b + r.len));
-        if matches!(r.kind, Kind::View { .. }) && a < z {
-            r.lazy = true;
-            lazy_add(a, z - a, prot);
-        }
-    }
-}
-
 
 /// The system calls in flight that copy memory of this module's mappings,
 /// and the discards waiting for them. The kernel's copy of a system call
@@ -4171,26 +4400,13 @@ mod tests {
 
     // A run that ends before the range asked about is not in it, and its
     // length is not worked out (`then_some` did, and a debug build panicked
-    // with an overflow: in `stale_within`, under the vectored exception
-    // handler, that ended the process; PC step 14f).
+    // with an overflow: in the list of discarded pages a released
+    // userfaultfd range had, under the vectored exception handler, that
+    // ended the process; PC step 14f; that list is its record's bits now).
     #[test]
     fn test_a_run_before_the_range_asked_about_is_not_in_it() {
         assert_eq!(ranges_within(&std::vec![(0, 0x1000), (0x3000, 0x1000)], 0x2000, 0x1000), Ranges::new());
         assert_eq!(ranges_within(&std::vec![(0, 0x1000), (0x2000, 0x2000)], 0x3000, 0x2000), std::vec![(0x3000, 0x1000)]);
-        // STALE runs in the first 64 KiB, which no mapping can have (Windows
-        // allocates nothing below 0x10000), so the access path of the other
-        // tests never finds them.
-        {
-            let mut m = STALE.lock().unwrap();
-            m.insert(0x1000, (0x1000, 0));
-            m.insert(0x4000, (0x1000, 0));
-            STALE_SET.store(true, std::sync::atomic::Ordering::Release);
-        }
-        let between = stale_within(0x3000, 0x1000);
-        let into = stale_within(0x4800, 0x1000);
-        stale_remove(0x1000, 0x4000);
-        assert_eq!(between, std::vec![]);
-        assert_eq!(into, std::vec![(0x4800, 0x800)]);
     }
 
     /// The tests below place mappings at addresses they freed a moment
