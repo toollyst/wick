@@ -623,12 +623,37 @@ jobs:
           grep -q "^== vmnet" "$RUNNER_TEMP/vmnet.log"
           out=$(ls -dt build/boot-test/*/vmnet | head -1)
           cat "$out/summary.txt"
-          hv=$(sysctl -n kern.hv_support)
+          # kern.hv_support exists only in a kernel built with HYPERVISOR
+          # (xnu-12377.1.9 bsd/kern/kern_sysctl.c, `#if HYPERVISOR`): the
+          # runner is a virtual Mac, whose kernel (uname -v) has no such oid
+          # (CI run 43688550565: "unknown oid"), so no Hypervisor.framework.
+          uname -m
+          uname -v
+          if hv=$(sysctl -n kern.hv_support 2>/dev/null); then
+            echo "kern.hv_support: $hv"
+          else
+            echo "kern.hv_support: no such oid (a kernel without HYPERVISOR)"
+            hv=0
+          fi
+          echo "kern.hv_vmm_present: $(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 'no such oid')"
           if [ "$hv" = 0 ]; then
-            # Expected: no Hypervisor.framework, so no VM and the stage fails.
-            echo "expected: the vmnet stage fails here, kern.hv_support $hv (no Hypervisor.framework on this runner)"
+            # Expected: no Hypervisor.framework, so no VM: the stage fails,
+            # and Firecracker says why and exits with its own code (the
+            # build's error, patches/0050), not with a panic of its API thread.
+            echo "expected: the vmnet stage fails here (no Hypervisor.framework on this runner)"
             if [ "$rc" = 0 ] || ! grep -q "^FAIL  vmnet: " "$out/summary.txt"; then
               echo "the vmnet stage did not fail as it must without Hypervisor.framework (exit $rc)"
+              exit 1
+            fi
+            grep -E "RunWithApiError error: |Firecracker exiting with error" "$out/vmnet.log" || true
+            if ! grep -q "RunWithApiError error: Failed to build MicroVM from Json: " "$out/vmnet.log" ||
+               ! grep -q "Firecracker exiting with error. exit_code=1$" "$out/vmnet.log"; then
+              echo "Firecracker did not end with the build's error and its exit code"
+              exit 1
+            fi
+            if grep -q "panicked" "$out/vmnet.log"; then
+              echo "Firecracker panicked:"
+              grep -A2 "panicked" "$out/vmnet.log"
               exit 1
             fi
           else

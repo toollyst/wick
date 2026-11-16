@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Mon, 16 Nov 2026 09:58:54 +0900
+Subject: [PATCH] api_server: a request after the VMM ended is answered with an
+ error
+
+The VMM's ends of the API channels go when the VMM does: a microVM that
+failed to build from its config file, or one that stopped, before the
+kill switch ends the API thread. A request sent in between panicked the
+API thread ("VMM disconnected", or "Failed to send VMM message"), and
+with panic=abort Firecracker ended with SIGABRT before main printed the
+VMM's error and exit code. It is now answered with 500 and a fault
+message, and Firecracker exits with the VMM's own error and code.
+---
+ src/firecracker/src/api_server/mod.rs | 68 +++++++++++++++++++++++++--
+ 1 file changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/src/firecracker/src/api_server/mod.rs b/src/firecracker/src/api_server/mod.rs
+index 54a52a7e587115a33b04c553dcdc5a8695a9ffb5..37665cdc1c99cc2505f6e0354866708a1612edca 100644
+--- a/src/firecracker/src/api_server/mod.rs
++++ b/src/firecracker/src/api_server/mod.rs
+@@ -218,11 +218,20 @@ impl ApiServer {
+             _ => None,
+         };
+ 
+-        self.api_request_sender
+-            .send(vmm_action)
+-            .expect("Failed to send VMM message");
++        // wick: the VMM's ends of these channels go when the VMM does (a
++        // microVM that failed to build, or one that stopped) before the kill
++        // switch ends this thread. A request in between gets an error
++        // response, and Firecracker then exits with the VMM's own error and
++        // exit code, where the panic here aborted it first (SIGABRT), the
++        // reason never printed.
++        if self.api_request_sender.send(vmm_action).is_err() {
++            return Self::vmm_ended();
++        }
+         self.to_vmm_fd.write(1).expect("Cannot update send VMM fd");
+-        let vmm_outcome = *(self.vmm_response_receiver.recv().expect("VMM disconnected"));
++        let Ok(vmm_outcome) = self.vmm_response_receiver.recv() else {
++            return Self::vmm_ended();
++        };
++        let vmm_outcome = *vmm_outcome;
+         let response = ParsedRequest::convert_to_response(&vmm_outcome);
+ 
+         if vmm_outcome.is_ok()
+@@ -235,6 +244,17 @@ impl ApiServer {
+         response
+     }
+ 
++    /// wick: the answer to a request the VMM can no longer serve: it has
++    /// ended, and Firecracker is exiting with its reason.
++    fn vmm_ended() -> Response {
++        let message = "The VMM has ended and Firecracker is exiting; its log and standard error say why.";
++        error_unrestricted!("{}", message);
++        ApiServer::json_response(
++            StatusCode::InternalServerError,
++            ApiServer::json_fault_message(message),
++        )
++    }
++
+     /// An HTTP response which also includes a body.
+     pub(crate) fn json_response<T: Into<String> + Debug>(status: StatusCode, body: T) -> Response {
+         let mut response = Response::new(Version::Http11, status);
+@@ -546,4 +566,44 @@ mod tests {
+         // Verify API thread was brought down.
+         api_thread.join().unwrap();
+     }
++
++    // wick: a request the VMM can no longer serve, its ends of the channels
++    // gone (a microVM that failed to build, or one that stopped, before the
++    // kill switch ends the API thread), is answered with an error instead of
++    // a panic that aborts Firecracker before it prints the VMM's reason.
++    #[test]
++    fn test_a_request_after_the_vmm_ended_is_answered() {
++        let fault = |response: Response| {
++            assert_eq!(response.status(), StatusCode::InternalServerError);
++            let mut buf = Vec::new();
++            response.write_all(&mut buf).unwrap();
++            let text = String::from_utf8(buf).unwrap();
++            assert!(text.contains("The VMM has ended and Firecracker is exiting"), "{text}");
++        };
++        // The VMM took nothing: both ends gone.
++        let (api_request_sender, from_api) = channel();
++        let (to_api, vmm_response_receiver) = channel::<Box<Result<VmmData, VmmActionError>>>();
++        let mut api_server = ApiServer::new(
++            api_request_sender,
++            vmm_response_receiver,
++            EventFd::new(libc::EFD_NONBLOCK).unwrap(),
++        );
++        drop((from_api, to_api));
++        fault(api_server.serve_vmm_action_request(Box::new(VmmAction::GetVmmVersion), 0));
++        // The VMM took the request and ended without an answer.
++        let (api_request_sender, from_api) = channel();
++        let (to_api, vmm_response_receiver) = channel::<Box<Result<VmmData, VmmActionError>>>();
++        let mut api_server = ApiServer::new(
++            api_request_sender,
++            vmm_response_receiver,
++            EventFd::new(libc::EFD_NONBLOCK).unwrap(),
++        );
++        let vmm = thread::spawn(move || {
++            let request = from_api.recv().unwrap();
++            assert!(matches!(*request, VmmAction::GetVmmVersion));
++            drop(to_api);
++        });
++        fault(api_server.serve_vmm_action_request(Box::new(VmmAction::GetVmmVersion), 0));
++        vmm.join().unwrap();
++    }
+ }
