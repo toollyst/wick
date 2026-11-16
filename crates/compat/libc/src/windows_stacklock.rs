@@ -471,6 +471,34 @@ mod tests {
         assert!(med[1] < med[2], "the uninitialised probe ({:.1} ns) is not cheaper than the zeroing one ({:.1} ns)", med[1], med[2]);
     }
 
+    /// A lock of this module taken in a thread's teardown, by one of its
+    /// thread-locals' destructors, probes and is taken as anywhere else:
+    /// [`HELD`], read on every lock, is a const-initialised thread-local of
+    /// a type with no destructor, which std on Windows (native TLS, the
+    /// target has `has-thread-local`) makes a plain `#[thread_local]`
+    /// static, with no registration, no allocation and no destroyed state
+    /// (library/std/src/sys/thread_local/native/mod.rs, "For `const`
+    /// initialization and `!Drop` types, we simply use `T` directly").
+    #[test]
+    fn test_a_lock_taken_in_a_threads_teardown_is_probed() {
+        static TOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        struct TakesALock;
+        impl Drop for TakesALock {
+            fn drop(&mut self) {
+                static L: ProbedMutex<u32> = ProbedMutex::new("a lock taken in teardown", 0);
+                let mut g = L.lock().unwrap();
+                *g += 1;
+                TOOK.store(*g, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        std::thread_local! {
+            static T: TakesALock = const { TakesALock };
+        }
+        std::thread::spawn(|| T.with(|_| {})).join().unwrap();
+        assert_eq!(TOOK.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(deepest_uses().iter().any(|&(n, _)| n == "a lock taken in teardown"), "{:?}", deepest_uses());
+    }
+
     #[inline(never)]
     fn use_stack<const N: usize>() -> u8 {
         let a = core::hint::black_box([1u8; N]);
