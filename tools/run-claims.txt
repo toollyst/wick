@@ -27,6 +27,7 @@ near-miss	\bnot been (?:run|tested)\b
 severity	warning
 # evidence-since: the newest CI run before the jobs uploaded their results
 # (results-<job>): a document citing a later run must have it in
-# docs/evidence/runs-index.tsv (tools/ci-results.py collect). Set, when the
-# results upload lands on main, to the run before its push's run.
-evidence-since	43790310601
+# docs/evidence/runs-index.tsv (tools/ci-results.py collect). The upload
+# landed with the push of 36ef73da, whose run 43800980377 is the first with
+# results-<job> artifacts; 43795832946 (47ee7bc2) is the run before it.
+evidence-since	43795832946
