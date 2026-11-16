@@ -2243,11 +2243,26 @@ mod macos {
         }
 
         // prepare() compiles in a child: the same bytecode as compiling here,
-        // and the compiler's error when the profile does not compile. (The
-        // test binary has other threads; libmalloc's fork handlers keep
-        // malloc usable in the child, which is all the compiler needs.)
+        // and the compiler's error when the profile does not compile. Run in
+        // a process of its own, as prepare() forks with one thread: in the
+        // test binary another test's thread may be compiling at the fork, and
+        // libsandbox takes locks of its own (it imports `os_unfair_lock_lock`
+        // and `dispatch_once`: `dyld_info -imports /usr/lib/libsandbox.1.dylib`,
+        // macOS 27.2), which the child's compile could then wait on for good.
+        // libmalloc's fork handlers keep malloc usable in the child
+        // (libmalloc-812.100.31 src/malloc.c `_malloc_fork_prepare` :3723,
+        // `_malloc_fork_child` :3737); nothing shows the compiler needs no
+        // other lock. Measured: no child hung in 6000 forks while one or four
+        // threads compiled (a C probe, macOS 27.2), which proves nothing
+        // either way.
         #[test]
         fn test_profile_compiles_in_a_child() {
+            run_child("profile_compiles_in_a_child_child", &[]);
+        }
+
+        #[test]
+        #[ignore = "run by test_profile_compiles_in_a_child in a separate process"]
+        fn profile_compiles_in_a_child_child() {
             let profile = profile_for(None, None).unwrap();
             // SAFETY: see above.
             let child = unsafe { Compiled::in_child(&profile) }.unwrap();
@@ -2258,6 +2273,7 @@ mod macos {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("no-such-operation"), "{err}");
+            println!("CHILD-OK");
         }
 
         // A system call outside SYSCALLS is a denial, as a seccomp filter's

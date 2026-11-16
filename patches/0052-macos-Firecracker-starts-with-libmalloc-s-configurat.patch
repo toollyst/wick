@@ -42,7 +42,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 438 insertions(+)
 
 diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
-index 8c3feb840496e9ea0e64ca8a40d9d598d264b2ce..061c534907dd806305040d51c337ad9887a522c0 100644
+index 1e2b5f1e4f09ea240f264705ea1cf4b6749631e9..c5afaab2e92ecaf175b5c2103f0a2416bee7a02c 100644
 --- a/src/firecracker/src/main.rs
 +++ b/src/firecracker/src/main.rs
 @@ -112,6 +112,19 @@ impl From<MainError> for FcExitCode {
@@ -65,7 +65,7 @@ index 8c3feb840496e9ea0e64ca8a40d9d598d264b2ce..061c534907dd806305040d51c337ad98
  fn main() -> ExitCode {
      let result = main_exec();
      if let Err(err) = result {
-@@ -823,3 +836,428 @@ mod wick_version_tests {
+@@ -825,3 +838,428 @@ mod wick_version_tests {
          assert!(version >= semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap());
      }
  }

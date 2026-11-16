@@ -30,11 +30,11 @@ test_resize_fdtable_with_a_soft_limit_above_the_tables_maximum sets the
 soft limit to kern.maxfilesperproc + 1 in a child. It failed with
 resize_fdtable's Dup2 error before the clamp and passes with it.
 ---
- src/firecracker/src/main.rs | 80 +++++++++++++++++++++++++++++++++++++
- 1 file changed, 80 insertions(+)
+ src/firecracker/src/main.rs | 82 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 82 insertions(+)
 
 diff --git a/src/firecracker/src/main.rs b/src/firecracker/src/main.rs
-index cf6a759a95b190259cb8bdd988325c630dc31408..8c3feb840496e9ea0e64ca8a40d9d598d264b2ce 100644
+index cf6a759a95b190259cb8bdd988325c630dc31408..1e2b5f1e4f09ea240f264705ea1cf4b6749631e9 100644
 --- a/src/firecracker/src/main.rs
 +++ b/src/firecracker/src/main.rs
 @@ -523,6 +523,14 @@ fn resize_fdtable() -> Result<(), ResizeFdTableError> {
@@ -52,7 +52,7 @@ index cf6a759a95b190259cb8bdd988325c630dc31408..8c3feb840496e9ea0e64ca8a40d9d598
  
      // Resize the file descriptor table to its maximal possible size, to ensure that
      // firecracker will not need to reallocate it later. If the file descriptor table
-@@ -722,6 +730,78 @@ fn run_without_api(
+@@ -722,6 +730,80 @@ fn run_without_api(
      Ok(())
  }
  
@@ -88,8 +88,10 @@ index cf6a759a95b190259cb8bdd988325c630dc31408..8c3feb840496e9ea0e64ca8a40d9d598
 +                };
 +                // SAFETY: an rlimit to fill.
 +                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
-+                let want = libc::rlim_t::try_from(per_proc).unwrap() + 1;
-+                let code = if got != 0 {
++                // No panic in this child: the test runs beside others, one of
++                // which may hold the panic hook's or stderr's lock at the fork.
++                let want = libc::rlim_t::try_from(per_proc).map_or(0, |n| n + 1);
++                let code = if got != 0 || want == 0 {
 +                    2
 +                } else if rl.rlim_max < want {
 +                    // The hard limit leaves no room above the maximum: say so (exit 3).
@@ -119,7 +121,7 @@ index cf6a759a95b190259cb8bdd988325c630dc31408..8c3feb840496e9ea0e64ca8a40d9d598
 +                let code = libc::WEXITSTATUS(status);
 +                assert_eq!(
 +                    code, 0,
-+                    "1: resize_fdtable failed; 2: sysctl failed; 3: the hard RLIMIT_NOFILE is \
++                    "1: resize_fdtable failed; 2: sysctl failed or gave no maximum; 3: the hard RLIMIT_NOFILE is \
 +                     below kern.maxfilesperproc + 1; 4: getdtablesize is not kern.maxfilesperproc; \
 +                     5: setrlimit refused"
 +                );
