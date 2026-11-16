@@ -234,7 +234,9 @@ upstream Firecracker and its jailer.
   directly in the network directory, owned by its owner or root, with the interface's lock file beside it, which
   no jail can make there (the sandbox lets a jail read lock files there and make nothing:
   `test_a_jail_reaches_only_lock_files_in_its_network`; the jailer refuses a network directory the jail's uid
-  owns or that its group, others or another uid's ACL entry may write: `test_the_jailer_refuses_a_network_others_may_write`;
+  owns or that its group, others or another uid's ACL entry may write: `test_the_jailer_refuses_a_network_others_may_write`,
+  which failed in CI run 43688550565 as root on macOS 26, a case it expects refused taken, so no run shows the
+  refusal yet and its fix is in progress (docs/COMPATIBILITY.md, Net hotplug);
   a jail of uid 0 may make one, its endpoint in its own directory and its lock file in the network directory, as
   root may make a TAP on Linux); and no path name, wherever it points (`test_only_the_operators_interface_opens`,
   `test_a_jail_opens_no_path_name`; `jailer-test netns`, root, not run yet). An interface is one Firecracker's at a
