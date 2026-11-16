@@ -15,6 +15,13 @@
 #   tools/linux/boot-test.sh [--firecracker PATH] [--workdir DIR]
 #                            [--stage all|boot|smp|block|vsock|restores] [--timeout SEC]
 #                            [--seccomp yes|no|auto] [--snapshots K] [--rounds R]
+#   tools/linux/boot-test.sh --selftest
+#
+# --selftest runs vm_stop against a stand-in for Firecracker, with no VM, no
+# KVM, curl or python3: one that answered patches/0050's 500 and exits only
+# once the harness waits for it (its two exit lines must be in its log, its
+# exit code 1), and one that never exits (killed at a 1 s bound, its log and
+# its failed check saying so).
 #
 # `restores` (not in `all`) looks for the late answer of a restored smp guest
 # (input that came while the guest's printk of the new VMGenID had the UART's
@@ -62,6 +69,7 @@ timeout=120
 seccomp=auto
 snapshots=3
 rounds=10
+selftest=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --firecracker) fc="$2"; shift 2 ;;
@@ -71,7 +79,8 @@ while [[ $# -gt 0 ]]; do
         --seccomp) seccomp="$2"; shift 2 ;;
         --snapshots) snapshots="$2"; shift 2 ;;
         --rounds) rounds="$2"; shift 2 ;;
-        -h|--help) sed -n '4,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --selftest) selftest=1; shift ;;
+        -h|--help) sed -n '4,53p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -82,6 +91,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/../common.sh"
 step() { echo "  - $*"; }
 die() { echo "error: $*" >&2; exit 1; }
 
+# The host, the binary and the guest's files (not for --selftest).
+if [[ "$selftest" == 0 ]]; then
 if [[ -z "$fc" ]]; then
     for c in \
         "$root/lib/firecracker/build/cargo_target/x86_64-unknown-linux-musl/release/firecracker" \
@@ -140,6 +151,7 @@ step "version: $version"
 } >"$results/host.txt"
 KERNEL="$(get_asset "$KERNEL_NAME")"
 ROOTFS="$(get_asset "$ROOTFS_NAME")"
+fi
 
 # --- one VM ------------------------------------------------------------------
 # vm_start NAME CONFIG_JSON [API_SOCKET]: starts Firecracker with its stdin a
@@ -194,14 +206,23 @@ vm_stop() {
         # main logs the error after), so it is waited for, not killed at
         # once, which cut its log before the reason (CI run 43823078930, the
         # macOS harness). A watchdog bounds the wait; its expiry is a failure.
-        rm -f "$VM_DIR/exit-bound-expired"
-        (sleep "$EXIT_BOUND"; kill -KILL "$VM_PID" 2>/dev/null && : >"$VM_DIR/exit-bound-expired") &
+        # The watchdog exits 0 only if it killed Firecracker; stopped first,
+        # it stops its sleep too (nothing of it outlives vm_stop).
+        (
+            trap 'kill "$s" 2>/dev/null; exit 3' TERM
+            sleep "$EXIT_BOUND" &
+            s=$!
+            wait "$s"
+            trap '' TERM
+            kill -KILL "$VM_PID" 2>/dev/null || exit 4
+        ) &
         local watchdog=$!
+        # The selftest's hook: the harness now waits for the exit.
+        "${VM_WAITING_EXIT:-:}"
         VM_EXIT=0
         wait "$VM_PID" || VM_EXIT=$?
-        kill "$watchdog" 2>/dev/null || true
-        wait "$watchdog" 2>/dev/null || true
-        if [[ -e "$VM_DIR/exit-bound-expired" ]]; then
+        kill -TERM "$watchdog" 2>/dev/null || true
+        if wait "$watchdog"; then
             echo "boot-test: killed by the harness while alive (SIGKILL); its log ends above" >>"$VM_DIR/firecracker.log"
             check "exits after answering that its VMM ended" 0 \
                 "said it was exiting and did not within ${EXIT_BOUND} s; killed by the harness while alive"
@@ -423,6 +444,100 @@ finish_vm() {
     fi
 }
 trap '[[ -n "${VM_PID:-}" && -z "${VM_EXIT:-}" ]] && kill -KILL "$VM_PID" 2>/dev/null; true' EXIT
+
+# --- selftest ----------------------------------------------------------------
+# vm_stop against a stand-in started by vm_start: it took the place of a
+# Firecracker that answered patches/0050's 500 (the selftest writes the body
+# where api writes it), and it writes the two lines Firecracker's main logs
+# after that answer and exits 1 only when let go: a byte in the FIFO
+# WICK_BT_SELFTEST_GO, which the selftest holds open read-write (so the
+# byte waits there for the stand-in's read) and writes from vm_stop's hook,
+# VM_WAITING_EXIT, once vm_stop waits for the exit.
+SELFTEST_STAND_IN='#!/usr/bin/env bash
+log=""
+while [[ $# -gt 0 ]]; do [[ "$1" == --log-path ]] && log="$2"; shift; done
+read -r -n 1 _ <"$WICK_BT_SELFTEST_GO"
+echo "[anonymous-instance:main] RunWithApiError error: Failed to build MicroVM from Json: the stand-in'"'"'s" >>"$log"
+echo "[anonymous-instance:main] Firecracker exiting with error. exit_code=1" >>"$log"
+exit 1
+'
+SELFTEST_FAULT='{"fault_message":"The VMM has ended and Firecracker is exiting; its log and standard error say why."}'
+
+selftest_release() { printf x >&"$SELFTEST_GO"; }
+
+# selftest_vm NAME HOOK: the stand-in as VM NAME, stopped with HOOK as
+# vm_stop's waiting hook; prints vm_stop's output, then "exit CODE pid PID".
+# Run in a command substitution, which ends when the last holder of its
+# output closes it: whatever vm_stop leaves running holds it.
+selftest_vm() {
+    vm_start "$1" "" "$results/$1.sock"
+    printf '%s' "$SELFTEST_FAULT" >"$VM_DIR/api-reply.txt"
+    VM_WAITING_EXIT="$2"
+    vm_stop
+    echo "exit $VM_EXIT pid $VM_PID"
+}
+
+selftest() {
+    local fails=() log out last pid t0 want
+    results="$(mktemp -d "${TMPDIR:-/tmp}/wick-bts-XXXXXX")"
+    summary="$results/summary.txt"
+    : >"$summary"
+    fc="$results/firecracker"
+    printf '%s' "$SELFTEST_STAND_IN" >"$fc"
+    chmod 755 "$fc"
+    mkfifo "$results/go"
+    exec {SELFTEST_GO}<>"$results/go"
+    export WICK_BT_SELFTEST_GO="$results/go"
+
+    # Exits once the harness waits: both lines in its log, exit 1, no kill,
+    # and nothing of vm_stop's left (its output closed within the bound).
+    t0=$SECONDS
+    out="$(selftest_vm ended selftest_release 2>"$results/ended.err")"
+    (((SECONDS - t0) < EXIT_BOUND)) ||
+        fails+=("exiting: vm_stop's output stayed open $((SECONDS - t0)) s: something it started outlived it")
+    last="${out##*$'\n'}"
+    if [[ "$out" == *$'\n'* ]]; then out="${out%$'\n'*}"; else out=""; fi
+    pid="${last##* }"
+    log="$(cat "$results/ended/firecracker.log")"
+    for want in "RunWithApiError error: Failed to build MicroVM from Json" \
+        "Firecracker exiting with error. exit_code=1"; do
+        [[ "$log" == *"$want"* ]] ||
+            fails+=("exiting: the log lacks '$want' (the harness did not wait for the exit): $log")
+    done
+    [[ "$last" == "exit 1 pid "* && -z "$out" && "$log" != *"killed by the harness"* ]] ||
+        fails+=("exiting: $last, vm_stop's output '$out', log: $log; $(cat "$results/ended.err")")
+    ! kill -0 "$pid" 2>/dev/null || fails+=("exiting: the stand-in still runs")
+
+    # Never let go: a failure of its own at the bound, killed, its log saying so.
+    EXIT_BOUND=1
+    out="$(selftest_vm stuck "" 2>"$results/stuck.err")"
+    EXIT_BOUND=10
+    last="${out##*$'\n'}"
+    if [[ "$out" == *$'\n'* ]]; then out="${out%$'\n'*}"; else out=""; fi
+    pid="${last##* }"
+    log="$(cat "$results/stuck/firecracker.log")"
+    [[ "$out" == "stuck    exits after answering that its VMM ended FAIL said it was exiting and did not within 1 s; killed by the harness while alive" ]] ||
+        fails+=("stuck: vm_stop's output '$out'")
+    grep -qxF "stuck    exits after answering that its VMM ended FAIL said it was exiting and did not within 1 s; killed by the harness while alive" "$summary" ||
+        fails+=("stuck: the summary lacks the check: $(cat "$summary")")
+    [[ "$log" == *"boot-test: killed by the harness while alive"* && "$last" == "exit 137 pid "* ]] ||
+        fails+=("stuck: $last, log: $log")
+    ! kill -0 "$pid" 2>/dev/null || fails+=("stuck: the stand-in still runs")
+
+    exec {SELFTEST_GO}>&-
+    rm -rf -- "$results"
+    if ((${#fails[@]} > 0)); then
+        printf 'boot-test: selftest failed:\n' >&2
+        printf '  %s\n' "${fails[@]}" >&2
+        exit 1
+    fi
+    echo "boot-test: selftest ok"
+}
+
+if [[ "$selftest" == 1 ]]; then
+    selftest
+    exit 0
+fi
 
 # --- stages ------------------------------------------------------------------
 

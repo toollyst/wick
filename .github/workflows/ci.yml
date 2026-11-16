@@ -264,6 +264,14 @@ jobs:
       # Upstream's release.sh builds without --locked.
       - name: The build kept Cargo.lock
         run: git -C lib/firecracker diff --exit-code -- Cargo.lock
+      # vm_stop against a stand-in for a Firecracker that answered patches/
+      # 0050's 500: one that exits only once the harness waits for it (both
+      # exit lines in its log, exit 1, nothing of the wait left running) and
+      # one that never exits (a failed check at the bound, killed, its log
+      # saying so). The guest stages reach that path only on such an answer.
+      # Needs no build and no VM.
+      - name: boot-test.sh selftest
+        run: tools/linux/boot-test.sh --selftest
       - name: Boot test
         run: tools/linux/boot-test.sh --workdir "$RUNNER_TEMP/boot-test"
       # Linux's side of the lazy-RAM grain (records, printed only), under
