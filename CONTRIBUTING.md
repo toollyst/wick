@@ -34,7 +34,11 @@ networking, snapshots, userfaultfd, PCI, vhost-user, the devices, the command
 line, memory hotplug and more); run it before sending a
 change to the macOS backends. `tools/macos/jailer-test.sh` (run it as yourself: it asks for sudo, and refuses to start under it)
 starts Firecracker through the jailer and checks the jail from outside; run it
-before a change to the jailer's macOS backend or the Seatbelt profile. The macOS sandbox
+before a change to the jailer's macOS backend or the Seatbelt profile.
+`tools/macos/root-batch.sh` runs every macOS check that needs root (the jailer's
+unit tests, the jailer stages that CI's runners cannot run, the guest timer at
+both idle levels, vmnet before macOS 26) in one go, as yourself, with one
+password prompt (`--list` says what each step proves). The macOS sandbox
 allows only the system calls in `SYSCALLS` (overlay/vmm/ext/sandbox.rs), as
 upstream's seccomp filters do on Linux: a change that makes Firecracker call
 another one is killed by the sandbox inside that call under boot-test (SIGKILL;
