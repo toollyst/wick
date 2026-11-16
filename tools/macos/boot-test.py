@@ -3032,8 +3032,11 @@ def summarize(out, results):
 # its API socket with patches/0050's 500, then, as Firecracker's main thread
 # does after that answer (it joins the API thread, then logs the build's
 # error), writes the two exit lines and exits 1, but only once the test lets
-# it go on: it opens the FIFO WICK_BT_SELFTEST_GO for reading, which blocks
-# until a writer comes.
+# it go on: it reads a byte from the FIFO WICK_BT_SELFTEST_GO, which the test
+# holds open read-write, so a byte written before the stand-in's read waits
+# there for it. With WICK_BT_SELFTEST_LATE it first reads a byte from that
+# FIFO, which the test writes only after its release: the release then
+# comes before the stand-in opens WICK_BT_SELFTEST_GO.
 STAND_IN = r'''
 import os, socket, sys
 path = sys.argv[sys.argv.index("--api-sock") + 1]
@@ -3051,8 +3054,11 @@ body = b'{"fault_message":"The VMM has ended and Firecracker is exiting; its log
 c.sendall(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n"
           b"Content-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
 c.close()
+if os.environ.get("WICK_BT_SELFTEST_LATE"):
+    with open(os.environ["WICK_BT_SELFTEST_LATE"]) as f:
+        f.read(1)
 with open(os.environ["WICK_BT_SELFTEST_GO"]) as f:
-    f.read()
+    f.read(1)
 print("[anonymous-instance:main] RunWithApiError error: Failed to build MicroVM from Json: the stand-in's", flush=True)
 print("[anonymous-instance:main] Firecracker exiting with error. exit_code=1", flush=True)
 sys.exit(1)
@@ -3069,19 +3075,28 @@ def selftest():
 
     fails = []
     with tempfile.TemporaryDirectory(dir="/tmp", prefix="wick-bts-") as tmp:
-        go = os.path.join(tmp, "go")
-        os.mkfifo(go)
-        os.environ["WICK_BT_SELFTEST_GO"] = go
         os.environ.pop("WICK_BOOT_TEST_FC_ARGS", None)
         standin = os.path.join(tmp, "firecracker")
         with open(standin, "w") as f:
             f.write(f"#!{sys.executable} -I\n" + STAND_IN)
         os.chmod(standin, 0o755)
 
-        def start(name, release):
+        def fifo(name):
+            """A FIFO of its own and the test's read-write end of it."""
+            path = os.path.join(tmp, name)
+            os.mkfifo(path)
+            return path, os.open(path, os.O_RDWR)
+
+        def start(name, release, late=False):
             """Starts the stand-in as a VM, lets it go on once the harness
-            waits for its exit or has given up on it, and returns (the
-            failure, the VMs the cleanup found killed while alive, the log)."""
+            waits for its exit or has given up on it (with late, only then
+            lets it reach its read of the go FIFO), and returns (the failure,
+            the VMs the cleanup found killed while alive, the log)."""
+            go, gofd = fifo(f"{name}.go")
+            os.environ["WICK_BT_SELFTEST_GO"] = go
+            if late:
+                after, afterfd = fifo(f"{name}.late")
+                os.environ["WICK_BT_SELFTEST_LATE"] = after
             ctx = types.SimpleNamespace(out=tmp, sock=tmp, firecracker=standin, vms=[])
             waiting = threading.Event()
             Vm.waiting_exit = waiting
@@ -3101,23 +3116,26 @@ def selftest():
             t.start()
             waiting.wait(60)
             if release:
-                # No reader (a stand-in already killed): ENXIO, nothing to let go.
-                try:
-                    os.close(os.open(go, os.O_WRONLY | os.O_NONBLOCK))
-                except OSError:
-                    pass
+                os.write(gofd, b"x")
+            if late:
+                os.write(afterfd, b"x")
+                os.close(afterfd)
+                del os.environ["WICK_BT_SELFTEST_LATE"]
             t.join(60)
+            os.close(gofd)
             Vm.waiting_exit = None
             with open(os.path.join(tmp, f"{name}.log")) as f:
                 return got.get("failure") or "", got.get("killed"), f.read()
 
-        failure, killed, log = start("ended", True)
-        for want in ("RunWithApiError error: Failed to build MicroVM from Json",
-                     "Firecracker exiting with error. exit_code=1"):
-            if want not in log:
-                fails.append(f"exiting: the log lacks {want!r} (the harness did not wait for the exit):\n{log}")
-        if "then it exited: exit 1" not in failure or killed:
-            fails.append(f"exiting: failure {failure!r}, killed {killed!r}")
+        # "late": the release comes before the stand-in opens its FIFO.
+        for name, late in (("ended", False), ("late", True)):
+            failure, killed, log = start(name, True, late)
+            for want in ("RunWithApiError error: Failed to build MicroVM from Json",
+                         "Firecracker exiting with error. exit_code=1"):
+                if want not in log:
+                    fails.append(f"{name}: the log lacks {want!r} (the harness did not wait for the exit):\n{log}")
+            if "then it exited: exit 1" not in failure or killed:
+                fails.append(f"{name}: failure {failure!r}, killed {killed!r}")
         Vm.EXIT_BOUND = 1
         try:
             failure, killed, log = start("stuck", False)
