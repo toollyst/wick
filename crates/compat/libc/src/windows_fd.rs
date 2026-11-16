@@ -316,8 +316,8 @@ pub mod wick_fd {
 
     /// The attachments, by descriptor: a lock the memory code takes too (a
     /// file mapping's section, through [`attached`]), so, as every lock of
-    /// this crate's Windows modules, it is taken with its stack committed
-    /// first (`windows_stacklock`).
+    /// this crate's Windows modules, it is taken through `windows_stacklock`,
+    /// which the stack reclaim's step 3 will cover.
     fn table() -> &'static ProbedMutex<HashMap<c_int, Entry>> {
         static T: OnceLock<ProbedMutex<HashMap<c_int, Entry>>> = OnceLock::new();
         T.get_or_init(|| ProbedMutex::new("the descriptor table", HashMap::new()))

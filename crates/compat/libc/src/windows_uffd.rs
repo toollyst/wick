@@ -1931,8 +1931,9 @@ mod tests {
     }
 
     /// PROBECOST: the fill path's time per page with the stack probe of its
-    /// locks as the product has it (`windows_stacklock::probe`, which writes
-    /// nothing) and with the probe that zeroed its 16 KiB frame, no watch
+    /// locks as the stack reclaim's step 3 will have it (`windows_stacklock::probe`,
+    /// which writes nothing; in tests only until then) and with the probe
+    /// that zeroed its 16 KiB frame, no watch
     /// in either. Per round, 4 MiB of a registered range not yet used: a
     /// fill (`copy`) of each page by this thread; or a host thread's read of
     /// each page, each filled by this thread as its handler (the fault, the
@@ -3477,13 +3478,13 @@ mod tests {
     /// end is either served or a stack overflow at the reserve's end, said
     /// as one: never a silent end. The access is served on the thread's own
     /// stack (`windows_mm::lazy_on_exception`, below the exception
-    /// dispatcher's frames), and its commit takes the region table, whose
-    /// probe commits 16 KiB more below that (`windows_stacklock`), so near
-    /// the reserve's end the probe meets the end inside the handler: the
-    /// stack overflow then raised there must be dispatched as any other,
+    /// dispatcher's frames), and its commit takes the region table and
+    /// commits the page, so near the reserve's end the handler's own frames
+    /// meet the end inside it: the stack overflow then raised there must be
+    /// dispatched as any other,
     /// Rust's "has overflowed its stack" line, the stack filter's
     /// STACKFILTER line (the reserve's end, passed on) and 0xC00000FD. A
-    /// child per case: a thread recurses until 64, 60, ... 4 KiB are left
+    /// child per case: a thread recurses until 64, 63, ... 4 KiB are left
     /// above its reserve's low end (DeallocationStack), then reads a lazy
     /// page; a Rust thread (a 20 KiB guarantee) and a `CreateThread` thread
     /// (none; a pool thread's stack is the same, and its overflow's end on
@@ -3496,7 +3497,7 @@ mod tests {
     fn test_a_lazy_touch_at_the_reserves_end_is_a_loud_overflow() {
         let mut in_the_handler = [false; 2];
         for (k, kind) in ["rust", "createthread"].into_iter().enumerate() {
-            for left in (1..=16).rev().map(|n| n * 4) {
+            for left in (4..=64).rev() {
                 let left_kib = std::format!("{left}");
                 let child = std::format!("lazy_at_the_reserves_end_{kind}_child");
                 let (code, text, _) = run_child_watched(&child, &[("WICK_TEST_LEFT_KIB", left_kib.as_str())]);
@@ -4101,6 +4102,9 @@ mod tests {
     #[test]
     #[ignore = "run by test_the_reclaimers_stack_on_record in a job of its own"]
     fn reclaimer_stack_child() {
+        // The locks as the product takes them: a watch's paint below a lock
+        // would count as the reclaimer's use.
+        crate::windows_stacklock::WATCHING.store(false, Ordering::SeqCst);
         let (ctx, user, mem, done) = fill_to_the_limit_and_discard_in_part();
         let page = std::vec![0x5au8; PAGE as usize];
         // SAFETY: a new anonymous mapping, committed at first touch.
@@ -4502,6 +4506,9 @@ mod tests {
     #[ignore = "run by test_the_reclaims_cost_on_record in a job of its own"]
     fn reclaim_record_child() {
         use windows_sys::Win32::System::ProcessStatus::K32GetProcessMemoryInfo;
+        // The locks as the product takes them: the watch's paint is no
+        // part of the reclaim's time.
+        crate::windows_stacklock::WATCHING.store(false, Ordering::SeqCst);
         #[repr(C)]
         #[derive(Default)]
         struct Counters {

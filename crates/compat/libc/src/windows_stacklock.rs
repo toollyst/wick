@@ -2,18 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The locks of wick's memory code (the region table, the charges, the
-//! reclaim's lists and its owed charge, ...), each taken with its stack
-//! committed first.
+//! reclaim's lists and its owed charge, ...), each taken through this
+//! module, so that the stack reclaim (its design's step 3) will cover them
+//! all.
 //!
 //! A thread whose stack must grow while it holds one of these locks cannot
 //! be helped by the reclaim, which takes them (the stack reclaim's design,
-//! condition A3). So a lock here commits [`PROBE`] bytes of the caller's
-//! stack before it locks: a stack page the job's limit refuses is refused
-//! there, with no lock held. The mutexes are private to this module; the
-//! only way to take one is [`ProbedMutex::lock`] (or [`ProbedRwLock`]'s
-//! `read` and `write`), which probes first. The probe writes nothing: it is
-//! a frame of [`PROBE`] uninitialised bytes, whose pages the compiler's stack
-//! probe (`__chkstk`) touches one at a time.
+//! condition A3). The design's answer is a probe that commits [`PROBE`]
+//! bytes of the caller's stack before an outermost lock, so that a stack
+//! page the job's limit refuses is refused there, with no lock held, and
+//! the reclaim asked for it. Until that ask exists the probe is in tests
+//! only ([`Probing::Guard`], and the cost records): in the product a refused
+//! probe ended the VMM with 137 at the limit where the lock without it
+//! needed no new page (`test_a_lock_commits_no_stack_before_it_is_taken`;
+//! on Windows Server 2025 a userfaultfd's thread releasing its ranges after
+//! a refused fill, `test_a_fill_at_the_limit_reclaims_partly_discarded_chunks`),
+//! so a lock here takes the stack its own frames use and no more, as a
+//! plain `Mutex` does. The mutexes are private to this module; the only
+//! way to take one is [`ProbedMutex::lock`] (or [`ProbedRwLock`]'s `read`
+//! and `write`). The probe writes nothing: it is a frame of [`PROBE`]
+//! uninitialised bytes, whose pages the compiler's stack probe (`__chkstk`)
+//! touches one at a time.
 //!
 //! `test_wicks_memory_locks_are_all_probed` fails on a `static` lock of
 //! another kind (a `Mutex` or `RwLock`, in a `OnceLock` or not) declared
@@ -22,24 +31,29 @@
 //! module is read too): the reclaim runs this crate's code only, and the
 //! crate's other modules are macOS's, not built on Windows.
 //!
-//! In tests a guard also checks, when it drops, that no stack page was
-//! committed while it was held (the TEB's StackLimit has not moved since
-//! the probe), and a held lock's deepest use of the stack is recorded
-//! (STACKLOCK) by painting the probed bytes before the lock and reading back
-//! how far they were overwritten.
+//! In tests a held lock's deepest use of the stack is recorded (STACKLOCK
+//! max) by painting the stack already committed below the caller (up to
+//! [`PROBE`] bytes, committing none) before the lock and reading back how
+//! far it was overwritten, and a stack page committed while it was held
+//! (the TEB's StackLimit moved) is recorded too (STACKLOCK grew): what the
+//! probe will have to cover. With [`Probing::Guard`] a lock probes first
+//! and such a page fails the test, naming the lock.
 
 use std::sync::{LockResult, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// The stack committed below the caller before a lock: the deepest use of
 /// the stack while one of these locks is held, nested ones included, with a
 /// margin (STACKLOCK's record; the stack reclaim's design, condition A3.4).
+#[cfg(test)]
 pub(crate) const PROBE: usize = 16 << 10;
 
 /// Commits [`PROBE`] bytes of stack below the caller: a frame of that size,
 /// which the compiler probes a page at a time (`__chkstk`), so that each
 /// page is committed now, in order, through the guard page. The frame is
 /// left uninitialised: the probe touches one word a page, and nothing else
-/// writes it (`test_the_probes_cost_on_record`).
+/// writes it (`test_the_probes_cost_on_record`). In tests only, until the
+/// stack reclaim can answer its refusal (the module's comment).
+#[cfg(test)]
 #[inline(never)]
 fn probe() {
     let frame = core::mem::MaybeUninit::<[u8; PROBE]>::uninit();
@@ -55,13 +69,16 @@ fn probe_zeroing() {
     core::hint::black_box(&frame);
 }
 
-/// What an outermost lock does in tests: watch ([`Watch`], the default), or,
-/// for the cost records, only probe, as the product does, with [`probe`]
+/// What an outermost lock does in tests: watch, committing nothing, as the
+/// product commits nothing ([`Watch`], the default); probe and watch, a
+/// page committed under the lock failing the test (`Guard`, the stack
+/// reclaim's design); or, for the cost records, only probe, with [`probe`]
 /// or [`probe_zeroing`].
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Probing {
     Watch,
+    Guard,
     Probe,
     Zeroing,
 }
@@ -71,13 +88,21 @@ std::thread_local! {
     pub(crate) static PROBING: core::cell::Cell<Probing> = const { core::cell::Cell::new(Probing::Watch) };
 }
 
+/// Whether the locks of every thread of this process are watched as
+/// [`PROBING`] says: off, a lock is taken as the product takes it, for the
+/// records of the reclaim's stack and time, which the watch's painting
+/// would add to (a lock's paint writes up to [`PROBE`] bytes below it).
+#[cfg(test)]
+pub(crate) static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// What a guard notes in tests: the lock's name, the TEB's StackLimit after
-/// the probe, and the painted range's low end.
+/// the probe (if any), the painted range, and whether it probed.
 #[cfg(test)]
 struct Watch {
     name: &'static str,
     at: &'static core::panic::Location<'static>,
     limit: usize,
+    guard: bool,
     /// The painted range, `[low, top)`, and the caller's depth it is
     /// measured from.
     low: usize,
@@ -92,17 +117,21 @@ const GAP: usize = 2048;
 
 #[cfg(test)]
 impl Watch {
-    /// Probes, then paints the probed bytes below this frame and notes the
-    /// StackLimit.
+    /// Probes if `guard`, then paints the committed stack below this frame
+    /// (at most what a probe commits) and notes the StackLimit.
     #[inline(never)]
     #[track_caller]
-    fn start(name: &'static str) -> Self {
+    fn start(name: &'static str, guard: bool) -> Self {
         let at = core::panic::Location::caller();
-        probe();
+        if guard {
+            probe();
+        }
         let here = core::ptr::addr_of!(name) as usize;
-        let (low, top) = (here - (PROBE - 1024), here - GAP);
+        let limit = stack_limit();
+        let top = here - GAP;
+        let low = (here - (PROBE - 1024)).max(limit).min(top);
         paint(low, top);
-        Self { name, at, limit: stack_limit(), low, top, here }
+        Self { name, at, limit, guard, low, top, here }
     }
 }
 
@@ -111,8 +140,14 @@ impl Drop for Watch {
     fn drop(&mut self) {
         let now = stack_limit();
         let first = overwritten_from(self.low, self.top);
-        record(self.name, self.at, self.here - first);
-        if std::thread::panicking() {
+        // A page committed under the lock: its code went below the
+        // committed stack, at most a page under the new limit.
+        let used = if now < self.limit { self.here - now } else { self.here - first };
+        record(self.name, self.at, used);
+        if now < self.limit && !self.guard {
+            record_growth(self.name, self.at, self.limit - now);
+        }
+        if std::thread::panicking() || !self.guard {
             return;
         }
         if now < self.limit {
@@ -189,26 +224,50 @@ fn record(name: &'static str, at: &core::panic::Location<'_>, used: usize) {
     }
 }
 
+/// The most stack committed under each lock (STACKLOCK grew), as
+/// [`DEEPEST`].
+#[cfg(test)]
+static GREW: Mutex<[(&str, usize); 32]> = Mutex::new([("", 0); 32]);
+
+/// Notes `grew` bytes committed while `name` was held, and says a new most
+/// on standard error (STACKLOCK grew), without allocating.
+#[cfg(test)]
+fn record_growth(name: &'static str, at: &core::panic::Location<'_>, grew: usize) {
+    let mut d = GREW.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(e) = d.iter_mut().find(|(n, _)| *n == name || n.is_empty()) {
+        e.0 = name;
+        if grew > e.1 {
+            e.1 = grew;
+            crate::windows_mm::say_at_the_limit(format_args!(
+                "STACKLOCK grew {name}: {grew} B of stack committed while it was held, taken at {at}"
+            ));
+        }
+    }
+}
+
 /// STACKLOCK's record so far: each lock's deepest use of the stack.
 #[cfg(test)]
 pub(crate) fn deepest_uses() -> std::vec::Vec<(&'static str, usize)> {
     DEEPEST.lock().unwrap_or_else(PoisonError::into_inner).iter().copied().filter(|(n, _)| !n.is_empty()).collect()
 }
 
+#[cfg(test)]
 std::thread_local! {
-    /// How many of these locks this thread holds: only the first probes, as
-    /// its probe covers the deepest nesting (condition A3.4), and a nested
-    /// probe would itself commit below the first one.
+    /// How many of these locks this thread holds: only the first is
+    /// watched (and, with [`Probing::Guard`], probes), as its probe covers
+    /// the deepest nesting (condition A3.4), and a nested probe would itself
+    /// commit below the first one.
     static HELD: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
 }
 
-/// A lock of this module held by this thread ([`HELD`]), with, in tests,
-/// the outermost one's watch.
+/// A lock of this module held by this thread, with, in tests, its count in
+/// `HELD` and the outermost one's watch.
 pub(crate) struct Held {
     #[cfg(test)]
     _watch: Option<Watch>,
 }
 
+#[cfg(test)]
 impl Drop for Held {
     fn drop(&mut self) {
         HELD.with(|h| h.set(h.get() - 1));
@@ -247,10 +306,11 @@ impl<'a, T> Probed<MutexGuard<'a, T>> {
     }
 }
 
-/// Probes if this thread holds none of these locks yet (and in tests starts
-/// the watch), then takes the lock with `take`, keeping its poison.
+/// Takes the lock with `take`, keeping its poison; in tests, if this
+/// thread holds none of these locks yet, watched first (see [`Probing`]).
 #[track_caller]
 fn probed<G>(name: &'static str, take: impl FnOnce() -> LockResult<G>) -> LockResult<Probed<G>> {
+    #[cfg(test)]
     let first = HELD.with(|h| {
         let n = h.get();
         h.set(n + 1);
@@ -260,7 +320,9 @@ fn probed<G>(name: &'static str, take: impl FnOnce() -> LockResult<G>) -> LockRe
     let held = Held {
         _watch: match (first, PROBING.with(core::cell::Cell::get)) {
             (false, _) => None,
-            (true, Probing::Watch) => Some(Watch::start(name)),
+            (true, _) if !WATCHING.load(std::sync::atomic::Ordering::Relaxed) => None,
+            (true, Probing::Watch) => Some(Watch::start(name, false)),
+            (true, Probing::Guard) => Some(Watch::start(name, true)),
             (true, Probing::Probe) => {
                 probe();
                 None
@@ -274,9 +336,6 @@ fn probed<G>(name: &'static str, take: impl FnOnce() -> LockResult<G>) -> LockRe
     #[cfg(not(test))]
     let held = {
         let _ = name;
-        if first {
-            probe();
-        }
         Held {}
     };
     match take() {
@@ -419,7 +478,6 @@ mod tests {
     /// stack as it starts (8 KiB committed on record: STACKEND), the TEB's
     /// StackLimit is the same while the lock is held as before it was taken.
     #[test]
-    #[ignore = "until the next commit"]
     fn test_a_lock_commits_no_stack_before_it_is_taken() {
         static L: ProbedMutex<u32> = ProbedMutex::new("a lock taken on a shallow stack", 0);
         let (before, held) = std::thread::spawn(|| {
@@ -435,25 +493,46 @@ mod tests {
     }
 
 
-    /// A guard's probe commits [`PROBE`] bytes below its caller, and a lock
+    /// With the guard ([`Probing::Guard`], the stack reclaim's design), a
+    /// lock's probe commits [`PROBE`] bytes below its caller, and a lock
     /// held while its code uses the stack within them commits nothing more;
     /// one used deeper fails, naming the lock.
     #[test]
     fn test_a_held_lock_commits_no_stack() {
         static L: ProbedMutex<u32> = ProbedMutex::new("test lock", 0);
+        let was = PROBING.with(|p| p.replace(Probing::Guard));
         {
             let mut g = L.lock().unwrap();
             *g += 1;
             core::hint::black_box(use_stack::<4096>());
         }
+        PROBING.with(|p| p.set(was));
         assert!(deepest_uses().iter().any(|&(n, u)| n == "test lock" && u >= 4096), "{:?}", deepest_uses());
         let deep = std::thread::spawn(|| {
+            PROBING.with(|p| p.set(Probing::Guard));
             let _g = L.lock().unwrap();
             core::hint::black_box(use_stack::<{ 64 << 10 }>());
         })
         .join();
         let msg = deep.err().and_then(|e| e.downcast_ref::<std::string::String>().cloned()).unwrap_or_default();
         assert!(msg.contains("STACKLOCK the stack grew by") && msg.contains("test lock"), "{msg}");
+    }
+
+    /// Without the guard, as the product takes them, a lock whose code goes
+    /// below the committed stack is not refused: the page committed under
+    /// it is recorded (STACKLOCK grew), what the probe of the stack
+    /// reclaim's step 3 must cover.
+    #[test]
+    fn test_a_page_committed_under_a_lock_is_on_record() {
+        static L: ProbedMutex<u32> = ProbedMutex::new("a lock whose code grows the stack", 0);
+        std::thread::spawn(|| {
+            let _g = L.lock().unwrap();
+            core::hint::black_box(use_stack::<{ 64 << 10 }>());
+        })
+        .join()
+        .unwrap();
+        let grew = GREW.lock().unwrap().iter().find(|(n, _)| *n == "a lock whose code grows the stack").map(|e| e.1);
+        assert!(grew.is_some_and(|g| g >= 32 << 10), "{grew:?}");
     }
 
     /// PROBECOST: an outermost lock's cost, the probe's share of it. The
@@ -499,8 +578,9 @@ mod tests {
     }
 
     /// A lock of this module taken in a thread's teardown, by one of its
-    /// thread-locals' destructors, probes and is taken as anywhere else:
-    /// [`HELD`], read on every lock, is a const-initialised thread-local of
+    /// thread-locals' destructors, is watched and taken as anywhere else:
+    /// [`HELD`], read on every lock in tests (and by the probe of the stack
+    /// reclaim's step 3), is a const-initialised thread-local of
     /// a type with no destructor, which std on Windows (native TLS, the
     /// target has `has-thread-local`) makes a plain `#[thread_local]`
     /// static, with no registration, no allocation and no destroyed state
