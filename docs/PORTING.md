@@ -133,6 +133,17 @@ exemption.
 | `hugepages`: a jailed guest on 2 MiB pages, restored through a uffd handler and with a vhost-user drive outside the jail | yes (the memory limit counts huge pages: row 10) | `hugepages` (row 10) |
 | `cpu`: a jailed guest's spinning vCPUs held to the limit | yes | yes |
 
+## Where wick differs from upstream on every host
+
+Most patches only make room for a host backend: on Linux, wick's build behaves as upstream's. These patches change
+what Firecracker does on every host, Linux included. Each is an upstream defect, fixed here with its test, until
+upstream fixes it.
+
+| Patch | Upstream v1.18.0 | wick, on Linux, macOS and Windows | Tests |
+|---|---|---|---|
+| 0049 | A serial console's input that arrives while the guest has the UART's interrupts masked stays unread until the next byte (vm-superio 0.8.1) | The interrupt is raised when the guest unmasks it: a backport of upstream's commits 18b08295a82a, 4a28969f6994 (vm-superio 0.8.2 and its test, made after v1.18.0) | `test_input_while_ier_is_masked_is_signalled_when_ier_comes_back` (unit); upstream's `test_serial_input_during_console_printk` (integration) |
+| 0050 | A request in flight when the VMM ends panics the API thread ("VMM disconnected", `src/firecracker/src/api_server/mod.rs` :225; `run_with_api` drops the VMM's channel ends before the kill switch, `api_server_adapter.rs` :252 to :273), and with panic=abort Firecracker ends with SIGABRT before it prints the VMM's error and exit code | The request is answered 500 with `{"fault_message": "The VMM has ended and Firecracker is exiting; its log and standard error say why."}`, and Firecracker exits with the VMM's error and code | `test_a_request_after_the_vmm_ended_is_answered` (unit); `tools/macos/api-vmm-ended-test.py` (process: a build held on a FIFO drive until the request is in the VMM's channel; exit 1 and the build's error, where upstream's code exits -6), run by CI on Linux and macOS; the unit test passed on Linux x86_64 and aarch64 in CI run 43783880314 (`linux-unit-tests`) |
+
 ## Where behaviour is not the same yet
 
 The standard is Linux's behaviour, not a lighter version of it. Each row below is something Firecracker on Linux
