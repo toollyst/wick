@@ -89,7 +89,10 @@ the windows-guest jobs of 14 saved runs from 43486495448, 3393774, to 4362020534
 43601688987). And At a glance's Windows column describes the hugepages and seccomp rows rather than
 saying "works". M3 is done when one PC run at a single commit passes `all`, `diff-nospace` elevated, `gdb`,
 `foreign-snapshot` and `linux-snapshot` with CI's artifact (a refusal it records counts as the stage passing, as
-its row in docs/COMPATIBILITY.md says), and those two rows say "works" for what the run covered.
+its row in docs/COMPATIBILITY.md says), and those two rows say "works" for what the run covered. A KVM-made state's
+XSAVE area is in the standard format, so wick's layout mark, which a WHP-made area carries in its software-available
+bytes, means nothing to it: its local APIC state is taken in KVM's layout; a WHP-made state without the mark (a build
+from before `KVM_GET_LAPIC` gave KVM's layout) is refused (docs/COMPATIBILITY.md, the Interrupt controller row).
 
 **Every boot test stage that has run on real hardware passes** (AMD Ryzen 9 7900, Windows 11 Pro build
 26300): boot, smp, block, vsock, net, snapshot, diff, uffd, pci, restores (20 restores, each paused and snapshotted

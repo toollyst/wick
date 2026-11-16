@@ -25,7 +25,7 @@
 //!   `VcpuExit::Shutdown` / `VcpuExit::InternalError`.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use wick_os::fd::{AsRawFd, RawFd};
@@ -107,17 +107,83 @@ fn kvm_to_legacy(regs: &[u8; LAPIC_REGS], page: &mut [u8; LAPIC_PAGE]) {
     }
 }
 
-/// Whether a `kvm_lapic_state` is in WHP's legacy layout, as this
-/// backend's `KVM_GET_LAPIC` gave it before it gave KVM's: a byte other
-/// than zero in bytes 4 to 15 of an ISR, TMR or IRR register, where WHP's
-/// layout has its words 1 to 3 and 5 to 7 and KVM's has nothing (its
-/// page is zeroed and each of those registers written 4 bytes at a time:
-/// lapic.c `kvm_create_lapic`, `kvm_lapic_set_vector`). A legacy state with
-/// vectors only in words 0 and 4 (0 to 31, 128 to 159) has none and is
-/// taken as KVM's, which reads word 4 as word 1 (32 to 63).
-fn in_legacy_layout(regs: &[u8; LAPIC_REGS]) -> bool {
-    LAPIC_VECTOR_ARRAYS.iter().any(|&base| (base..base + 0x80).any(|o| o % 16 >= 4 && regs[o] != 0))
+
+/// Bytes 464 to 511 of an XSAVE area, the last 48 of its FXSAVE region,
+/// which the processor leaves to software: FXSAVE and XSAVE do not write
+/// them, FXRSTOR and XRSTOR do not read them (Intel SDM volume 1, 10.5.1,
+/// Table 10-2, and 13.4.1). `KVM_GET_XSAVE` writes wick's mark there, its
+/// magic ([`XSAVE_MARK_MAGIC`]) and the layout version
+/// ([`XSAVE_LAYOUT`]), and `KVM_SET_XSAVE` reads it and gives WHP those
+/// bytes zero, as WHP leaves them (XSAVETEST). The version names the
+/// layouts of the vCPU state this build's ioctls give with that area: 1,
+/// `KVM_GET_LAPIC`'s IRR, ISR and TMR in KVM's layout ([`legacy_to_kvm`]).
+/// Upstream's snapshot has no field that names the build that made it
+/// (src/vmm/src/arch/x86_64/vcpu.rs `VcpuState`), and its restore sets the
+/// XSAVE area before the local APIC (`restore_state`), so the area tells
+/// `KVM_SET_LAPIC` in which layout its state is ([`xsave_maker`]).
+///
+/// A guest cannot put a mark there: the area is the VMM's copy of the
+/// vCPU's registers, which WHP fills with the processor's own save of
+/// them, and no instruction of the guest's writes those bytes of it (its
+/// FXSAVE and XSAVE images are in its own memory, and its FXRSTOR and
+/// XRSTOR do not load them). Whoever can write a snapshot file can give
+/// any vCPU state, mark or none: the mark names a layout, it guards
+/// nothing.
+const XSAVE_MARK: std::ops::Range<usize> = 464..512;
+const XSAVE_MARK_MAGIC: [u8; 8] = *b"wick-whp";
+const XSAVE_LAYOUT: u32 = 1;
+
+/// Who made a `KVM_SET_XSAVE` area, as its local APIC state is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XsaveMaker {
+    /// KVM: an area in the standard format, `XCOMP_BV` 0, which Linux's
+    /// `KVM_GET_XSAVE` gives and its `KVM_SET_XSAVE` requires (v6.1
+    /// arch/x86/kernel/fpu/xstate.c `__copy_xstate_to_uabi_buf`,
+    /// `validate_user_xstate_header`). Its bytes 464 to 511 are Linux's own
+    /// (the host's XCR0 mask, then zeros: `xstate_fx_sw_bytes`,
+    /// arch/x86/kernel/ptrace.c `update_regset_xstate_info`) and are not
+    /// read. Its local APIC state is in KVM's layout.
+    Kvm,
+    /// This build or another with its layouts: compacted (WHP's area, the
+    /// compacted format, XSAVETEST) with the mark, version [`XSAVE_LAYOUT`].
+    ThisLayout,
+    /// A wick build from before the mark: compacted, no mark. Its
+    /// `KVM_GET_LAPIC` gave WHP's page as it is, the IRR, ISR and TMR
+    /// words 4 bytes apart, which no reading of the state tells from
+    /// KVM's for every state: its `KVM_SET_LAPIC` is refused.
+    BeforeTheMark,
+    /// The mark with another version: a later wick's layouts, or a
+    /// version no wick writes; refused at `KVM_SET_XSAVE`.
+    Layout(u32),
 }
+
+/// Who made `area`, by its format and mark ([`XSAVE_MARK`]). An area too
+/// short for its header is KVM's here and refused by `regs::set_xsave`.
+fn xsave_maker(area: &[u8]) -> XsaveMaker {
+    const COMPACTED: u64 = 1 << 63;
+    match (regs::xcomp_bv(area), area.get(XSAVE_MARK)) {
+        (Some(comp), Some(mark)) if comp & COMPACTED != 0 => {
+            if mark[..8] != XSAVE_MARK_MAGIC {
+                return XsaveMaker::BeforeTheMark;
+            }
+            match u32::from_le_bytes(mark[8..12].try_into().unwrap()) {
+                XSAVE_LAYOUT => XsaveMaker::ThisLayout,
+                version => XsaveMaker::Layout(version),
+            }
+        }
+        _ => XsaveMaker::Kvm,
+    }
+}
+
+/// `KVM_GET_XSAVE`'s mark in `area`, WHP's, whose bytes there are zero.
+fn mark_xsave(area: &mut [u8]) {
+    if let Some(mark) = area.get_mut(XSAVE_MARK) {
+        mark.fill(0);
+        mark[..8].copy_from_slice(&XSAVE_MARK_MAGIC);
+        mark[8..12].copy_from_slice(&XSAVE_LAYOUT.to_le_bytes());
+    }
+}
+
 /// Longest a vCPU that WHP reported halted waits before it re-enters the
 /// guest: WHP's local APIC timer fires inside the hypervisor without telling
 /// the run loop, so the wait is bounded (see the `X64Halt` exit).
@@ -281,6 +347,10 @@ pub(crate) struct VcpuShared {
     /// Linux's image of the x87 and SSE state until the first `KVM_RUN`
     /// (`regs::BeforeRun`); `None` from then on.
     before_run: Mutex<Option<regs::BeforeRun>>,
+    /// Whether the last `KVM_SET_XSAVE` area was a wick build's from
+    /// before the XSAVE mark ([`XsaveMaker::BeforeTheMark`]), whose local
+    /// APIC state `KVM_SET_LAPIC` refuses.
+    lapic_before_the_mark: AtomicBool,
     /// The last `MSR_KVM_SYSTEM_TIME_NEW` value.
     system_time_msr: AtomicU64,
     /// The clock generation (`pvclock::State::generation`) this vCPU's time
@@ -596,6 +666,7 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         cpuid: Mutex::new(Vec::new()),
         cr4_guest_rsvd: AtomicU64::new(0),
         before_run: Mutex::new(Some(regs::BeforeRun::new())),
+        lapic_before_the_mark: AtomicBool::new(false),
         pending: Mutex::new(None),
         string_data: Box::new(UnsafeCell::new([0; STRING_DATA])),
         device_writes: Mutex::new(Vec::new()),
@@ -1061,7 +1132,8 @@ impl VcpuFd {
     /// # Safety
     /// Matches kvm-ioctls: the XSAVE region must be a valid XSAVE image.
     /// `KVM_GET_XSAVE`: `EINVAL` on a host whose state is larger than
-    /// `struct kvm_xsave`, as on Linux (`regs::get_xsave`).
+    /// `struct kvm_xsave`, as on Linux (`regs::get_xsave`). The area has
+    /// wick's mark in its software-available bytes ([`XSAVE_MARK`]).
     pub unsafe fn get_xsave(&self) -> Result<kvm_xsave> {
         let mut out = kvm_xsave { region: [0; 1024], extra: Default::default() };
         // SAFETY: the region's 4096 bytes, as bytes.
@@ -1070,6 +1142,7 @@ impl VcpuFd {
         if let Some(image) = self.shared.before_run.lock().unwrap().as_ref() {
             image.as_linux_reads(bytes);
         }
+        mark_xsave(bytes);
         Ok(out)
     }
     /// # Safety
@@ -1080,11 +1153,32 @@ impl VcpuFd {
         self.set_xsave_bytes(bytes)
     }
     /// `KVM_SET_XSAVE`, and for a vCPU that has not run what it makes of
-    /// Linux's image.
+    /// Linux's image. Who made the area ([`xsave_maker`]) is kept for the
+    /// `KVM_SET_LAPIC` that comes after it in a restore; an area marked
+    /// with a layout version this build does not have is refused with
+    /// `EINVAL`, and WHP is given the mark's bytes zero.
     fn set_xsave_bytes(&self, bytes: &[u8]) -> Result<()> {
-        regs::set_xsave(self.part(), self.vp(), bytes)?;
+        let maker = xsave_maker(bytes);
+        if let XsaveMaker::Layout(version) = maker {
+            let whose = if version > XSAVE_LAYOUT { "a state from a later wick build" } else { "a version no wick build writes" };
+            super::ffi::report(
+                log::Level::Error,
+                &format!(
+                    "whp: vCPU {}'s KVM_SET_XSAVE refused (EINVAL): its area has wick's layout mark with version {version}, \
+                     where this build has version {XSAVE_LAYOUT}: {whose}, whose vCPU state this build would misread",
+                    self.vp()
+                ),
+            );
+            return err(libc::EINVAL);
+        }
+        let mut area = bytes.to_vec();
+        if let Some(mark) = area.get_mut(XSAVE_MARK) {
+            mark.fill(0);
+        }
+        regs::set_xsave(self.part(), self.vp(), &area)?;
+        self.shared.lapic_before_the_mark.store(maker == XsaveMaker::BeforeTheMark, Ordering::Relaxed);
         if let Some(image) = self.shared.before_run.lock().unwrap().as_mut() {
-            image.set_xsave(bytes);
+            image.set_xsave(&area);
         }
         Ok(())
     }
@@ -1092,6 +1186,7 @@ impl VcpuFd {
     /// As [`Self::get_xsave`].
     /// `KVM_GET_XSAVE2`: into the whole of `xsave`, which its caller made
     /// of `KVM_CAP_XSAVE2`'s size; `EINVAL` if the state does not fit it.
+    /// Marked as `KVM_GET_XSAVE`'s.
     pub unsafe fn get_xsave2(&self, xsave: &mut Xsave) -> Result<()> {
         let p = xsave.as_mut_fam_struct_ptr();
         // SAFETY: the wrapper owns a `kvm_xsave2` followed by `len` entries
@@ -1104,6 +1199,7 @@ impl VcpuFd {
         if let Some(image) = self.shared.before_run.lock().unwrap().as_ref() {
             image.as_linux_reads(bytes);
         }
+        mark_xsave(bytes);
         Ok(())
     }
     /// # Safety
@@ -1719,29 +1815,29 @@ impl VcpuFd {
     ///
     /// The IRR, ISR and TMR are taken in KVM's layout and given to WHP in
     /// its own ([`kvm_to_legacy`]); the PPR is not taken, as KVM computes
-    /// its own (lapic.c `kvm_apic_set_state`, `apic_update_ppr`). A state
-    /// in WHP's layout, which `KVM_GET_LAPIC` gave before (a snapshot made
-    /// by an earlier build), is told by those words' bytes 4 to 15, which
-    /// KVM's layout never has ([`in_legacy_layout`]), and taken as it is.
+    /// its own (lapic.c `kvm_apic_set_state`, `apic_update_ppr`). After a
+    /// `KVM_SET_XSAVE` area that a wick build made before the XSAVE mark
+    /// ([`XsaveMaker::BeforeTheMark`]: a snapshot whose `KVM_GET_LAPIC`
+    /// gave WHP's layout), refused with `EINVAL`, named: such a state's
+    /// words are not KVM's, and no reading of the state alone tells the two
+    /// apart for every state (one with vectors only from 0 to 31 and 128 to
+    /// 159 reads as either).
     pub fn set_lapic(&self, klapic: &kvm_lapic_state) -> Result<()> {
+        if self.shared.lapic_before_the_mark.load(Ordering::Relaxed) {
+            super::ffi::report(
+                log::Level::Error,
+                &format!(
+                    "whp: vCPU {}'s KVM_SET_LAPIC refused (EINVAL): its snapshot was made by a wick build from before \
+                     KVM_GET_LAPIC gave KVM's layout (its XSAVE area, WHP's, has no layout mark), whose IRR, ISR and TMR \
+                     words are WHP's, 4 bytes apart, and would be misread; take the snapshot again with this build",
+                    self.vp()
+                ),
+            );
+            return err(libc::EINVAL);
+        }
         let (mut page, size) = self.lapic_page()?;
         let regs: [u8; LAPIC_REGS] = std::array::from_fn(|i| klapic.regs[i] as u8);
-        if in_legacy_layout(&regs) {
-            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !SAID.swap(true, Ordering::Relaxed) {
-                super::ffi::report(
-                    log::Level::Info,
-                    &format!(
-                        "whp: vCPU {}'s KVM_SET_LAPIC state has its IRR, ISR and TMR in the layout an earlier build's \
-                         KVM_GET_LAPIC gave (WHP's, 4 bytes a word: a snapshot made by it), not KVM's; taken as it is",
-                        self.vp()
-                    ),
-                );
-            }
-            page[..LAPIC_REGS].copy_from_slice(&regs);
-        } else {
-            kvm_to_legacy(&regs, &mut page);
-        }
+        kvm_to_legacy(&regs, &mut page);
         if self.register(whv::WHvX64RegisterApicBase)? & tscdeadline::APIC_BASE_EXTD != 0 {
             let id = u32::from_le_bytes(page[0x20..0x24].try_into().unwrap()) >> 24;
             page[0x20..0x24].copy_from_slice(&id.to_le_bytes());
@@ -13950,7 +14046,10 @@ mod fpu_tests {
 
 #[cfg(test)]
 mod lapic_format_tests {
-    use super::{LAPIC_PAGE, LAPIC_PPR, LAPIC_REGS, in_legacy_layout, kvm_to_legacy, lapic_word, legacy_to_kvm};
+    use super::{
+        LAPIC_PAGE, LAPIC_PPR, LAPIC_REGS, XSAVE_MARK, XsaveMaker, kvm_to_legacy, lapic_word, legacy_to_kvm, mark_xsave,
+        xsave_maker,
+    };
 
     fn put(b: &mut [u8], at: usize, v: u32) {
         b[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -14025,28 +14124,56 @@ mod lapic_format_tests {
         }
     }
 
-    // A state in KVM's layout (KVM's or this backend's) is taken as KVM's;
-    // one an earlier build gave, WHP's, is told by bytes 4 to 15 of its
-    // words, except one with vectors only in words 0 and 4.
+    // A Linux guest's state from KVM, the timer's vector in service and
+    // requested, goes to WHP's page 4 bytes a word.
     #[test]
-    fn test_a_state_in_whps_layout_is_told_from_kvms() {
-        let mut kvm = first_kib(&legacy(0x20));
-        legacy_to_kvm(&mut kvm);
-        assert!(!in_legacy_layout(&kvm));
-        assert!(in_legacy_layout(&first_kib(&legacy(0x20))), "IRR words 2 and 3, ISR word 7");
-        let mut words_0_and_4 = [0u8; LAPIC_REGS];
-        put(&mut words_0_and_4, 0x200 + 4 * 4, 1);
-        assert!(!in_legacy_layout(&words_0_and_4), "vectors 128 to 159 only: taken as KVM's 32 to 63");
-        // A Linux guest's state from KVM: the timer's vector in service and
-        // requested; WHP's page gets it 4 bytes a word.
+    fn test_a_kvm_state_goes_to_whps_page_4_bytes_a_word() {
         let mut linux = [0u8; LAPIC_REGS];
         put(&mut linux, 0x170, 1 << 12);
         put(&mut linux, 0x270, 1 << 12);
-        assert!(!in_legacy_layout(&linux));
         let mut page = [0u8; LAPIC_PAGE];
         kvm_to_legacy(&linux, &mut page);
         assert_eq!((lapic_word(&page, 0x11c), lapic_word(&page, 0x21c)), (1 << 12, 1 << 12));
         assert_eq!((lapic_word(&page, 0x170), lapic_word(&page, 0x270)), (0, 0), "WHP's bytes there kept: zero");
+    }
+
+    /// An area of `len` bytes with `XCOMP_BV` `comp` and bytes everywhere
+    /// but in the mark's room.
+    fn area(comp: u64, len: usize) -> Vec<u8> {
+        let mut a: Vec<u8> = (0..len).map(|i| (i % 251) as u8 | 1).collect();
+        a[XSAVE_MARK].fill(0);
+        a[520..528].copy_from_slice(&comp.to_le_bytes());
+        a
+    }
+
+    // KVM_GET_XSAVE's mark: b"wick-whp", the layout version, zeros, in
+    // bytes 464 to 511 only; KVM_SET_XSAVE's reading of it, by the area's
+    // format first (KVM's is standard, WHP's compacted).
+    #[test]
+    fn test_the_xsave_mark_tells_who_made_a_state() {
+        const COMPACTED: u64 = 1 << 63 | 0x1807;
+        let whp = area(COMPACTED, 4096);
+        assert_eq!(xsave_maker(&whp), XsaveMaker::BeforeTheMark, "compacted, no mark: a wick build's from before it");
+        let mut marked = whp.clone();
+        mark_xsave(&mut marked);
+        let mut want = [0u8; 48];
+        want[..12].copy_from_slice(b"wick-whp\x01\0\0\0");
+        assert_eq!(marked[XSAVE_MARK], want[..]);
+        assert!(marked[..464] == whp[..464] && marked[512..] == whp[512..], "only bytes 464 to 511 written");
+        assert_eq!(xsave_maker(&marked), XsaveMaker::ThisLayout);
+        for version in [2, 0, u32::MAX] {
+            let mut other = marked.clone();
+            other[472..476].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(xsave_maker(&other), XsaveMaker::Layout(version));
+        }
+        // KVM's: XCOMP_BV 0, Linux's sw bytes (the XCR0 mask first), or
+        // anything there, the mark too.
+        let mut kvm = area(0, 4096);
+        kvm[464..472].copy_from_slice(&0x2e7u64.to_le_bytes());
+        assert_eq!(xsave_maker(&kvm), XsaveMaker::Kvm);
+        mark_xsave(&mut kvm);
+        assert_eq!(xsave_maker(&kvm), XsaveMaker::Kvm, "the standard format is KVM's whatever its bytes 464 to 511");
+        assert_eq!(xsave_maker(&whp[..520]), XsaveMaker::Kvm, "no header: left to regs::set_xsave, which refuses it");
     }
 
     #[test]

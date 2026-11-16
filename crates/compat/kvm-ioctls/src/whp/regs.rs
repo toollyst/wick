@@ -435,7 +435,7 @@ fn xstate_bv(area: &[u8]) -> Option<u64> {
 /// compacted, with the supervisor components (measured: `XCOMP_BV`
 /// 0x8000000000001807 on an AMD EPYC 7763, 872 bytes, CI run 43363585319);
 /// KVM's are in the standard format.
-fn xcomp_bv(area: &[u8]) -> Option<u64> {
+pub(crate) fn xcomp_bv(area: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(area.get(520..528)?.try_into().ok()?))
 }
 
