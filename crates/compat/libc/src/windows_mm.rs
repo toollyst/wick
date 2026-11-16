@@ -1314,7 +1314,7 @@ pub enum Access {
     /// with [`wick_mm::commit_block_on_access_again`], a lazy page committed
     /// before), as Linux's fault finds the page present. The access can be
     /// run again; a caller that sees it again and again counts it
-    /// (`RAM_RETRY_BOUND` in kvm-ioctls' WHP run loop).
+    /// (`exit::RamRetries` in kvm-ioctls' WHP run loop).
     Present,
     /// They could not be committed (the Windows error): the memory limit is
     /// reached.

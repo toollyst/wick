@@ -696,8 +696,12 @@ has the per-control details and results.
   so that a fill, discard, move or release between the looks is seen whole: a page they would resolve is asked of
   them again, one the host allows runs again, one it refuses fails the run with `EFAULT` and a line naming the
   address and the access (`test_a_page_changed_between_a_vcpus_looks_is_settled_as_it_is_now`, Windows Server 2022
-  20348 and 2025 26100). A page the host allows that keeps exiting fails the run so after a million runs again in a
-  row, said as such. Until the follow-up (found by reading, review of this fix), a page the commit found there
+  20348 and 2025 26100). A page the host allows that keeps exiting fails the run so once its runs again in a row
+  have lasted a second and number at least 64, said as such, with the count and the time (`exit::RamRetries`,
+  `test_runs_again_fail_the_run_after_a_second_and_64`; before, after a million, which took 48501 ms for a write and
+  23271 ms for a lazy read, the vCPU spinning; on WHP the time is asserted from 1 s to under 10 s by
+  `test_a_guest_ram_access_exit_is_decided_as_kvms`, not run yet with this bound). The most runs again in a row of
+  one access is said in a RAMRETRY line at each new power of two, which `boot-test.ps1 boot` prints. Until the follow-up (found by reading, review of this fix), a page the commit found there
   already, lazy memory committed before or a released page resolved before, started the count again at each exit,
   the commit answering committed, and ran again without end; the commit now answers it present and it is counted
   (`test_a_lazy_page_committed_before_is_present_when_asked_again`,

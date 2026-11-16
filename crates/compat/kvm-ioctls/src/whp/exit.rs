@@ -547,22 +547,95 @@ pub enum RamExit {
     AnotherPass,
     /// The host refuses the access: the run fails with `EFAULT`.
     Refused,
-    /// [`RAM_RETRY_BOUND`] times in a row the page was present, allowed or
-    /// resolvable and the access exited again: the run fails with `EFAULT`.
+    /// The page was present, allowed or resolvable and the access kept
+    /// exiting for [`RAM_RETRY_TIME`] and at least [`RAM_RETRY_LEAST`] runs
+    /// again in a row ([`RamRetries::kept`]): the run fails with `EFAULT`.
     KeptExiting,
 }
 
-/// How many times in a row an access may be run again or asked again for
-/// one exit's page that the host allows ([`RamExit::RunAgain`],
+/// The least runs again in a row of one access ([`RamExit::RunAgain`],
 /// [`RamExit::AnotherPass`]; a page the commit found present,
-/// [`RamCommit::Present`], runs again so) before the run fails.
-pub const RAM_RETRY_BOUND: u32 = 1_000_000;
+/// [`RamCommit::Present`], runs again so) before the run may fail: a page
+/// filled, moved or committed between an exit and the run loop's look runs
+/// again once (RAMEXIT), so a handful is the legitimate count, and 64 lets
+/// no slow host pass for a page that keeps exiting.
+pub const RAM_RETRY_LEAST: u32 = 64;
+
+/// How long the runs again in a row of one access must have lasted before
+/// the run fails ([`RamRetries::kept`]). Before, the bound was a million
+/// runs again, which took 48501 ms for a write and 23271 ms for a lazy read
+/// that kept exiting (RAMEXIT, CI's windows job), the vCPU spinning all
+/// that time; a second is still far past a fill or a move it may wait for
+/// (each runs again at once, `RamExit::Faulted` starting the count again).
+pub const RAM_RETRY_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The runs again in a row of one access in a run call: their count and
+/// when the first was made.
+#[derive(Debug, Default)]
+pub struct RamRetries {
+    count: u32,
+    first: Option<std::time::Instant>,
+}
+
+/// The most runs again in a row of one access in this process, for the
+/// RAMRETRY line ([`RamRetries::note`]).
+static RAM_RETRY_MOST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+impl RamRetries {
+    /// The runs again so far.
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// How long since the first run again (zero with none).
+    pub fn lasted(&self) -> std::time::Duration {
+        self.first.map_or(std::time::Duration::ZERO, |f| f.elapsed())
+    }
+
+    /// One run again more. The most in a row in this process is said in a
+    /// RAMRETRY line each time it reaches a new power of two from 2, so the
+    /// log holds a measure of what the bound must allow, a line or two in
+    /// a VM's life (the boot stages print it).
+    pub fn note(&mut self) {
+        let first = *self.first.get_or_insert_with(std::time::Instant::now);
+        self.count = self.count.saturating_add(1);
+        let n = self.count;
+        if n >= 2 && n.is_power_of_two() && RAM_RETRY_MOST.fetch_max(n, std::sync::atomic::Ordering::Relaxed) < n {
+            super::ffi::report(
+                log::Level::Info,
+                &format!(
+                    "whp: RAMRETRY {n} runs again in a row of one guest RAM access, over {} us: the most so far",
+                    first.elapsed().as_micros()
+                ),
+            );
+        }
+    }
+
+    /// The access was resolved (committed, or a userfaultfd's wait): the
+    /// count starts again.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Whether the access has kept exiting long enough to fail the run:
+    /// at least [`RAM_RETRY_LEAST`] runs again in a row, lasting
+    /// [`RAM_RETRY_TIME`].
+    pub fn kept(&self) -> bool {
+        self.kept_at(std::time::Instant::now())
+    }
+
+    /// [`Self::kept`] at `now`.
+    fn kept_at(&self, now: std::time::Instant) -> bool {
+        self.count >= RAM_RETRY_LEAST && self.first.is_some_and(|f| now.saturating_duration_since(f) >= RAM_RETRY_TIME)
+    }
+}
 
 /// Decides a memory access exit at a guest RAM address, in KVM's order for
 /// the stage-2 fault (v6.1 arch/x86/kvm/mmu/mmu.c `kvm_faultin_pfn` :4140
 /// to `handle_abnormal_pfn` :3170): `readonly` is the slot's
 /// `KVM_MEM_READONLY`, `write` the access, `userfaultfd` whether one is
-/// registered; `retries` the runs again so far for this access; `commit`,
+/// registered; `kept` whether its runs again so far have lasted the bound
+/// ([`RamRetries::kept`]); `commit`,
 /// `fault` and `settled` are asked in that order, each only if the step
 /// before left the access:
 /// 1. a write to a read-only slot is MMIO before the page is looked at:
@@ -587,7 +660,7 @@ pub fn ram_access(
     readonly: bool,
     write: bool,
     userfaultfd: bool,
-    retries: u32,
+    kept: bool,
     commit: impl FnOnce() -> RamCommit,
     fault: impl FnOnce() -> bool,
     settled: impl FnOnce() -> RamSettled,
@@ -597,7 +670,7 @@ pub fn ram_access(
     }
     match commit() {
         RamCommit::Committed => return RamExit::Committed,
-        RamCommit::Present if retries >= RAM_RETRY_BOUND => return RamExit::KeptExiting,
+        RamCommit::Present if kept => return RamExit::KeptExiting,
         RamCommit::Present => return RamExit::RunAgain,
         RamCommit::Exhausted(err) => return RamExit::OutOfMemory(err),
         RamCommit::NotLazy => {}
@@ -607,7 +680,7 @@ pub fn ram_access(
     }
     match settled() {
         RamSettled::Refused => RamExit::Refused,
-        _ if retries >= RAM_RETRY_BOUND => RamExit::KeptExiting,
+        _ if kept => RamExit::KeptExiting,
         RamSettled::Resolvable => RamExit::AnotherPass,
         RamSettled::Allowed => RamExit::RunAgain,
     }
@@ -623,39 +696,39 @@ mod tests {
     fn test_a_ram_access_is_decided_in_kvms_order() {
         use RamCommit::{Committed, Exhausted, NotLazy, Present};
         use RamSettled::{Allowed, Refused, Resolvable};
-        /// KVM's answer, readonly, write, userfaultfd, retries, commit,
-        /// fault, settled, ours, the steps asked.
-        type Row = (&'static str, bool, bool, bool, u32, RamCommit, bool, RamSettled, RamExit, &'static str);
+        /// KVM's answer, readonly, write, userfaultfd, kept (the bound
+        /// reached), commit, fault, settled, ours, the steps asked.
+        type Row = (&'static str, bool, bool, bool, bool, RamCommit, bool, RamSettled, RamExit, &'static str);
         #[rustfmt::skip]
         let rows: &[Row] = &[
-            // (KVM's answer, readonly, write, userfaultfd, retries, commit, fault, settled, ours, asked)
-            ("KVM_PFN_ERR_RO_FAULT, RET_PF_EMULATE: MMIO, the page not looked at", true, true, true, 0, Committed, true, Allowed, RamExit::Mmio, ""),
-            ("the same without a userfaultfd", true, true, false, 0, NotLazy, false, Refused, RamExit::Mmio, ""),
-            ("a read of a read-only slot is faulted in as any (hva_to_pfn)", true, false, false, 0, Committed, false, Refused, RamExit::Committed, "c"),
-            ("hva_to_pfn faults the lazy page in", false, true, true, 0, Committed, false, Refused, RamExit::Committed, "c"),
-            ("hva_to_pfn finds the page present: mapped, re-run, counted", false, true, true, 0, Present, false, Refused, RamExit::RunAgain, "c"),
-            ("present, yet exiting a million times: EFAULT", false, false, false, RAM_RETRY_BOUND, Present, false, Allowed, RamExit::KeptExiting, "c"),
-            ("present just below the bound: run again", false, true, false, RAM_RETRY_BOUND - 1, Present, false, Allowed, RamExit::RunAgain, "c"),
-            ("a store to a read-only slot over a present page: MMIO", true, true, true, RAM_RETRY_BOUND, Present, false, Allowed, RamExit::Mmio, ""),
-            ("the memory cgroup's OOM kill at the charge", false, true, false, 0, Exhausted(1455), false, Refused, RamExit::OutOfMemory(1455), "c"),
-            ("handle_userfault waits for the fill", false, false, true, 0, NotLazy, true, Refused, RamExit::Faulted, "cf"),
-            ("no userfaultfd: fault() is not asked", false, false, false, 0, NotLazy, true, Allowed, RamExit::RunAgain, "cs"),
-            ("filled between the exit and the look: the fault finds it present, re-run", false, true, true, 0, NotLazy, false, Allowed, RamExit::RunAgain, "cfs"),
-            ("discarded between the looks: faults again, another pass", false, true, true, 0, NotLazy, false, Resolvable, RamExit::AnotherPass, "cfs"),
-            ("KVM_PFN_ERR_FAULT, -EFAULT: a write to a host page without write", false, true, true, 0, NotLazy, false, Refused, RamExit::Refused, "cfs"),
-            ("the same without a userfaultfd", false, true, false, 0, NotLazy, false, Refused, RamExit::Refused, "cs"),
-            ("the same at the bound: still EFAULT, for the host's refusal", false, true, true, RAM_RETRY_BOUND, NotLazy, false, Refused, RamExit::Refused, "cfs"),
-            ("allowed, yet exiting a million times: EFAULT, no counterpart in KVM", false, false, true, RAM_RETRY_BOUND, NotLazy, false, Allowed, RamExit::KeptExiting, "cfs"),
-            ("resolvable, yet exiting a million times: EFAULT", false, false, false, RAM_RETRY_BOUND, NotLazy, false, Resolvable, RamExit::KeptExiting, "cs"),
-            ("just below the bound: run again", false, false, false, RAM_RETRY_BOUND - 1, NotLazy, false, Allowed, RamExit::RunAgain, "cs"),
+            // (KVM's answer, readonly, write, userfaultfd, kept, commit, fault, settled, ours, asked)
+            ("KVM_PFN_ERR_RO_FAULT, RET_PF_EMULATE: MMIO, the page not looked at", true, true, true, false, Committed, true, Allowed, RamExit::Mmio, ""),
+            ("the same without a userfaultfd", true, true, false, false, NotLazy, false, Refused, RamExit::Mmio, ""),
+            ("a read of a read-only slot is faulted in as any (hva_to_pfn)", true, false, false, false, Committed, false, Refused, RamExit::Committed, "c"),
+            ("hva_to_pfn faults the lazy page in", false, true, true, false, Committed, false, Refused, RamExit::Committed, "c"),
+            ("hva_to_pfn finds the page present: mapped, re-run, counted", false, true, true, false, Present, false, Refused, RamExit::RunAgain, "c"),
+            ("present, yet exiting past the bound: EFAULT", false, false, false, true, Present, false, Allowed, RamExit::KeptExiting, "c"),
+            ("present just below the bound: run again", false, true, false, false, Present, false, Allowed, RamExit::RunAgain, "c"),
+            ("a store to a read-only slot over a present page: MMIO", true, true, true, true, Present, false, Allowed, RamExit::Mmio, ""),
+            ("the memory cgroup's OOM kill at the charge", false, true, false, false, Exhausted(1455), false, Refused, RamExit::OutOfMemory(1455), "c"),
+            ("handle_userfault waits for the fill", false, false, true, false, NotLazy, true, Refused, RamExit::Faulted, "cf"),
+            ("no userfaultfd: fault() is not asked", false, false, false, false, NotLazy, true, Allowed, RamExit::RunAgain, "cs"),
+            ("filled between the exit and the look: the fault finds it present, re-run", false, true, true, false, NotLazy, false, Allowed, RamExit::RunAgain, "cfs"),
+            ("discarded between the looks: faults again, another pass", false, true, true, false, NotLazy, false, Resolvable, RamExit::AnotherPass, "cfs"),
+            ("KVM_PFN_ERR_FAULT, -EFAULT: a write to a host page without write", false, true, true, false, NotLazy, false, Refused, RamExit::Refused, "cfs"),
+            ("the same without a userfaultfd", false, true, false, false, NotLazy, false, Refused, RamExit::Refused, "cs"),
+            ("the same at the bound: still EFAULT, for the host's refusal", false, true, true, true, NotLazy, false, Refused, RamExit::Refused, "cfs"),
+            ("allowed, yet exiting past the bound: EFAULT, no counterpart in KVM", false, false, true, true, NotLazy, false, Allowed, RamExit::KeptExiting, "cfs"),
+            ("resolvable, yet exiting past the bound: EFAULT", false, false, false, true, NotLazy, false, Resolvable, RamExit::KeptExiting, "cs"),
+            ("just below the bound: run again", false, false, false, false, NotLazy, false, Allowed, RamExit::RunAgain, "cs"),
         ];
-        for &(kvm, readonly, write, uffd, retries, commit, fault, settled, want, asked) in rows {
+        for &(kvm, readonly, write, uffd, kept, commit, fault, settled, want, asked) in rows {
             let seen = core::cell::RefCell::new(String::new());
             let got = ram_access(
                 readonly,
                 write,
                 uffd,
-                retries,
+                kept,
                 || {
                     seen.borrow_mut().push('c');
                     commit
@@ -671,6 +744,28 @@ mod tests {
             );
             assert_eq!((got, seen.borrow().as_str()), (want, asked), "{kvm}");
         }
+    }
+
+    /// The bound of an access that keeps exiting: at least
+    /// [`RAM_RETRY_LEAST`] runs again in a row and [`RAM_RETRY_TIME`] since
+    /// the first, both; a reset starts again.
+    #[test]
+    fn test_runs_again_fail_the_run_after_a_second_and_64() {
+        let start = std::time::Instant::now();
+        let mut r = RamRetries::default();
+        assert!(!r.kept_at(start + RAM_RETRY_TIME * 10), "none made");
+        for _ in 0..RAM_RETRY_LEAST - 1 {
+            r.note();
+        }
+        let first = r.first.unwrap();
+        assert!(!r.kept_at(first + RAM_RETRY_TIME * 10), "63 runs again over 10 s");
+        r.note();
+        assert_eq!(r.count(), RAM_RETRY_LEAST);
+        assert!(!r.kept_at(first + RAM_RETRY_TIME - std::time::Duration::from_millis(1)), "64 within the second");
+        assert!(r.kept_at(first + RAM_RETRY_TIME), "64 over a second");
+        r.reset();
+        assert_eq!((r.count(), r.lasted()), (0, std::time::Duration::ZERO));
+        assert!(!r.kept_at(first + RAM_RETRY_TIME * 10));
     }
 
     #[test]

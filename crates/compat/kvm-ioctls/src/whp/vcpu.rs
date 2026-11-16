@@ -2042,11 +2042,12 @@ impl VcpuFd {
         // Complete a read deferred from the previous exit, before any entry
         // and before a kick is looked at, as KVM's KVM_RUN runs
         // `complete_userspace_io` before its `immediate_exit` check.
-        let mut ram_retries = 0u32;
+        let mut ram_retries = super::exit::RamRetries::default();
         // The host pages this run call's last two commits answered for:
         // an exit at one of them again asks the commit whether the page is
         // there already (`commit_block_on_access_again`), so that a page
-        // WHP keeps exiting on is counted toward `RAM_RETRY_BOUND`; a first
+        // WHP keeps exiting on is counted toward the bound
+        // (`exit::RamRetries::kept`); a first
         // access asks nothing more. Two: an access across a page boundary.
         let mut ram_committed = [u64::MAX; 2];
         let pending = self.shared.pending.lock().unwrap().take();
@@ -2236,7 +2237,8 @@ impl VcpuFd {
                     //   with EFAULT, as KVM's for a host page it cannot fault
                     //   in, and Firecracker's vCPU ends the VMM. A page the
                     //   host allows that keeps exiting fails the run so
-                    //   after `RAM_RETRY_BOUND` runs again in a row.
+                    //   once its runs again in a row have lasted a second
+                    //   and number 64 (`exit::RamRetries::kept`).
                     #[cfg(test)]
                     let looked_up = std::time::Instant::now();
                     if let Some((host, readonly)) = self.shared.inner.ram_slot(mem.Gpa) {
@@ -2255,7 +2257,7 @@ impl VcpuFd {
                                 readonly,
                                 write,
                                 libc::wick_uffd::active(),
-                                ram_retries,
+                                ram_retries.kept(),
                                 || {
                                     let commit = if again {
                                         libc::wick_mm::commit_block_on_access_again
@@ -2282,10 +2284,15 @@ impl VcpuFd {
                                 break next;
                             }
                             #[cfg(test)]
-                            exit_ring::note(came, mem.Gpa, exit_ring::PASS, ram_retries);
+                            exit_ring::note(came, mem.Gpa, exit_ring::PASS, ram_retries.count());
                             #[cfg(test)]
                             RAM_RERUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            ram_retries += 1;
+                            ram_retries.note();
+                            // Another pass runs no guest: a yield every 64,
+                            // as a run again yields each time.
+                            if ram_retries.count() % 64 == 0 {
+                                std::thread::yield_now();
+                            }
                         };
                         match next {
                             super::exit::RamExit::Mmio => {}
@@ -2304,29 +2311,29 @@ impl VcpuFd {
                                 if !again {
                                     ram_committed = [page, ram_committed[0]];
                                 }
-                                ram_retries = 0;
+                                ram_retries.reset();
                                 continue;
                             }
                             super::exit::RamExit::OutOfMemory(err) => libc::wick_mm::out_of_memory(host as usize, err),
                             super::exit::RamExit::Faulted => {
                                 #[cfg(test)]
-                                exit_ring::note(came, mem.Gpa, exit_ring::FAULTED, ram_retries);
-                                ram_retries = 0;
+                                exit_ring::note(came, mem.Gpa, exit_ring::FAULTED, ram_retries.count());
+                                ram_retries.reset();
                                 continue;
                             }
                             super::exit::RamExit::RunAgain => {
                                 #[cfg(test)]
-                                exit_ring::note(came, mem.Gpa, exit_ring::RERUN, ram_retries);
+                                exit_ring::note(came, mem.Gpa, exit_ring::RERUN, ram_retries.count());
                                 #[cfg(test)]
                                 RAM_RERUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                ram_retries += 1;
+                                ram_retries.note();
                                 std::thread::yield_now();
                                 continue;
                             }
                             super::exit::RamExit::AnotherPass => unreachable!("taken by the loop above"),
                             super::exit::RamExit::Refused => {
                                 #[cfg(test)]
-                                exit_ring::note(came, mem.Gpa, exit_ring::REFUSED, ram_retries);
+                                exit_ring::note(came, mem.Gpa, exit_ring::REFUSED, ram_retries.count());
                                 let line = format!(
                                     "whp: the guest's {} of RAM at {:#x} (host {host:#x}): the host refuses it, \
                                      and the run fails with EFAULT, as KVM's for a host page it cannot fault in",
@@ -2340,12 +2347,14 @@ impl VcpuFd {
                             }
                             super::exit::RamExit::KeptExiting => {
                                 #[cfg(test)]
-                                exit_ring::note(came, mem.Gpa, exit_ring::REFUSED, ram_retries);
+                                exit_ring::note(came, mem.Gpa, exit_ring::REFUSED, ram_retries.count());
                                 let line = format!(
                                     "whp: the guest's {} of RAM at {:#x} (host {host:#x}): a page the host allows kept \
-                                     exiting ({ram_retries} runs again in a row), and the run fails with EFAULT",
+                                     exiting ({} runs again in a row over {} ms), and the run fails with EFAULT",
                                     super::exit::memory_access_kind(info),
-                                    mem.Gpa
+                                    mem.Gpa,
+                                    ram_retries.count(),
+                                    ram_retries.lasted().as_millis()
                                 );
                                 super::ffi::report(log::Level::Error, &line);
                                 #[cfg(test)]
@@ -12854,17 +12863,18 @@ mod fpu_tests {
     ///   `wick_uffd::fault`'s look (`RAM_HOOK_AFTER_THE_COMMIT`): read with
     ///   its filled byte, 1 run again;
     /// - a page the host refuses that the look is made to call allowed
-    ///   (`FORCE_SETTLED`): `EFAULT` after `RAM_RETRY_BOUND` runs again, the
-    ///   "kept exiting" line, and the wall time of the million (RAMEXIT
-    ///   kept exiting);
+    ///   (`FORCE_SETTLED`): `EFAULT` once its runs again have lasted a
+    ///   second and number 64 (`exit::RamRetries::kept`), the "kept
+    ///   exiting" line, and the wall time, asserted from 1 s to under 10 s
+    ///   (RAMEXIT kept exiting; before, a million runs again, 48501 ms);
     /// - a committed page of lazy writable memory (`MAP_NORESERVE`, written
     ///   by the host first) that WHP keeps exiting on, its slot's GPA
     ///   unmapped from the partition behind the slot's back: the commit
     ///   finds it present at the second exit, and the run fails with
-    ///   `EFAULT` after `RAM_RETRY_BOUND` runs again, the "kept exiting"
-    ///   line (RAMEXIT lazy kept exiting; before: each exit's commit
-    ///   answered committed and started the count again, re-run without
-    ///   end).
+    ///   `EFAULT` on the same bound, its time asserted the same, the "kept
+    ///   exiting" line (RAMEXIT lazy kept exiting; before: each exit's
+    ///   commit answered committed and started the count again, re-run
+    ///   without end; then a million runs again, 23271 ms).
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_a_guest_ram_access_exit_is_decided_as_kvms() {
@@ -13013,7 +13023,12 @@ mod fpu_tests {
         let line = RAM_LINE.lock().unwrap().clone();
         say(format!("kept exiting: {got}, {n} runs again in {} ms, RIP {:#x}; the line: {line}", took.as_millis(), regs.rip));
         assert_eq!((got, regs.rip), (efault, PROGRAM));
-        assert_eq!(n, u64::from(super::super::exit::RAM_RETRY_BOUND));
+        let bounded = |n: u64, took: std::time::Duration| {
+            n >= u64::from(super::super::exit::RAM_RETRY_LEAST)
+                && took >= super::super::exit::RAM_RETRY_TIME
+                && took < std::time::Duration::from_secs(10)
+        };
+        assert!(bounded(n, took), "{n} runs again in {} ms", took.as_millis());
         assert!(line.contains("a page the host allows kept exiting"), "{line}");
         // A committed lazy page WHP keeps exiting on: the GPA of its slot
         // (a page, slot 4) unmapped from the partition, the slot kept.
@@ -13042,7 +13057,7 @@ mod fpu_tests {
         let line = RAM_LINE.lock().unwrap().clone();
         say(format!("lazy kept exiting: {got}, {n} runs again in {} ms, RIP {:#x}; the line: {line}", took.as_millis(), regs.rip));
         assert_eq!((got, regs.rip), (format!("errno {}", libc::EFAULT), PROGRAM));
-        assert_eq!(n, u64::from(super::super::exit::RAM_RETRY_BOUND));
+        assert!(bounded(n, took), "{n} runs again in {} ms", took.as_millis());
         assert!(line.contains("the guest's read of RAM at 0x3a0000") && line.contains("a page the host allows kept exiting"), "{line}");
         drop(vcpu);
         drop(vm);

@@ -1541,8 +1541,9 @@ jobs:
           # a slot over lazy writable memory is an MMIO write exit with 0
           # runs again (before: a million, and no end); a missing page
           # filled between the exit and fault()'s look runs again once;
-          # and a page the look is made to call allowed fails the run after
-          # the bound, with the time the million took.
+          # and a page the look is made to call allowed fails the run once
+          # its runs again have lasted a second and number 64, the time
+          # asserted from 1 s to under 10 s.
           alone whp::vcpu::fpu_tests::test_a_guest_ram_access_exit_is_decided_as_kvms
           # What WHP answers a VP's state gets and sets (CANCELGET lines, by
           # HRESULT), the record behind the x2storm stage's

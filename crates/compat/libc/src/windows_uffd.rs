@@ -9490,7 +9490,7 @@ mod tests {
     /// A released range's pending page, resolved by its first access
     /// (`Committed`), is `Present` to the commit after, nothing committed,
     /// read or written: the page another access resolved before, which
-    /// WHP's run loop then counts toward its bound (`RAM_RETRY_BOUND`)
+    /// WHP's run loop then counts toward its bound (`exit::RamRetries`)
     /// where `Committed` started the count again. RELPRESENT line.
     #[test]
     fn test_a_released_page_resolved_before_is_present_to_the_commit() {

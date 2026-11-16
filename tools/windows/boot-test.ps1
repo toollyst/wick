@@ -2350,7 +2350,13 @@ function Stage-Boot {
     $vm.Reboot()
     $vm.Drain(2000)
     $msrs = Get-GpMsrs $vm
-    return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), serial input after 30 s of silence and after a full FIFO, reset exits 0; SRSO: {2}; MSRREC the MSRs the guest reached that are #GP(0), as on KVM: {3}" -f $dt, $host_dt, (($srso -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | '), $msrs)
+    # RAMRETRY: the most runs again in a row of one guest RAM access, which
+    # the backend says at each new power of two from 2 (none said: at most
+    # 1), the measure behind the bound (a second and 64, exit::RamRetries).
+    $said = $vm.Output + "`n" + (Get-Content -Raw $vm.LogPath -ErrorAction SilentlyContinue)
+    $most = @([regex]::Matches($said, 'whp: RAMRETRY (\d+) ') | ForEach-Object { [int]$_.Groups[1].Value } | Sort-Object -Descending)
+    $ramretry = if ($most.Count) { "$($most[0])" } else { 'at most 1' }
+    return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), serial input after 30 s of silence and after a full FIFO, reset exits 0; SRSO: {2}; MSRREC the MSRs the guest reached that are #GP(0), as on KVM: {3}; RAMRETRY the most runs again in a row of one guest RAM access: $ramretry" -f $dt, $host_dt, (($srso -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | '), $msrs)
 }
 
 # CPU 1 taken offline and back online three times, then work on it: on x86
