@@ -262,6 +262,14 @@ std::thread_local! {
     static HELD: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
 }
 
+/// Tests: how many of these locks this thread holds now
+/// (`wick_uffd::unmapping` asserts 0: no `munmap` or `MAP_FIXED` runs under
+/// one of this layer's locks).
+#[cfg(test)]
+pub(crate) fn held_here() -> u32 {
+    HELD.with(core::cell::Cell::get)
+}
+
 /// A lock of this module held by this thread, with, in tests, its count in
 /// `HELD` and the outermost one's watch.
 pub(crate) struct Held {

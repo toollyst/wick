@@ -433,9 +433,22 @@ enum Kind {
     /// `charge`: for anonymous shared memory, the commit that pays for its
     /// pages ([`Charge`]).
     View {
-        /// None for a userfaultfd range's chunk, whose section handle is
-        /// closed once its views are mapped ([`uffd_alias`]).
+        /// The section's handle, kept while the view stands; none for a
+        /// chunked userfaultfd range's views ([`uffd_alias_chunked`]), which
+        /// close it once mapped, so that a range holds no handle a chunk:
+        /// "Mapped views of a file mapping object maintain internal
+        /// references to the object, and a file mapping object does not
+        /// close until all references to it are released" (Microsoft Learn,
+        /// CreateFileMappingW). Whether a view is a userfaultfd range's is
+        /// `uffd`, not this.
         _section: Option<Arc<Owned>>,
+        /// Whether this is the view of a userfaultfd range's memory, put in
+        /// place by [`uffd_alias`] or [`uffd_alias_chunked`] (and kept
+        /// through [`uffd_swap_chunk`] and [`uffd_move_chunk`], which map
+        /// another section into the same region); never set by `mmap`.
+        /// [`uffd_pages_gone`] keeps in a registration only the pages of such
+        /// a view.
+        uffd: bool,
         file: Option<Arc<Owned>>,
         charge: Option<Arc<Charge>>,
         /// A released userfaultfd range's alias of the section, handed over
@@ -2366,6 +2379,7 @@ fn fill(
         };
         Kind::View {
             _section: Some(section),
+            uffd: false,
             file,
             charge,
             alias: None,
@@ -2764,11 +2778,39 @@ fn zero_large(base: usize, len: usize) {
     unsafe { std::ptr::write_bytes(base as *mut u8, 0, len) };
 }
 
-/// `mmap`.
+/// `mmap`. With `MAP_FIXED`, the memory it maps over leaves any
+/// userfaultfd registration in the same step (`wick_uffd::unmapping`), as
+/// Linux's `MAP_FIXED` unmaps what it maps over first.
 ///
 /// # Safety
 /// Same contract as `mmap(2)`.
 pub unsafe fn mmap(
+    addr: *mut c_void,
+    len: size_t,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    offset: off_t,
+) -> *mut c_void {
+    if flags & MAP_FIXED == 0 {
+        // SAFETY: the caller's contract.
+        return unsafe { mmap_now(addr, len, prot, flags, fd, offset) };
+    }
+    // A mapping over memory discards it: it waits for the system calls in
+    // flight on the range ([`InFlight`]), before the userfaultfd's lock is
+    // taken: a call in flight may be waiting on a fill, which takes that
+    // lock.
+    let _discard = discard_waiting(addr as usize, len.div_ceil(PAGE).saturating_mul(PAGE));
+    // SAFETY: the caller's contract.
+    crate::wick_uffd::unmapping(addr as u64, len as u64, || unsafe { mmap_now(addr, len, prot, flags, fd, offset) })
+}
+
+/// [`mmap`] once the memory it maps over is out of any userfaultfd
+/// registration's reach and no system call in flight copies it.
+///
+/// # Safety
+/// Same contract as `mmap(2)`.
+unsafe fn mmap_now(
     addr: *mut c_void,
     len: size_t,
     prot: c_int,
@@ -2782,9 +2824,6 @@ pub unsafe fn mmap(
     {
         return fail(crate::EINVAL, MAP_FAILED);
     }
-    // A mapping over memory discards it: it waits for the system calls in
-    // flight on the range ([`InFlight`]).
-    let _discard = (flags & MAP_FIXED != 0).then(|| discard_waiting(addr as usize, len.div_ceil(PAGE) * PAGE));
     if flags & MAP_HUGETLB != 0 {
         return match map_large(addr, len, prot, flags) {
             Ok(p) => p,
@@ -2891,11 +2930,22 @@ pub unsafe fn mmap(
     }
 }
 
-/// `munmap`.
+/// `munmap`. The memory leaves any userfaultfd registration in the same
+/// step (`wick_uffd::unmapping`), as Linux's registration goes with the vma.
 ///
 /// # Safety
 /// Same contract as `munmap(2)`.
 pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
+    // SAFETY: the caller's contract.
+    crate::wick_uffd::unmapping(addr as u64, len as u64, || unsafe { munmap_now(addr, len) })
+}
+
+/// [`munmap`] once the memory is out of any userfaultfd registration's
+/// reach.
+///
+/// # Safety
+/// Same contract as `munmap(2)`.
+unsafe fn munmap_now(addr: *mut c_void, len: size_t) -> c_int {
     let start = addr as usize;
     if !start.is_multiple_of(PAGE) || len == 0 {
         return fail(crate::EINVAL, -1);
@@ -2969,18 +3019,18 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
     }
     // Registered userfaultfd memory keeps each page's protection in its
     // range, given to its pages that hold memory and to its missing ones
-    // when they are filled (`wick_uffd::mprotect_registered`); the spans done
-    // are left alone here. Before the table: the userfaultfd lock comes first.
-    let registered = match crate::wick_uffd::mprotect_registered(
-        start as u64,
-        end as u64,
-        prot & PROT_READ != 0,
-        prot & PROT_WRITE != 0,
-        wprot,
-    ) {
-        Ok(done) => done,
-        Err(errno) => return fail(errno, -1),
-    };
+    // when they are filled (`wick_uffd::protecting`); the spans done are
+    // left alone here. The rest is changed under the userfaultfd's lock, or
+    // counted as a change without it, so that no register takes the memory
+    // in between; that lock comes before the table.
+    crate::wick_uffd::protecting(start as u64, end as u64, prot & PROT_READ != 0, prot & PROT_WRITE != 0, wprot, |registered| match registered {
+        Ok(done) => mprotect_rest(start, end, prot, wprot, &done),
+        Err(errno) => fail(errno, -1),
+    })
+}
+
+/// [`mprotect`] of `[start, end)` past the registered spans `registered`.
+fn mprotect_rest(start: usize, end: usize, prot: c_int, wprot: PAGE_PROTECTION_FLAGS, registered: &[(u64, u64)]) -> c_int {
     let mut t = table().lock().unwrap();
     if !covered(&t, start, end) {
         return fail(crate::ENOMEM, -1);
@@ -3014,7 +3064,7 @@ pub unsafe fn mprotect(addr: *mut c_void, len: size_t, prot: c_int) -> c_int {
                 if !r.mapped_in(rs - b, re - rs) {
                     return fail(crate::ENOMEM, -1);
                 }
-                for (s, e) in spans_outside(rs, re, &registered) {
+                for (s, e) in spans_outside(rs, re, registered) {
                     // Lazy memory stays lazy: its pages not committed get the
                     // protection when they are.
                     if t[&b].lazy || released_overlaps(s, e) {
@@ -3196,6 +3246,7 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(u
     let r = t.get_mut(&start).unwrap();
     r.kind = Kind::View {
         _section: Some(section),
+        uffd: true,
         file: None,
         charge: paid,
         alias: None,
@@ -3207,6 +3258,72 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(u
         r.lazy = false;
     }
     Ok((alias, reserved))
+}
+
+/// Calls `gone(page)` for each page of `[s, e)` (page aligned) that is no
+/// longer the memory a userfaultfd range registered there: not in a view
+/// that [`uffd_alias`] made (or [`uffd_swap_chunk`] or [`uffd_move_chunk`]
+/// put in its place), or in a hole of one. Memory mapped anew at the
+/// address (`MAP_FIXED`, or `mmap` in a hole) is never such a view: only
+/// those views are marked `uffd` ([`Kind::View`]). Under the
+/// region table's lock; allocates only the list of the regions.
+pub(crate) fn uffd_pages_gone(s: usize, e: usize, mut gone: impl FnMut(usize)) {
+    let t = table().lock().unwrap();
+    let mut at = s;
+    for b in overlapping(&t, s, e) {
+        let r = &t[&b];
+        while at < b.min(e) {
+            gone(at);
+            at += PAGE;
+        }
+        let ours = matches!(r.kind, Kind::View { uffd: true, .. });
+        let end = (b + r.len).min(e);
+        while at < end {
+            if !ours || !r.mapped_in(at - b, PAGE) {
+                gone(at);
+            }
+            at += PAGE;
+        }
+    }
+    while at < e {
+        gone(at);
+        at += PAGE;
+    }
+}
+
+/// The protection `mprotect` gave each page of `[start, start + len)`, the
+/// private memory a register is about to take ([`uffd_alias`] maps its view
+/// read-write): bit 1 of `out[i]` set if page `i` denies reads
+/// (`PAGE_NOACCESS`), bit 2 if it denies writes (that or `PAGE_READONLY`).
+/// A committed page's is its own (`VirtualQuery`); a lazy page not yet
+/// committed has the one its allocation records ([`LAZY`]).
+pub(crate) fn uffd_protections(start: usize, len: usize, out: &mut [u8]) {
+    let lazy = lazy_within(start, len);
+    let end = start + len;
+    let mut at = start;
+    while at < end {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            return;
+        }
+        let run_end = (mbi.BaseAddress as usize + mbi.RegionSize).min(end);
+        for page in (at..run_end).step_by(PAGE) {
+            let prot = if mbi.State == MEM_COMMIT {
+                mbi.Protect & 0xff
+            } else {
+                lazy.iter().find(|&&(s, n, _)| page >= s && page < s + n).map_or(PAGE_READWRITE, |l| l.2)
+            };
+            let i = (page - start) / PAGE;
+            if prot == PAGE_NOACCESS {
+                out[i] |= 2 | 4;
+            } else if prot == PAGE_READONLY {
+                out[i] |= 4;
+            }
+        }
+        at = run_end;
+    }
 }
 
 /// The grain of a userfaultfd range's reserved section ([`uffd_alias`]):
@@ -3381,7 +3498,7 @@ fn uffd_alias_chunked(t: &mut Table, start: usize, len: usize, resident: &[u8]) 
     }
     drop(sections);
     for (&(o, n), c) in chunks.iter().zip(charges) {
-        t.insert(start + o, Region::new(n, Kind::View { _section: None, file: None, charge: Some(c), alias: None }));
+        t.insert(start + o, Region::new(n, Kind::View { _section: None, uffd: true, file: None, charge: Some(c), alias: None }));
     }
     Ok(alias)
 }
@@ -3406,7 +3523,7 @@ pub(crate) fn uffd_swap_chunk(view: usize, len: usize, alias: usize) -> bool {
             if r.len == len
                 && r.holes.is_empty()
                 && !r.lazy
-                && matches!(r.kind, Kind::View { _section: None, charge: Some(_), file: None, alias: None }) => {}
+                && matches!(r.kind, Kind::View { _section: None, uffd: true, charge: Some(_), file: None, alias: None }) => {}
         _ => return false,
     }
     let Some(section) = reserved_section(len) else {
@@ -3711,7 +3828,7 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
             if r.len == len
                 && r.holes.is_empty()
                 && !r.lazy
-                && matches!(r.kind, Kind::View { _section: None, charge: Some(_), file: None, alias: None }) => {}
+                && matches!(r.kind, Kind::View { _section: None, uffd: true, charge: Some(_), file: None, alias: None }) => {}
         _ => return None,
     }
     let live = |at: usize| !missing(at);
@@ -4656,7 +4773,10 @@ pub(crate) fn accessible(addr: usize, len: usize, write: bool) -> bool {
 pub unsafe fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
     let _discard = (advice == MADV_DONTNEED || advice == MADV_FREE)
         .then(|| discard_waiting(addr as usize, len.div_ceil(PAGE) * PAGE));
-    if (advice == MADV_DONTNEED || advice == MADV_FREE) && crate::wick_uffd::active() {
+    // Every discard goes through the userfaultfd's side, registered memory
+    // or not: one that finds no range in reach is counted as a change
+    // without its lock, which a register waits for (`wick_uffd::discarding`).
+    if advice == MADV_DONTNEED || advice == MADV_FREE {
         let end = (addr as usize).saturating_add(len.div_ceil(PAGE) * PAGE);
         return crate::wick_uffd::discarding(addr as u64, (end - addr as usize) as u64, |done| {
             // SAFETY: the caller's contract.

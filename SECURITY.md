@@ -197,6 +197,43 @@ has the per-control details and results.
 
 ## Fixed defects
 
+- **Windows: `munmap` and `mmap(MAP_FIXED)` of userfaultfd-registered memory left the registration** (from the
+  Windows userfaultfd backend's start; its tests and this entry, then under "Not at parity yet", in 5859a449; fixed
+  in the commit that moved it here). On Linux the registration belongs to the vma and goes with it (mm/vma.c, v6.12,
+  `do_vmi_align_munmap` :1332; mm/mmap.c `__mmap_region` :1361). On Windows both calls changed the mapping and left
+  the range registered over memory that was gone or new. Measured on Windows Server 2022 20348 before the fix:
+  - a fill (`UFFDIO_COPY`, `UFFDIO_ZEROPAGE`) into memory mapped anew ended the VMM with an access violation
+    (0xC0000005), where Linux's is `ENOENT`: the page was committed at the address, by then the new mapping, and
+    written through the old range's alias, whose page was never committed;
+  - unmapped memory was opened: a fill into a page unmapped from a registered range filled it, and once the
+    userfaultfd was released the first access to such a page committed it read-write;
+  - an access fault on memory mapped anew waited as a userfault, and a thread waiting on a page then unmapped
+    waited again once woken;
+  - memory mapped anew could not be registered (`EBUSY`), and its discard made it missing and closed;
+  - a fill whose destination held a page unregistered from the middle of a range filled the pages before it, where
+    Linux's is `ENOENT` with nothing filled.
+  Firecracker unmaps its registered guest memory whole at teardown, while its userfaultfd is open
+  (vstate/memory.rs:308, before the VM's `uffd`, vstate/vm.rs:84 and :95); fills after that would come from its
+  handler. Now `munmap` and `MAP_FIXED` hold the userfaultfd's lock from before the change until the pages they took
+  are in no registration, so a fill or a release arriving in between waits and then finds none
+  (`test_an_unmapping_and_its_unregistration_are_one_step`); a fill whose destination holds a page in no
+  registration is `ENOENT` with nothing filled; a waiter waits on its userfaultfd, whose wake or release ends the
+  wait; a range with no page left registered is freed
+  (`test_memory_unmapped_while_registered_leaves_no_registration_behind`,
+  `test_memory_replaced_while_registered_is_in_no_registration`,
+  `test_a_discard_of_memory_replaced_while_registered_is_ordinary`,
+  `test_a_waiter_on_memory_mapped_over_is_woken_by_its_userfaultfd`,
+  `test_a_waiter_on_unmapped_memory_takes_its_own_fault_once_woken`, `test_a_fill_of_an_unregistered_page_is_enoent`,
+  `test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is`). A change of memory in no
+  registration (`munmap`, `MAP_FIXED`, `mprotect`, a discard) and a register of the same memory are ordered by two
+  sequentially consistent counts, as on macOS (the entry below), so a register racing one finds the memory as the
+  change left it (`test_a_register_racing_a_munmap_leaves_nothing_registered`,
+  `test_a_register_racing_a_map_fixed_registers_the_new_memory`,
+  `test_a_register_racing_an_mprotect_keeps_its_pages_missing`, `test_a_register_racing_a_discard_fills_the_new_pages`);
+  and a register keeps the protection `mprotect` gave each page, where before it mapped the memory read-write (as
+  read from the code).
+  Each of these tests fails under the mutation that takes its part of the fix out (docs/ARCHITECTURE.md, "Memory
+  calls on registered memory"). What stays different is under "Not at parity yet".
 - **Windows: a thread pool could keep a jailed process running after one of its threads used up its stack**
   (shipped since the jailer's job got `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`, 5579ea53; fixed in 50021416 for
   a stack used up, and for every other unhandled exception by the last unhandled-exception filter that followed it).
@@ -665,33 +702,32 @@ upstream Firecracker and its jailer.
   jail that can make pipes could, once the first reader has gone, take the log or metrics another jail of the same
   user wrote meanwhile (up to 64 KiB), if it knows the name. Run each jail's pipes under names the others cannot
   guess, or run tenants under different accounts.
-- **Windows: `munmap` and `mmap(MAP_FIXED)` of userfaultfd-registered memory leave the registration; fix in
-  progress.** On Linux the registration belongs to the vma and goes with it (mm/vma.c, v6.12, `do_vmi_align_munmap`
-  :1332; mm/mmap.c `__mmap_region` :1361). On Windows both calls change the mapping and leave the range registered
-  over memory that is gone or new, so:
-  - a fill (`UFFDIO_COPY`, `UFFDIO_ZEROPAGE`) into memory mapped anew where registered memory was ends the VMM with
-    an access violation (0xC0000005), where Linux's is `ENOENT`: the page is committed at the address, now the new
-    mapping, and then written through the old range's alias, whose page was never committed
-    (`test_memory_replaced_while_registered_is_in_no_registration`);
-  - unmapped memory is opened: a fill into a page unmapped from a registered range fills it, and once the
-    userfaultfd is released, the first access to such a page commits it read-write, where Linux's is the process's
-    `SIGSEGV` (`test_memory_unmapped_while_registered_leaves_no_registration_behind`);
-  - an access fault on memory mapped anew is taken as a userfault and waits for a fill that never comes, and a
-    thread waiting on a page that is then unmapped waits again once woken
-    (`test_memory_replaced_while_registered_is_in_no_registration`,
-    `test_a_waiter_on_unmapped_memory_takes_its_own_fault_once_woken`);
-  - memory mapped anew cannot be registered (`EBUSY`), and its discard makes it missing and closed
-    (`test_memory_replaced_while_registered_registers_anew`,
-    `test_a_discard_of_memory_replaced_while_registered_is_ordinary`,
-    `test_a_waiter_on_memory_mapped_over_is_woken_by_its_userfaultfd`).
-  A fill whose destination holds a page unregistered from the middle of a range fills the pages before it, where
-  Linux's is `ENOENT` with nothing filled (`test_a_fill_of_an_unregistered_page_is_enoent`), and `MAP_FIXED` over
-  part of a registered mapping is `EINVAL`, where Linux maps it
-  (`test_a_page_mapped_over_and_registered_again_is_filled_in_the_new_memory`). A release after all of a range was
-  unmapped leaves a mapping made in the hole as it is (`test_a_release_after_the_memory_was_unmapped_leaves_a_new_mapping_as_it_is`,
-  passing). Firecracker's teardown unmaps its registered guest memory whole while its userfaultfd is open
-  (vstate/memory.rs:308, before the VM's `uffd`, vstate/vm.rs:84 and :95), and fills after that would come from its
-  handler. The failing tests are ignored until the fix, each citing this entry.
+- **Windows: a resident page made `PROT_NONE` before a register is taken as missing.** The register takes a page's
+  residency from `mincore`, whose working-set query (`QueryWorkingSetEx`'s `Valid`) does not count a
+  `PAGE_NOACCESS` page, so such a page becomes missing, and its contents are not what a fill or an access then finds,
+  where Linux's `mincore` counts a present `PROT_NONE` pte (mm/mincore.c v6.1 :129 to :130; arch/x86 `pte_present`
+  :735 to :738) and the register changes no page
+  (`test_a_resident_page_made_prot_none_keeps_its_contents_through_a_register`, ignored citing this entry: "the
+  resident PROT_NONE page is missing" on Windows Server 2022 20348; on main a33f5aba the same check, one line for
+  both pages then, failed: "a resident page is missing"). Firecracker registers guest memory it has just mapped
+  (src/vmm/src/persist.rs `guest_memory_from_uffd`: `memory::anonymous`, then `register` of each region), so no
+  page of it is resident and closed then.
+- **Windows: memory a userfaultfd registered once is not registered again.** After its last registered pages are
+  unregistered or its userfaultfd is released, a register of the same memory is `EINVAL`, where Linux registers it
+  (the vma is ordinary anonymous memory again): the register takes private memory only, and the memory is now the
+  range's section views, a chunked range's with no section handle to map a new alias from
+  (`test_memory_unregistered_whole_registers_again`, `test_memory_replaced_while_registered_registers_anew`, ignored
+  citing this entry; memory mapped anew where a registration was registers and is filled, the second test's first
+  half). Before the unmap fix it was `EBUSY` for the same memory, the range's slot kept after its unregister (the
+  first test on main a33f5aba, Windows Server 2022 20348: "Err(Os { code: 170, kind: ResourceBusy, ... })" for both
+  userfaultfds and both kinds). Not registered either, as Linux registers it: part of a mapping (`EINVAL`), a
+  userfaultfd's own range again (`EBUSY`), and pages unregistered from a range's middle by another userfaultfd
+  (`EBUSY` until all of the range is unregistered) (`test_part_of_a_mapping_is_registered`,
+  `test_the_same_userfaultfd_registers_its_range_again`,
+  `test_a_partial_unregister_frees_that_part_for_another_userfaultfd`, ignored; the same lines before the fix).
+  `MAP_FIXED` over part of a registered mapping is `EINVAL`, where Linux maps it
+  (`test_a_page_mapped_over_and_registered_again_is_filled_in_the_new_memory`, ignored citing this entry).
+  Firecracker registers each region of its guest memory once, whole, and maps nothing over part of one.
 - **macOS: a call Firecracker's own sandbox denies ends it by SIGKILL, not exit 148.** On Linux the seccomp trap's
   SIGSYS runs upstream's handler, which logs the bad system call, counts `seccomp.num_faults` and exits 148.
   Seatbelt has no action that traps the calling thread, and a signal the process can catch let the denying thread

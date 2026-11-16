@@ -149,11 +149,27 @@ against Linux v6.12:
 | `read`, `write`, `recv`, `send`, ... into or out of registered memory | the copy faults to the userfaultfd and waits (for a userfaultfd made with `user_mode_only(false)`) | the buffer's missing pages are faulted in first (`prefault`), and again on `EFAULT` | `test_system_calls_wait_for_missing_pages` |
 | `UFFDIO_UNREGISTER` of part of a range | the vma is split and the rest stays registered (fs/userfaultfd.c `userfaultfd_unregister` :1413); the part unregistered is in no registration, and another userfaultfd registers it (`userfaultfd_register` refuses only a vma another context has, :1364 to :1366) | the same, but not yet that: another userfaultfd's register of the part is `EBUSY` until all of the range is unregistered, fix in progress (the range kept whole); a fill whose destination holds an unregistered page is `ENOENT`, as Linux's destination must lie in one registered vma (mm/userfaultfd.c `validate_dst_vma` :23 to :37); the same userfaultfd registers its own range again, and part of a mapping is registered, as Linux's | `test_a_partial_unregister_keeps_the_rest_registered`, `test_a_fill_of_an_unregistered_page_is_enoent`, `test_the_same_userfaultfd_registers_its_range_again`, `test_part_of_a_mapping_is_registered`; `test_a_partial_unregister_frees_that_part_for_another_userfaultfd` (ignored until the fix) |
 
-On Windows (`windows_uffd`, `windows_mm`), not yet for `munmap` and `mmap(MAP_FIXED)`: both change the mapping and
-leave the range registered, where Linux's registration goes with the vma (the row above). The consequences, with
-their tests (ignored until the fix), are in SECURITY.md, "Not at parity yet"; the same test names as macOS's. A
-fill whose destination holds an unregistered page (the last row) is not yet `ENOENT` on Windows either
-(`test_a_fill_of_an_unregistered_page_is_enoent`, ignored with them).
+On Windows (`windows_uffd`, `windows_mm`) the same, with the same test names, for the `munmap` and `MAP_FIXED` row:
+`windows_mm`'s `munmap` and its `mmap` with `MAP_FIXED` go through `wick_uffd::unmapping`, which holds `LOCK` from
+before the change until the pages it took (`windows_mm::uffd_pages_gone`: no longer in a view of the range's
+sections: only the views `uffd_alias` made, or a move or swap put in their place, are marked a userfaultfd range's,
+`Kind::View`'s `uffd`; `test_a_shared_mapping_over_registered_memory_is_in_no_registration`) are in no registration. A fill of
+such a page is `ENOENT` with nothing filled, as is one whose destination holds an unregistered page (the last row);
+a waiter waits on its userfaultfd, whose wake (the range checked as Linux's `validate_range` checks it, against
+Windows' lowest and highest user addresses) or release ends the wait; a range with no page left registered is
+freed, by the unmapping or by an unregister of its last pages. A change in no registration and a register are
+ordered by the two counts as on macOS (`unlocked_change`; the register waits on `WaitOnAddress`, without a lock, and
+no exception handler reaches it or any of the four changes); a register keeps each page's protection, as Linux's
+leaves the vma's, checks its range as Linux's `validate_range` does, and with nothing mapped in it is `ENOMEM` (nothing
+at or above its start) or `EINVAL` (the first mapping past its end), as Linux's (fs/userfaultfd.c v6.1 :1323 to
+:1330). Not as Linux on Windows (SECURITY.md, "Not at parity yet"): memory registered once is not
+registered again (`EINVAL`; before this was `EBUSY`, the slot kept: `test_memory_unregistered_whole_registers_again`),
+`MAP_FIXED` over part of a registered mapping is `EINVAL`, and a huge page mapping is not registered. Not yet, for the
+`UFFDIO_UNREGISTER` row: part of a mapping is not registered (`EINVAL`), the same userfaultfd's register of its own
+range again is `EBUSY`, and pages unregistered from a range's middle are `EBUSY` to another userfaultfd until all of
+the range is unregistered (`test_part_of_a_mapping_is_registered`,
+`test_the_same_userfaultfd_registers_its_range_again`,
+`test_a_partial_unregister_frees_that_part_for_another_userfaultfd`, each ignored until it passes).
 
 ## Hypervisors
 
