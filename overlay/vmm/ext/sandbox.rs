@@ -946,7 +946,9 @@ mod macos {
     /// The POSIX shared memory objects of the process `pid`: the names the
     /// compatibility memfd gives them (`/fcm.<pid>.<n>`, and
     /// `/fcmH.<pid>.<n>` for a huge page one, `libc::HUGE_MEMFD_PREFIX`;
-    /// made and unlinked at once). Another name is a denial (the default
+    /// made and unlinked at once), and a userfaultfd's waiter mirror
+    /// (`/fcm.<pid>.u<n>`, `libc::wick_uffd`, opened twice and unlinked at
+    /// once). Another name is a denial (the default
     /// rule): on Linux a memfd has no name another process could
     /// open.
     fn shm_rule(pid: u32) -> String {
@@ -4018,6 +4020,185 @@ mod macos {
             }
             wick_uffd::unregister(ctx, registered, LEN as u64).unwrap();
             println!("DISCARDS-OK");
+        }
+
+        // The userfaultfd as Firecracker has it under the profiles: made in
+        // the setup phase (the snapshot load comes after the API thread's
+        // filter put the setup profile on, vmm::seccomp::apply_filter), its
+        // waiter mirror a shared memory object of this process's own name
+        // (shm_rule, no rule of its own), its descriptor sent to a handler
+        // process (started before the sandbox, as upstream's handler is
+        // started apart from Firecracker); then in the run phase the
+        // handler sets up its channel and gets the mirror (OP_MIRROR: this
+        // process's serving thread sends the read-only descriptor), a fault
+        // whose page the handler unregistered before reading it is not
+        // read, and a thread's fault is read and filled. The child must end
+        // by its own exit.
+        #[test]
+        fn test_a_userfaultfd_and_its_mirror_work_under_the_profiles() {
+            let (out, reason) = child_reason("uffd_mirror_child", &[]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("MIRROR-OK"), "{}", text(&out));
+            assert!(out.status.success() && !sandbox_kill(reason) && !denied(&out), "{}", text(&out));
+        }
+
+        /// One byte each way on the stream `fd`.
+        fn send_byte(fd: libc::c_int, b: u8) {
+            // SAFETY: one byte from a local.
+            assert_eq!(unsafe { libc::write(fd, (&b as *const u8).cast(), 1) }, 1);
+        }
+
+        fn recv_byte(fd: libc::c_int) -> u8 {
+            let mut b = 0u8;
+            // SAFETY: one byte into a local.
+            assert_eq!(unsafe { libc::read(fd, (&mut b as *mut u8).cast(), 1) }, 1, "the other process ended");
+            b
+        }
+
+        /// The control space for one descriptor, and its length field.
+        fn one_fd_space() -> (Vec<u8>, u32) {
+            let n = u32::try_from(std::mem::size_of::<libc::c_int>()).unwrap();
+            // SAFETY: arithmetic on a size.
+            let space = unsafe { libc::CMSG_SPACE(n) };
+            (vec![0u8; space as usize], space)
+        }
+
+        #[test]
+        #[ignore = "run by test_a_userfaultfd_and_its_mirror_work_under_the_profiles in a separate process"]
+        fn uffd_mirror_child() {
+            use std::os::fd::AsRawFd;
+            use std::sync::atomic::{AtomicU8, Ordering};
+            use userfaultfd::UffdBuilder;
+            // SAFETY: sysconf has no preconditions.
+            let ps = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            let mut sv = [0; 2];
+            // SAFETY: creates two descriptors.
+            assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) }, 0);
+            let [mine, theirs] = sv;
+            // SAFETY: descriptor flags of this test's descriptor.
+            unsafe { libc::fcntl(mine, libc::F_SETFD, libc::FD_CLOEXEC) };
+            // Not waited for: the profiles have no wait4. The handler ends
+            // after its last byte, and this process right after.
+            #[allow(clippy::zombie_processes)]
+            let _handler = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["ext::sandbox::macos::tests::uffd_mirror_handler", "--exact", "--include-ignored", "--nocapture"])
+                .env("WICK_UFFD_HANDLER_FD", theirs.to_string())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            // SAFETY: the handler's end, its copy now in the handler.
+            unsafe { libc::close(theirs) };
+            select(Policy::Default);
+            apply().unwrap();
+            let owner = UffdBuilder::new().non_blocking(true).create().unwrap();
+            // SAFETY: a fresh anonymous mapping.
+            let mem = unsafe {
+                libc::mmap(std::ptr::null_mut(), 2 * ps, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
+            };
+            assert_ne!(mem, libc::MAP_FAILED);
+            let mem = mem as usize;
+            owner.register(mem as *mut _, 2 * ps).unwrap();
+            // The userfaultfd and the memory's address, to the handler, as
+            // Firecracker sends them at the snapshot load.
+            let mut data = (mem as u64).to_le_bytes();
+            let mut iov = libc::iovec { iov_base: data.as_mut_ptr().cast(), iov_len: data.len() };
+            let (mut control, space) = one_fd_space();
+            let n = u32::try_from(std::mem::size_of::<libc::c_int>()).unwrap();
+            // SAFETY: a msghdr with local buffers and one descriptor.
+            unsafe {
+                let mut msg: libc::msghdr = std::mem::zeroed();
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = control.as_mut_ptr().cast();
+                msg.msg_controllen = space;
+                let c = libc::CMSG_FIRSTHDR(&msg);
+                (*c).cmsg_level = libc::SOL_SOCKET;
+                (*c).cmsg_type = libc::SCM_RIGHTS;
+                (*c).cmsg_len = libc::CMSG_LEN(n);
+                *(libc::CMSG_DATA(c).cast::<libc::c_int>()) = owner.as_raw_fd();
+                assert_eq!(libc::sendmsg(mine, &msg, 0), 8);
+            }
+            // The threads that fault, made before the run phase as
+            // Firecracker makes its vCPU threads (a thread is made in the
+            // setup phase only): each reads its page once told to.
+            static GO: AtomicU8 = AtomicU8::new(0);
+            let reader = |page: u8| {
+                std::thread::spawn(move || {
+                    while GO.load(Ordering::SeqCst) < page {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    let at = mem + usize::from(page - 1) * ps;
+                    // SAFETY: registered memory: the read waits for its page.
+                    unsafe { std::ptr::read_volatile(at as *const u8) }
+                })
+            };
+            let (stale, live) = (reader(1), reader(2));
+            narrow().unwrap();
+            println!("NARROWED");
+            let wait_readable = || {
+                let mut p = libc::pollfd { fd: owner.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                // SAFETY: one pollfd, ours.
+                assert_eq!(unsafe { libc::poll(&mut p, 1, 10_000) }, 1, "no event in 10 s");
+            };
+            GO.store(1, Ordering::SeqCst);
+            wait_readable();
+            send_byte(mine, b'U');
+            assert_eq!(recv_byte(mine), b'u', "the handler read an unregistered page's unread fault");
+            assert_eq!(stale.join().unwrap(), 0);
+            GO.store(2, Ordering::SeqCst);
+            wait_readable();
+            send_byte(mine, b'L');
+            assert_eq!(recv_byte(mine), b'l', "the handler did not serve the fault");
+            assert_eq!(live.join().unwrap(), 7);
+            println!("MIRROR-OK");
+        }
+
+        /// The handler of `uffd_mirror_child`, a process without the sandbox:
+        /// nothing unless WICK_UFFD_HANDLER_FD names its end of the stream.
+        #[test]
+        #[ignore = "run by uffd_mirror_child as its handler"]
+        fn uffd_mirror_handler() {
+            use std::os::fd::FromRawFd;
+            use userfaultfd::{Event, Uffd};
+            let Ok(fd) = std::env::var("WICK_UFFD_HANDLER_FD") else {
+                return;
+            };
+            let sv: libc::c_int = fd.parse().unwrap();
+            // SAFETY: sysconf has no preconditions.
+            let ps = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            let mut data = [0u8; 8];
+            let mut iov = libc::iovec { iov_base: data.as_mut_ptr().cast(), iov_len: data.len() };
+            let (mut control, space) = one_fd_space();
+            // SAFETY: a msghdr with local buffers.
+            let ufd = unsafe {
+                let mut msg: libc::msghdr = std::mem::zeroed();
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = control.as_mut_ptr().cast();
+                msg.msg_controllen = space;
+                assert_eq!(libc::recvmsg(sv, &mut msg, libc::MSG_WAITALL), 8);
+                *(libc::CMSG_DATA(libc::CMSG_FIRSTHDR(&msg)).cast::<libc::c_int>())
+            };
+            let mem = usize::try_from(u64::from_le_bytes(data)).unwrap();
+            // SAFETY: the userfaultfd received, owned by the reader.
+            let reader = unsafe { Uffd::from_raw_fd(ufd) };
+            assert_eq!(recv_byte(sv), b'U');
+            reader.unregister(mem as *mut _, ps).unwrap();
+            let none = reader.read_event().unwrap().is_none();
+            send_byte(sv, if none { b'u' } else { b'x' });
+            assert_eq!(recv_byte(sv), b'L');
+            let event = loop {
+                if let Some(e) = reader.read_event().unwrap() {
+                    break e;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            let Event::Pagefault { addr, .. } = event else { panic!("{event:?}") };
+            assert_eq!(addr as usize, mem + ps);
+            let src = vec![7u8; ps];
+            // SAFETY: a page; the registered page.
+            assert_eq!(unsafe { reader.copy(src.as_ptr().cast(), (mem + ps) as *mut _, ps, true) }.unwrap(), ps);
+            send_byte(sv, b'l');
         }
 
         // fcntl: after narrow(), the commands of FCNTL_COMMANDS run and any

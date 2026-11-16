@@ -550,6 +550,46 @@ has the per-control details and results.
   where before, and on Linux, it ended at once. Not as Linux either: an address in no registered range whose
   protection came to allow the access between the fault and the handler's read (an `mprotect` on another thread)
   is retried, where Linux delivers the signal; the handler cannot tell it from a page an unregister freed.
+- **macOS: a userfaultfd page fault event whose waiter was woken before it was read was still read** (from 6c4320c5,
+  the macOS userfaultfd's start; this entry, then under "Not at parity yet", in 7d4d9645; fixed in the commit that
+  moved it here). On Linux a wake (an unregister, a `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` that wakes, `UFFDIO_WAKE`, the
+  release) takes each waiting fault it wakes off the queue, read or not (v6.12 fs/userfaultfd.c
+  `userfaultfd_wake_function` :141, `__wake_userfault` :1166 to :1176). Here the event was a record written into the
+  userfaultfd's socket at the fault, and the wake left it there. Upstream's on-demand handler reads every event into
+  a batch (examples/uffd/on_demand_handler.rs :80) and unregisters a page on its remove event (:93 to :94); a fault on
+  that page posted before the unregister and read in the next batch was served with a `UFFDIO_COPY`, `ENOENT`, and the
+  handler panics on that error (uffd_utils.rs :169 to :187): a guest touching pages its balloon was inflating could
+  end its own restore's handler (test_uffd.py :100 to :109). Read from the code, not observed in a VM. Now each
+  userfaultfd has a waiter mirror, and the `userfaultfd` crate returns a page fault only while its waiter waits
+  (`test_an_unread_fault_unregistered_is_not_read`, `test_an_unread_fault_filled_with_a_wake_is_not_read`,
+  `test_an_unread_fault_woken_is_read_once_as_its_new_fault`, `test_a_record_written_after_its_wake_is_not_read`,
+  `test_a_blocking_read_waits_past_a_woken_waiters_record`; the first three and the last failed before the change;
+  `test_an_unread_fault_filled_without_a_wake_is_still_read` passes on both). What the mirror is, as a channel:
+  - It is a POSIX shared memory object of one page (256 words, one per waiter slot), which the VMM maps read-write
+    and each reader maps read-only. Its direction is VMM to handler only: the VMM never reads what a reader could
+    write, and a reader cannot write it. The descriptor a reader gets (`OP_MIRROR` on its request channel) is opened
+    read-only, so it maps no writable view (`EPERM`) and no private one (`EINVAL`), and its read-only mapping cannot
+    be made writable (`EACCES`), as xnu-12377.121.6 bsd/kern/posix_shm.c `pshm_mmap` refuses a write to a descriptor
+    opened without `FWRITE` and takes write out of the mapping's maximum protection (:828 to :832), and refuses a
+    mapping not `MAP_SHARED` (:823 to :825) (`test_the_mirror_a_reader_gets_is_read_only`).
+  - What a compromised VMM can do with it: make the handler drop or return page fault events, which it can already
+    do by writing records (or none) into the userfaultfd's socket. The reader checks a record's slot against the
+    table before it reads (`EBADMSG` past it, `test_a_tag_past_the_mirror_is_an_error`), maps only a descriptor of the
+    table's size (`test_a_mirror_of_another_size_is_refused`), and fails the read if the mirror cannot be set up,
+    never reading without the check (`test_a_kernel_side_without_the_mirror_fails_the_read`: a kernel side that
+    predates the mirror). A reader that predates the mirror fails on the first page fault, whose event type changed
+    (`test_a_page_fault_record_is_no_type_a_reader_before_the_mirror_decodes`).
+  - The Seatbelt profile is unchanged: the object is named as the compatibility memfd names its objects
+    (`/fcm.<pid>.u<n>`), which the profile's `shm_rule` already allows (overlay/vmm/ext/sandbox.rs :956), and is
+    unlinked at once. Firecracker makes its userfaultfd at the snapshot load, after the API thread's filter has put
+    the setup profile on (`vmm::seccomp::apply_filter`), and its handler reads in the run phase
+    (`test_a_userfaultfd_and_its_mirror_work_under_the_profiles`, run by the seatbelt jobs on macOS 15 and 26).
+  - One mirror a userfaultfd (at most 16, `MAX_CTX`), given back at its release on both sides: the VMM unmaps it and
+    closes its descriptor once no thread uses it, and a reader unmaps its view when it is dropped
+    (`test_a_userfaultfds_mirror_is_given_back_at_its_release`, 48 made and released, descriptors and mirrors as
+    before and each mapping gone; `test_a_readers_mirror_goes_with_it`). The release's wait for the threads using
+    the userfaultfd also closes a race of its own: before, a waiter's write of its record could reach a kernel end
+    the release had closed meanwhile, or a descriptor that had taken its number (found by reading).
 - **macOS: a reader of a userfaultfd range without the lock could read one range's bounds with another's arrays, and
   every registration leaked its arrays** (from 6c4320c5, the macOS userfaultfd's start, to the commit that brought
   `Range::gen`; found by reading, not observed). The signal handler, `fault` and the stage-2 side read a slot's
@@ -1056,20 +1096,6 @@ upstream Firecracker and its jailer.
   parent (`test_a_denied_call_in_the_api_process_ends_firecracker_as_its_own`). Fix: a supervising parent of the
   VMM that does the same for it (the line, the metric, exit 148), proven by the same test against the VMM; it waits
   on a decision.
-- **macOS: a userfaultfd page fault event whose waiter was woken before it was read is still read.** On Linux a
-  wake (an unregister, a `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` that wakes, `UFFDIO_WAKE`, the release) takes each
-  waiting fault it wakes off the queue, read or not (v6.12 fs/userfaultfd.c `userfaultfd_wake_function` :141,
-  `__wake_userfault` :1166 to :1176), so a fault not read before its wake is never read. Here the event is a record
-  already written into the userfaultfd's socket at the fault, and the wake leaves it there. Upstream's on-demand
-  handler reads every event into a batch (examples/uffd/on_demand_handler.rs :80) and unregisters a page on its
-  remove event (:93 to :94); a fault on that page posted before the unregister and read in the next batch is
-  served with a `UFFDIO_COPY`, which is `ENOENT` (the page is in no registration), and the handler panics on that
-  error (uffd_utils.rs :169 to :187). So a guest that touches pages its balloon is inflating can end that handler
-  and, with it, its own restore (test_uffd.py :100 to :109 inflates under that handler). Read from the code, not
-  observed in a VM; it harms the VM's own handler, no other VM or the host. Fix, approved and next: a waiter mirror,
-  a page the VMM writes and each reader maps read-only, through which the reader drops a record whose waiter was
-  woken, proven by tests that land with it (a fault posted and not read, then its page unregistered, reads as no
-  event; a record posted after its wake is dropped).
 - **No per-thread filters outside Linux.** Neither macOS nor Windows filters system calls per thread. Threads of a
   process share its address space, so the union of upstream's filters applies process-wide, and the API server,
   whose separate filter is a real boundary, moves into a process of its own. On macOS that is in place: the API

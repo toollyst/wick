@@ -102,10 +102,24 @@
 //! records read from it ([`proto`]). Another process holding the descriptor
 //! sends its requests over a private channel it sets up through it; a thread
 //! per userfaultfd serves them.
+//!
+//! The waiter mirror. A fault's record is written into the socket at the
+//! fault, and a socket cannot take a record back; Linux's wake takes each
+//! waiting fault it wakes off the queue, read or not (v6.12 fs/userfaultfd.c
+//! `userfaultfd_wake_function` :141), so a fault not read before its wake is
+//! never read. So each userfaultfd has a mirror ([`Ctx`]): one word per
+//! waiter slot in shared memory, which this side writes and each reader maps
+//! read-only (`OP_MIRROR`). A waiter stores its tag there, waiting, before it
+//! validates its page ([`fault`]), and its record carries the tag; a wake
+//! clears the waiting bit of the exact tag it saw ([`wake_where`]), and the
+//! waiter waits until it is clear. A reader returns a page fault record only
+//! while the mirror's word is still its tag, waiting: a record whose waiter
+//! was woken before the reader checked it is dropped, however late it was
+//! written. The mirror is the only state that says woken.
 
 use core::ffi::c_int;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::boxed::Box;
 use std::io;
 use std::sync::{Mutex, Once};
@@ -117,8 +131,11 @@ use upstream as libc;
 pub mod proto {
     /// Size of an event, a request header and a reply: four `u64` words.
     pub const RECORD: usize = 32;
-    /// Event: `[EVENT_PAGEFAULT, addr, flags, 0]`.
-    pub const EVENT_PAGEFAULT: u64 = 1;
+    /// Event: `[EVENT_PAGEFAULT, addr, flags, tag]`: `tag` is the waiter's
+    /// (its word in the waiter mirror, [`tag`]). 1 before the mirror: a
+    /// reader that predates it fails on this type loudly (an unrecognized
+    /// event), where it would have returned events whose waiters were woken.
+    pub const EVENT_PAGEFAULT: u64 = 3;
     /// Event: `[EVENT_REMOVE, start, end, 0]`.
     pub const EVENT_REMOVE: u64 = 2;
     /// Page fault flag: the access was a write.
@@ -136,8 +153,42 @@ pub mod proto {
     pub const OP_REGISTER: u64 = 4;
     /// Request: `[OP_UNREGISTER, start, len, 0]`.
     pub const OP_UNREGISTER: u64 = 5;
+    /// Request: `[OP_MIRROR, 0, 0, 0]`. Reply: `[size, 0, 0, 0]` with the
+    /// waiter mirror's read-only descriptor (`SCM_RIGHTS`), a POSIX shared
+    /// memory object of `size` bytes ([`mirror_bytes`]); a negative errno
+    /// and no descriptor if it fails. A serving thread that predates the
+    /// mirror answers `-EINVAL` (an unknown request).
+    pub const OP_MIRROR: u64 = 6;
     /// Copy and zeropage mode: do not wake the waiting threads.
     pub const MODE_DONTWAKE: u64 = 1;
+    /// The waiter mirror's words: one per waiter slot.
+    pub const MIRROR_WORDS: usize = 256;
+    /// A tag's bit 0: its waiter waits.
+    pub const TAG_WAITING: u64 = 1;
+    /// A tag's slot field: bits 1 to 16. Wider than the table, so a reader
+    /// checks it against [`MIRROR_WORDS`].
+    const TAG_SLOT_SHIFT: u32 = 1;
+    const TAG_SLOT_MASK: u64 = 0xffff;
+    /// A tag's claim count: bits 17 to 63, the slot's own count of the
+    /// waiters it has held, so that no two waiters of a slot share a tag.
+    const TAG_COUNT_SHIFT: u32 = 17;
+
+    /// The tag of the `count`th waiter of slot `slot`, waiting.
+    pub const fn tag(count: u64, slot: usize) -> u64 {
+        (count << TAG_COUNT_SHIFT) | ((slot as u64 & TAG_SLOT_MASK) << TAG_SLOT_SHIFT) | TAG_WAITING
+    }
+
+    /// A tag's slot field, unchecked: up to 65535.
+    pub const fn tag_slot(tag: u64) -> usize {
+        ((tag >> TAG_SLOT_SHIFT) & TAG_SLOT_MASK) as usize
+    }
+
+    /// The mirror object's size: its words in whole pages of `page` bytes
+    /// (macOS's shared memory is sized in pages, xnu bsd/kern/posix_shm.c
+    /// `pshm_truncate`'s `vm_map_round_page`).
+    pub const fn mirror_bytes(page: usize) -> usize {
+        (MIRROR_WORDS * 8).div_ceil(page) * page
+    }
     // Reply: `[result, count, 0, 0]`: `result` is the byte count, or a
     // negative errno; for a partial copy `-EAGAIN` with the count copied.
 }
@@ -153,6 +204,7 @@ const VM_FLAGS_ANYWHERE: c_int = 1;
 const VM_FLAGS_FIXED_OVERWRITE: c_int = 0x4000;
 const MAX_CTX: usize = 16;
 const MAX_WAITERS: usize = 256;
+const _: () = assert!(MAX_WAITERS == proto::MIRROR_WORDS);
 /// The protection bits a page's asked protection keeps.
 const PROT_RWX: c_int = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
 
@@ -383,6 +435,14 @@ const _: () = assert!(MAX_CTX < NONE as usize);
 struct Ctx {
     fd: AtomicI32,
     features: AtomicU64,
+    /// The waiter mirror, mapped read-write here; null when there is no
+    /// userfaultfd (before [`create`] has made it, after [`destroy`]).
+    mirror: AtomicPtr<AtomicU64>,
+    /// The mirror's read-only descriptor, sent to each reader (-1: none).
+    mirror_fd: AtomicI32,
+    /// Threads using the mirror or the kernel end ([`enter`]): [`destroy`]
+    /// unmaps and closes them once none is left.
+    users: AtomicUsize,
 }
 
 /// A thread waiting for a page.
@@ -392,7 +452,8 @@ struct Waiter {
     /// The userfaultfd the fault was posted to: only its wakes and its
     /// release end the wait, as Linux's waiter is on its context's queue.
     ctx: AtomicUsize,
-    woken: AtomicBool,
+    /// The waiters this slot has held: the count in their tags.
+    count: AtomicU64,
     /// A Mach semaphore.
     sem: AtomicU64,
 }
@@ -402,13 +463,16 @@ static CTXS: [Ctx; MAX_CTX] = [const {
     Ctx {
         fd: AtomicI32::new(-1),
         features: AtomicU64::new(0),
+        mirror: AtomicPtr::new(ptr::null_mut()),
+        mirror_fd: AtomicI32::new(-1),
+        users: AtomicUsize::new(0),
     }
 }; MAX_CTX];
 static WAITERS: [Waiter; MAX_WAITERS] = [const {
     Waiter {
         page: AtomicU64::new(0),
         ctx: AtomicUsize::new(usize::MAX),
-        woken: AtomicBool::new(false),
+        count: AtomicU64::new(0),
         sem: AtomicU64::new(0),
     }
 }; MAX_WAITERS];
@@ -917,6 +981,37 @@ fn post(ctx: usize, record: [u64; 4]) {
     }
 }
 
+/// The mirror of userfaultfd `ctx`, held against its release until [`leave`];
+/// `None` if it has none (released). Async-signal-safe.
+///
+/// The count is raised before the mirror is read, and [`destroy`] takes the
+/// mirror away before it reads the count (SeqCst both): either this reads
+/// the mirror gone, or [`destroy`] sees the count and waits for it to fall.
+fn enter(ctx: usize) -> Option<&'static [AtomicU64; MAX_WAITERS]> {
+    let c = CTXS.get(ctx)?;
+    c.users.fetch_add(1, Ordering::SeqCst);
+    let m = c.mirror.load(Ordering::SeqCst);
+    if m.is_null() {
+        c.users.fetch_sub(1, Ordering::SeqCst);
+        return None;
+    }
+    // SAFETY: a mapping of MAX_WAITERS words, kept until `users` is 0.
+    Some(unsafe { &*m.cast::<[AtomicU64; MAX_WAITERS]>() })
+}
+
+/// The waiter mirror of userfaultfd `ctx`, for a reader in this process (the
+/// `userfaultfd` crate's object that made it): `MIRROR_WORDS` words, mapped
+/// until the userfaultfd's last user descriptor is closed.
+pub fn mirror(ctx: usize) -> Option<*const AtomicU64> {
+    let m = CTXS.get(ctx)?.mirror.load(Ordering::SeqCst);
+    (!m.is_null()).then_some(m.cast_const())
+}
+
+/// Ends an [`enter`] that returned the mirror.
+fn leave(ctx: usize) {
+    CTXS[ctx].users.fetch_sub(1, Ordering::SeqCst);
+}
+
 /// Resolves an access to `addr`: if it is a missing registered page, queues
 /// a page fault event and waits until the page is filled and the waiters are
 /// woken. Returns false if `addr` is not a missing registered page.
@@ -924,19 +1019,23 @@ fn post(ctx: usize, record: [u64; 4]) {
 pub fn fault(addr: u64, write: bool) -> bool {
     #[cfg(test)]
     tests::fault_hook(addr);
-    let Found::In(range, page, page_addr, g1, true) =
-        lookup(addr, |r, page| r.owned(page) && Range::test(&r.missing, page))
-    else {
+    let Found::In(range, page, page_addr, g1, Some(ctx)) = lookup(addr, |r, page| {
+        if Range::test(&r.missing, page) {
+            r.owner(page)
+        } else {
+            None
+        }
+    }) else {
         return false;
     };
     // Claim a waiter slot.
-    let slot = loop {
-        if let Some(w) = WAITERS.iter().find(|w| {
+    let (index, slot) = loop {
+        if let Some(found) = WAITERS.iter().enumerate().find(|(_, w)| {
             w.page
                 .compare_exchange(0, page_addr, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         }) {
-            break w;
+            break found;
         }
         // All slots busy: wait a little.
         let ts = libc::timespec {
@@ -946,39 +1045,51 @@ pub fn fault(addr: u64, write: bool) -> bool {
         // SAFETY: async-signal-safe sleep.
         unsafe { libc::nanosleep(&ts, ptr::null_mut()) };
     };
+    // Its userfaultfd released since the lookup: no fault to report, and the
+    // access runs again.
+    let Some(mirror) = enter(ctx) else {
+        slot.page.store(0, Ordering::SeqCst);
+        return true;
+    };
+    slot.ctx.store(ctx, Ordering::SeqCst);
+    let tag = proto::tag(slot.count.fetch_add(1, Ordering::Relaxed).wrapping_add(1), index);
+    let word = &mirror[index];
+    // Waiting, before the validation reads below. Two validations compose
+    // here, each a store before a load against a writer's store before a
+    // load (SeqCst all). The slot's: the waiter is in [`WAITERS`] before
+    // `gen` is read, after the page's bits (`test_fault_reads_the_generation_after_the_page`),
+    // against a writer's `gen` store before it changes the slot. The
+    // wake's: the tag is in the mirror before the bits are read, against a
+    // writer's change before its wake loads the mirror ([`wake_where`]). So
+    // a waiter whose reads saw the page before a change is woken by that
+    // change's wake, its tag cleared; one that reads after it sees the
+    // change, posts nothing and runs its access again
+    // (`test_fault_validates_after_its_waiter_is_registered`). A page made
+    // missing again after the change takes a change under [`LOCK`] in a
+    // `gen` window, which `g1`, read before the tag, then no longer matches.
+    word.store(tag, Ordering::SeqCst);
     #[cfg(test)]
     tests::validate_hook(addr);
-    slot.woken.store(false, Ordering::SeqCst);
-    // Its owner, or none if an unregister or an unmapping took it out
-    // meanwhile: then no fault to report, and the access runs again.
-    let ctx = range.owner(page);
-    slot.ctx.store(ctx.unwrap_or(usize::MAX), Ordering::SeqCst);
-    // Filled, or taken out, while the slot was claimed: no fault to report.
-    let report = ctx.is_some() && Range::test(&range.missing, page) && range.owner(page) == ctx;
+    // Filled, or taken out, since the lookup: no fault to report.
+    let report = Range::test(&range.missing, page) && range.owner(page) == Some(ctx);
     #[cfg(test)]
     tests::between_hook(addr);
-    // The slot is still the range `lookup` read, its `gen` read last, after
-    // the page's bits. A free slot's arrays are reset outside any window
-    // (by the next register, before its window), so bits read after a
-    // release may be the next range's; `gen` unchanged after them means no
-    // release had begun before them (a release is a window, which moves
-    // it), so they were this range's (`test_fault_reads_the_generation_after_the_page`).
-    // And the waiter is in [`WAITERS`] before `gen` is read (SeqCst both),
-    // against a writer's SeqCst `gen` store before it changes the slot and
-    // its wake after, which scans `WAITERS` with SeqCst loads: a waiter in
-    // the table before that store is woken; one that reads `gen` after it
-    // sees it moved, posts nothing, and its access runs again against the
-    // new state (`test_fault_validates_after_its_waiter_is_registered`).
     let same = range.gen.load(Ordering::SeqCst) == g1;
-    if report && same {
-        let ctx = ctx.unwrap_or(usize::MAX);
+    // Woken already (by a wake of its page, or spuriously: a wake that read
+    // the slot's page of the waiter before): no record, the access runs again.
+    if report && same && word.load(Ordering::SeqCst) == tag {
         let flags = if write { proto::FLAG_WRITE } else { 0 };
-        post(ctx, [proto::EVENT_PAGEFAULT, addr, flags, 0]);
-        while !slot.woken.load(Ordering::SeqCst) {
+        #[cfg(test)]
+        tests::post_hook(addr);
+        post(ctx, [proto::EVENT_PAGEFAULT, addr, flags, tag]);
+        while word.load(Ordering::SeqCst) == tag {
             // SAFETY: a semaphore created at init; Mach traps are async-signal-safe.
             unsafe { semaphore_wait(slot.sem.load(Ordering::Acquire) as u32) };
         }
     }
+    word.store(0, Ordering::SeqCst);
+    leave(ctx);
+    slot.ctx.store(usize::MAX, Ordering::SeqCst);
     slot.page.store(0, Ordering::SeqCst);
     true
 }
@@ -996,15 +1107,34 @@ fn wake_ctx(ctx: usize, start: u64, len: u64) {
     wake_where(|c, page| c == ctx && page >= start && page < start.saturating_add(len));
 }
 
-/// Wakes the waiters `which(ctx, page)` names.
+/// Wakes the waiters `which(ctx, page)` names: clears the waiting bit of
+/// the exact tag read from the mirror, so the bit of a later waiter of the
+/// slot is never cleared, and a reader drops the woken waiter's record from
+/// then on, read or not, as Linux's wake takes the waiter off its queue
+/// (v6.12 fs/userfaultfd.c `userfaultfd_wake_function` :141). The slot's
+/// page and the tag may be two waiters' (the slot changed hands between):
+/// then the later one is woken spuriously and runs its access again, as a
+/// Linux fault woken spuriously retries.
 fn wake_where(which: impl Fn(usize, u64) -> bool) {
-    for w in WAITERS.iter() {
+    for (index, w) in WAITERS.iter().enumerate() {
         let page = w.page.load(Ordering::SeqCst);
-        if page != 0 && which(w.ctx.load(Ordering::SeqCst), page) {
-            w.woken.store(true, Ordering::SeqCst);
+        let ctx = w.ctx.load(Ordering::SeqCst);
+        if page == 0 || ctx >= MAX_CTX || !which(ctx, page) {
+            continue;
+        }
+        let Some(mirror) = enter(ctx) else {
+            continue;
+        };
+        let tag = mirror[index].load(Ordering::SeqCst);
+        if tag & proto::TAG_WAITING != 0
+            && mirror[index]
+                .compare_exchange(tag, tag & !proto::TAG_WAITING, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
             // SAFETY: a semaphore created at init.
             unsafe { semaphore_signal(w.sem.load(Ordering::Acquire) as u32) };
         }
+        leave(ctx);
     }
 }
 
@@ -1342,14 +1472,101 @@ pub fn protecting(start: u64, len: u64, prot: c_int, apply: impl Fn(u64, u64) ->
     0
 }
 
+/// Mirrors made and not yet given back ([`new_mirror`], [`drop_mirror`]).
+#[cfg(test)]
+static MIRRORS: AtomicUsize = AtomicUsize::new(0);
+
+/// A waiter mirror: a POSIX shared memory object of [`proto::mirror_bytes`],
+/// named as the compatibility memfd names its objects (`/fcm.<pid>.u<n>`,
+/// under the sandbox's rule for them, vmm's sandbox.rs `shm_rule`), opened a
+/// second time read-only and unlinked at once, so that only these two
+/// descriptors reach it. Returns its read-write mapping and the read-only
+/// descriptor (close-on-exec); the read-write descriptor is closed.
+fn new_mirror() -> io::Result<(*mut AtomicU64, c_int)> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let bytes = proto::mirror_bytes(page_size() as usize);
+    let (rw, ro) = loop {
+        let name = std::format!(
+            "/fcm.{}.u{}\0",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let cname = name.as_ptr().cast::<core::ffi::c_char>();
+        // SAFETY: a NUL-terminated name; the results are checked.
+        let rw = unsafe { libc::shm_open(cname, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600 as libc::c_uint) };
+        if rw < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EEXIST) {
+                continue;
+            }
+            return Err(e);
+        }
+        // SAFETY: as above.
+        let ro = unsafe { libc::shm_open(cname, libc::O_RDONLY, 0 as libc::c_uint) };
+        let e = io::Error::last_os_error();
+        // SAFETY: as above; the descriptors keep the object.
+        unsafe { libc::shm_unlink(cname) };
+        if ro < 0 {
+            // SAFETY: the descriptor opened above.
+            unsafe { libc::close(rw) };
+            return Err(e);
+        }
+        break (rw, ro);
+    };
+    // SAFETY: the object's descriptor; a fresh shared mapping of it.
+    let (sized, map) = unsafe {
+        let sized = libc::ftruncate(rw, (proto::MIRROR_WORDS * 8) as libc::off_t) == 0;
+        let map = libc::mmap(
+            ptr::null_mut(),
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            rw,
+            0,
+        );
+        (sized, map)
+    };
+    let e = io::Error::last_os_error();
+    // SAFETY: the read-write descriptor; the mapping keeps the object.
+    unsafe { libc::close(rw) };
+    if !sized || map == libc::MAP_FAILED {
+        if map != libc::MAP_FAILED {
+            // SAFETY: the mapping made above.
+            unsafe { libc::munmap(map, bytes) };
+        }
+        // SAFETY: the read-only descriptor opened above.
+        unsafe { libc::close(ro) };
+        return Err(e);
+    }
+    // SAFETY: the read-only descriptor opened above.
+    unsafe { libc::fcntl(ro, libc::F_SETFD, libc::FD_CLOEXEC) };
+    #[cfg(test)]
+    MIRRORS.fetch_add(1, Ordering::SeqCst);
+    Ok((map.cast(), ro))
+}
+
+/// Gives back a mirror [`new_mirror`] made.
+fn drop_mirror(map: *mut AtomicU64, ro: c_int) {
+    // SAFETY: the mapping and descriptor `new_mirror` made, no longer used.
+    unsafe {
+        libc::munmap(map.cast(), proto::mirror_bytes(page_size() as usize));
+        libc::close(ro);
+    }
+    #[cfg(test)]
+    MIRRORS.fetch_sub(1, Ordering::SeqCst);
+}
+
 /// Creates a userfaultfd. Returns its index and the user's descriptor (the
 /// other end stays with the serving thread).
 pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(usize, c_int)> {
     init()?;
+    let (mirror, mirror_fd) = new_mirror()?;
     let mut fds = [0 as c_int; 2];
     // SAFETY: creates two descriptors.
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        drop_mirror(mirror, mirror_fd);
+        return Err(e);
     }
     let [kernel, user] = fds;
     let one: c_int = 1;
@@ -1391,14 +1608,20 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
             libc::close(kernel);
             libc::close(user);
         }
+        drop_mirror(mirror, mirror_fd);
         return Err(errno_err(libc::EMFILE));
     };
+    CTXS[index].mirror_fd.store(mirror_fd, Ordering::SeqCst);
+    CTXS[index].mirror.store(mirror, Ordering::SeqCst);
     CTXS[index].features.store(features, Ordering::Release);
     std::thread::Builder::new()
         .name("userfaultfd".into())
         .spawn(move || serve(index, kernel))
         .inspect_err(|_| {
-            CTXS[index].fd.store(-1, Ordering::Release);
+            let c = &CTXS[index];
+            let (m, fd) = (c.mirror.swap(ptr::null_mut(), Ordering::SeqCst), c.mirror_fd.swap(-1, Ordering::SeqCst));
+            drop_mirror(m, fd);
+            c.fd.store(-1, Ordering::Release);
         })?;
     Ok((index, user))
 }
@@ -2427,7 +2650,22 @@ fn destroy(ctx: usize) {
     // included, as Linux's release wakes its whole queue (fs/userfaultfd.c,
     // v6.12, `userfaultfd_release` :873, a range of length 0).
     wake_where(|c, _| c == ctx);
-    let fd = CTXS[ctx].fd.swap(-1, Ordering::AcqRel);
+    // Then the mirror goes, and once no thread uses it or the kernel end
+    // ([`enter`]: a waiter woken above, on its way out, or one that read
+    // the owner before it was cleared and finds the page no longer its),
+    // both are given back. Before, a waiter's write could reach a kernel
+    // end closed meanwhile, or a descriptor that took its number.
+    let c = &CTXS[ctx];
+    let mirror = c.mirror.swap(ptr::null_mut(), Ordering::SeqCst);
+    while c.users.load(Ordering::SeqCst) != 0 {
+        let ts = libc::timespec { tv_sec: 0, tv_nsec: 100_000 };
+        // SAFETY: a plain sleep.
+        unsafe { libc::nanosleep(&ts, ptr::null_mut()) };
+    }
+    if !mirror.is_null() {
+        drop_mirror(mirror, c.mirror_fd.swap(-1, Ordering::SeqCst));
+    }
+    let fd = c.fd.swap(-1, Ordering::AcqRel);
     if fd >= 0 {
         // SAFETY: the kernel end owned by the serving thread.
         unsafe { libc::close(fd) };
@@ -2605,12 +2843,53 @@ fn serve_request(ctx: usize, fd: c_int) -> bool {
                 .map_err(|e| (e.raw_os_error().unwrap_or(libc::EINVAL), 0)),
         ),
         proto::OP_UNREGISTER => to_reply(unregister(ctx, a, b).map(|()| 0).map_err(|e| (e, 0))),
+        proto::OP_MIRROR => return send_mirror(ctx, fd),
         _ => to_reply(Err((libc::EINVAL, 0))),
     };
     let mut out = [0u8; proto::RECORD];
     out[..8].copy_from_slice(&reply[0].to_le_bytes());
     out[8..16].copy_from_slice(&reply[1].to_le_bytes());
     write_full(fd, &out)
+}
+
+/// Serves `OP_MIRROR`: the reply with the mirror's read-only descriptor.
+/// The serving thread holds the mirror while it serves (its `destroy` comes
+/// after its loop), so the descriptor is open here.
+fn send_mirror(ctx: usize, fd: c_int) -> bool {
+    let ro = CTXS[ctx].mirror_fd.load(Ordering::SeqCst);
+    let mut out = [0u8; proto::RECORD];
+    if ro < 0 {
+        out[..8].copy_from_slice(&(-i64::from(libc::EBADF)).to_le_bytes());
+        return write_full(fd, &out);
+    }
+    out[..8].copy_from_slice(&(proto::mirror_bytes(page_size() as usize) as u64).to_le_bytes());
+    // SAFETY: arithmetic on a size.
+    let space = unsafe { libc::CMSG_SPACE(core::mem::size_of::<c_int>() as u32) } as usize;
+    let mut control = std::vec![0u8; space];
+    let mut iov = libc::iovec {
+        iov_base: out.as_mut_ptr().cast(),
+        iov_len: out.len(),
+    };
+    // SAFETY: a msghdr with one buffer and one descriptor, all local.
+    let sent = unsafe {
+        let mut msg: libc::msghdr = core::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = space as _;
+        let c = libc::CMSG_FIRSTHDR(&msg);
+        (*c).cmsg_level = libc::SOL_SOCKET;
+        (*c).cmsg_type = libc::SCM_RIGHTS;
+        (*c).cmsg_len = libc::CMSG_LEN(core::mem::size_of::<c_int>() as u32) as _;
+        *(libc::CMSG_DATA(c).cast::<c_int>()) = ro;
+        libc::sendmsg(fd, &msg, 0)
+    };
+    match usize::try_from(sent) {
+        Ok(n) if n == out.len() => true,
+        // The rest of the reply, the descriptor gone with its first byte.
+        Ok(n) if n > 0 => write_full(fd, &out[n..]),
+        _ => false,
+    }
 }
 
 /// The serving thread of userfaultfd `ctx`: accepts request channels sent on
@@ -2976,6 +3255,8 @@ pub mod syscalls {
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
+
+    use core::sync::atomic::AtomicBool;
 
     use super::*;
 
@@ -3764,8 +4045,8 @@ mod tests {
         }
     }
 
-    /// [`fault`], once its waiter is in [`WAITERS`] and before it reads the
-    /// page's owner and validates the slot.
+    /// [`fault`], once its waiter is in [`WAITERS`] and its tag in the
+    /// mirror, before it reads the page and validates the slot.
     pub(super) fn validate_hook(addr: u64) {
         let at = VALIDATE_AT.load(Ordering::SeqCst);
         if at != 0 && addr == at && VALIDATE_AT.compare_exchange(at, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
@@ -3775,6 +4056,17 @@ mod tests {
 
     static BETWEEN_HOOK: AtomicUsize = AtomicUsize::new(0);
     static BETWEEN_AT: AtomicU64 = AtomicU64::new(0);
+    static POST_HOOK: AtomicUsize = AtomicUsize::new(0);
+    static POST_AT: AtomicU64 = AtomicU64::new(0);
+
+    /// [`fault`], once it has validated and seen its tag still waiting, just
+    /// before it writes its record.
+    pub(super) fn post_hook(addr: u64) {
+        let at = POST_AT.load(Ordering::SeqCst);
+        if at != 0 && addr == at && POST_AT.compare_exchange(at, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            run_once(&POST_HOOK);
+        }
+    }
 
     /// [`fault`], between its validation's reads of the page (missing,
     /// owner) and of the slot's `gen`.
@@ -3888,6 +4180,141 @@ mod tests {
         assert!(is_missing(second) && !is_missing(first));
         assert_eq!(unregister(b, second, ps), Ok(()));
         close(&[ua, ub]);
+    }
+
+    /// The next record on `fd` (a non-blocking user end), waited for 10 s.
+    fn next_record(fd: c_int) -> [u64; 4] {
+        let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one pollfd.
+        assert_eq!(unsafe { libc::poll(&mut p, 1, 10_000) }, 1, "no record in 10 s");
+        let mut rec = [0u8; proto::RECORD];
+        // SAFETY: reads one record into a local buffer.
+        let n = unsafe { libc::read(fd, rec.as_mut_ptr().cast(), proto::RECORD) };
+        assert_eq!(n, proto::RECORD as isize);
+        words(&rec)
+    }
+
+    /// Whether a reader of userfaultfd `ctx` would return a page fault
+    /// record of tag `tag`: its slot's word in the mirror is the tag, waiting
+    /// (the `userfaultfd` crate's check).
+    fn mirror_waits(ctx: usize, tag: u64) -> bool {
+        let slot = proto::tag_slot(tag);
+        assert!(slot < MAX_WAITERS, "tag {tag:#x}");
+        // SAFETY: the mirror's MAX_WAITERS words, while `ctx` is open.
+        let word = unsafe { &*mirror(ctx).unwrap().add(slot) }.load(Ordering::SeqCst);
+        tag & proto::TAG_WAITING != 0 && word == tag
+    }
+
+    fn wake_the_first() {
+        let ps = test_page_size();
+        assert_eq!(wake_range(HOOK_CTX.load(Ordering::SeqCst), FIRST.load(Ordering::SeqCst), ps), Ok(()));
+    }
+
+    /// A wake that lands after a waiter validated and saw its tag waiting,
+    /// and before its record is written: the record is written all the
+    /// same, after the wake, and the mirror says its waiter was woken, so a
+    /// reader drops it, as Linux's read never returns a fault its wake took
+    /// off the queue (v6.12 fs/userfaultfd.c `userfaultfd_wake_function`
+    /// :141). The waiter runs its access again on the page, still missing,
+    /// and faults again: that record is read.
+    #[test]
+    fn test_a_record_written_after_its_wake_is_not_read() {
+        if !in_own_process("wick_uffd::tests::test_a_record_written_after_its_wake_is_not_read") {
+            return;
+        }
+        // SAFETY: plain alarm; its default action ends the child.
+        unsafe { libc::alarm(20) };
+        let (ctx, user) = create(0, true, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(1);
+        register(ctx, mem, ps).unwrap();
+        HOOK_CTX.store(ctx, Ordering::SeqCst);
+        FIRST.store(mem, Ordering::SeqCst);
+        POST_HOOK.store(wake_the_first as fn() as usize, Ordering::SeqCst);
+        POST_AT.store(mem, Ordering::SeqCst);
+        // SAFETY: registered memory; the read waits for its page.
+        let reader = std::thread::spawn(move || unsafe { ptr::read_volatile(mem as *const u8) });
+        let late = next_record(user);
+        assert_eq!(POST_AT.load(Ordering::SeqCst), 0, "the hook did not run");
+        assert_eq!(late[..2], [proto::EVENT_PAGEFAULT, mem]);
+        assert!(!mirror_waits(ctx, late[3]), "a record written after its wake reads as its waiter's");
+        let again = next_record(user);
+        assert_eq!(again[..2], [proto::EVENT_PAGEFAULT, mem]);
+        assert!(mirror_waits(ctx, again[3]), "the new fault's record reads as woken");
+        assert_ne!(late[3], again[3], "two waiters with one tag");
+        assert_eq!(zeropage(ctx, mem, ps, true), Ok(ps));
+        assert_eq!(reader.join().unwrap(), 0);
+        assert!(!mirror_waits(ctx, again[3]), "filled and woken, its record still reads as waiting");
+        assert_eq!(unregister(ctx, mem, ps), Ok(()));
+        close(&[user]);
+    }
+
+    fn fill_the_first() {
+        let ps = test_page_size();
+        assert_eq!(zeropage(HOOK_CTX.load(Ordering::SeqCst), FIRST.load(Ordering::SeqCst), ps, true), Ok(ps));
+    }
+
+    /// A fill with its wake between a waiter's read of its page (missing)
+    /// and the rest of its validation: the wake clears the tag the waiter
+    /// stored before that read, so the waiter writes no record and runs its
+    /// access again, which reads the filled page. Were the tag stored after
+    /// the read, the wake would find none to clear, and the waiter would
+    /// post and wait for a wake already gone, without end (the child ends
+    /// by its alarm then).
+    #[test]
+    fn test_a_wake_between_a_waiters_read_and_its_post_is_not_missed() {
+        if !in_own_process("wick_uffd::tests::test_a_wake_between_a_waiters_read_and_its_post_is_not_missed") {
+            return;
+        }
+        // SAFETY: plain alarm; its default action ends the child.
+        unsafe { libc::alarm(20) };
+        let (ctx, user) = create(0, true, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(1);
+        register(ctx, mem, ps).unwrap();
+        HOOK_CTX.store(ctx, Ordering::SeqCst);
+        FIRST.store(mem, Ordering::SeqCst);
+        BETWEEN_HOOK.store(fill_the_first as fn() as usize, Ordering::SeqCst);
+        BETWEEN_AT.store(mem, Ordering::SeqCst);
+        // SAFETY: registered memory; the hook fills it in the fault.
+        let v = unsafe { ptr::read_volatile(mem as *const u8) };
+        assert_eq!(BETWEEN_AT.load(Ordering::SeqCst), 0, "the hook did not run");
+        assert_eq!(v, 0);
+        assert!(nothing_to_read(user), "a record was written");
+        assert_eq!(unregister(ctx, mem, ps), Ok(()));
+        close(&[user]);
+    }
+
+    /// A userfaultfd's mirror is made with it and given back at its release:
+    /// three times `MAX_CTX` userfaultfds made and released one after another
+    /// leave the process's descriptors and its count of mirrors as they were,
+    /// and each mirror's mapping is gone (`msync`: `ENOMEM`) once its
+    /// release is done. In a process of its own, so that no other test's
+    /// descriptors or mappings come and go meanwhile.
+    #[test]
+    fn test_a_userfaultfds_mirror_is_given_back_at_its_release() {
+        if !in_own_process("wick_uffd::tests::test_a_userfaultfds_mirror_is_given_back_at_its_release") {
+            return;
+        }
+        init().unwrap();
+        // SAFETY: F_GETFD of each number, open or not.
+        let open = || (0..4096).filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0).count();
+        let (fds, mirrors) = (open(), MIRRORS.load(Ordering::SeqCst));
+        for round in 0..3 * MAX_CTX {
+            let (ctx, user) = create(0, false, true).unwrap();
+            let m = mirror(ctx).unwrap();
+            assert_eq!(MIRRORS.load(Ordering::SeqCst), mirrors + 1, "round {round}");
+            assert_eq!(open(), fds + 3, "round {round}: the kernel end, the user end and the mirror's descriptor");
+            close(&[user]);
+            until("the release", || CTXS[ctx].fd.load(Ordering::SeqCst) < 0);
+            // SAFETY: an asynchronous sync of one page, mapped or not:
+            // ENOMEM where nothing is mapped (mincore answers 0 there).
+            let r = unsafe { libc::msync(m as *mut _, test_page_size() as usize, libc::MS_ASYNC) };
+            let e = io::Error::last_os_error().raw_os_error();
+            assert_eq!((r, e), (-1, Some(libc::ENOMEM)), "round {round}: the mirror is still mapped");
+        }
+        assert_eq!(open(), fds, "descriptors left");
+        assert_eq!(MIRRORS.load(Ordering::SeqCst), mirrors, "mirrors left");
     }
 
     /// A fault whose slot is released and taken by another userfaultfd's
@@ -5911,7 +6338,7 @@ mod tests {
         assert!(readable(user), "no page fault event");
         let mut rec = [0u8; proto::RECORD];
         assert!(read_full(user, &mut rec));
-        assert_eq!(words(&rec), [proto::EVENT_PAGEFAULT, at, 0, 0]);
+        assert_eq!(words(&rec)[..3], [proto::EVENT_PAGEFAULT, at, 0]);
         std::thread::sleep(Duration::from_millis(50));
         assert!(!reader.is_finished(), "the reader went on before the fill");
         let whole = (HUGE_PAGE as i64, HUGE_PAGE);
@@ -6007,7 +6434,7 @@ mod tests {
             assert!(readable(user), "no page fault event for {at:#x}");
             let mut rec = [0u8; proto::RECORD];
             assert!(read_full(user, &mut rec));
-            assert_eq!(words(&rec), [proto::EVENT_PAGEFAULT, at, flags, 0]);
+            assert_eq!(words(&rec)[..3], [proto::EVENT_PAGEFAULT, at, flags]);
             std::thread::sleep(Duration::from_millis(50));
             assert!(!call.is_finished(), "the call went on before the fill");
             let base = at - at % ps;

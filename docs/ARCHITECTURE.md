@@ -148,6 +148,26 @@ against Linux v6.12:
 | `read`, `write`, `recv`, `send`, ... into or out of registered memory | the copy faults to the userfaultfd and waits (for a userfaultfd made with `user_mode_only(false)`) | the buffer's missing pages are faulted in first (`prefault`), and again on `EFAULT` | `test_system_calls_wait_for_missing_pages` |
 | `UFFDIO_UNREGISTER` of part of a range | the vma is split and the rest stays registered (fs/userfaultfd.c `userfaultfd_unregister` :1413); the part unregistered is in no registration, and another userfaultfd registers it (`userfaultfd_register` refuses only a vma another context has, :1364 to :1366) | the same. A range stays one slot and alias; each of its pages has an owner, the userfaultfd it is registered with or none (a byte a page: 64 KiB a GiB of 16 KiB pages), so an unregister takes no slot and cannot fail for want of one, however scattered (Firecracker's on-demand handler unregisters the range of every remove event and asserts it succeeds, examples/uffd/on_demand_handler.rs :93 to :94, many runs under a balloon). The part unregistered is in no registration, and any userfaultfd registers it; a register with a page of another userfaultfd anywhere in its range is `EBUSY` with nothing changed, as Linux checks every vma first (`userfaultfd_register` :1363 to :1366, before :1378); an unregister through any userfaultfd takes the pages and wakes their waiters, as 6.12's (`userfaultfd_unregister` :1500 to :1501, :1519; 6.17 refuses it with `EINVAL`). A fill whose destination holds a page that is not the caller's, unregistered or another userfaultfd's, is `ENOENT`, as Linux's destination must lie in one vma of the caller (mm/userfaultfd.c `validate_dst_vma` :23 to :37); one across pages the same userfaultfd registered again is one call, as over Linux's merged vma. The same userfaultfd registers its own range again, and part of a mapping is registered, as Linux's | `test_a_partial_unregister_keeps_the_rest_registered`, `test_a_fill_of_an_unregistered_page_is_enoent`, `test_the_same_userfaultfd_registers_its_range_again`, `test_part_of_a_mapping_is_registered`, `test_a_partial_unregister_frees_that_part_for_another_userfaultfd`, `test_more_scattered_unregisters_than_slots_all_succeed`, `test_a_register_ending_in_another_userfaultfds_page_changes_nothing`, `test_two_userfaultfds_in_one_slot_fill_discard_and_release_their_own`, `test_a_fill_lies_in_one_userfaultfds_pages`, `test_an_unregister_through_another_userfaultfd_wakes_and_takes_the_pages` |
 
+**Events and their wakes.** On macOS a page fault's event is a record written into the userfaultfd's socket at the fault
+(`wick_uffd::post`), and a socket cannot take a record back, where Linux's wake takes each waiting fault it wakes off
+the queue, read or not (v6.12 fs/userfaultfd.c `userfaultfd_wake_function` :141). So each userfaultfd has a waiter
+mirror: one 64-bit word per waiter slot (256) in a POSIX shared memory object of one page, which the VMM maps
+read-write and each reader maps read-only (`OP_MIRROR` on its request channel sends the read-only descriptor). A
+waiter stores its tag (its slot, the slot's count of its waiters, a waiting bit) before it reads its page to validate
+the fault, and its record carries the tag (event type 3; it was 1, so a reader from before fails on it loudly). Every
+wake (an unregister, a fill with a wake, `UFFDIO_WAKE`, the release) clears the waiting bit of the exact tag it read,
+and the waiter waits until its bit is clear. The `userfaultfd` crate returns a page fault only while the mirror's
+word is still its tag, waiting, at one load of it: a record of a woken waiter is dropped however late it was written,
+and a read with only such records reads again (a non-blocking one then returns none, as Linux's read may be `EAGAIN`
+after poll said readable, :927 to :928 and :1069 to :1070). The tests are in SECURITY.md's entry. The mirror adds no system call: per fault a
+slot count and two stores, per wake a load and a compare-and-swap, per read one load. Measured (a timed test kept out
+of the tree: 8 threads read 512 registered pages each, a second object reads each event and fills its page; debug
+build, the Mac in timing mode; three runs of 9 rounds, binaries from before and after the change and a control
+interleaved in a rotated order): faults/s medians before 11895, 11865 and 11987, after 11768, 11612 and 11632, 1.1 to
+3.0% lower and inside each run's spread (before 11218 to 12787, after 11063 to 12502). The control, the after binary
+with 200 `getppid` calls added to each read, lowered the median to 9073 (22%), its range clear of the others: the
+measurement resolves a cost of that size, not one of 1 to 3%.
+
 On Windows (`windows_uffd`, `windows_mm`) the same, with the same test names, for the `munmap` and `MAP_FIXED` row:
 `windows_mm`'s `munmap` and its `mmap` with `MAP_FIXED` go through `wick_uffd::unmapping`, which holds `LOCK` from
 before the change until the pages it took (`windows_mm::uffd_pages_gone`: no longer in a view of the range's
