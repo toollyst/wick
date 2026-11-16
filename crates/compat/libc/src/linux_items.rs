@@ -464,7 +464,7 @@ fn io_errno() -> c_int {
 
 /// Whether `fd` is a POSIX shared memory object, as the compatibility
 /// `memfd` crate makes a memfd (`Some`), and then whether it is a huge page
-/// memfd: one named `/fcmH.<pid>.<n>`; the object keeps its name after
+/// memfd: one named `/fcmH.<pid>.<random>`; the object keeps its name after
 /// `shm_unlink` and through `dup` (measured; `proc_pidfdinfo` with
 /// `PROC_PIDFDPSHMINFO`, which the narrowed sandbox allows as `proc_info`).
 /// An object's `fstat` tells nothing (device and inode 0, measured), so the

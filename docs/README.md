@@ -60,7 +60,7 @@ semantics, on that host's facilities.
 | `libc` | Linux-only libc | `fallocate`, `memfd_create`, the userfaultfd kernel side (`wick_uffd`), ... | the POSIX layer over Win32: fds as handles, mmap, sockets, signals (`wick_fd`) |
 | `vmm-sys-util` | eventfd, epoll, timerfd, signals | pipes, kqueue, timer threads | IOCP, sections, waitable timers |
 | `userfaultfd` | the userfaultfd API | on the userfaultfd kernel side in the compatibility `libc` | the same, on its Windows kernel side (`libc::wick_uffd`, `windows_uffd.rs`) |
-| `memfd` | memfd and seals | an unlinked POSIX shared memory object | an unnamed temporary file; size seals are sections |
+| `memfd` | memfd and seals | an unlinked POSIX shared memory object, of a random name and mode `0` | an unnamed temporary file; size seals are sections |
 | `os`, `std` | `std::os::{unix, fd}` | re-exported | the same traits and types on handles |
 | `vm-memory`, `event-manager`, `micro-http`, `vhost` | rust-vmm crates | the original | upstream's source with mechanical rewrites, generated |
 

@@ -944,16 +944,17 @@ mod macos {
     const DENIED_CALL_RULE: &str = "(deny syscall-unix (syscall-number SYS_invalid) (with send-signal SIGKILL))\n";
 
     /// The POSIX shared memory objects of the process `pid`: the names the
-    /// compatibility memfd gives them (`/fcm.<pid>.<n>`, and
-    /// `/fcmH.<pid>.<n>` for a huge page one, `libc::HUGE_MEMFD_PREFIX`;
-    /// made and unlinked at once), and a userfaultfd's waiter mirror
-    /// (`/fcm.<pid>.u<n>`, `libc::wick_uffd`, opened twice and unlinked at
-    /// once). Another name is a denial (the default
-    /// rule): on Linux a memfd has no name another process could
-    /// open. Here each has its name for a moment, while it is made, in
-    /// which a process of the same uid that is not under this profile can
-    /// open it (SECURITY.md, "macOS: a memfd and a waiter mirror have a name
-    /// while they are made").
+    /// compatibility memfd gives them (`/fcm.<pid>.` and 16 random hex
+    /// digits, and `/fcmH.<pid>.` and 16 for a huge page one,
+    /// `libc::HUGE_MEMFD_PREFIX`; made with mode 0 and unlinked at once),
+    /// and a userfaultfd's waiter mirror (`/fcm.<pid>.u` and 16,
+    /// `libc::wick_uffd`, made with mode 0400, opened twice and unlinked at
+    /// once). Another name is a denial (the default rule): on Linux a memfd
+    /// has no name another process could open. Here each has its name for a
+    /// moment, while it is made, which no process can guess or take first,
+    /// and in which none but root opens a memfd again, and a mirror for
+    /// reading only (SECURITY.md, Fixed defects, "macOS: a memfd and a waiter
+    /// mirror had a name anyone could guess while they were made").
     fn shm_rule(pid: u32) -> String {
         format!(
             "(allow ipc-posix-shm* (ipc-posix-name-prefix \"/fcm.{pid}.\") \

@@ -1476,27 +1476,54 @@ pub fn protecting(start: u64, len: u64, prot: c_int, apply: impl Fn(u64, u64) ->
 #[cfg(test)]
 static MIRRORS: AtomicUsize = AtomicUsize::new(0);
 
+/// How many fresh names [`new_mirror`] tries when the name it drew is
+/// taken: one taken is already a draw of 64 random bits matching another's.
+const MIRROR_NAME_TRIES: u32 = 8;
+
+/// A test's look at a mirror's name ([`MIRROR_NAMED`]).
+#[cfg(test)]
+type MirrorHook = Box<dyn FnMut(&core::ffi::CStr)>;
+
+#[cfg(test)]
+std::thread_local! {
+    /// Run between a mirror's opens and its unlink, with its name, on the
+    /// thread that makes it (tests only: a product build keeps no name).
+    static MIRROR_NAMED: core::cell::RefCell<Option<MirrorHook>> = const { core::cell::RefCell::new(None) };
+}
+
 /// A waiter mirror: a POSIX shared memory object of [`proto::mirror_bytes`],
-/// named as the compatibility memfd names its objects (`/fcm.<pid>.u<n>`,
-/// under the sandbox's rule for them, vmm's sandbox.rs `shm_rule`), opened a
-/// second time read-only and unlinked at once, so that only these two
-/// descriptors reach it. Returns its read-write mapping and the read-only
-/// descriptor (close-on-exec); the read-write descriptor is closed.
+/// named `/fcm.<pid>.u` and 64 random bits from `getentropy` (16 hex
+/// digits; under the sandbox's rule for this process's objects, vmm's
+/// sandbox.rs `shm_rule`), made with mode 0400, opened a second time
+/// read-only and unlinked at once, so that only these two descriptors reach
+/// it. The name cannot be taken first or guessed, and while it is there a
+/// process of the same uid could open it for reading only, which gives it
+/// waiter tags (slot numbers and counts), no guest data (SECURITY.md, Fixed
+/// defects, "macOS: a memfd and a waiter mirror had a name anyone could
+/// guess while they were made"). No predictable name stands in when
+/// `getentropy` fails: the error is returned. Returns its read-write mapping
+/// and the read-only descriptor (close-on-exec); the read-write descriptor is
+/// closed.
 fn new_mirror() -> io::Result<(*mut AtomicU64, c_int)> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let bytes = proto::mirror_bytes(page_size() as usize);
+    let mut tries = 0;
     let (rw, ro) = loop {
-        let name = std::format!(
-            "/fcm.{}.u{}\0",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
+        let mut bits = [0u8; 8];
+        // SAFETY: a buffer of 8 bytes, under getentropy's 256.
+        if unsafe { libc::getentropy(bits.as_mut_ptr().cast(), bits.len()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let name = std::format!("/fcm.{}.u{:016x}\0", std::process::id(), u64::from_ne_bytes(bits));
         let cname = name.as_ptr().cast::<core::ffi::c_char>();
-        // SAFETY: a NUL-terminated name; the results are checked.
-        let rw = unsafe { libc::shm_open(cname, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600 as libc::c_uint) };
+        // SAFETY: a NUL-terminated name; the results are checked. Its
+        // maker's descriptor is read-write whatever the mode: the mode is
+        // asked of an open of an existing object only (xnu-12377.121.6
+        // bsd/kern/posix_shm.c :534).
+        let rw = unsafe { libc::shm_open(cname, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o400 as libc::c_uint) };
         if rw < 0 {
             let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EEXIST) {
+            tries += 1;
+            if e.raw_os_error() == Some(libc::EEXIST) && tries < MIRROR_NAME_TRIES {
                 continue;
             }
             return Err(e);
@@ -1504,11 +1531,24 @@ fn new_mirror() -> io::Result<(*mut AtomicU64, c_int)> {
         // SAFETY: as above.
         let ro = unsafe { libc::shm_open(cname, libc::O_RDONLY, 0 as libc::c_uint) };
         let e = io::Error::last_os_error();
+        #[cfg(test)]
+        MIRROR_NAMED.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                // SAFETY: the name above, NUL-terminated.
+                hook(unsafe { core::ffi::CStr::from_ptr(cname) });
+            }
+        });
         // SAFETY: as above; the descriptors keep the object.
-        unsafe { libc::shm_unlink(cname) };
-        if ro < 0 {
-            // SAFETY: the descriptor opened above.
-            unsafe { libc::close(rw) };
+        let unlinked = unsafe { libc::shm_unlink(cname) } == 0;
+        let e = if unlinked { e } else { io::Error::last_os_error() };
+        if ro < 0 || !unlinked {
+            // SAFETY: the descriptors opened above.
+            unsafe {
+                libc::close(rw);
+                if ro >= 0 {
+                    libc::close(ro);
+                }
+            }
             return Err(e);
         }
         break (rw, ro);
@@ -4315,6 +4355,99 @@ mod tests {
         }
         assert_eq!(open(), fds, "descriptors left");
         assert_eq!(MIRRORS.load(Ordering::SeqCst), mirrors, "mirrors left");
+    }
+
+    /// Makes a userfaultfd, with [`MIRROR_NAMED`] reading its mirror's name
+    /// and trying, while the name is there, a second `shm_open` of it for
+    /// reading and writing and for reading, as another process of this uid
+    /// could; gives the userfaultfd back. Returns the name and the two opens.
+    fn mirror_name_and_opens() -> (std::ffi::CString, [Result<(), Option<c_int>>; 2]) {
+        let seen = std::rc::Rc::new(core::cell::RefCell::new(std::vec::Vec::new()));
+        let into = seen.clone();
+        MIRROR_NAMED.set(Some(std::boxed::Box::new(move |name: &core::ffi::CStr| {
+            let opens = [libc::O_RDWR, libc::O_RDONLY].map(|flags| {
+                // SAFETY: a NUL-terminated name; a descriptor opened is closed.
+                let fd = unsafe { libc::shm_open(name.as_ptr(), flags, 0 as libc::c_uint) };
+                if fd >= 0 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(fd) };
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error().raw_os_error())
+                }
+            });
+            into.borrow_mut().push((std::ffi::CString::from(name), opens));
+        })));
+        let made = create(0, false, true);
+        MIRROR_NAMED.set(None);
+        let (_, user) = made.unwrap();
+        close(&[user]);
+        let mut seen = seen.take();
+        assert_eq!(seen.len(), 1, "one mirror made");
+        seen.remove(0)
+    }
+
+    /// Whether `name` is this process's mirror name with 16 hex digits.
+    fn random_mirror_name(name: &core::ffi::CStr) -> bool {
+        let name = name.to_str().unwrap();
+        name.strip_prefix(&std::format!("/fcm.{}.u", std::process::id()))
+            .is_some_and(|rest| rest.len() == 16 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+
+    /// While a userfaultfd's mirror has its name, between its making and its
+    /// unlink, a second `shm_open` of that name by the same uid opens it for
+    /// reading only (mode 0400): reading and writing is `EACCES`, so another
+    /// process cannot change the waiter tags the VMM's wakes compare, and
+    /// what reading gives is those tags, slot numbers and counts, no guest
+    /// data. With mode 0600 the second open read and wrote it.
+    #[test]
+    fn test_a_mirror_opens_for_reading_only_while_it_has_its_name() {
+        init().unwrap();
+        // SAFETY: no arguments.
+        assert_ne!(unsafe { libc::geteuid() }, 0, "root opens any object; run as a user");
+        let (name, opens) = mirror_name_and_opens();
+        assert_eq!(opens, [Err(Some(libc::EACCES)), Ok(())], "{name:?} opened again");
+        // SAFETY: as above; nothing is made (no O_CREAT).
+        assert_eq!(unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0 as libc::c_uint) }, -1, "{name:?} after the unlink");
+    }
+
+    /// A mirror's name cannot be guessed: with the names a counter gave
+    /// (`/fcm.<pid>.u0` on) taken first, as a process of any uid could take
+    /// them (the names are one namespace, xnu-12377.121.6
+    /// bsd/kern/posix_shm.c `pshm_cache_search` :223; here the same uid),
+    /// two userfaultfds are made, each mirror's name is 16 random hex
+    /// digits after `u`, and the two differ. With the counter a taken name
+    /// was skipped, and the userfaultfd made anyway, so what this test shows
+    /// is not a creation the taking stopped but that no name is guessable
+    /// (a mirror's name a counter gave fails it). The names taken are given
+    /// back before any check.
+    #[test]
+    fn test_a_mirrors_name_cannot_be_guessed() {
+        init().unwrap();
+        let pid = std::process::id();
+        std::println!("SWEEP-PID {pid}");
+        let mut taken = std::vec::Vec::new();
+        for n in 0..256 {
+            let name = std::ffi::CString::new(std::format!("/fcm.{pid}.u{n}")).unwrap();
+            // SAFETY: a NUL-terminated name; a descriptor opened is closed,
+            // the name keeping the object.
+            let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600 as libc::c_uint) };
+            if fd >= 0 {
+                // SAFETY: as above.
+                unsafe { libc::close(fd) };
+                taken.push(name);
+            }
+        }
+        let names = std::panic::catch_unwind(|| [mirror_name_and_opens().0, mirror_name_and_opens().0]);
+        for name in &taken {
+            // SAFETY: a name made above.
+            unsafe { libc::shm_unlink(name.as_ptr()) };
+        }
+        let names = names.unwrap_or_else(|e| std::panic::resume_unwind(e));
+        for name in &names {
+            assert!(random_mirror_name(name), "{name:?}");
+        }
+        assert_ne!(names[0], names[1]);
     }
 
     /// A fault whose slot is released and taken by another userfaultfd's

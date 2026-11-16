@@ -26,7 +26,8 @@ pub use linux_items::*;
 #[cfg(target_os = "macos")]
 pub use linux_items::{getsockopt, madvise, mincore, mmap, mprotect, munmap, syscall};
 /// The name prefix of a huge page memfd's shared memory object on macOS
-/// (`/fcmH.<pid>.<n>`, made by the compatibility `memfd` crate), by which
+/// (`/fcmH.<pid>.` and 16 random hex digits, made by the compatibility
+/// `memfd` crate), by which
 /// `mmap` knows to map it in huge pages (docs/PORTING.md row 10).
 #[cfg(target_os = "macos")]
 pub const HUGE_MEMFD_PREFIX: &str = "/fcmH.";

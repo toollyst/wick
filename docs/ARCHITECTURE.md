@@ -151,7 +151,8 @@ against Linux v6.12:
 **Events and their wakes.** On macOS a page fault's event is a record written into the userfaultfd's socket at the fault
 (`wick_uffd::post`), and a socket cannot take a record back, where Linux's wake takes each waiting fault it wakes off
 the queue, read or not (v6.12 fs/userfaultfd.c `userfaultfd_wake_function` :141). So each userfaultfd has a waiter
-mirror: one 64-bit word per waiter slot (256) in a POSIX shared memory object of one page, which the VMM maps
+mirror: one 64-bit word per waiter slot (256) in a POSIX shared memory object of one page (a random name, mode `0400`,
+unlinked once its two descriptors are open: SECURITY.md, Fixed defects), which the VMM maps
 read-write and each reader maps read-only (`OP_MIRROR` on its request channel sends the read-only descriptor). A
 waiter stores its tag (its slot, the slot's count of its waiters, a waiting bit) before it reads its page to validate
 the fault, and its record carries the tag (event type 3; it was 1, so a reader from before fails on it loudly). Every

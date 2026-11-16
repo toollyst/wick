@@ -580,8 +580,8 @@ has the per-control details and results.
     predates the mirror). A reader that predates the mirror fails on the first page fault, whose event type changed
     (`test_a_page_fault_record_is_no_type_a_reader_before_the_mirror_decodes`).
   - The Seatbelt profile is unchanged: the object is named as the compatibility memfd names its objects
-    (`/fcm.<pid>.u<n>`), which the profile's `shm_rule` already allows (overlay/vmm/ext/sandbox.rs :956), and is
-    unlinked at once. Firecracker makes its userfaultfd at the snapshot load, after the API thread's filter has put
+    (`/fcm.<pid>.u` and 16 random hex digits since the entry below), which the profile's `shm_rule` already allows
+    (overlay/vmm/ext/sandbox.rs :960), and is unlinked at once. Firecracker makes its userfaultfd at the snapshot load, after the API thread's filter has put
     the setup profile on (`vmm::seccomp::apply_filter`), and its handler reads in the run phase
     (`test_a_userfaultfd_and_its_mirror_work_under_the_profiles`, run by the seatbelt jobs on macOS 15 and 26).
   - One mirror a userfaultfd (at most 16, `MAX_CTX`), given back at its release on both sides: the VMM unmaps it and
@@ -590,6 +590,48 @@ has the per-control details and results.
     before and each mapping gone; `test_a_readers_mirror_goes_with_it`). The release's wait for the threads using
     the userfaultfd also closes a race of its own: before, a waiter's write of its record could reach a kernel end
     the release had closed meanwhile, or a descriptor that had taken its number (found by reading).
+- **macOS: a memfd and a waiter mirror had a name anyone could guess while they were made** (the memfd from
+  9fc77c46, the compatibility memfd's start; the mirror from bdf94c63; under "Not at parity yet" in a554ef2c; fixed in
+  the commit that moved it here). On Linux a memfd has no name: its file is made unlinked (v6.12 mm/memfd.c :393,
+  `shmem_file_setup`). Here each is a POSIX shared memory object, which has a name from its `shm_open` to its
+  `shm_unlink`: the compatibility memfd's (guest memory when Firecracker backs it with a memfd) for no call between,
+  a userfaultfd's waiter mirror across one, the read-only open whose descriptor readers get. The names were the pid
+  and a counter (`/fcm.<pid>.<n>`, `/fcmH.<pid>.<n>`, `/fcm.<pid>.u<n>`) and the mode `0600`, so:
+  - a process of the VMM's uid not under a jail's profile (whose `shm_rule` allows only its own pid's names, another
+    ending it: `test_own_memfds_are_made_after_narrow`), and root, could open the name meanwhile for reading and
+    writing: an open of an existing object asks `pshm_access`, the owner's bits for any uid but root's
+    (xnu-12377.121.6 bsd/kern/posix_shm.c :534, :781 to :791), and the mode is kept whole, with no umask (:422). On
+    Linux such a process reaches a memfd at any time through `/proc/<pid>/fd/<n>`, with ptrace read access (v6.12
+    fs/proc/base.c `proc_fd_access_allowed` :709 to :722, used at :1806 and :1849: the same uid and a dumpable VMM,
+    kernel/ptrace.c :317 to :322, :341 to :344, which Yama does not restrict, security/yama/yama_lsm.c :362, and
+    upstream never makes itself non-dumpable); on macOS one that is not root gets no other's task port without the
+    MAC policy's check and taskgated's authorization (bsd/kern/kern_proc.c `task_for_pid` :5941, :5948 to :5969), so
+    the window was a reach into guest memory it had no other way to;
+  - a process of any uid could take a name first: the names are one namespace for every uid (`pshm_cache_search`,
+    :223, by name alone) and `O_EXCL` fails on an existing one, whoever's it is (:492 to :495), so a memfd's
+    creation failed with `EEXIST` and the VMM did not start; a mirror went on to the next number.
+
+  Now a memfd's object is made with mode `0` and a mirror's with `0400`, each named with its prefix, the pid and 64
+  random bits from `getentropy` (16 hex digits, at most 28 bytes of the 31 macOS allows), still under the profile's
+  prefixes, so `shm_rule` and the profile are unchanged; `getentropy` is in both profiles' lists. A failed
+  `getentropy` fails the creation, with no predictable name in its place, and a name drawn and found taken is
+  drawn again, 8 times at most, then the creation fails. The maker's descriptor, opened by the call that made the
+  object, reads, writes and maps it whatever the mode. While the name is there, a second open of it by the same uid
+  is `EACCES` for a memfd, for reading and writing and for reading, and `EACCES` for reading and writing a mirror,
+  which opens for reading (`test_a_memfd_opens_for_no_one_else_while_it_has_its_name`, plain and huge page;
+  `test_a_mirror_opens_for_reading_only_while_it_has_its_name`; with the mode `0600` again each fails, the second
+  open reading and writing). With the counter's names taken first, a memfd is made, plain and huge page
+  (`test_a_memfds_name_cannot_be_taken_first`; with the counter's names it fails, `EEXIST`), and two mirrors are
+  made with names of 16 random hex digits that differ (`test_a_mirrors_name_cannot_be_guessed`; with the counter's
+  names it fails on `/fcm.<pid>.u256`, the counter having skipped the 256 taken, so what it shows is that no name
+  is guessable, the creation having gone on before too). Taken here by the same uid, which `O_EXCL` refuses as it
+  refuses any; that another uid's object is refused alike is from the source above, not run. What stays:
+  - root opens either while it has its name, as root on Linux opens any process's descriptors;
+  - a process of the VMM's uid not under a jail's profile can read the name from the VMM's descriptor
+    (`proc_pidfdinfo`, which xnu allows the same uid: bsd/kern/proc_info.c :2900, `proc_security_policy` :3193; the
+    name is kept after the unlink), and so could open a mirror for reading while it has its name, across the
+    read-only open: that gives waiter tags, slot numbers and counts, no guest data. With one uid per jail, the
+    processes of a jail's uid are that jail's own.
 - **macOS: a reader of a userfaultfd range without the lock could read one range's bounds with another's arrays, and
   every registration leaked its arrays** (from 6c4320c5, the macOS userfaultfd's start, to the commit that brought
   `Range::gen`; found by reading, not observed). The signal handler, `fault` and the stage-2 side read a slot's
@@ -812,42 +854,6 @@ upstream Firecracker and its jailer.
   hotplug), so a jail cannot take another jail's interface, nor hold one against the jail it was made for. A jail
   can tell which names exist directly in the network directory (it may look at their metadata, not list the
   directory), as a namespace's members see its interfaces on Linux.
-- **macOS: a memfd and a waiter mirror have a name while they are made.** On Linux a memfd has no name: its file is
-  made unlinked (v6.12 mm/memfd.c :393, `shmem_file_setup`). Here each is a POSIX shared memory object, made with
-  `shm_open(O_RDWR | O_CREAT | O_EXCL, 0600)` and unlinked by the next call: the compatibility memfd's
-  `/fcm.<pid>.<n>` (`/fcmH.<pid>.<n>` for a huge page one), which is guest memory when Firecracker backs it with a
-  memfd, from its `shm_open` to its `shm_unlink` with no call between (crates/compat/memfd/src/macos.rs :62 to :72);
-  a userfaultfd's waiter mirror, `/fcm.<pid>.u<n>`, across one call more, the read-only open whose descriptor
-  readers get (crates/compat/libc/src/wick_uffd.rs :1496 to :1508). The pid and the counter make both names
-  predictable.
-  - Who can open one in that window: a process of the VMM's uid, for reading and writing, and root. Mode `0600`
-    is kept whole (xnu-12377.121.6 bsd/kern/posix_shm.c :422, no umask), and an open of an existing object asks
-    `pshm_access`, the owner's bits for any uid but root's (:534, :781 to :791)
-    (`test_a_shared_memory_objects_name_opens_for_its_uid_until_it_is_unlinked`: a second open of the name reads and
-    writes until the unlink, and finds nothing after it). The opener's own sandbox decides too: a jailed
-    Firecracker's profile allows only its own pid's names, and another name ends it
-    (`test_own_memfds_are_made_after_narrow`), so another jail of the same uid cannot. With one uid per jail, as
-    the jailer is meant to be run, the processes of a jail's uid are that jail's own, and only root can win the
-    race. Without the jailer, or with jails sharing a uid, any unsandboxed process of that uid can.
-  - What it would get, and how that compares: the memfd's opener reads and writes the guest's memory; the mirror's
-    can make the VMM's waiters miss their wakes or the handler drop and return events, which a process of that uid
-    can match by signalling the VMM or the handler. On Linux a process of the VMM's uid reaches a memfd at any time,
-    not for a moment, through `/proc/<pid>/fd/<n>`, which needs only ptrace read access (v6.12 fs/proc/base.c
-    `proc_fd_access_allowed` :709 to :722, used at :1806 and :1849): the same uid and a dumpable VMM (kernel/ptrace.c
-    :317 to :322, :341 to :344), which Yama does not restrict (security/yama/yama_lsm.c :362, attach only), and
-    upstream never makes itself non-dumpable. On macOS a process of the same uid that is not root does not get
-    another's task port without the MAC policy's check and taskgated's authorization (bsd/kern/kern_proc.c
-    `task_for_pid` :5941, :5948 to :5969), so this window gives it a reach into guest memory that it has no other
-    way to.
-  - Anyone can take a name first: the names are one namespace for every uid (`pshm_cache_search`, posix_shm.c :223,
-    by name alone), and `O_EXCL` fails on an existing one, whoever's it is (:492 to :495). A process of any uid that
-    makes `/fcm.<pid>.<n>` before the VMM with that pid does makes that memfd's creation fail with `EEXIST`, so the
-    VMM does not start; a mirror goes on to the next number. Linux has no name to take.
-  - The fix proposed, not done: make a memfd's object with mode `0` and its name random. Its maker keeps the
-    descriptor it opened, readable, writable and mappable, and no one but root opens it again (`EACCES`, the same
-    test's second case), as root on Linux opens any process's descriptors; a name of 64 random bits after the
-    pid cannot be taken first. A mirror would take a random name too, and mode `0400`, so that the window gives
-    reading only. Until then, run each jail as a uid of its own.
 - **Windows jailer: one network directory's jails are separated in code; the elevated stage has run on CI only.** On
   Linux two Firecrackers in one network namespace cannot reach each other's TAP: a TAP is its owner's, and a second
   attach is refused (drivers/net/tun.c, `tun_not_capable`, `tun_attach`). On Windows the network directory granted
