@@ -75,7 +75,7 @@ use windows_sys::Win32::System::Memory::{
     GetLargePageMinimum, MEM_LARGE_PAGES,
     CreateFileMappingW, FlushViewOfFile, MEM_COMMIT, MEM_DECOMMIT, MEM_PRESERVE_PLACEHOLDER,
     MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
-    MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_EXECUTE_READ,
+    MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_EXECUTE, PAGE_EXECUTE_READ,
     PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS,
     PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
     PrefetchVirtualMemory, UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect,
@@ -1001,7 +1001,7 @@ fn make_placeholder(t: &mut Table, start: usize, end: usize) -> Result<(), c_int
 /// has used that much.
 ///
 /// An access is caught where it happens: a host thread's (a device's, a
-/// snapshot's) by a vectored exception handler ([`lazy_on_exception`]), the
+/// snapshot's) by a vectored exception handler ([`on_exception`]), the
 /// guest's by the hypervisor's run loop, which WHP leaves with a memory
 /// access exit for a page that is not committed (measured: the exit, then
 /// the commit, then the access re-run). Sorted, disjoint `(start, len,
@@ -1487,7 +1487,7 @@ std::thread_local! {
 
 #[cfg(test)]
 std::thread_local! {
-    /// Whether this thread is in [`lazy_on_exception`]'s commit of a lazy
+    /// Whether this thread is in [`on_exception`]'s commit of a lazy
     /// page: STACKASK says so of a stack overflow raised there.
     static IN_THE_LAZY_HANDLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1515,9 +1515,65 @@ fn stack_committed() -> usize {
     0
 }
 
-/// A host thread's access to lazy memory: its pages are committed and the
-/// access runs again.
-unsafe extern "system" fn lazy_on_exception(
+/// The process's one vectored exception handler, first in the chain
+/// ([`exception_handler`] adds it once, at the first lazy mapping, create
+/// or register, whichever comes first): a host thread's access to memory
+/// of ours that is to be resolved, and a stack overflow. Where there were
+/// two handlers (this one and the userfaultfd's), their order was the order
+/// they were added in, and a page that changed between the two looks went
+/// to neither: with the lazy-memory handler first, a missing registered
+/// page unregistered and resolved by another thread between its look and
+/// the userfaultfd's ended the process with the access violation
+/// (`test_a_host_access_that_faulted_before_an_unregister_runs_again`).
+/// One handler, one order, each step leaving what it does not resolve to
+/// the next and every change between two looks to the last:
+/// 1. `STATUS_STACK_OVERFLOW`: [`stack_page_after_the_reclaim`]'s retry;
+///    a page not had goes on to [`stack_filter`].
+/// 2. An access violation (`ExceptionInformation[0]`: 0 read, 1 write, 8
+///    execute; `[1]`: the address), the userfaultfd's step
+///    ([`wick_uffd::resolve_access`](crate::wick_uffd::resolve_access)): a
+///    chunk being moved waits for the move, a missing registered page
+///    queues its fault and waits for its fill; run again. It leaves a page
+///    not registered, not missing or moving at its look, or whose
+///    protection denies the access.
+/// 3. The released and lazy resolve ([`commit_on_access`]): a released
+///    userfaultfd range's pending page is resolved (committed, or zeroed
+///    and opened) and a lazy page committed; run again, or the VMM ends at
+///    the limit. A released page found no longer pending (another thread
+///    resolved it while this one waited for the records' lock) is answered
+///    there with step 4's check, made under that lock, which the vCPU's
+///    path (`commit_block_on_access`) needs as well. It leaves a page in no
+///    record and not lazy (a registered page among them), and a lazy or
+///    released page whose protection denies the access.
+/// 4. One last check, for memory that is ours ([`ours`]: in a
+///    registration, held by a released record, or lazy) and accessible to
+///    this access now ([`runs_again`]): run again. That is a registered
+///    page filled or moved after the fault and before step 2 looked
+///    (`test_a_host_access_that_faulted_before_its_fill_runs_again`,
+///    `test_a_host_access_that_faulted_during_a_move_runs_again`), and any
+///    page of ours that changed after the step that would have resolved it
+///    looked, as Linux's fault, finding the page present, returns and the
+///    access runs again (v6.1 mm/userfaultfd.c, `userfaultfd_must_wait`).
+///    Every other violation, on our memory or any other address, goes on
+///    at once to the next handler, as before.
+///
+/// The last check cannot spin, so it needs no bound (macOS bounds its own
+/// re-runs because its handler cannot read the page's state as the
+/// processor does): it re-runs the access only when `VirtualQuery` says
+/// the page is committed, not a guard page, and of a protection that
+/// allows this access's kind (a write: a writable protection; a read: any
+/// readable one, so a read of a `PAGE_EXECUTE` page goes on; an execution
+/// (`ExceptionInformation[0]` 8, a DEP fault): an executable protection),
+/// which is all a user-mode access to such memory is checked for: ours is
+/// anonymous or pagefile-section memory mapped by this library with those
+/// protections only, never a shadow stack, an enclave or a write-copy view
+/// (`accessible`), and an address the processor refuses outright (not
+/// canonical, the kernel's) is in no range of ours. The access faults
+/// again only if that state changed after the check (a move, a discard, an
+/// unmap), a new state for the next exception's steps. An access
+/// violation raised by `RaiseException` on our memory continues after the
+/// call and re-runs nothing.
+unsafe extern "system" fn on_exception(
     info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
 ) -> i32 {
     const ACCESS_VIOLATION: i32 = 0xC000_0005_u32 as i32;
@@ -1534,11 +1590,19 @@ unsafe extern "system" fn lazy_on_exception(
         return windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION;
     }
     if rec.ExceptionCode == ACCESS_VIOLATION && rec.NumberParameters >= 2 {
-        // [0]: 0 read, 1 write, 8 execute; [1]: the address.
+        #[cfg(test)]
+        crate::wick_uffd::exception_hook();
+        let (kind, addr) = (rec.ExceptionInformation[0], rec.ExceptionInformation[1]);
+        let write = kind == 1;
+        if crate::wick_uffd::resolve_access(addr as u64, write) {
+            return windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION;
+        }
+        #[cfg(test)]
+        exception_hook_after_the_userfaultfd();
         let stack = stack_committed();
         #[cfg(test)]
         IN_THE_LAZY_HANDLER.set(true);
-        let access = commit_on_access(rec.ExceptionInformation[1], rec.ExceptionInformation[0] == 1).0;
+        let access = commit_on_access(addr, write).0;
         #[cfg(test)]
         IN_THE_LAZY_HANDLER.set(false);
         match access {
@@ -1547,11 +1611,65 @@ unsafe extern "system" fn lazy_on_exception(
                 HOST_FAULTS.set((n + 1, deepest.max(stack)));
                 return windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION;
             }
-            Access::Exhausted(err) => out_of_memory(rec.ExceptionInformation[1], err),
+            Access::Exhausted(err) => out_of_memory(addr, err),
             Access::NotLazy => {}
+        }
+        if ours(addr) && runs_again(addr, kind) {
+            return windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION;
         }
     }
     windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Tests: called in [`on_exception`] between the userfaultfd's step and the
+/// released and lazy resolve, for a change between those two looks
+/// (`test_a_host_access_that_faulted_before_an_unregister_runs_again`). An
+/// `fn()` as a `usize`, 0 for none; taken as it runs.
+#[cfg(test)]
+pub(crate) static HOOK_AFTER_THE_USERFAULTFD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn exception_hook_after_the_userfaultfd() {
+    let hook = HOOK_AFTER_THE_USERFAULTFD.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if hook != 0 {
+        // SAFETY: only `fn()` values are stored.
+        unsafe { core::mem::transmute::<usize, fn()>(hook)() };
+    }
+}
+
+/// Whether `addr` is memory of ours that [`on_exception`] resolves: in a
+/// userfaultfd registration, held by a released range's record, or lazy.
+#[inline(never)]
+fn ours(addr: usize) -> bool {
+    crate::wick_uffd::registered(addr as u64)
+        || (RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) != 0
+            && RELEASED.lock().unwrap().iter().any(|r| r.holds(addr)))
+        || {
+            let l = LAZY.lock().unwrap();
+            let i = l.partition_point(|&(s, _, _)| s <= addr);
+            i.checked_sub(1).is_some_and(|i| addr < l[i].0 + l[i].1)
+        }
+}
+
+/// Whether an access of `kind` (`ExceptionInformation[0]`: 0 read, 1
+/// write, 8 execute) to `addr` is allowed now: committed, not a guard
+/// page, and of a protection that allows it ([`accessible`]; for an
+/// execution, an executable protection).
+#[inline(never)]
+fn runs_again(addr: usize, kind: usize) -> bool {
+    if kind != 8 {
+        return accessible(addr, 1, kind == 1);
+    }
+    // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { VirtualQuery(addr as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+        return false;
+    }
+    let base = mbi.Protect & 0xff;
+    mbi.State == MEM_COMMIT
+        && mbi.Protect & PAGE_GUARD == 0
+        && [PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY].contains(&base)
 }
 
 /// STACKASK (tests): where a stack overflow's first-chance handler runs,
@@ -1594,9 +1712,11 @@ fn stack_ask_record(fault_rsp: usize, fault_addr: usize) {
     ));
 }
 
-/// Installs [`lazy_on_exception`] once, and [`stack_filter`] with it;
-/// whether the handler is in place.
-fn lazy_handler() -> bool {
+/// Installs the process's one exception handler ([`on_exception`]) once,
+/// and [`stack_filter`] with it; whether the handler is in place. Called by
+/// the first lazy mapping, userfaultfd create or register, whichever comes
+/// first: the handler is the same whichever does.
+pub(crate) fn exception_handler() -> bool {
     static INSTALLED: OnceLock<bool> = OnceLock::new();
     *INSTALLED.get_or_init(|| {
         // SAFETY: a new allocation, committed; given back by `out_of_memory`.
@@ -1609,7 +1729,7 @@ fn lazy_handler() -> bool {
         let previous = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(stack_filter)) };
         PREVIOUS_FILTER.store(previous.map_or(0, |f| f as usize), std::sync::atomic::Ordering::SeqCst);
         // SAFETY: first in the chain; the handler stays for the process.
-        !unsafe { windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(lazy_on_exception)) }
+        !unsafe { windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(on_exception)) }
             .is_null()
     })
 }
@@ -1703,7 +1823,7 @@ pub(crate) fn stack_pages_had_again() -> u64 {
 /// A stack page the job's limit refused: asked for once more, after a wait
 /// for the reclaim's next step while the reclaim moves a chunk; whether it
 /// is had, and the access that overflowed runs again. For the vectored
-/// handler ([`lazy_on_exception`]), first in the chain, at
+/// handler ([`on_exception`]), first in the chain, at
 /// `STATUS_STACK_OVERFLOW`; a page not had goes on as before, to
 /// [`stack_filter`] and its 137, with [`STACK_WAIT`] saying why.
 ///
@@ -2770,7 +2890,7 @@ fn fill(
     let kind = if anon && !shared {
         if prot == PROT_NONE {
             Kind::Placeholder
-        } else if flags & MAP_NORESERVE != 0 && flags & MAP_POPULATE == 0 && lazy_handler() {
+        } else if flags & MAP_NORESERVE != 0 && flags & MAP_POPULATE == 0 && exception_handler() {
             // Reserved now, committed page block by page block at the first
             // access ([`LAZY`]).
             // SAFETY: reserves our placeholder.
@@ -2852,7 +2972,7 @@ fn fill(
             // with the page's charge ([`Charge`], [`LAZY`]), as Linux
             // allocates and charges a shmem page when it is touched. Without
             // the exception handler, committed whole, as before.
-            charged = lazy_handler();
+            charged = exception_handler();
             let reserve = if charged { SEC_RESERVE } else { 0 };
             // SAFETY: creates a pagefile-backed section.
             let s = unsafe {
@@ -3712,7 +3832,7 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(u
                 && r.noaccess.is_empty() => {}
         _ => return Err(crate::EINVAL),
     }
-    if lazy_handler() {
+    if exception_handler() {
         return uffd_alias_chunked(&mut t, start, len, resident).map(|alias| (alias, true));
     }
     let hi = u32::try_from((len as u64) >> 32).unwrap();

@@ -513,6 +513,24 @@ has the per-control details and results.
   `test_a_register_racing_a_map_fixed_registers_the_new_memory`,
   `test_a_register_racing_an_mprotect_keeps_its_pages_missing`, `test_a_register_racing_a_discard_fills_the_new_pages`;
   each fails with neither count; docs/ARCHITECTURE.md, "Memory calls on registered memory").
+- **Windows: a host thread's access to a userfaultfd page unregistered and resolved by another thread before the
+  access's handler looked ended the process with an access violation, when the userfaultfd was made before any lazy
+  memory** (the order from 74108a7b, which added the lazy-memory handler at a register; the case from a1e58baa,
+  whose released records let another thread resolve the page in between; found by the hook test asked for after the
+  macOS fault-after-fill race). The lazy-memory code and the userfaultfd each added a vectored exception handler,
+  first in the chain, so the one added last ran first. With the userfaultfd made first, the lazy-memory handler
+  looked at the page while it was registered and missing (not its to resolve) and the userfaultfd's looked after an
+  unregister and the other thread's write: no longer registered, so it passed the exception on and the process ended
+  with 0xC0000005, where Linux's fault finds the page present and the access runs again
+  (`test_a_host_access_that_faulted_before_an_unregister_runs_again`, its child with the create first: 0xC0000005
+  on bfccf902, Windows Server 2022 20348 and 2025 26100). Firecracker's restore maps its guest memory (`MAP_NORESERVE`) before it makes the
+  userfaultfd (persist.rs :557 to :589, memory.rs :186), the order that passed. Now one handler
+  (`windows_mm::on_exception`), added by whichever of a lazy mapping, a create or a register comes first, runs its
+  steps in one order: a stack overflow's retry; the userfaultfd's wait for a move or a fill; the released and lazy
+  resolve; and one last check that re-runs an access to memory of ours (registered, held by a released record, or
+  lazy) that its protection allows now, every other violation going on at once as before. Both orders of first use
+  pass, and so does the mirror, the page resolved between the userfaultfd's step and the resolve
+  (`test_a_host_access_that_faulted_on_a_released_page_resolved_meanwhile_runs_again`; 20348 and 26100).
 
 ## Not at parity yet
 

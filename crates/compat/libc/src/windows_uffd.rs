@@ -10,10 +10,11 @@
 //! `UFFDIO_ZEROPAGE`) and wakes it (`UFFDIO_WAKE`). KVM takes the same path
 //! for guest accesses. This module gives the process those semantics:
 //!
-//! - Host threads: missing pages are `PAGE_NOACCESS`. A vectored exception
-//!   handler, first in the chain, turns an access violation on one into a
-//!   page fault event and waits in a waiter slot; other exceptions go on
-//!   down the chain.
+//! - Host threads: missing pages are `PAGE_NOACCESS`. The process's one
+//!   vectored exception handler (`windows_mm::on_exception`, first in the
+//!   chain, shared with lazy and released memory) turns an access violation
+//!   on one into a page fault event and waits in a waiter slot
+//!   ([`resolve_access`]); other exceptions go on down the chain.
 //! - Guests: the Windows Hypervisor Platform honours the host protection of
 //!   memory mapped into a partition: a guest access to a `PAGE_NOACCESS`
 //!   page exits with `WHvRunVpExitReasonMemoryAccess` at the instruction,
@@ -61,10 +62,6 @@ use windows_sys::Win32::Networking::WinSock::{
     SOCK_STREAM, WSAPOLLFD, WSAPROTOCOL_INFOW, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
 };
 use windows_sys::Win32::Storage::FileSystem::DeleteFileW;
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-    EXCEPTION_POINTERS,
-};
 use windows_sys::Win32::System::Memory::{
     DiscardVirtualMemory, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, VirtualProtect,
 };
@@ -111,8 +108,6 @@ const PAGE: u64 = 4096;
 const MAX_RANGES: usize = 64;
 const MAX_CTX: usize = 16;
 const MAX_WAITERS: usize = 256;
-/// `STATUS_ACCESS_VIOLATION`.
-const ACCESS_VIOLATION: i32 = 0xC000_0005_u32 as i32;
 
 /// A registered range. Its bitmaps are never freed: the exception handler
 /// may be reading them.
@@ -342,8 +337,8 @@ fn end_unlocked_change() {
 /// starved. The register waits with `WaitOnAddress` on
 /// [`UNLOCKED_CHANGES`] (the last change out wakes it with
 /// `WakeByAddressAll`), holding no lock; no exception handler reaches it or
-/// any of the four changes (the handlers, this module's `on_exception` and
-/// `windows_mm`'s `lazy_on_exception`, resolve a fault: `fault`,
+/// any of the four changes (the exception handler, `windows_mm::on_exception`,
+/// resolves a fault: `fault`,
 /// `commit_on_access`, `reclaim_at_touch`, `released_access`; the changes
 /// are reached only from `windows_mm`'s `munmap`, `mmap`, `mprotect` and
 /// `madvise`). Returns the change's count, ended when dropped, or `None`:
@@ -394,8 +389,10 @@ fn init() -> io::Result<()> {
             }
             w.sem.store(sem as usize, Ordering::Release);
         }
-        // SAFETY: first in the chain; the handler stays for the process.
-        if unsafe { AddVectoredExceptionHandler(1, Some(on_exception)) }.is_null() {
+        // The process's one vectored exception handler, which runs this
+        // module's step ([`resolve_access`]) first: added by whichever of
+        // a lazy mapping, a create and a register comes first.
+        if !crate::windows_mm::exception_handler() {
             return;
         }
         READY.store(true, Ordering::Release);
@@ -571,44 +568,41 @@ fn wake_where(which: impl Fn(usize, u64) -> bool) {
     }
 }
 
-/// Called first in [`on_exception`] at an access violation, for tests: it
+/// Called first in the process's exception handler (`windows_mm::on_exception`)
+/// at an access violation, before any of its steps looks, for tests: it
 /// holds the handler between the fault and its checks
 /// (`test_a_host_access_that_faulted_before_its_fill_runs_again`). An
 /// `fn()` as a `usize`, 0 for none.
 #[cfg(test)]
 static EXCEPTION_HOOK: AtomicUsize = AtomicUsize::new(0);
 
-unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
-    // SAFETY: the system passes valid exception pointers.
-    let rec = unsafe { &*(*info).ExceptionRecord };
-    if rec.ExceptionCode == ACCESS_VIOLATION && rec.NumberParameters >= 2 {
-        #[cfg(test)]
-        {
-            let hook = EXCEPTION_HOOK.load(Ordering::SeqCst);
-            if hook != 0 {
-                // SAFETY: only `fn()` values are stored.
-                unsafe { core::mem::transmute::<usize, fn()>(hook)() };
-            }
-        }
-        // [0]: 0 read, 1 write, 8 execute; [1]: the address.
-        let addr = rec.ExceptionInformation[1] as u64;
-        let write = rec.ExceptionInformation[0] == 1;
-        if (is_moving(addr) || is_missing(addr)) && fault(addr, write) {
-            // Re-run the access.
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        // Registered memory that faulted while missing or moving and is
-        // accessible by now (filled, or its move over, before this handler
-        // looked: the thread preempted in between): the access runs again,
-        // as Linux's fault returns for it when it finds the page no longer
-        // missing (v6.1 mm/userfaultfd.c, `userfaultfd_must_wait`). Not an
-        // execution (8): guest RAM is never executable here.
-        #[allow(clippy::cast_possible_truncation)]
-        if rec.ExceptionInformation[0] != 8 && find(addr).is_some() && crate::windows_mm::accessible(addr as usize, 1, write) {
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
+/// Tests: runs [`EXCEPTION_HOOK`]'s function, if any.
+#[cfg(test)]
+pub(crate) fn exception_hook() {
+    let hook = EXCEPTION_HOOK.load(Ordering::SeqCst);
+    if hook != 0 {
+        // SAFETY: only `fn()` values are stored.
+        unsafe { core::mem::transmute::<usize, fn()>(hook)() };
     }
-    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// This module's step of the process's exception handler
+/// (`windows_mm::on_exception`, its first step for an access violation):
+/// an access to a chunk being moved waits for the move, and one to a
+/// missing registered page queues its fault and waits for its fill
+/// ([`fault`]); whether so, and the access runs again. Anything else (not
+/// registered, not missing, an access the page's protection denies, a page
+/// filled or moved since the access faulted) is left to the handler's next
+/// steps.
+#[inline(never)]
+pub(crate) fn resolve_access(addr: u64, write: bool) -> bool {
+    READY.load(Ordering::Acquire) && (is_moving(addr) || is_missing(addr)) && fault(addr, write)
+}
+
+/// Whether `addr` is in a registered range (the handler's last check:
+/// memory that is ours).
+pub(crate) fn registered(addr: u64) -> bool {
+    READY.load(Ordering::Acquire) && find(addr).is_some()
 }
 
 /// Calls `f(start, len)` for each run of missing registered pages in
@@ -4023,7 +4017,7 @@ mod tests {
     }
 
     /// A mapping committed at first touch, so that the lazy-memory handler,
-    /// and the stack filter with it, are in place (`windows_mm::lazy_handler`),
+    /// and the stack filter with it, are in place (`windows_mm::exception_handler`),
     /// as in a VMM with guest memory.
     fn lazy_memory_is_mapped() {
         // SAFETY: a new anonymous mapping, committed at first touch.
@@ -5201,7 +5195,7 @@ mod tests {
     /// A host thread's first access to lazy memory near its stack reserve's
     /// end is either served or a stack overflow at the reserve's end, said
     /// as one: never a silent end. The access is served on the thread's own
-    /// stack (`windows_mm::lazy_on_exception`, below the exception
+    /// stack (`windows_mm::on_exception`, below the exception
     /// dispatcher's frames), and its commit takes the region table and
     /// commits the page, so near the reserve's end the handler's own frames
     /// meet the end inside it: the stack overflow then raised there must be
@@ -8498,6 +8492,143 @@ mod tests {
         EXCEPTION_HOOK.store(0, Ordering::SeqCst);
         std::println!("read back {got:#x}");
         assert_eq!(got, 0xab);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// [`EXCEPTION_HOOK`]'s: holds the first access violation's handler
+    /// until the test releases it; the others' handlers run on.
+    fn hold_the_first_handler() {
+        static FIRST: AtomicBool = AtomicBool::new(false);
+        if FIRST.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        HELD.store(true, Ordering::SeqCst);
+        wait_for(&RELEASED, "the release of the handler");
+    }
+
+    /// A host thread's access that faulted on a missing registered page
+    /// whose range is unregistered, and the page resolved by another
+    /// thread's write, before the access's handler looks at it (the thread
+    /// preempted between the fault and the handler's checks, held by
+    /// [`EXCEPTION_HOOK`]): the access runs again and reads what the other
+    /// thread wrote, as on Linux, where the unregistered page is ordinary
+    /// memory the other thread's fault allocated (v6.1 mm/memory.c,
+    /// `do_anonymous_page`) and the held fault, finding the page present,
+    /// returns and the access runs again. In each order of first use of the
+    /// process's exception handler (a child each): a lazy (`MAP_NORESERVE`)
+    /// mapping first, as in a VMM whose guest memory is mapped before its
+    /// userfaultfd is made, and the userfaultfd's create first. While the
+    /// two modules had a vectored handler each, the one added last ran
+    /// first, and with the userfaultfd's created first the lazy-memory
+    /// handler looked (the page registered and missing, not its to
+    /// resolve) before the userfaultfd's was held, and the userfaultfd's,
+    /// finding the page no longer registered, passed the exception on: the
+    /// process ended with the access violation (0xC0000005).
+    #[test]
+    fn test_a_host_access_that_faulted_before_an_unregister_runs_again() {
+        for child in ["late_handler_unregister_lazy_mapping_first_child", "late_handler_unregister_create_first_child"] {
+            let (code, text) = run_child(child, None);
+            std::eprintln!("LATEUNREG {child}: {code:?}; {}", text.lines().filter(|l| l.starts_with("LATEUNREG") || l.contains("panicked") || l.starts_with("wick:")).collect::<std::vec::Vec<_>>().join(" | "));
+            assert!(text.contains("LATEUNREG read back 0x77"), "{child}: {text}");
+            assert_eq!(code, Some(0), "{child}: {text}");
+        }
+    }
+
+    #[test]
+    #[ignore = "run by test_a_host_access_that_faulted_before_an_unregister_runs_again in a process of its own"]
+    fn late_handler_unregister_lazy_mapping_first_child() {
+        lazy_memory_is_mapped();
+        late_handler_unregister();
+    }
+
+    #[test]
+    #[ignore = "run by test_a_host_access_that_faulted_before_an_unregister_runs_again in a process of its own"]
+    fn late_handler_unregister_create_first_child() {
+        late_handler_unregister();
+    }
+
+    /// [`test_a_host_access_that_faulted_before_an_unregister_runs_again`]'s
+    /// body: a page never filled, the reader's access held in its handler,
+    /// the range unregistered (the page pending in its released record),
+    /// another thread's write of 0x77 resolving it, then the reader let go.
+    fn late_handler_unregister() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 64 * 1024;
+        let mem = map(len);
+        register(ctx, mem, len as u64).unwrap();
+        assert!(is_missing(mem + PAGE));
+        EXCEPTION_HOOK.store(hold_the_first_handler as fn() as usize, Ordering::SeqCst);
+        let reader = std::thread::spawn(move || {
+            // SAFETY: registered memory; the read faults, and its handler
+            // is held until the page is resolved by the writer.
+            unsafe { core::ptr::read_volatile((mem + PAGE + 5) as *const u8) }
+        });
+        wait_for(&HELD, "the reader's fault");
+        unregister(ctx, mem, len as u64).unwrap();
+        assert!(!is_missing(mem + PAGE));
+        std::thread::spawn(move || {
+            // SAFETY: the unregistered range: the write resolves the page.
+            unsafe { core::ptr::write_volatile((mem + PAGE + 5) as *mut u8, 0x77) };
+        })
+        .join()
+        .expect("the writer failed");
+        RELEASED.store(true, Ordering::SeqCst);
+        let got = reader.join().expect("the reader failed");
+        EXCEPTION_HOOK.store(0, Ordering::SeqCst);
+        std::println!("LATEUNREG read back {got:#x}");
+        assert_eq!(got, 0x77);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// The mirror of the test above, the change between the handler's
+    /// userfaultfd step and its released and lazy resolve: the range
+    /// unregistered before the access, so that the userfaultfd's step finds
+    /// the page not registered and leaves it, the page pending in its
+    /// released record; the handler held there
+    /// (`windows_mm::HOOK_AFTER_THE_USERFAULTFD`) while another thread's
+    /// write resolves the page; let go, the access runs again and reads
+    /// what the other thread wrote, the resolve finding the page held by
+    /// its record, no longer pending and accessible. (A page released
+    /// pending and registered again before the handler's last check cannot
+    /// be: a released range is not registered again yet,
+    /// test_memory_unregistered_whole_registers_again.) In a process of
+    /// its own.
+    #[test]
+    fn test_a_host_access_that_faulted_on_a_released_page_resolved_meanwhile_runs_again() {
+        let (code, text) = run_child("late_handler_released_child", None);
+        std::eprintln!("LATERELEASED {code:?}; {}", text.lines().filter(|l| l.starts_with("LATERELEASED") || l.contains("panicked") || l.starts_with("wick:")).collect::<std::vec::Vec<_>>().join(" | "));
+        assert!(text.contains("LATERELEASED read back 0x77"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_host_access_that_faulted_on_a_released_page_resolved_meanwhile_runs_again in a process of its own"]
+    fn late_handler_released_child() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let len = 64 * 1024;
+        let mem = map(len);
+        register(ctx, mem, len as u64).unwrap();
+        unregister(ctx, mem, len as u64).unwrap();
+        assert!(!is_missing(mem + PAGE));
+        crate::windows_mm::HOOK_AFTER_THE_USERFAULTFD.store(hold_the_first_handler as fn() as usize, Ordering::SeqCst);
+        let reader = std::thread::spawn(move || {
+            // SAFETY: the unregistered range, its page pending: the read
+            // faults, and its handler is held after the userfaultfd's step.
+            unsafe { core::ptr::read_volatile((mem + PAGE + 5) as *const u8) }
+        });
+        wait_for(&HELD, "the reader's fault");
+        std::thread::spawn(move || {
+            // SAFETY: as above: the write resolves the page.
+            unsafe { core::ptr::write_volatile((mem + PAGE + 5) as *mut u8, 0x77) };
+        })
+        .join()
+        .expect("the writer failed");
+        RELEASED.store(true, Ordering::SeqCst);
+        let got = reader.join().expect("the reader failed");
+        std::println!("LATERELEASED read back {got:#x}");
+        assert_eq!(got, 0x77);
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
