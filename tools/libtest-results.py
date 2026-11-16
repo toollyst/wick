@@ -24,7 +24,13 @@ stand for the parent's. So, within one binary's section:
   rest add up to the counts of that last "test result:" line;
 - if they do not add up, the section is a named problem: its results cannot
   be told from what was written, and a test begun with no result of its own
-  is left with none (the caller's "started, no result").
+  is left with none (the caller's "started, no result");
+- a result word at the end of a begun line, after the test's own output
+  ("test x ... printed ok", a word apart: "... a book" is none), is the
+  test's, except on the last test line of a
+  section with no "test result:" line (the process ended): there it may be
+  the test's own output when the process died, so that test is left with
+  none.
 
 Used by tools/linux/compare-unit-tests.py (and so tools/ci-results.py) and
 tools/macos/check-unit-tests.py; loaded by path (importlib), as the tools load
@@ -37,8 +43,12 @@ import sys
 RESULT = re.compile(r"^test (.+?)(?: - should panic)? \.\.\. (ok|FAILED|ignored(?:, .*)?)$")
 STARTED = re.compile(r"^test (.+?)(?: - should panic)? \.\.\. ?(.*)$")
 # libtest's result word ends the line, after anything a test wrote to the
-# terminal itself (a guest's serial output, say: "test x ... HHok").
-LATE_RESULT = re.compile(r"(ok|FAILED|ignored(?:, .*)?)$")
+# terminal itself ("test x ... printed by the test ok"); a word, not the end of
+# one: "test x ... a book" is no result. A result glued to a test's output
+# ("HHok") is then read as none, and the test as begun; no CI log of this
+# repository has one (job 133046993494's Linux unit log: the four begun lines
+# with output end in "Hello, world!", their "ok" on a line of its own).
+LATE_RESULT = re.compile(r"(?<![A-Za-z0-9_])(ok|FAILED|ignored(?:, .*)?)$")
 SUMMARY = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored;")
 
 
@@ -57,21 +67,29 @@ def section_results(lines, name=lambda n: n):
 
     found = {}
     begun = []
+    # The name whose result came late on the last test line read, if any.
+    last_late = None
     for line in lines:
         m = RESULT.match(line)
         if m:
             found.setdefault(nm(m.group(1)), m.group(2).split(",")[0])
+            last_late = None
             continue
         m = STARTED.match(line)
         if m:
             n = nm(m.group(1))
             late = LATE_RESULT.search(m.group(2))
+            last_late = None
             if late:
-                found.setdefault(n, late.group(1).split(",")[0])
+                if n not in found:
+                    found[n] = late.group(1).split(",")[0]
+                    last_late = n
             else:
                 begun.append(n)
     last = max((i for i, line in enumerate(lines) if SUMMARY.match(line)), default=None)
     if last is None:
+        if last_late is not None:
+            del found[last_late]
         return found, None, None
     # The parent's failures: "failures:", one indented name a line, a blank
     # line, then its summary.
@@ -137,6 +155,14 @@ def selftest():
     late = ("running 1 test\ntest a::w ... printed by the test ok\n\n"
             "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n")
     assert run(late) == ({"a::w": "ok"}, (1, 0, 0), None), run(late)
+    # The process ended in the last test, whose own output ended in a result
+    # word: no summary, so that word is not taken; an earlier late one is.
+    died = "running 3 tests\ntest a::v ... printed ok\ntest a::w ... ok\ntest a::x ... the child said ok\n"
+    assert run(died) == ({"a::v": "ok", "a::w": "ok"}, None, None), run(died)
+    # A result word is a word: "a book" ends in no result, so the test is
+    # only begun, and in a section with no summary it keeps none.
+    book = "running 2 tests\ntest a::b ... read a book\ntest a::c ... ok\n"
+    assert run(book) == ({"a::c": "ok"}, None, None), run(book)
     # Lines that do not add up to the counts: a problem, with both counts.
     lost = "running 3 tests\ntest b::y ... ok\ntest b::v ... \n\ntest result: ok. 3 passed; 0 failed; 0 ignored;\n"
     assert run(lost) == ({"b::y": "ok"}, (3, 0, 0), "libtest counted 3 passed, 0 failed, 0 ignored, its lines 2, 0, 0"), \
