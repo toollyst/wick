@@ -5278,26 +5278,32 @@ mod tests {
     /// A move whose room another commit takes between the giving back of
     /// part of its dead pages' charge (12 KiB, `windows_mm::MOVE_ROOM`) and
     /// its first map (`windows_mm::AFTER_DEAD_UNCHARGED`), with no room left
-    /// in the job ([`no_room_left`]): its map is refused, the charge cannot
-    /// be taken again, and the chunk owes it (`windows_mm::OWED`), said in
-    /// one line on standard error; the chunk as it was. While it owes, the
-    /// job's limit and the jailer's count are 12 KiB below what the process
-    /// holds, no more: no other chunk is moved, so the fill that needed the
-    /// reclaim is refused (`ENOMEM`), and so is the next. Once the other
-    /// commit gives its room back, the next fill takes the owed charge again
-    /// first (nothing owed then) and goes on through the reclaim, its moves
-    /// made: 4 MiB filled, the live pages read back, the discarded ones
-    /// missing.
+    /// in the job ([`no_room_left`]), and whose map is then refused: the
+    /// charge cannot be taken again, and the chunk owes it
+    /// (`windows_mm::OWED`), said in one line on standard error; the chunk
+    /// as it was. The map into the move slot needs no room, so the refusal
+    /// is a test's (`windows_mm::REFUSE_SLOT_MAP`); with the room taken and
+    /// no refusal the move is made
+    /// ([`test_a_move_whose_guest_view_room_is_taken_is_made`]). While it
+    /// owes, the job's limit and the jailer's count are 12 KiB below what the
+    /// process holds, no more, and no other chunk is moved, so the fill that
+    /// needed the reclaim is refused (`ENOMEM`). The next fill cannot take
+    /// the owed charge again either (the room is still taken), and its
+    /// reclaim moves the owing chunk, which the slot's map lets it make with
+    /// no room: nothing owed then, and the fill made (before the slot its map
+    /// was refused again and the fill `ENOMEM`). Once the other commit gives
+    /// its room back, the fills go on through the reclaim, its moves made:
+    /// 4 MiB filled, the live pages read back, the discarded ones missing.
     #[test]
     fn test_a_move_whose_room_is_taken_owes_its_charge() {
         let (code, text) = run_child("room_taken_child", Some(96 << 20));
         assert!(text.contains("room left before the reclaim: 0 KiB"), "{text}");
         assert!(
-            text.contains("could not map its new section (error 1455) with its dead pages' charge given back for its maps"),
+            text.contains("could not map its new section (error 0) with its dead pages' charge given back for its maps"),
             "no line for the refused map: {text}"
         );
         assert!(text.contains("not taken again (another commit holds the room): owed"), "{text}");
-        assert!(text.contains("while owed: the fill ENOMEM, 12 KiB owed; again ENOMEM, 12 KiB owed"), "{text}");
+        assert!(text.contains("while owed: the fill ENOMEM, 12 KiB owed; again made, 0 KiB owed"), "{text}");
         assert!(text.contains("the room given back: 0 KiB owed, the fill made: 4096 KiB"), "{text}");
         assert_eq!(code, Some(0), "{text}");
     }
@@ -5309,6 +5315,7 @@ mod tests {
         ROOM_TAKEN.lock().unwrap().reserve_exact(4096);
         let mut held = no_room_left();
         *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = Some(take_the_room_given_up);
+        crate::windows_mm::REFUSE_SLOT_MAP.store(true, Ordering::SeqCst);
         let first = fill_a_page(ctx, mem + done);
         let owed = crate::windows_mm::owed_bytes();
         let again = fill_a_page(ctx, mem + done);
@@ -5322,7 +5329,7 @@ mod tests {
         give_back_the_room_taken();
         let mut n = 0;
         while n < 4 << 20 {
-            if fill_a_page(ctx, mem + done + n) != "made" {
+            if fill_a_page(ctx, mem + done + PAGE + n) != "made" {
                 break;
             }
             n += PAGE;
@@ -5349,9 +5356,9 @@ mod tests {
     }
 
     /// VIEWCOST: the last view swap's steps (`windows_mm::VIEWREC`) in KiB
-    /// of private commit, each `None` if not reached: the alias's first
-    /// view's unmap, its second's, its first's map, its second's, then the
-    /// same for the guest's view.
+    /// of private commit, each `None` if not reached, in the order they are
+    /// made: the alias's first view's unmap, its map, the second view's
+    /// unmap, its map, then the same for the guest's view.
     fn viewcost_steps() -> [Option<i64>; 8] {
         let v: [usize; 10] = core::array::from_fn(|i| crate::windows_mm::VIEWREC[i].load(Ordering::SeqCst));
         let d = |a: usize, b: usize| (a != 0 && b != 0).then(|| (b as i64 - a as i64) / 1024);
@@ -5365,8 +5372,8 @@ mod tests {
         let v = viewcost_steps();
         crate::windows_mm::say_at_the_limit(format_args!(
             "VIEWCOST {case}, {}: the guest view at {view:#x}, {} KiB into its 2 MiB, {} MiB into its 1 GiB; its alias at {alias:#x}, \
-             {} KiB into its 2 MiB, {} MiB into its 1 GiB; KiB, each of a chunk's two views (first, second): alias unmap {:+} {:+}, \
-             alias map {:+} {:+}, guest view unmap {:+} {:+}, guest view map {:+} {:+}{extra}",
+             {} KiB into its 2 MiB, {} MiB into its 1 GiB; KiB, a view at a time: the alias's first view unmap {:+}, map {:+}, \
+             its second unmap {:+}, map {:+}; the guest view's first unmap {:+}, map {:+}, its second unmap {:+}, map {:+}{extra}",
             if crate::windows_mm::VIEWREC[9].load(Ordering::SeqCst) == 1 { "move" } else { "swap" },
             (view % CHUNK as usize) >> 10,
             (view % (1 << 30)) >> 20,
@@ -5392,31 +5399,30 @@ mod tests {
     }
 
     /// VIEWCOST's assertion for the chunk at `chunk` of the range `[mem,
-    /// mem + len)`, whose alias is at `alias`: a view's unmap while the
-    /// chunk's other view still maps it (the first's), and a view's map
-    /// while the other does (the second's), take and give no page table, in
-    /// the alias and the guest's view, but for a view alone in a 2 MiB region
-    /// of its range ([`alone_in_a_region`]: a range's edge 1 MiB or more
-    /// short of a 2 MiB boundary), not asserted.
+    /// mem + len)`, whose alias is at `alias`: each view's unmap and map,
+    /// made while the chunk's other view (old or new) maps its 2 MiB region,
+    /// take and give no page table, in the alias and the guest's view, but
+    /// for a view alone in a 2 MiB region of its range ([`alone_in_a_region`]:
+    /// a range's edge 1 MiB or more short of a 2 MiB boundary), not asserted.
     fn assert_halves_cost_nothing(what: &str, chunk: usize, mem: usize, len: usize, alias: usize) {
         let v = viewcost_steps();
         let h = crate::windows_mm::chunk_half(CHUNK as usize);
         let c = CHUNK as usize;
-        for (side, base, unmap, map) in [("the alias's", alias, v[0], v[3]), ("the guest view's", mem, v[4], v[7])] {
+        for (k, (side, base)) in [("the alias's", alias), ("the guest view's", mem)].into_iter().enumerate() {
             let at = base + (chunk - mem);
-            if !alone_in_a_region(at, at + h, base, base + len) {
-                assert_eq!(unmap, Some(0), "{what}: {side} first view's unmap, the second mapped: {v:?}");
-            }
-            if !alone_in_a_region(at + h, at + c, base, base + len) {
-                assert_eq!(map, Some(0), "{what}: {side} second view's map, the first mapped: {v:?}");
+            for (i, (a, z)) in [(at, at + h), (at + h, at + c)].into_iter().enumerate() {
+                if !alone_in_a_region(a, z, base, base + len) {
+                    assert_eq!(v[4 * k + 2 * i], Some(0), "{what}: {side} view {i}'s unmap: {v:?}");
+                    assert_eq!(v[4 * k + 2 * i + 1], Some(0), "{what}: {side} view {i}'s map: {v:?}");
+                }
             }
         }
     }
 
     /// VIEWCOST, a record: what each step of a chunk's view swap
-    /// (`windows_mm::unmap_alias` and `swap_views`: the alias's two views
-    /// unmapped keeping their placeholders, the new section's views mapped
-    /// there, then the same for the guest's view) adds to the process's
+    /// (`windows_mm::unmap_alias` and `swap_views`: each of the alias's two
+    /// views unmapped keeping its placeholder and the new section's mapped
+    /// there, one at a time, then the same for the guest's view) adds to the process's
     /// private commit, for a move (one dead page, `reclaim_at_touch`) and
     /// then a swap (the chunk discarded whole), of the first, middle and last
     /// chunk of a 3-chunk range and of a 1-chunk range, the range and its
@@ -5426,11 +5432,12 @@ mod tests {
     /// at its unmap (MAPCOST); between the guest view's unmap and its map,
     /// what the unmap gave is room another commit can take
     /// (`test_a_move_whose_guest_view_room_is_taken_is_made`). Asserted: the
-    /// moves and swaps are made, and a view's unmap or map while the
-    /// chunk's other view maps it takes no page table
-    /// ([`assert_halves_cost_nothing`]), but for a view alone in a 2 MiB
-    /// region of its range: the last chunk's second view of a range whose
-    /// end is 1 MiB or less past a 2 MiB boundary.
+    /// moves and swaps are made, each view's unmap and map takes no page
+    /// table ([`assert_halves_cost_nothing`]), but for a view alone in a
+    /// 2 MiB region of its range: the last chunk's second view of a range
+    /// whose end is 1 MiB or less past a 2 MiB boundary; and the move's view
+    /// of its new section, in the move slot, takes none at its map and gives
+    /// none back at its unmap.
     #[test]
     #[ignore = "a record: run alone on Windows with --ignored --nocapture (CI's WHP step)"]
     fn test_what_a_chunks_view_swap_costs_on_record() {
@@ -5498,6 +5505,7 @@ mod tests {
                         ),
                     );
                     assert_halves_cost_nothing(&std::format!("{what}, the move"), chunk as usize, mem as usize, len as usize, alias);
+                    assert_eq!((m[3] as i64 - m[1] as i64, m[8] as i64 - m[7] as i64), (0, 0), "{what}: the move's view in the slot, its map and unmap");
                     // SAFETY: registered memory of ours, the chunk whole.
                     assert_eq!(unsafe { crate::madvise(chunk as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED) }, 0);
                     assert_eq!(crate::windows_mm::VIEWREC[9].load(Ordering::SeqCst), 2, "{what}: the swap");
@@ -6101,17 +6109,22 @@ mod tests {
     static VIEW_ROOM_TAKEN: Mutex<std::vec::Vec<usize>> = Mutex::new(std::vec::Vec::new());
     static VIEW_ROOM_TAKEN_ONCE: AtomicBool = AtomicBool::new(false);
 
-    /// Another commit taking the room a move's guest view unmap gave
-    /// (`windows_mm::BETWEEN_GUEST_UNMAP_AND_MAP`), the first time only:
-    /// all the job has, its pages and the slack ([`take_the_slack`]).
-    fn take_the_room_the_unmap_gave() {
+    /// Another commit taking the room a view's unmap gave in a chunk's swap
+    /// (`windows_mm::BETWEEN_GUEST_UNMAP_AND_MAP` or
+    /// `BETWEEN_ALIAS_UNMAP_AND_MAP`, `view` the view's index), the first
+    /// time only: all the job has, its pages and the slack
+    /// ([`take_the_slack`]). The unmap's step is the alias's first view's if
+    /// the guest view's has not been reached (VIEWREC).
+    fn take_the_room_the_unmap_gave(view: usize) {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         if VIEW_ROOM_TAKEN_ONCE.swap(true, Ordering::SeqCst) {
             return;
         }
         let gave = {
             let v = &crate::windows_mm::VIEWREC;
-            (v[4].load(Ordering::SeqCst) as i64 - v[6].load(Ordering::SeqCst) as i64) / 1024
+            let guest = v[4].load(Ordering::SeqCst) != 0;
+            let step = if guest { 5 } else { 1 } + 2 * view;
+            (v[step - 1].load(Ordering::SeqCst) as i64 - v[step].load(Ordering::SeqCst) as i64) / 1024
         };
         let mut held = VIEW_ROOM_TAKEN.lock().unwrap();
         while held.len() < held.capacity() {
@@ -6125,7 +6138,7 @@ mod tests {
         let before = SLACK_TAKEN.load(Ordering::SeqCst);
         let after = take_the_slack();
         crate::windows_mm::say_at_the_limit(format_args!(
-            "VIEWROOM the guest view's unmap gave {gave} KiB; the hook took {} KiB in pages and {} KiB where a page table was; \
+            "VIEWROOM the view's unmap gave {gave} KiB; the hook took {} KiB in pages and {} KiB where a page table was; \
              private commit {} KiB",
             held.len() * PAGE as usize / 1024,
             (after - before) * PAGE as usize / 1024,
@@ -6133,32 +6146,64 @@ mod tests {
         ));
     }
 
-    /// A move whose guest view's room, what its unmap gave back (a page
+    /// A move whose guest view's room, what a view's unmap gave back (a page
     /// table for each 2 MiB region only it maps: VIEWCOST), another commit
     /// takes before the view is mapped again
     /// (`windows_mm::BETWEEN_GUEST_UNMAP_AND_MAP`), with no room left in
     /// the job ([`no_room_left`]): the move is made, the fill that needed
-    /// it too, and the VMM goes on. The range on a 2 MiB boundary, so that
-    /// each chunk's view is the only one in its 2 MiB region; its first
-    /// chunk with 8 dead pages.
+    /// it too, and the VMM goes on. The range on a 2 MiB boundary, as
+    /// Firecracker's guest memory is; its first chunk with 8 dead pages.
+    /// With both views of a chunk swapped together, the unmaps gave back the
+    /// region's page table, the hook took it, and the map was refused: the
+    /// VMM ended with 137 (fails on 9dcf90d0).
     #[test]
-    #[ignore = "fails until a chunk's views are swapped half by half (SECURITY.md, Not at parity yet: a reclaim's move, or the swap of a chunk discarded whole, ends the VMM with 137 when another thread's commit takes a view's page table room)"]
     fn test_a_move_whose_guest_view_room_is_taken_is_made() {
-        let (code, text) = run_child("guest_view_room_taken_child", Some(96 << 20));
+        view_room_taken("guest_view_room_taken_child", "VIEWROOM the fill made, 1 moves made, 0 not made, 0 KiB owed");
+    }
+
+    /// The same with the alias's view (`windows_mm::BETWEEN_ALIAS_UNMAP_AND_MAP`).
+    #[test]
+    fn test_a_move_whose_alias_room_is_taken_is_made() {
+        view_room_taken("alias_room_taken_child", "VIEWROOM the fill made, 1 moves made, 0 not made, 0 KiB owed");
+    }
+
+    /// The same with the swap of a registered chunk discarded whole
+    /// (`windows_mm::uffd_swap_chunk`, the guest view's room taken): the
+    /// discard is made, the chunk's pages missing and its commit given back.
+    #[test]
+    fn test_a_discard_whose_guest_view_room_is_taken_is_made() {
+        view_room_taken("discard_room_taken_child", "VIEWROOM the discard made, its pages missing");
+    }
+
+    /// Runs `child` in a job of its own and asserts its hook ran and `made`.
+    fn view_room_taken(child: &str, made: &str) {
+        let (code, text) = run_child(child, Some(96 << 20));
         for l in text
             .lines()
             .filter(|l| l.starts_with("VIEWROOM") || l.starts_with("VIEWCOST") || l.starts_with("room left") || l.starts_with("wick:") || l.starts_with("filled"))
         {
             std::eprintln!("{l}");
         }
-        assert!(text.contains("VIEWROOM the guest view's unmap gave"), "the hook did not run: {text}");
-        assert!(text.contains("VIEWROOM the fill made, 1 moves made, 0 not made, 0 KiB owed"), "{text}");
+        assert!(text.contains("VIEWROOM the view's unmap gave"), "the hook did not run: {text}");
+        assert!(text.contains(made), "{text}");
         assert_eq!(code, Some(0), "{text}");
     }
 
     #[test]
     #[ignore = "run by test_a_move_whose_guest_view_room_is_taken_is_made in a job of its own"]
     fn guest_view_room_taken_child() {
+        move_room_taken(&crate::windows_mm::BETWEEN_GUEST_UNMAP_AND_MAP);
+    }
+
+    #[test]
+    #[ignore = "run by test_a_move_whose_alias_room_is_taken_is_made in a job of its own"]
+    fn alias_room_taken_child() {
+        move_room_taken(&crate::windows_mm::BETWEEN_ALIAS_UNMAP_AND_MAP);
+    }
+
+    /// The children's move: the range at the limit, its first chunk with 8
+    /// dead pages, the room taken by `hook`'s turn.
+    fn move_room_taken(hook: &Mutex<Option<fn(usize)>>) {
         let at = fresh_gib(1) + (64 << 20);
         let (ctx, user, mem, done) = fill_to_the_limit_at(at, 0);
         for p in 0..8 {
@@ -6167,11 +6212,11 @@ mod tests {
         }
         VIEW_ROOM_TAKEN.lock().unwrap().reserve_exact(4096);
         let mut held = no_room_left();
-        *crate::windows_mm::BETWEEN_GUEST_UNMAP_AND_MAP.lock().unwrap() = Some(take_the_room_the_unmap_gave);
+        *hook.lock().unwrap() = Some(take_the_room_the_unmap_gave);
         let (m1, refused1) = (moves_on_record().0.len(), crate::windows_mm::moves_refused());
         let fill = fill_a_page(ctx, mem + done);
         let (m2, refused2) = (moves_on_record().0.len(), crate::windows_mm::moves_refused());
-        *crate::windows_mm::BETWEEN_GUEST_UNMAP_AND_MAP.lock().unwrap() = None;
+        *hook.lock().unwrap() = None;
         let alias = range_of_view(mem as usize).map_or(0, |(r, _)| r.alias.load(Ordering::Acquire) as usize);
         viewcost_line("the hook's move", mem as usize, alias, format_args!(""));
         crate::windows_mm::say_at_the_limit(format_args!(
@@ -6180,13 +6225,7 @@ mod tests {
             refused2 - refused1,
             crate::windows_mm::owed_bytes() >> 10
         ));
-        {
-            let mut t = VIEW_ROOM_TAKEN.lock().unwrap();
-            while !t.is_empty() {
-                give_back_a_page(&mut t);
-            }
-        }
-        give_back_every_page(&mut held);
+        give_back_the_room(&mut held);
         for p in (0..CHUNK).step_by(PAGE as usize) {
             if p % (2 * PAGE) == PAGE && p < 16 * PAGE {
                 assert!(is_missing(mem + p), "{p:#x} is not missing");
@@ -6197,6 +6236,211 @@ mod tests {
         }
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// Gives back what the hook and [`no_room_left`] took.
+    fn give_back_the_room(held: &mut std::vec::Vec<usize>) {
+        {
+            let mut t = VIEW_ROOM_TAKEN.lock().unwrap();
+            while !t.is_empty() {
+                give_back_a_page(&mut t);
+            }
+        }
+        give_back_every_page(held);
+    }
+
+    #[test]
+    #[ignore = "run by test_a_discard_whose_guest_view_room_is_taken_is_made in a job of its own"]
+    fn discard_room_taken_child() {
+        let at = fresh_gib(1) + (64 << 20);
+        let (_ctx, user, mem, _) = fill_to_the_limit_at(at, 0);
+        VIEW_ROOM_TAKEN.lock().unwrap().reserve_exact(4096);
+        let mut held = no_room_left();
+        let commit = committed(mem, CHUNK);
+        *crate::windows_mm::BETWEEN_GUEST_UNMAP_AND_MAP.lock().unwrap() = Some(take_the_room_the_unmap_gave);
+        // SAFETY: registered memory of ours, its first chunk whole.
+        let d = unsafe { crate::madvise(mem as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED) };
+        *crate::windows_mm::BETWEEN_GUEST_UNMAP_AND_MAP.lock().unwrap() = None;
+        assert_eq!(d, 0);
+        assert_eq!(crate::windows_mm::VIEWREC[9].load(Ordering::SeqCst), 2, "the swap");
+        let alias = range_of_view(mem as usize).map_or(0, |(r, _)| r.alias.load(Ordering::Acquire) as usize);
+        viewcost_line("the hook's swap", mem as usize, alias, format_args!(""));
+        let (missing, after) = ((0..CHUNK).step_by(PAGE as usize).all(|p| is_missing(mem + p)), committed(mem, CHUNK));
+        give_back_the_room(&mut held);
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "VIEWROOM the discard made, its pages {}; the chunk's commit {commit:#x} -> {after:#x}",
+            if missing { "missing" } else { "not all missing" }
+        ));
+        assert_eq!(after, 0, "the chunk's commit");
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// The move slot (`windows_mm::MOVE_SLOT`), in a process of its own
+    /// (MOVESLOT lines): none, nor the move budget, in a process that maps
+    /// and unmaps memory and registers nothing; made with the budget at the
+    /// first registration, 64 KiB past a 2 MiB boundary, at what cost to the
+    /// private commit (a record); then a move of a chunk with a dead page
+    /// maps its new section's view in the slot, the map and its unmap taking
+    /// and giving back no commit, where a view mapped anywhere took 4 KiB
+    /// (MOVEREC; fails on 9dcf90d0); and a short last chunk's move (a range
+    /// of a chunk and a half) uses the slot split to its length, a whole
+    /// chunk's after it the slot whole again.
+    #[test]
+    fn test_a_moves_temporary_view_takes_no_commit() {
+        let (code, text) = run_child("move_slot_child", None);
+        for l in text.lines().filter(|l| l.starts_with("MOVESLOT")) {
+            std::eprintln!("{l}");
+        }
+        assert!(text.contains("MOVESLOT done"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_moves_temporary_view_takes_no_commit in a process of its own"]
+    fn move_slot_child() {
+        // SAFETY: a mapping of ours, written and unmapped.
+        unsafe {
+            let m = crate::mmap(ptr::null_mut(), 4 << 20, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0);
+            assert_ne!(m, crate::MAP_FAILED);
+            ptr::write_bytes(m.cast::<u8>(), 1, 4 << 20);
+            assert_eq!(crate::munmap(m, 4 << 20), 0);
+        }
+        assert_eq!(crate::windows_mm::move_slot_and_budget_for_tests(), (0, 0), "a process that registers nothing");
+        let before = private_commit();
+        assert!(crate::windows_mm::uffd_budget_now_for_tests());
+        let after = private_commit();
+        let (slot, budget) = crate::windows_mm::move_slot_and_budget_for_tests();
+        assert_ne!(budget, 0);
+        std::println!(
+            "MOVESLOT the budget and the slot (at {slot:#x}): {:+} KiB of private commit (the budget 2048)",
+            (after as i64 - before as i64) / 1024
+        );
+        let page = [0x5au8; PAGE as usize];
+        for (what, len) in [("a whole chunk", CHUNK), ("a chunk and a half, the short last chunk", CHUNK + CHUNK / 2), ("a whole chunk again", CHUNK)] {
+            let (ctx, user) = create(0, false, true).unwrap();
+            // SAFETY: a new anonymous mapping, committed at first touch.
+            let mem = unsafe {
+                crate::mmap(ptr::null_mut(), len as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE, -1, 0)
+            };
+            assert_ne!(mem, crate::MAP_FAILED);
+            let mem = mem as u64;
+            register(ctx, mem, len).unwrap();
+            let last = (len - 1) / CHUNK * CHUNK;
+            for p in (last..len).step_by(PAGE as usize) {
+                // SAFETY: `page` holds a page.
+                unsafe { copy(ctx, page.as_ptr(), mem + p, PAGE, false) }.unwrap();
+            }
+            // SAFETY: registered memory of ours.
+            assert_eq!(unsafe { crate::madvise((mem + last + PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+            let r = reclaim_at_touch(PAGE as usize);
+            let m: [usize; 12] = core::array::from_fn(|i| crate::windows_mm::MOVEREC[i].load(Ordering::SeqCst));
+            let (map, unmap) = ((m[3] as i64 - m[1] as i64) / 1024, (m[8] as i64 - m[7] as i64) / 1024);
+            std::println!("MOVESLOT {what}: {} moved, its view at {:#x} (the slot {slot:#x}): map {map:+} KiB, unmap {unmap:+} KiB", r.chunks, m[2]);
+            assert_eq!(r.chunks, 1, "{what}: the move");
+            assert_eq!((map, unmap), (0, 0), "{what}: the view's map and unmap");
+            assert_eq!(m[2], slot, "{what}: the move's view");
+            for p in (last..len).step_by(PAGE as usize).filter(|&p| p != last + PAGE) {
+                // SAFETY: a filled page.
+                assert_eq!(unsafe { *((mem + p) as *const u8) }, 0x5a, "{what}: {p:#x}");
+            }
+            assert!(is_missing(mem + last + PAGE));
+            // SAFETY: closes the user end, then unmaps our mapping.
+            unsafe {
+                ws::closesocket(sock(user));
+                assert_eq!(crate::munmap(mem as *mut c_void, len as usize), 0);
+            }
+        }
+        assert_eq!(slot % CHUNK as usize, 64 << 10, "the slot at {slot:#x}");
+        std::println!("MOVESLOT done");
+    }
+
+    /// The readers [`read_both_halves`] started, each giving the byte it
+    /// read and when it was read.
+    static HALF_READERS: Mutex<std::vec::Vec<std::thread::JoinHandle<(u8, std::time::Instant)>>> = Mutex::new(std::vec::Vec::new());
+    /// The two pages they read (one in each of a chunk's views) and when the
+    /// hook ended.
+    static HALF_PAGES: Mutex<(u64, u64, Option<std::time::Instant>)> = Mutex::new((0, 0, None));
+
+    /// `windows_mm::BETWEEN_GUEST_UNMAP_AND_MAP`'s turn for the guest view's
+    /// first view (its placeholder out, the second view the old section's,
+    /// its live pages closed): a reader of a page of each starts, then the
+    /// hook waits 50 ms.
+    fn read_both_halves(view: usize) {
+        if view != 0 {
+            return;
+        }
+        let (a, b, _) = *HALF_PAGES.lock().unwrap();
+        let mut readers = HALF_READERS.lock().unwrap();
+        for at in [a, b] {
+            readers.push(std::thread::spawn(move || {
+                // SAFETY: a page of a registered range of the test's.
+                let v = unsafe { ptr::read_volatile(at as *const u8) };
+                (v, std::time::Instant::now())
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        HALF_PAGES.lock().unwrap().2 = Some(std::time::Instant::now());
+    }
+
+    /// The chunk being moved is marked moving whole (`move_chunk`'s
+    /// `MOVING_START` to its end) while its views are swapped one at a time:
+    /// an access to a live page of either view, made when the guest view's
+    /// first view is out and its second still the old section's, waits for
+    /// the move and then reads the page's data.
+    #[test]
+    fn test_an_access_to_either_view_of_a_moving_chunk_waits_for_the_move() {
+        let (code, text) = run_child("moving_halves_child", None);
+        for l in text.lines().filter(|l| l.starts_with("MOVINGHALVES")) {
+            std::eprintln!("{l}");
+        }
+        assert!(text.contains("MOVINGHALVES done"), "{text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_an_access_to_either_view_of_a_moving_chunk_waits_for_the_move in a process of its own"]
+    fn moving_halves_child() {
+        let half = crate::windows_mm::chunk_half(CHUNK as usize) as u64;
+        let (ctx, user) = create(0, false, true).unwrap();
+        // SAFETY: a new anonymous mapping, committed at first touch.
+        let mem = unsafe {
+            crate::mmap(ptr::null_mut(), CHUNK as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE, -1, 0)
+        };
+        assert_ne!(mem, crate::MAP_FAILED);
+        let mem = mem as u64;
+        register(ctx, mem, CHUNK).unwrap();
+        let page = [0x5au8; PAGE as usize];
+        for p in [0, PAGE, half, half + PAGE] {
+            // SAFETY: `page` holds a page.
+            unsafe { copy(ctx, page.as_ptr(), mem + p, PAGE, false) }.unwrap();
+        }
+        // SAFETY: registered memory of ours.
+        assert_eq!(unsafe { crate::madvise((mem + PAGE) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        *HALF_PAGES.lock().unwrap() = (mem, mem + half + PAGE, None);
+        *crate::windows_mm::BETWEEN_GUEST_UNMAP_AND_MAP.lock().unwrap() = Some(read_both_halves);
+        let r = reclaim_at_touch(PAGE as usize);
+        *crate::windows_mm::BETWEEN_GUEST_UNMAP_AND_MAP.lock().unwrap() = None;
+        let moved = std::time::Instant::now();
+        assert_eq!(r.chunks, 1, "the move");
+        let hook_end = HALF_PAGES.lock().unwrap().2.expect("the hook ran");
+        let readers = std::mem::take(&mut *HALF_READERS.lock().unwrap());
+        for (k, h) in readers.into_iter().enumerate() {
+            let (v, at) = h.join().unwrap();
+            std::println!(
+                "MOVINGHALVES the reader of view {k}: read {v:#x}, {} us after the hook ended, the move ended {} us after it",
+                at.saturating_duration_since(hook_end).as_micros(),
+                moved.saturating_duration_since(hook_end).as_micros()
+            );
+            assert_eq!(v, 0x5a, "view {k}'s page");
+            assert!(at >= hook_end, "view {k}'s reader did not wait for the move");
+        }
+        // SAFETY: closes the user end, then unmaps our mapping.
+        unsafe {
+            ws::closesocket(sock(user));
+            assert_eq!(crate::munmap(mem as *mut c_void, CHUNK as usize), 0);
+        }
+        std::println!("MOVINGHALVES done");
     }
 
     /// A chunk with one dead page, the least a move gives back for its maps
@@ -6372,7 +6616,8 @@ mod tests {
     }
 
     /// A charge owed (`windows_mm::OWED`, as in
-    /// [`test_a_move_whose_room_is_taken_owes_its_charge`]) goes with its
+    /// [`test_a_move_whose_room_is_taken_owes_its_charge`], its map refused
+    /// by the test) goes with its
     /// range: once the range is unregistered and unmapped, nothing is owed,
     /// before any commit; memory committed at the same address afterwards
     /// is no charged view's, and a fill of another range is made, with no
@@ -6397,6 +6642,7 @@ mod tests {
         let mut held = no_room_left();
         owed_step("no room left");
         *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = Some(take_the_room_given_up);
+        crate::windows_mm::REFUSE_SLOT_MAP.store(true, Ordering::SeqCst);
         let fill = fill_a_page(ctx, mem + done);
         *crate::windows_mm::AFTER_DEAD_UNCHARGED.lock().unwrap() = None;
         crate::windows_mm::say_at_the_limit(format_args!("OWEDREC the fill at the limit: {fill}"));
