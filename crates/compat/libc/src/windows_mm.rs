@@ -695,9 +695,14 @@ fn to_placeholder(t: &mut Table, base: usize) -> bool {
     // them holds the records' lock from its check that the page is
     // committed to its protection, so the view stays while it does (the
     // view is counted out of its record by [`unalias`] once it is gone).
-    if matches!(r.kind, Kind::View { .. }) {
+    if matches!(r.kind, Kind::View { .. }) && !is_chunk(&r.kind) {
         released_forget(base, r.len);
     }
+    // A chunk's views ([`chunk_views`]) leave a placeholder each, made one
+    // again; if that is refused, the table has the two. Their pages leave
+    // the records with them ([`unmap_chunk_forgetting`]): a refused first
+    // unmap changes nothing.
+    let mut apart = None;
     // SAFETY: frees our allocation or view, keeping the address space.
     let ok = unsafe {
         match r.kind {
@@ -709,6 +714,15 @@ fn to_placeholder(t: &mut Table, base: usize) -> bool {
                 r.len,
                 MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
             ),
+            Kind::View { .. } if is_chunk(&r.kind) => {
+                if !unmap_chunk_forgetting(base, r.len, true) {
+                    return false;
+                }
+                if !coalesce_chunk(base, r.len) {
+                    apart = Some(chunk_half(r.len));
+                }
+                1
+            }
             Kind::View { .. } => UnmapViewOfFile2(
                 proc(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -735,11 +749,22 @@ fn to_placeholder(t: &mut Table, base: usize) -> bool {
     r.kind = Kind::Placeholder;
     r.holes.clear();
     r.noaccess.clear();
+    if let Some(h) = apart {
+        let len = r.len;
+        r.len = h;
+        t.insert(base + h, Region::new(len - h, Kind::Placeholder));
+    }
     true
 }
 
-/// Releases the region at `base` and its address space.
+/// Releases the region at `base` and its address space. A chunk's views
+/// go first ([`unmap_chunk_forgetting`]): refused, nothing changed, the
+/// region still in the table, and `false`.
 fn release(t: &mut Table, base: usize) -> bool {
+    let chunk = is_chunk(&t[&base].kind);
+    if chunk && !unmap_chunk_forgetting(base, t[&base].len, false) {
+        return false;
+    }
     let r = t.remove(&base).unwrap();
     if r.lazy {
         lazy_remove(base, r.len);
@@ -764,6 +789,7 @@ fn release(t: &mut Table, base: usize) -> bool {
             Kind::Placeholder | Kind::Private { .. } | Kind::Large { .. } => {
                 VirtualFree(base as *mut c_void, 0, MEM_RELEASE)
             }
+            Kind::View { .. } if chunk => 1,
             Kind::View { .. } => UnmapViewOfFile2(
                 proc(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -899,6 +925,10 @@ fn make_placeholder(t: &mut Table, start: usize, end: usize) -> Result<(), c_int
             return Err(crate::EINVAL);
         }
     }
+    // Counted again: a chunk whose two placeholders were not made one is
+    // two regions now ([`to_placeholder`]), which [`fill`] cannot take as
+    // one.
+    let bases = overlapping(t, start, end);
     if bases.len() > 1 {
         // SAFETY: coalesces our adjacent placeholders covering the range.
         if unsafe {
@@ -3149,7 +3179,9 @@ unsafe fn munmap_now(addr: *mut c_void, len: size_t) -> c_int {
         let r = &t[&b];
         let (s, e) = (start.max(b), end.min(b + r.len));
         if s == b && e == b + r.len {
-            release(&mut t, b);
+            if !release(&mut t, b) && t.contains_key(&b) {
+                return refused_unmap(b);
+            }
             continue;
         }
         match r.kind {
@@ -3169,17 +3201,32 @@ unsafe fn munmap_now(addr: *mut c_void, len: size_t) -> c_int {
                     released_forget(s, e - s);
                     protect_committed(s, e, PAGE_NOACCESS);
                 } else {
-                    protect(s, e - s, PAGE_NOACCESS);
+                    either_side(s, e - s, view_cut(b, r.len, &r.kind), |a, n| protect(a, n, PAGE_NOACCESS));
                 }
             }
         }
         let r = t.get_mut(&b).unwrap();
         r.add_hole(s - b, e - s);
-        if r.all_holes() {
-            release(&mut t, b);
+        if r.all_holes() && !release(&mut t, b) && t.contains_key(&b) {
+            return refused_unmap(b);
         }
     }
     0
+}
+
+/// `munmap`'s end when Windows refused the first view of the chunk at `b`
+/// ([`release`]): the chunk is as it was, `EINVAL`, said in a line; the
+/// regions before it in the range are unmapped. Linux's `munmap` changes
+/// nothing or all, its refusals all before it unmaps anything (v6.1
+/// mm/mmap.c, `do_mas_align_munmap`: its failures at :2331 to :2375,
+/// before "Point of no return" at :2403); this differs from it only here,
+/// where Windows refused the unmap of a view of our own, which it should
+/// never do.
+fn refused_unmap(b: usize) -> c_int {
+    // SAFETY: plain call.
+    let err = unsafe { GetLastError() };
+    say_at_the_limit(format_args!("wick: munmap: Windows refused the unmap of the chunk at {b:#x} (error {err}): it stays mapped, EINVAL"));
+    fail(crate::EINVAL, -1)
 }
 
 /// `mprotect`.
@@ -3256,24 +3303,26 @@ fn mprotect_rest(start: usize, end: usize, prot: c_int, wprot: PAGE_PROTECTION_F
                         continue;
                     }
                     let r = &t[&b];
+                    // A chunk's commits and protections, a view at a time.
+                    let cut = view_cut(b, r.len, &r.kind);
                     let decommitted = ranges_within(&r.noaccess, s - b, e - s);
                     if prot != PROT_NONE {
                         // Mapped `PROT_NONE` parts get their (zero) pages now.
                         for &(o, l) in &decommitted {
-                            if !commit(b + o, l, wprot, false) {
+                            if !either_side(b + o, l, cut, |a, n| commit(a, n, wprot, false)) {
                                 return fail(crate::ENOMEM, -1);
                             }
                         }
                         let r = t.get_mut(&b).unwrap();
                         ranges_remove(&mut r.noaccess, s - b, e - s);
-                        if !protect(s, e - s, wprot) {
+                        if !either_side(s, e - s, cut, |a, n| protect(a, n, wprot)) {
                             return fail(crate::EACCES, -1);
                         }
                     } else {
                         // Decommitted parts already fault; protect the rest.
                         let mut at = s;
                         for (o, l) in decommitted.into_iter().chain([(e - b, 0)]) {
-                            if b + o > at && !protect(at, b + o - at, wprot) {
+                            if b + o > at && !either_side(at, b + o - at, cut, |a, n| protect(a, n, wprot)) {
                                 return fail(crate::EACCES, -1);
                             }
                             at = b + o + l;
@@ -3515,6 +3564,128 @@ pub(crate) fn uffd_protections(start: usize, len: usize, out: &mut [u8]) {
 /// ([`uffd_swap_chunk`]), which a section's pages cannot (SECTREC-h).
 pub(crate) const UFFD_CHUNK: usize = 2 << 20;
 
+/// Where a chunk of `len` bytes (a [`UFFD_CHUNK`], or a range's shorter
+/// last one) is split into the two views that map it, in its guest view's
+/// placeholder, its alias's and its section: the offset of the second,
+/// half of `len` rounded down to the allocation granularity, as a view's
+/// offset in its section must be ("a multiple of the allocation
+/// granularity", Learn, MapViewOfFile3); 0 for a chunk of less than two
+/// granules, mapped as one view. While one view is out (unmapped, its
+/// placeholder kept), the other still maps the 2 MiB region and the 1 GiB
+/// they share, so the unmap gives back no page table and the map needs
+/// none (VIEWCOST: a view's unmap gives back the page table of each 2 MiB
+/// region only it maps, and a page-directory page of each 1 GiB).
+pub(crate) const fn chunk_half(len: usize) -> usize {
+    len / 2 / GRANULE * GRANULE
+}
+
+/// The views of the chunk at `at` of `len` bytes ([`chunk_half`]): (address,
+/// offset in its section, length), the first and, if there is one, the
+/// second.
+fn chunk_views(at: usize, len: usize) -> impl Iterator<Item = (usize, usize, usize)> {
+    let h = chunk_half(len);
+    let first = if h == 0 { len } else { h };
+    [(at, 0, first), (at + h, h, len - h)].into_iter().take(if h == 0 { 1 } else { 2 })
+}
+
+/// Whether a region of this kind is a chunk of a reserved userfaultfd range
+/// ([`uffd_alias_chunked`]): mapped as the views [`chunk_views`] gives.
+fn is_chunk(kind: &Kind) -> bool {
+    matches!(kind, Kind::View { _section: None, uffd: true, charge: Some(_), file: None, .. })
+}
+
+/// Where the region at `b` of `len` bytes and `kind` is split between two
+/// views: `b` for none (a region that is no chunk, or a chunk of one view).
+fn view_cut(b: usize, len: usize, kind: &Kind) -> usize {
+    if is_chunk(kind) { b + chunk_half(len) } else { b }
+}
+
+/// Calls `f` with the part of `[a, a + n)` below `cut` and the part from it,
+/// those that are not empty, in order, until one gives `false`; whether
+/// every call gave `true`. A commit or a protection change is refused across
+/// two views (each is an allocation of its own: "All pages in the specified
+/// region must be within the same reserved region", Learn, VirtualProtect).
+fn either_side(a: usize, n: usize, cut: usize, mut f: impl FnMut(usize, usize) -> bool) -> bool {
+    if cut > a && cut < a + n { f(a, cut - a) && f(cut, a + n - cut) } else { f(a, n) }
+}
+
+/// Maps `section`'s views of the chunk at `at` of `len` bytes into their
+/// placeholders ([`chunk_views`]); how many were mapped, in order.
+fn map_chunk(section: &Owned, at: usize, len: usize) -> usize {
+    chunk_views(at, len).take_while(|&(a, o, n)| view_into(section, a, o, n)).count()
+}
+
+/// Unmaps the views of the chunk at `at` of `len` bytes, in order, keeping
+/// their placeholders if `keep`: whether they were. The first refused,
+/// nothing changed. The second refused once the first is gone, the chunk
+/// is half mapped, which no caller can undo (the first view's placeholder
+/// cannot take its view back while the record of what it held is the
+/// caller's) or account for: the VMM ends, named (review B1).
+fn unmap_chunk(at: usize, len: usize, keep: bool) -> bool {
+    let flags = if keep { MEM_PRESERVE_PLACEHOLDER } else { 0 };
+    for (i, (a, _, _)) in chunk_views(at, len).enumerate() {
+        #[cfg(test)]
+        let refused = REFUSE_CHUNK_UNMAP.lock().unwrap().take_if(|&mut (c, v)| c == at && v == i).is_some();
+        #[cfg(not(test))]
+        let refused = false;
+        // SAFETY: unmaps a view of our chunk.
+        if refused || unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void }, flags) } == 0 {
+            if i == 0 {
+                return false;
+            }
+            // SAFETY: plain call.
+            let err = if refused { 0 } else { unsafe { GetLastError() } };
+            say_at_the_limit(format_args!(
+                "wick: guest memory: the second view of the chunk at {at:#x} ({len:#x} bytes), at {a:#x}, could not be \
+                 unmapped once its first was (error {err}): the VMM aborts"
+            ));
+            std::process::abort();
+        }
+    }
+    true
+}
+
+/// Tests: the next unmap of view `.1` (0 or 1) of the chunk at `.0` is
+/// refused ([`unmap_chunk`]), as if Windows refused it.
+#[cfg(test)]
+pub(crate) static REFUSE_CHUNK_UNMAP: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
+/// [`unmap_chunk`] with the released ranges' records locked, the chunk's
+/// pages forgotten in them once its views are gone: a first access
+/// resolving one of them holds the lock from its check that the page is
+/// committed to its protection, so the views stay while it does, and a
+/// refused first unmap leaves the records as they were (with
+/// [`released_forget`] before the unmap, a refusal left the chunk mapped
+/// and its pending pages no longer pending). The table's lock is the
+/// caller's, taken before the records'.
+fn unmap_chunk_forgetting(at: usize, len: usize, keep: bool) -> bool {
+    let mut records = (RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) != 0).then(|| RELEASED.lock().unwrap());
+    if !unmap_chunk(at, len, keep) {
+        return false;
+    }
+    if let Some(records) = records.as_mut() {
+        forget_in(&mut records[..], at, len);
+    }
+    true
+}
+
+/// The placeholders of the chunk at `at` of `len` bytes, one per view
+/// ([`chunk_views`]), made one again; whether they are.
+fn coalesce_chunk(at: usize, len: usize) -> bool {
+    #[cfg(test)]
+    if REFUSE_COALESCE.lock().unwrap().take_if(|&mut c| c == at).is_some() {
+        return false;
+    }
+    // SAFETY: coalesces our adjacent placeholders, the chunk's ("To coalesce
+    // two placeholders", Learn, VirtualFree).
+    chunk_half(len) == 0 || unsafe { VirtualFree(at as *mut c_void, len, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) } != 0
+}
+
+/// Tests: the next coalesce of the chunk at this address is refused
+/// ([`coalesce_chunk`]), as if Windows refused it.
+#[cfg(test)]
+pub(crate) static REFUSE_COALESCE: Mutex<Option<usize>> = Mutex::new(None);
+
 /// A new reserved (`SEC_RESERVE`) pagefile-backed section of `len` bytes.
 fn reserved_section(len: usize) -> Option<Owned> {
     let hi = u32::try_from((len as u64) >> 32).unwrap();
@@ -3527,16 +3698,16 @@ fn reserved_section(len: usize) -> Option<Owned> {
     (!s.is_null()).then(|| Owned(s))
 }
 
-/// Maps `section` (`len` bytes, from its start) into the placeholder of the
+/// Maps `len` bytes of `section` from `offset` into the placeholder of the
 /// same size at `at`; whether it is.
-fn view_into(section: &Owned, at: usize, len: usize) -> bool {
+fn view_into(section: &Owned, at: usize, offset: usize, len: usize) -> bool {
     // SAFETY: maps our section over our placeholder.
     let v = unsafe {
         MapViewOfFile3(
             section.0,
             proc(),
             at as *const c_void,
-            0,
+            offset as u64,
             len,
             MEM_REPLACE_PLACEHOLDER,
             PAGE_READWRITE,
@@ -3564,28 +3735,53 @@ fn split_into(base: usize, chunks: &[(usize, usize)]) -> usize {
 
 /// [`uffd_alias`] with the exception handler: the mapping moved into one
 /// reserved section per [`UFFD_CHUNK`] (the last one shorter if the length
-/// is not a multiple), each mapped into a placeholder of the mapping's and
-/// one of the alias's, its handle closed then (the views keep the section:
-/// "Mapped views of a file mapping object maintain internal references to
-/// the object", Learn, CreateFileMappingW), so no handle is held for it
-/// (UFFDCHUNK b, CI run 43528910212: 1 GiB as 512 chunks in 5.43 us a
-/// chunk, commit and paged pool as one section's, handles +0). Each chunk
-/// is a view of the table's, with a charge of its own ([`Charge`]). WHP
-/// maps the guest's range over the views in one call (UFFDCHUNK a).
+/// is not a multiple), each mapped as two views ([`chunk_views`]) into
+/// placeholders of the mapping's and of the alias's, its handle closed then
+/// (the views keep the section: "Mapped views of a file mapping object
+/// maintain internal references to the object", Learn, CreateFileMappingW),
+/// so no handle is held for it (UFFDCHUNK b, CI run 43528910212: 1 GiB as
+/// 512 chunks, one view each, in 5.43 us a chunk, commit and paged pool as
+/// one section's, handles +0). The alias is reserved on a 2 MiB boundary,
+/// as Firecracker allocates guest memory (src/vmm/src/vstate/memory.rs,
+/// `GUEST_MEMORY_ALIGNMENT`), so that each of its chunks fills its 2 MiB
+/// region and its two views keep the region's page table between them.
+/// Each chunk is a view of the table's, one region, with a charge of its
+/// own ([`Charge`]). WHP maps the guest's range over the views in one call
+/// (UFFDCHUNK a).
 fn uffd_alias_chunked(t: &mut Table, start: usize, len: usize, resident: &[u8]) -> Result<usize, c_int> {
+    use windows_sys::Win32::System::Memory::{MEM_ADDRESS_REQUIREMENTS, MEM_EXTENDED_PARAMETER, MemExtendedParameterAddressRequirements};
     // The move budget, charged at the first registration as a page filled
     // is: refused, the registration fails as one that cannot be charged.
     if !uffd_budget() {
         return Err(crate::ENOMEM);
     }
     let chunks: Vec<(usize, usize)> = (0..len).step_by(UFFD_CHUNK).map(|o| (o, UFFD_CHUNK.min(len - o))).collect();
+    // Every view of every chunk: (offset in the range, offset in its
+    // chunk's section, length).
+    let views: Vec<(usize, usize, usize)> = chunks.iter().flat_map(|&(o, n)| chunk_views(o, n)).collect();
+    let pieces: Vec<(usize, usize)> = views.iter().map(|&(o, _, n)| (o, n)).collect();
+    // The chunk of each view.
+    let chunk_of = |v: usize| views[v].0 / UFFD_CHUNK;
     #[cfg(test)]
     let at = ALIAS_AT.swap(0, std::sync::atomic::Ordering::SeqCst);
     #[cfg(not(test))]
     let at = 0;
-    // SAFETY: reserves address space of our own, as a placeholder.
+    // On a 2 MiB boundary, anywhere ("a power-of-2 alignment restriction for
+    // new allocations", Learn, VirtualAlloc2); an address asked for (a
+    // test's) takes no requirement ("any provided MEM_ADDRESS_REQUIREMENTS
+    // structure must consist of all zeroes", ibid.).
+    let mut need = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: std::ptr::null_mut(),
+        HighestEndingAddress: std::ptr::null_mut(),
+        Alignment: if at == 0 { HUGE_PAGE } else { 0 },
+    };
+    let mut param: MEM_EXTENDED_PARAMETER = MEM_EXTENDED_PARAMETER::default();
+    param.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+    param.Anonymous2.Pointer = (&raw mut need).cast();
+    // SAFETY: reserves address space of our own, as a placeholder, with the
+    // requirement above, which outlives the call.
     let alias = unsafe {
-        VirtualAlloc2(proc(), at as *const c_void, len, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0)
+        VirtualAlloc2(proc(), at as *const c_void, len, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &raw mut param, 1)
     } as usize;
     if alias == 0 {
         return Err(crate::ENOMEM);
@@ -3593,12 +3789,12 @@ fn uffd_alias_chunked(t: &mut Table, start: usize, len: usize, resident: &[u8]) 
     let mut sections = Vec::with_capacity(chunks.len());
     let mut charges = Vec::with_capacity(chunks.len());
     // Undoes the alias's views and placeholders (a placeholder not split
-    // off is freed at its own start, a later chunk's) and the charges.
+    // off is freed at its own start, a later view's) and the charges.
     let undo = |mapped: usize, charged: usize| {
-        for (i, &(o, _)) in chunks.iter().enumerate() {
+        for (v, &(o, _, _)) in views.iter().enumerate() {
             // SAFETY: frees the alias's view or placeholder made here.
             unsafe {
-                if i < mapped {
+                if v < mapped {
                     UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: (alias + o) as *mut c_void }, 0);
                 } else {
                     VirtualFree((alias + o) as *mut c_void, 0, MEM_RELEASE);
@@ -3609,29 +3805,34 @@ fn uffd_alias_chunked(t: &mut Table, start: usize, len: usize, resident: &[u8]) 
             charge_remove(start + o);
         }
     };
-    if split_into(alias, &chunks) + 1 != chunks.len() {
+    if split_into(alias, &pieces) + 1 != pieces.len() {
         undo(0, 0);
         return Err(crate::ENOMEM);
     }
+    let mut mapped = 0;
     for &(o, n) in &chunks {
         let Some(section) = reserved_section(n) else {
-            undo(sections.len(), charges.len());
+            undo(mapped, charges.len());
             return Err(crate::ENOMEM);
         };
-        if !view_into(&section, alias + o, n) {
-            undo(sections.len(), charges.len());
+        let views_here = chunk_views(o, n).count();
+        let done = map_chunk(&section, alias + o, n);
+        mapped += done;
+        if done != views_here {
+            undo(mapped, charges.len());
             return Err(crate::ENOMEM);
         }
         sections.push(section);
         let Some(c) = charge_add(start + o, n) else {
-            undo(sections.len(), charges.len());
+            undo(mapped, charges.len());
             return Err(crate::ENOMEM);
         };
         charges.push(c);
     }
     // The resident pages: their charge, then the section's pages through the
-    // alias, a chunk at a time (a commit stays within one view), then their
+    // alias, a view at a time (a commit stays within one view), then their
     // content.
+    let view_start = |off: usize| pieces.binary_search_by_key(&off, |&(o, _)| o).is_ok();
     let mut i = 0;
     while i < resident.len() {
         if resident[i] & 1 == 0 {
@@ -3639,12 +3840,12 @@ fn uffd_alias_chunked(t: &mut Table, start: usize, len: usize, resident: &[u8]) 
             continue;
         }
         let first = i;
-        while i < resident.len() && resident[i] & 1 != 0 && (i == first || !(i * PAGE).is_multiple_of(UFFD_CHUNK)) {
+        while i < resident.len() && resident[i] & 1 != 0 && (i == first || !view_start(i * PAGE)) {
             i += 1;
         }
         let (off, n) = (first * PAGE, (i - first) * PAGE);
         if !charge(start + off, n) || !commit_now(alias + off, n, PAGE_READWRITE, false) {
-            undo(sections.len(), charges.len());
+            undo(mapped, charges.len());
             return Err(crate::ENOMEM);
         }
         // SAFETY: resident pages of the mapping, into the alias.
@@ -3652,7 +3853,7 @@ fn uffd_alias_chunked(t: &mut Table, start: usize, len: usize, resident: &[u8]) 
     }
     // SAFETY: gives the private allocation back as a placeholder.
     if unsafe { VirtualFree(start as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
-        undo(sections.len(), charges.len());
+        undo(mapped, charges.len());
         return Err(crate::EINVAL);
     }
     let r = t.remove(&start).unwrap();
@@ -3660,26 +3861,29 @@ fn uffd_alias_chunked(t: &mut Table, start: usize, len: usize, resident: &[u8]) 
         lazy_remove(start, len);
         touched_remove(start);
     }
-    // From here the private memory is gone: a failure leaves the chunks as
-    // placeholders of the table's.
-    let split = split_into(start, &chunks);
-    let mut mapped = 0;
-    if split + 1 == chunks.len() {
-        while mapped < chunks.len() && view_into(&sections[mapped], start + chunks[mapped].0, chunks[mapped].1) {
-            mapped += 1;
+    // From here the private memory is gone: a failure leaves the range a
+    // placeholder of the table's.
+    let split = split_into(start, &pieces);
+    let mut guest = 0;
+    if split + 1 == pieces.len() {
+        while guest < views.len() && view_into(&sections[chunk_of(guest)], start + views[guest].0, views[guest].1, views[guest].2) {
+            guest += 1;
         }
     }
-    if mapped < chunks.len() {
-        for (k, &(o, n)) in chunks.iter().enumerate().take(split + 1) {
-            if k < mapped {
-                // SAFETY: unmaps a view made here, keeping its placeholder.
-                unsafe {
-                    UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: (start + o) as *mut c_void }, MEM_PRESERVE_PLACEHOLDER)
-                };
-            }
-            t.insert(start + o, Region::new(if k < split { n } else { len - o }, Kind::Placeholder));
+    if guest < views.len() {
+        for &(o, _, _) in &views[..guest] {
+            // SAFETY: unmaps a view made here, keeping its placeholder.
+            unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: (start + o) as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) };
         }
-        undo(sections.len(), charges.len());
+        // SAFETY: coalesces the placeholders split here back into one.
+        if split == 0 || unsafe { VirtualFree(start as *mut c_void, len, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) } != 0 {
+            t.insert(start, Region::new(len, Kind::Placeholder));
+        } else {
+            for (k, &(o, n)) in pieces.iter().enumerate().take(split + 1) {
+                t.insert(start + o, Region::new(if k < split { n } else { len - o }, Kind::Placeholder));
+            }
+        }
+        undo(mapped, charges.len());
         return Err(crate::ENOMEM);
     }
     drop(sections);
@@ -3715,15 +3919,14 @@ pub(crate) fn uffd_swap_chunk(view: usize, len: usize, alias: usize) -> bool {
     let Some(section) = reserved_section(len) else {
         return false;
     };
-    #[cfg(test)]
-    viewrec_alias(0);
-    // SAFETY: unmaps the chunk's alias view, keeping its placeholder; the
-    // guest's view keeps the old section until it is unmapped too.
-    if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
-        return false;
+    // The chunk's alias views, unmapped keeping their placeholders; the
+    // guest's views keep the old section until they are unmapped too.
+    match unmap_alias(alias, len) {
+        Some(true) => {}
+        Some(false) => return false,
+        // SAFETY: plain call.
+        None => out_of_memory(view, unsafe { GetLastError() }),
     }
-    #[cfg(test)]
-    viewrec_alias(1);
     if !swap_views(&section, view, alias, len, 2) {
         // SAFETY: plain call.
         out_of_memory(view, unsafe { GetLastError() });
@@ -3821,14 +4024,16 @@ fn moverec(i: usize, v: usize) {
     MOVEREC[i].store(v, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// VIEWCOST, for tests: the last swap of a chunk's two views
-/// ([`swap_views`], by [`uffd_move_chunk`] or [`uffd_swap_chunk`]), the
-/// process's private commit in bytes: [0] before the alias's unmap, [1]
-/// after it, [2] after the alias's map, [3] after the guest view's unmap,
-/// [4] after its map (0 where a step was not reached); [5] 1 for a move, 2
-/// for a swap.
+/// VIEWCOST, for tests: the last swap of a chunk's views in the alias and
+/// the guest's view, two each ([`chunk_views`]; [`unmap_alias`] and
+/// [`swap_views`], by [`uffd_move_chunk`] or [`uffd_swap_chunk`]), the
+/// process's private commit in bytes: [0] before the alias's first view's
+/// unmap, [1] after it, [2] after its second view's unmap, [3] after its
+/// first view's map, [4] after its second's; [5] to [8] the same for the
+/// guest's view (0 where a step was not reached; a chunk of one view has
+/// its second steps as its first's); [9] 1 for a move, 2 for a swap.
 #[cfg(test)]
-pub(crate) static VIEWREC: [std::sync::atomic::AtomicUsize; 6] = [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
+pub(crate) static VIEWREC: [std::sync::atomic::AtomicUsize; 10] = [const { std::sync::atomic::AtomicUsize::new(0) }; 10];
 
 /// Run by [`swap_views`] between the guest view's unmap and its map: for
 /// the test of another commit taking the room the unmap gave
@@ -3842,47 +4047,94 @@ pub(crate) static BETWEEN_GUEST_UNMAP_AND_MAP: Mutex<Option<fn()>> = Mutex::new(
 #[cfg(test)]
 pub(crate) static ALIAS_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The chunk's alias view, unmapped by the caller keeping its placeholder,
-/// and then its guest view, each given `section` in its place
-/// ([`uffd_swap_chunk`], [`uffd_move_chunk`]): whether all three steps
-/// were made. `kind` is for the record (VIEWREC: 1 a move, 2 a swap).
+/// The chunk's alias views ([`chunk_views`]) unmapped keeping their
+/// placeholders ([`uffd_swap_chunk`], [`uffd_move_chunk`]): `Some(true)`;
+/// `Some(false)` if its first view's unmap was refused, nothing changed;
+/// `None` if its second's was, the first's placeholder left.
+fn unmap_alias(alias: usize, len: usize) -> Option<bool> {
+    #[cfg(test)]
+    {
+        for v in &VIEWREC {
+            v.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+        viewrec(0);
+    }
+    for (i, (a, _, _)) in chunk_views(alias, len).enumerate() {
+        // SAFETY: unmaps a view of the chunk's alias, keeping its placeholder.
+        if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
+            return if i == 0 { Some(false) } else { None };
+        }
+        #[cfg(test)]
+        viewrec(1 + i);
+    }
+    #[cfg(test)]
+    viewrec_same(1, 2);
+    Some(true)
+}
+
+/// The chunk's alias views, unmapped by the caller keeping their
+/// placeholders ([`unmap_alias`]), and then its guest views, each given
+/// `section`'s view in its place ([`chunk_views`]; [`uffd_swap_chunk`],
+/// [`uffd_move_chunk`]): whether every step was made. `kind` is for the
+/// record (VIEWREC: 1 a move, 2 a swap).
 fn swap_views(section: &Owned, view: usize, alias: usize, len: usize, #[cfg_attr(not(test), allow(unused_variables))] kind: usize) -> bool {
     #[cfg(test)]
-    {
-        VIEWREC[2].store(0, std::sync::atomic::Ordering::SeqCst);
-        VIEWREC[3].store(0, std::sync::atomic::Ordering::SeqCst);
-        VIEWREC[4].store(0, std::sync::atomic::Ordering::SeqCst);
-        VIEWREC[5].store(kind, std::sync::atomic::Ordering::SeqCst);
-    }
-    if !view_into(section, alias, len) {
-        return false;
-    }
-    #[cfg(test)]
-    VIEWREC[2].store(moverec_commit(), std::sync::atomic::Ordering::SeqCst);
-    // SAFETY: unmaps the chunk's guest view, keeping its placeholder.
-    if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
-        return false;
+    VIEWREC[9].store(kind, std::sync::atomic::Ordering::SeqCst);
+    for (i, (a, o, n)) in chunk_views(alias, len).enumerate() {
+        #[cfg(not(test))]
+        let _ = i;
+        if !view_into(section, a, o, n) {
+            return false;
+        }
+        #[cfg(test)]
+        viewrec(3 + i);
     }
     #[cfg(test)]
+    viewrec_same(3, 4);
+    for (i, (a, _, _)) in chunk_views(view, len).enumerate() {
+        #[cfg(not(test))]
+        let _ = i;
+        // SAFETY: unmaps a view of the chunk's guest view, keeping its placeholder.
+        if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
+            return false;
+        }
+        #[cfg(test)]
+        viewrec(5 + i);
+    }
+    #[cfg(test)]
     {
-        VIEWREC[3].store(moverec_commit(), std::sync::atomic::Ordering::SeqCst);
+        viewrec_same(5, 6);
         if let Some(hook) = *BETWEEN_GUEST_UNMAP_AND_MAP.lock().unwrap() {
             hook();
         }
     }
-    let mapped = view_into(section, view, len);
-    #[cfg(test)]
-    if mapped {
-        VIEWREC[4].store(moverec_commit(), std::sync::atomic::Ordering::SeqCst);
+    for (i, (a, o, n)) in chunk_views(view, len).enumerate() {
+        #[cfg(not(test))]
+        let _ = i;
+        if !view_into(section, a, o, n) {
+            return false;
+        }
+        #[cfg(test)]
+        viewrec(7 + i);
     }
-    mapped
+    #[cfg(test)]
+    viewrec_same(7, 8);
+    true
 }
 
-/// VIEWCOST: the private commit before a chunk's alias view is unmapped
-/// ([0]) and after ([1]).
+/// VIEWCOST: the private commit now, as step `i`.
 #[cfg(test)]
-fn viewrec_alias(i: usize) {
+fn viewrec(i: usize) {
     VIEWREC[i].store(moverec_commit(), std::sync::atomic::Ordering::SeqCst);
+}
+
+/// VIEWCOST: step `second` as step `first` if a chunk of one view did not
+/// reach it.
+#[cfg(test)]
+fn viewrec_same(first: usize, second: usize) {
+    if VIEWREC[second].load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        VIEWREC[second].store(VIEWREC[first].load(std::sync::atomic::Ordering::SeqCst), std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// How many moves were not made once begun ([`uffd_move_chunk`]: their new
@@ -4197,13 +4449,10 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
         unmap_tmp("commit its live pages in the new section");
         return None;
     }
+    let cut = view + chunk_half(len);
     let protect_live = |prot| {
         let mut ok = true;
-        for_each_picked(view, len, &live, |a, n| {
-            let mut old = 0;
-            // SAFETY: changes the protection of the chunk's committed pages.
-            ok &= unsafe { VirtualProtect(a as *const c_void, n, prot, &mut old) != 0 };
-        });
+        for_each_picked(view, len, &live, |a, n| ok &= either_side(a, n, cut, |a, n| protect(a, n, prot)));
         ok
     };
     if !protect_live(PAGE_NOACCESS) {
@@ -4227,19 +4476,20 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
     if let Some(hook) = *MOVE_HOOK.lock().unwrap() {
         hook();
     }
-    #[cfg(test)]
-    viewrec_alias(0);
-    // SAFETY: unmaps the chunk's alias view, keeping its placeholder; the
-    // guest's view keeps the old section until it is unmapped too.
-    if unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) } == 0 {
-        protect_live(PAGE_READWRITE);
-        #[cfg(test)]
-        moverec(9, 4);
-        unmap_tmp("unmap its alias");
-        return None;
+    // The chunk's alias views, unmapped keeping their placeholders; the
+    // guest's views keep the old section until they are unmapped too.
+    match unmap_alias(alias, len) {
+        Some(true) => {}
+        Some(false) => {
+            protect_live(PAGE_READWRITE);
+            #[cfg(test)]
+            moverec(9, 4);
+            unmap_tmp("unmap its alias");
+            return None;
+        }
+        // SAFETY: plain call.
+        None => out_of_memory(view, unsafe { GetLastError() }),
     }
-    #[cfg(test)]
-    viewrec_alias(1);
     if !swap_views(&section, view, alias, len, 1) {
         // SAFETY: plain call.
         out_of_memory(view, unsafe { GetLastError() });
@@ -4278,9 +4528,9 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, missing: &d
 }
 
 /// Calls `f` with the part of `[s, s + len)` in each region of the table,
-/// in order (the whole of it if no region holds any of it), until `f`
-/// gives `false`; whether every call gave `true`. A commit or protection
-/// change stays within one view. Each part is found under the table's lock
+/// and in each view of a chunk's ([`chunk_views`]), in order (the whole of
+/// it if no region holds any of it), until `f` gives `false`; whether every
+/// call gave `true`. A commit or protection change stays within one view. Each part is found under the table's lock
 /// and `f` runs without it, as the parts were listed before (a fill at the
 /// job's limit allocates nothing: `test_a_fill_at_the_limit_allocates_nothing`).
 fn each_region_piece(s: usize, len: usize, mut f: impl FnMut(usize, usize) -> bool) -> bool {
@@ -4295,7 +4545,11 @@ fn each_region_piece(s: usize, len: usize, mut f: impl FnMut(usize, usize) -> bo
                 .next_back()
                 .filter(|(b, r)| **b + r.len > at)
                 .or_else(|| t.range(at..e).next())
-                .map(|(b, r)| (at.max(*b), e.min(*b + r.len)))
+                .map(|(b, r)| {
+                    let (a, z) = (at.max(*b), e.min(*b + r.len));
+                    let cut = view_cut(*b, r.len, &r.kind);
+                    (a, if cut > a && cut < z { cut } else { z })
+                })
         };
         let Some((a, z)) = piece else {
             break;
@@ -4538,8 +4792,12 @@ fn released_forget(s: usize, len: usize) {
     if RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) == 0 {
         return;
     }
+    forget_in(&mut RELEASED.lock().unwrap()[..], s, len);
+}
+
+/// [`released_forget`] in `records`, locked by the caller.
+fn forget_in(records: &mut [Record], s: usize, len: usize) {
     let e = s.saturating_add(len);
-    let mut records = RELEASED.lock().unwrap();
     for r in records.iter_mut().filter(|r| r.state != RecordState::Free && r.start < e && s < r.end) {
         for at in (s.max(r.start)..e.min(r.end)).step_by(PAGE) {
             if r.left == 0 {
@@ -4597,7 +4855,7 @@ fn released_protect(s: usize, e: usize, wprot: PAGE_PROTECTION_FLAGS) -> bool {
     true
 }
 
-fn released_is_pending(at: usize) -> bool {
+pub(crate) fn released_is_pending(at: usize) -> bool {
     RELEASED_LIVE.load(std::sync::atomic::Ordering::Acquire) != 0 && RELEASED.lock().unwrap().iter().any(|r| r.holds(at) && r.get(PENDING, at))
 }
 
@@ -4609,8 +4867,9 @@ fn released_is_pending(at: usize) -> bool {
 /// discarded one is charged, zeroed through the alias while still closed,
 /// then given its protection. `PROT_NONE`, or a write the protection
 /// denies: [`Access::NotLazy`], the fault as on Linux. Refused (the job's
-/// limit): [`Access::Exhausted`], nothing changed, for the caller to
-/// reclaim and ask again. The bit is cleared once the page is open, under
+/// limit): [`Access::Exhausted`], nothing changed but the regions of a
+/// block committed before the refusal (resolved, [`commit_regions`]), for
+/// the caller to reclaim and ask again. The bit is cleared once the page is open, under
 /// the lock, so a thread that faulted on it meanwhile finds it open.
 fn released_resolve(addr: usize, write: bool, grain: usize) -> Option<(Access, core::ops::Range<usize>)> {
     let page = addr - addr % PAGE;
@@ -4672,21 +4931,61 @@ fn released_resolve(addr: usize, write: bool, grain: usize) -> Option<(Access, c
         && (block..block + grain).step_by(PAGE).all(|a| r.get(PENDING, a) && r.prot(a) == prot)
         && reserved_only(block, block + grain);
     let (from, to) = if whole { (block, block + grain) } else { (page, page + PAGE) };
-    if !commit(from, to - from, prot, false) {
-        // A huge page that cannot be charged falls back to a page, as
-        // Linux's does (mm/huge_memory.c, `THP_FAULT_FALLBACK_CHARGE`).
-        // SAFETY: plain call.
-        let err = unsafe { GetLastError() };
-        if to - from == PAGE || !commit(page, PAGE, prot, false) {
-            return Some((Access::Exhausted(err), 0..0));
-        }
-        r.resolved(page);
-        return Some((Access::Committed, page..page + PAGE));
-    }
-    for at in (from..to).step_by(PAGE) {
+    // A region at a time: the block is reserved only, so each region lies
+    // in one view, and a chunk's 2 MiB is two views (review B1), which one
+    // commit cannot span (refused, and before this a page committed in
+    // place of the huge one: test_a_released_chunks_huge_page_is_committed_whole).
+    let (done, err) = commit_regions(from, to, prot);
+    // What was committed is resolved, all of it or the regions before a
+    // refusal: each page of the block was pending, never filled and
+    // reserved (`whole` checks all three), so a commit made it a new zero
+    // page of the reserved section, with the block's protection (each
+    // page's is `prot`, checked) and its charge taken by [`commit`]: what
+    // its own first access would have given it.
+    for at in (from..done).step_by(PAGE) {
         r.resolved(at);
     }
-    Some((Access::Committed, from..to))
+    if done == to {
+        return Some((Access::Committed, from..to));
+    }
+    // Refused part way: the regions committed before the refusal stay
+    // committed (a section's page cannot be decommitted: SECTREC-h), and
+    // are resolved above. A huge page that cannot be
+    // charged falls back to a page, as Linux's does (mm/huge_memory.c,
+    // `THP_FAULT_FALLBACK_CHARGE`); the error reported is the first
+    // refusal's.
+    if page < done {
+        return Some((Access::Committed, from..done));
+    }
+    if to - from == PAGE || !commit(page, PAGE, prot, false) {
+        return Some((Access::Exhausted(err), 0..0));
+    }
+    r.resolved(page);
+    Some((Access::Committed, page..page + PAGE))
+}
+
+/// Commits `[from, to)`, reserved memory, with `prot` and its charge
+/// ([`commit`]), one `VirtualQuery` region at a time, which stays within one
+/// allocation (a view), in order, up to the first refusal: the end of the
+/// part committed, and that refusal's error (0 if none).
+fn commit_regions(from: usize, to: usize, prot: PAGE_PROTECTION_FLAGS) -> (usize, u32) {
+    let mut at = from;
+    while at < to {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        let run = if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            to - at
+        } else {
+            (mbi.BaseAddress as usize + mbi.RegionSize).min(to) - at
+        };
+        if !commit(at, run, prot, false) {
+            // SAFETY: plain call.
+            return (at, unsafe { GetLastError() });
+        }
+        at += run;
+    }
+    (to, 0)
 }
 
 /// Tests: a resolve of a discarded page parks after zeroing it, holding the
@@ -4773,8 +5072,12 @@ fn released_prefault(addr: usize, len: usize) {
 fn unalias(base: usize, len: usize, kind: &Kind) {
     released_view_gone(base, len);
     if let Kind::View { alias: Some(alias), .. } = kind {
-        // SAFETY: unmaps the alias view made by `uffd_alias`.
-        unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: *alias as *mut c_void }, 0) };
+        if is_chunk(kind) {
+            unmap_chunk(*alias, len, false);
+        } else {
+            // SAFETY: unmaps the alias view made by `uffd_alias`.
+            unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: *alias as *mut c_void }, 0) };
+        }
     }
 }
 
@@ -4782,7 +5085,8 @@ fn unalias(base: usize, len: usize, kind: &Kind) {
 /// `alias` ([`uffd_alias`]) no longer the userfaultfd's: handed to the view
 /// if the view has discarded pages still to zero (pending and committed in
 /// its record), which keeps it until it goes, else unmapped now.
-/// `reserved`: the alias is one view per [`UFFD_CHUNK`], else one view.
+/// `reserved`: the alias is a chunk's views per [`UFFD_CHUNK`]
+/// ([`chunk_views`]), else one view.
 pub(crate) fn uffd_unalias(start: usize, len: usize, alias: usize, reserved: bool) {
     let step = if reserved { UFFD_CHUNK } else { len };
     let mut guard = table().lock().unwrap();
@@ -4797,8 +5101,12 @@ pub(crate) fn uffd_unalias(start: usize, len: usize, alias: usize, reserved: boo
                 continue;
             }
         }
-        // SAFETY: unmaps an alias view made by `uffd_alias`.
-        unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: (alias + o) as *mut c_void }, 0) };
+        if reserved {
+            unmap_chunk(alias + o, n, false);
+        } else {
+            // SAFETY: unmaps an alias view made by `uffd_alias`.
+            unsafe { UnmapViewOfFile2(proc(), MEMORY_MAPPED_VIEW_ADDRESS { Value: (alias + o) as *mut c_void }, 0) };
+        }
     }
 }
 

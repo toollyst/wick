@@ -1891,6 +1891,14 @@ jobs:
           alone wick_uffd::tests::test_what_a_view_mapping_charges_on_record
           alone wick_uffd::tests::test_the_room_a_move_needs_on_record
           alone wick_uffd::tests::test_a_stack_that_grows_at_the_limit_on_record
+          # VIEWCOST: what each step of a chunk's view swap gives back and
+          # takes of the process's commit, each chunk two views split at its
+          # midpoint, by placement; asserted, a view's unmap or map while
+          # the chunk's other view maps its 2 MiB region takes nothing.
+          # UFFDHALF: a 1 GiB register and 100 whole-chunk discards, in us a
+          # chunk.
+          alone wick_uffd::tests::test_what_a_chunks_view_swap_costs_on_record
+          alone wick_uffd::tests::test_a_chunks_views_cost_on_record
           # FILTERREC: how an unhandled exception on a thread pool's thread
           # ends by the child's error mode (0, 2, and 3 as this runner gives
           # its children): a stack overflow at the reserve's end and an

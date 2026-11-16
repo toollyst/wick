@@ -5330,41 +5330,90 @@ mod tests {
     }
 
     /// VIEWCOST: the last view swap's steps (`windows_mm::VIEWREC`) in KiB
-    /// of private commit, said without allocating.
+    /// of private commit, each `None` if not reached: the alias's first
+    /// view's unmap, its second's, its first's map, its second's, then the
+    /// same for the guest's view.
+    fn viewcost_steps() -> [Option<i64>; 8] {
+        let v: [usize; 10] = core::array::from_fn(|i| crate::windows_mm::VIEWREC[i].load(Ordering::SeqCst));
+        let d = |a: usize, b: usize| (a != 0 && b != 0).then(|| (b as i64 - a as i64) / 1024);
+        [d(v[0], v[1]), d(v[1], v[2]), d(v[2], v[3]), d(v[3], v[4]), d(v[4], v[5]), d(v[5], v[6]), d(v[6], v[7]), d(v[7], v[8])]
+    }
+
+    /// VIEWCOST: the last view swap's steps ([`viewcost_steps`]), said
+    /// without allocating.
     fn viewcost_line(case: &str, view: usize, alias: usize, extra: core::fmt::Arguments<'_>) {
-        let v: [usize; 6] = core::array::from_fn(|i| crate::windows_mm::VIEWREC[i].load(Ordering::SeqCst));
-        let d = |a: usize, b: usize| if a == 0 || b == 0 { i64::MIN } else { (b as i64 - a as i64) / 1024 };
+        let k = |x: Option<i64>| x.unwrap_or(i64::MIN);
+        let v = viewcost_steps();
         crate::windows_mm::say_at_the_limit(format_args!(
             "VIEWCOST {case}, {}: the guest view at {view:#x}, {} KiB into its 2 MiB, {} MiB into its 1 GiB; its alias at {alias:#x}, \
-             {} KiB into its 2 MiB, {} MiB into its 1 GiB; KiB: alias unmap {:+}, alias map {:+}, guest view unmap {:+}, guest view \
-             map {:+}{extra}",
-            if v[5] == 1 { "move" } else { "swap" },
+             {} KiB into its 2 MiB, {} MiB into its 1 GiB; KiB, each of a chunk's two views (first, second): alias unmap {:+} {:+}, \
+             alias map {:+} {:+}, guest view unmap {:+} {:+}, guest view map {:+} {:+}{extra}",
+            if crate::windows_mm::VIEWREC[9].load(Ordering::SeqCst) == 1 { "move" } else { "swap" },
             (view % CHUNK as usize) >> 10,
             (view % (1 << 30)) >> 20,
             (alias % CHUNK as usize) >> 10,
             (alias % (1 << 30)) >> 20,
-            d(v[0], v[1]),
-            d(v[1], v[2]),
-            d(v[2], v[3]),
-            d(v[3], v[4]),
+            k(v[0]),
+            k(v[1]),
+            k(v[2]),
+            k(v[3]),
+            k(v[4]),
+            k(v[5]),
+            k(v[6]),
+            k(v[7]),
         ));
     }
 
+    /// Whether a 2 MiB region that `[a, z)` touches holds no other part of
+    /// the range `[s, e)`: a view's unmap there, with the rest of the range
+    /// mapped, gives back the region's page table.
+    fn alone_in_a_region(a: usize, z: usize, s: usize, e: usize) -> bool {
+        let c = CHUNK as usize;
+        (a - a % c..z).step_by(c).any(|r| r.max(s) >= a && (r + c).min(e) <= z)
+    }
+
+    /// VIEWCOST's assertion for the chunk at `chunk` of the range `[mem,
+    /// mem + len)`, whose alias is at `alias`: a view's unmap while the
+    /// chunk's other view still maps it (the first's), and a view's map
+    /// while the other does (the second's), take and give no page table, in
+    /// the alias and the guest's view, but for a view alone in a 2 MiB region
+    /// of its range ([`alone_in_a_region`]: a range's edge 1 MiB or more
+    /// short of a 2 MiB boundary), not asserted.
+    fn assert_halves_cost_nothing(what: &str, chunk: usize, mem: usize, len: usize, alias: usize) {
+        let v = viewcost_steps();
+        let h = crate::windows_mm::chunk_half(CHUNK as usize);
+        let c = CHUNK as usize;
+        for (side, base, unmap, map) in [("the alias's", alias, v[0], v[3]), ("the guest view's", mem, v[4], v[7])] {
+            let at = base + (chunk - mem);
+            if !alone_in_a_region(at, at + h, base, base + len) {
+                assert_eq!(unmap, Some(0), "{what}: {side} first view's unmap, the second mapped: {v:?}");
+            }
+            if !alone_in_a_region(at + h, at + c, base, base + len) {
+                assert_eq!(map, Some(0), "{what}: {side} second view's map, the first mapped: {v:?}");
+            }
+        }
+    }
+
     /// VIEWCOST, a record: what each step of a chunk's view swap
-    /// (`windows_mm::swap_views`: the alias view unmapped keeping its
-    /// placeholder, the new section mapped there, then the same for the
-    /// guest view) adds to the process's private commit, for a move (one
-    /// dead page, `reclaim_at_touch`) and then a swap (the chunk discarded
-    /// whole), of the first, middle and last chunk of a 3-chunk range and
-    /// of a 1-chunk range, the range and its alias each on a 2 MiB boundary
-    /// in a fresh 1 GiB, 64 KiB past one, and where the product puts them
-    /// (anywhere). A view's page tables are charged at its map and given
-    /// back at its unmap (MAPCOST); between the guest view's unmap and its
-    /// map, what the unmap gave is room another commit can take
-    /// (`test_a_move_whose_guest_view_room_is_taken_is_made`). Printed,
-    /// asserted only for the moves and swaps being made.
+    /// (`windows_mm::unmap_alias` and `swap_views`: the alias's two views
+    /// unmapped keeping their placeholders, the new section's views mapped
+    /// there, then the same for the guest's view) adds to the process's
+    /// private commit, for a move (one dead page, `reclaim_at_touch`) and
+    /// then a swap (the chunk discarded whole), of the first, middle and last
+    /// chunk of a 3-chunk range and of a 1-chunk range, the range and its
+    /// alias each on a 2 MiB boundary in a fresh 1 GiB, 64 KiB past one, and
+    /// where the product puts them (anywhere: the alias on a 2 MiB
+    /// boundary). A view's page tables are charged at its map and given back
+    /// at its unmap (MAPCOST); between the guest view's unmap and its map,
+    /// what the unmap gave is room another commit can take
+    /// (`test_a_move_whose_guest_view_room_is_taken_is_made`). Asserted: the
+    /// moves and swaps are made, and a view's unmap or map while the
+    /// chunk's other view maps it takes no page table
+    /// ([`assert_halves_cost_nothing`]), but for a view alone in a 2 MiB
+    /// region of its range: the last chunk's second view of a range whose
+    /// end is 1 MiB or less past a 2 MiB boundary.
     #[test]
-    #[ignore = "a record, run by hand"]
+    #[ignore = "a record: run alone on Windows with --ignored --nocapture (CI's WHP step)"]
     fn test_what_a_chunks_view_swap_costs_on_record() {
         let page = [0x5au8; PAGE as usize];
         for (case, off) in [("on a 2 MiB boundary", Some(0usize)), ("64 KiB past a 2 MiB boundary", Some(64 << 10)), ("anywhere", None)] {
@@ -5396,6 +5445,7 @@ mod tests {
                 register(ctx, mem, len).unwrap();
                 let alias = range_of_view(mem as usize).unwrap().0.alias.load(Ordering::Acquire) as usize;
                 assert!(alias_at == 0 || alias == alias_at, "{case}: the alias at {alias:#x}, asked at {alias_at:#x}");
+                assert!(alias_at != 0 || alias.is_multiple_of(CHUNK as usize), "{case}: the alias at {alias:#x}, not on a 2 MiB boundary");
                 // The first and last 16 pages of each chunk filled.
                 for c in 0..n {
                     for p in (0..16).chain(CHUNK / PAGE - 16..CHUNK / PAGE) {
@@ -5428,12 +5478,14 @@ mod tests {
                             (m[8] as i64 - m[7] as i64) / 1024
                         ),
                     );
+                    assert_halves_cost_nothing(&std::format!("{what}, the move"), chunk as usize, mem as usize, len as usize, alias);
                     // SAFETY: registered memory of ours, the chunk whole.
                     assert_eq!(unsafe { crate::madvise(chunk as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED) }, 0);
-                    assert_eq!(crate::windows_mm::VIEWREC[5].load(Ordering::SeqCst), 2, "{what}: the swap");
-                    assert_ne!(crate::windows_mm::VIEWREC[4].load(Ordering::SeqCst), 0, "{what}: the swap");
+                    assert_eq!(crate::windows_mm::VIEWREC[9].load(Ordering::SeqCst), 2, "{what}: the swap");
+                    assert_ne!(crate::windows_mm::VIEWREC[8].load(Ordering::SeqCst), 0, "{what}: the swap");
                     viewcost_line(&what, chunk as usize, alias + (c * CHUNK) as usize, format_args!(""));
-                    crate::windows_mm::VIEWREC[5].store(0, Ordering::SeqCst);
+                    assert_halves_cost_nothing(&std::format!("{what}, the swap"), chunk as usize, mem as usize, len as usize, alias);
+                    crate::windows_mm::VIEWREC[9].store(0, Ordering::SeqCst);
                 }
                 // SAFETY: closes the user end, then unmaps our mapping.
                 unsafe {
@@ -5441,6 +5493,369 @@ mod tests {
                     assert_eq!(crate::munmap(mem as *mut c_void, len as usize), 0);
                 }
             }
+        }
+    }
+
+    /// A chunk's two views (`windows_mm::chunk_views`, split at 1 MiB) are
+    /// one mapping to every call across the split, each of which Windows
+    /// refuses across two views ("All pages in the specified region must be
+    /// within the same reserved region", Learn, VirtualProtect): a register
+    /// with resident pages on both sides of it (its commits through the
+    /// alias); a fill of two pages across it (`uffd_commit`); a
+    /// `MADV_DONTNEED` of two pages across it while registered (missing
+    /// again), a `UFFDIO_ZEROPAGE` across it, and a refill; once
+    /// unregistered, an mprotect read-only and back and a partial munmap
+    /// across it (`mprotect_rest`, `munmap`); a `MAP_FIXED` mapping over
+    /// the second chunk (its views unmapped and their placeholders made one
+    /// region again); and the munmap of the rest. Each call succeeds and
+    /// the pages read back.
+    #[test]
+    fn test_a_chunks_two_views_are_one_mapping_to_every_call() {
+        let half = crate::windows_mm::chunk_half(CHUNK as usize) as u64;
+        assert_eq!(half, CHUNK / 2);
+        let len = 2 * CHUNK;
+        // SAFETY: a new anonymous mapping.
+        let mem = unsafe {
+            crate::mmap(ptr::null_mut(), len as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0)
+        };
+        assert_ne!(mem, crate::MAP_FAILED);
+        let mem = mem as u64;
+        let byte = |at: u64| {
+            // SAFETY: mapped memory of ours.
+            unsafe { ptr::read_volatile(at as *const u8) }
+        };
+        for p in [half - PAGE, half] {
+            // SAFETY: mapped memory of ours.
+            unsafe { ptr::write_volatile((mem + p) as *mut u8, 0x11) };
+        }
+        let (ctx, user) = create(0, false, true).unwrap();
+        register(ctx, mem, len).unwrap();
+        assert!(range_of_view(mem as usize).is_some_and(|(r, _)| r.reserved.load(Ordering::Acquire)), "not a chunked range");
+        for p in [half - PAGE, half] {
+            assert_eq!(byte(mem + p), 0x11, "resident page {p:#x} after the register");
+        }
+        let src = [0x22u8; 2 * PAGE as usize];
+        let across = mem + CHUNK + half - PAGE;
+        // SAFETY: `src` holds the two pages.
+        assert_eq!(unsafe { copy(ctx, src.as_ptr(), across, 2 * PAGE, false) }, Ok(2 * PAGE), "the fill across the split");
+        assert_eq!((byte(across), byte(across + PAGE)), (0x22, 0x22));
+        // A discard of the two pages across the split while registered:
+        // missing again, a zero page across it, discarded again, refilled.
+        let two = (mem + half - PAGE) as *mut c_void;
+        let discard = || {
+            // SAFETY: two pages of ours across the split.
+            assert_eq!(unsafe { crate::madvise(two, 2 * PAGE as usize, crate::MADV_DONTNEED) }, 0, "MADV_DONTNEED across the split");
+            assert!(is_missing(mem + half - PAGE) && is_missing(mem + half), "the discarded pages are missing");
+        };
+        discard();
+        assert_eq!(zeropage(ctx, mem + half - PAGE, 2 * PAGE, false), Ok(2 * PAGE), "the zero page across the split");
+        assert_eq!((byte(mem + half - PAGE), byte(mem + half)), (0, 0));
+        discard();
+        let refill = [0x44u8; 2 * PAGE as usize];
+        // SAFETY: `refill` holds the two pages.
+        assert_eq!(unsafe { copy(ctx, refill.as_ptr(), mem + half - PAGE, 2 * PAGE, false) }, Ok(2 * PAGE), "the refill across the split");
+        assert_eq!((byte(mem + half - PAGE), byte(mem + half)), (0x44, 0x44));
+        unregister(ctx, mem, len).unwrap();
+        let start = (mem + half - 2 * PAGE) as *mut c_void;
+        // SAFETY: mapped memory of ours, four pages across the split.
+        unsafe {
+            assert_eq!(crate::mprotect(start, 4 * PAGE as usize, crate::PROT_READ), 0, "mprotect read-only across the split");
+            assert_eq!(crate::mprotect(start, 4 * PAGE as usize, crate::PROT_READ | crate::PROT_WRITE), 0, "and back");
+        }
+        assert_eq!((byte(mem + half - PAGE), byte(mem + half)), (0x44, 0x44));
+        // SAFETY: mapped memory of ours, written across the split.
+        unsafe { ptr::write_volatile((mem + half) as *mut u8, 0x33) };
+        // SAFETY: two pages of ours across the split.
+        assert_eq!(unsafe { crate::munmap((mem + half - PAGE) as *mut c_void, 2 * PAGE as usize) }, 0, "munmap across the split");
+        // SAFETY: a new anonymous mapping over the second chunk.
+        let fixed = unsafe {
+            crate::mmap(
+                (mem + CHUNK) as *mut c_void,
+                CHUNK as usize,
+                crate::PROT_READ | crate::PROT_WRITE,
+                crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(fixed as u64, mem + CHUNK, "MAP_FIXED over the second chunk");
+        assert_eq!(byte(across), 0, "the new mapping's page");
+        // SAFETY: our mappings, whole.
+        unsafe {
+            assert_eq!(crate::munmap(mem as *mut c_void, len as usize), 0);
+            ws::closesocket(sock(user));
+        }
+    }
+
+    /// A `MADV_DONTNEED` of a released chunk's pages (registered, then
+    /// unregistered) reads zeros after, as Linux's anonymous memory does
+    /// once its userfaultfd is gone (mm/madvise.c `MADV_DONTNEED` zaps the
+    /// pages): two pages across the split, then the whole second chunk.
+    /// Here the pages keep their data, a defect from before review B1 (one
+    /// view a chunk: PROBEDISCARD "reserved true madvise 0 byte after
+    /// 0x11"), not made by it: SECURITY.md, Not at parity yet.
+    #[test]
+    #[ignore = "fails until a released chunk's discard is made (SECURITY.md, Not at parity yet: MADV_DONTNEED of a released userfaultfd chunk keeps its data)"]
+    fn test_a_discard_of_a_released_chunk_reads_zeros() {
+        let half = crate::windows_mm::chunk_half(CHUNK as usize) as u64;
+        let len = 2 * CHUNK;
+        // SAFETY: a new anonymous mapping.
+        let mem = unsafe {
+            crate::mmap(ptr::null_mut(), len as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0)
+        };
+        assert_ne!(mem, crate::MAP_FAILED);
+        let mem = mem as u64;
+        let byte = |at: u64| {
+            // SAFETY: mapped memory of ours.
+            unsafe { ptr::read_volatile(at as *const u8) }
+        };
+        let pages = [half - PAGE, half, CHUNK + PAGE, CHUNK + half];
+        for p in pages {
+            // SAFETY: mapped memory of ours.
+            unsafe { ptr::write_volatile((mem + p) as *mut u8, 0x11) };
+        }
+        let (ctx, user) = create(0, false, true).unwrap();
+        register(ctx, mem, len).unwrap();
+        assert!(range_of_view(mem as usize).is_some_and(|(r, _)| r.reserved.load(Ordering::Acquire)), "not a chunked range");
+        unregister(ctx, mem, len).unwrap();
+        // SAFETY: two pages of ours across the split, then our second chunk.
+        unsafe {
+            assert_eq!(crate::madvise((mem + half - PAGE) as *mut c_void, 2 * PAGE as usize, crate::MADV_DONTNEED), 0);
+            assert_eq!(crate::madvise((mem + CHUNK) as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED), 0);
+        }
+        let read: std::vec::Vec<u8> = pages.iter().map(|&p| byte(mem + p)).collect();
+        // SAFETY: our mapping, whole; closes the user end.
+        unsafe {
+            assert_eq!(crate::munmap(mem as *mut c_void, len as usize), 0);
+            ws::closesocket(sock(user));
+        }
+        assert_eq!(read, [0, 0, 0, 0], "the discarded pages of a released chunk: across the split, then the whole second chunk");
+    }
+
+    /// A released chunk never filled, on a 2 MiB boundary and advised
+    /// `MADV_HUGEPAGE`: a first write commits the whole aligned 2 MiB, its
+    /// two views, and reports it, as `windows_mm`'s
+    /// test_madv_hugepage_is_what_a_first_access_commits asserts for lazy
+    /// memory; a record's 64 KiB grain commits its 64 KiB block on either
+    /// side of the split. Review B1: with two views a chunk's huge commit
+    /// was refused (one commit across two allocations) and fell back to a
+    /// page, silently.
+    #[test]
+    fn test_a_released_chunks_huge_page_is_committed_whole() {
+        use crate::windows_mm::wick_mm::{Access, commit_block_on_access, record_grain};
+        let half = crate::windows_mm::chunk_half(CHUNK as usize) as u64;
+        let grain = 64 << 10;
+        let rw = crate::PROT_READ | crate::PROT_WRITE;
+        let flags = crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE;
+        // Two chunks on a 2 MiB boundary: three chunks' room found, freed,
+        // and asked for at its boundary (a hint; another thread may take
+        // the room meanwhile, so a few tries).
+        let mem = (0..8)
+            .find_map(|_| {
+                // SAFETY: a new anonymous mapping, unmapped at once.
+                let room = unsafe { crate::mmap(ptr::null_mut(), 3 * CHUNK as usize, rw, flags, -1, 0) };
+                assert_ne!(room, crate::MAP_FAILED);
+                // SAFETY: the mapping just made.
+                assert_eq!(unsafe { crate::munmap(room, 3 * CHUNK as usize) }, 0);
+                let at = (room as u64).next_multiple_of(CHUNK);
+                // SAFETY: a new anonymous mapping, at `at` if it is free.
+                let p = unsafe { crate::mmap(at as *mut c_void, 2 * CHUNK as usize, rw, flags, -1, 0) } as u64;
+                assert_ne!(p, crate::MAP_FAILED as u64);
+                if p != at {
+                    // SAFETY: our mapping, elsewhere than asked.
+                    assert_eq!(unsafe { crate::munmap(p as *mut c_void, 2 * CHUNK as usize) }, 0);
+                }
+                (p == at).then_some(p)
+            })
+            .expect("no 2 MiB boundary found free in 8 tries");
+        assert!(mem.is_multiple_of(CHUNK));
+        let (ctx, user) = create(0, false, true).unwrap();
+        register(ctx, mem, 2 * CHUNK).unwrap();
+        assert!(range_of_view(mem as usize).is_some_and(|(r, _)| r.reserved.load(Ordering::Acquire)), "not a chunked range");
+        unregister(ctx, mem, 2 * CHUNK).unwrap();
+        // SAFETY: our mapping.
+        assert_eq!(unsafe { crate::madvise(mem as *mut c_void, CHUNK as usize, crate::MADV_HUGEPAGE) }, 0);
+        #[allow(clippy::cast_possible_truncation)]
+        let (m, c, h, g) = (mem as usize, CHUNK as usize, half as usize, grain as usize);
+        let at = commit_block_on_access(m + 5 * PAGE as usize, true);
+        std::eprintln!("HUGERESOLVE a write into the advised chunk: {at:?}, {:#x} bytes of it committed", committed(mem, CHUNK));
+        assert_eq!(at, (Access::Committed, m..m + c), "the whole aligned 2 MiB, both views");
+        assert_eq!(committed(mem, CHUNK), CHUNK);
+        // The range returned is what was resolved: no page of it pending in
+        // the record, every other page of the chunk still pending.
+        let pending_outside = |chunk: usize, resolved: &[&core::ops::Range<usize>]| {
+            (chunk..chunk + c).step_by(PAGE as usize).find(|&p| {
+                crate::windows_mm::released_is_pending(p) == resolved.iter().any(|r| r.contains(&p))
+            })
+        };
+        assert_eq!(pending_outside(m, &[&at.1]), None, "a page resolved outside the range returned, or pending in it");
+        // The second chunk at a record's 64 KiB grain: the block below the
+        // split, then the one above it.
+        record_grain(m + c, c, g);
+        let below = commit_block_on_access(m + c + h - PAGE as usize, true);
+        let above = commit_block_on_access(m + c + h, true);
+        std::eprintln!("HUGERESOLVE 64 KiB below the split: {below:?}; above: {above:?}; {:#x} bytes committed", committed(mem + CHUNK, CHUNK));
+        record_grain(m + c, c, 0);
+        assert_eq!(below, (Access::Committed, m + c + h - g..m + c + h), "the block below the split");
+        assert_eq!(above, (Access::Committed, m + c + h..m + c + h + g), "the block above the split");
+        assert_eq!(pending_outside(m + c, &[&below.1, &above.1]), None, "a page resolved outside the blocks returned, or pending in them");
+        assert_eq!(committed(mem + CHUNK, CHUNK), 2 * grain);
+        // SAFETY: our mappings, whole; closes the user end.
+        unsafe {
+            assert_eq!(crate::munmap(mem as *mut c_void, 2 * CHUNK as usize), 0);
+            ws::closesocket(sock(user));
+        }
+    }
+
+    /// A chunk's views go together: Windows refusing the unmap of the
+    /// first (a test refusal, `windows_mm::REFUSE_CHUNK_UNMAP`) changes
+    /// nothing, for a munmap of the chunk (`EINVAL`) and a `MAP_FIXED`
+    /// mapping over it (`EINVAL`): both views keep their pages, and a page
+    /// of the released range never filled is still pending in its record
+    /// (zeros at its first access, which takes a write); its placeholders
+    /// not made one again (`windows_mm::REFUSE_COALESCE`), the chunk is two
+    /// placeholders, which a `MAP_FIXED` mapping over it takes as one
+    /// (`make_placeholder` counts them again). Review B1.
+    #[test]
+    fn test_a_chunk_whose_first_unmap_is_refused_is_left_whole() {
+        let half = crate::windows_mm::chunk_half(CHUNK as usize) as u64;
+        let len = 2 * CHUNK;
+        let rw = crate::PROT_READ | crate::PROT_WRITE;
+        // SAFETY: a new anonymous mapping.
+        let mem = unsafe { crate::mmap(ptr::null_mut(), len as usize, rw, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0) };
+        assert_ne!(mem, crate::MAP_FAILED);
+        let mem = mem as u64;
+        let byte = |at: u64| {
+            // SAFETY: mapped memory of ours.
+            unsafe { ptr::read_volatile(at as *const u8) }
+        };
+        for p in [half - PAGE, half] {
+            // SAFETY: mapped memory of ours.
+            unsafe { ptr::write_volatile((mem + p) as *mut u8, 0x11) };
+        }
+        let (ctx, user) = create(0, false, true).unwrap();
+        register(ctx, mem, len).unwrap();
+        assert!(range_of_view(mem as usize).is_some_and(|(r, _)| r.reserved.load(Ordering::Acquire)), "not a chunked range");
+        unregister(ctx, mem, len).unwrap();
+        let einval = Some(crate::EINVAL);
+        for case in ["munmap", "MAP_FIXED"] {
+            *crate::windows_mm::REFUSE_CHUNK_UNMAP.lock().unwrap() = Some((mem as usize, 0));
+            // SAFETY: our mapping's first chunk, its first view's unmap refused.
+            let failed = unsafe {
+                if case == "munmap" {
+                    crate::munmap(mem as *mut c_void, CHUNK as usize) == -1
+                } else {
+                    let flags = crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_FIXED;
+                    crate::mmap(mem as *mut c_void, CHUNK as usize, rw, flags, -1, 0) == crate::MAP_FAILED
+                }
+            };
+            let errno = io::Error::last_os_error().raw_os_error();
+            assert!(crate::windows_mm::REFUSE_CHUNK_UNMAP.lock().unwrap().is_none(), "{case}: the refusal was not reached");
+            assert!(failed && errno == einval, "{case} over a chunk whose first unmap is refused: failed {failed}, errno {errno:?}");
+            assert_eq!((byte(mem + half - PAGE), byte(mem + half)), (0x11, 0x11), "{case}: the chunk's pages");
+        }
+        // A page never filled, pending in the record still.
+        let never = mem + 5 * PAGE;
+        assert_eq!(byte(never), 0, "a page never filled");
+        // SAFETY: mapped memory of ours, released.
+        unsafe { ptr::write_volatile(never as *mut u8, 0x55) };
+        assert_eq!(byte(never), 0x55);
+        // The second chunk's placeholders not made one again.
+        *crate::windows_mm::REFUSE_COALESCE.lock().unwrap() = Some((mem + CHUNK) as usize);
+        let flags = crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_FIXED;
+        // SAFETY: a fixed anonymous mapping over our second chunk.
+        let fixed = unsafe { crate::mmap((mem + CHUNK) as *mut c_void, CHUNK as usize, rw, flags, -1, 0) } as u64;
+        assert!(crate::windows_mm::REFUSE_COALESCE.lock().unwrap().is_none(), "the coalesce refusal was not reached");
+        assert_eq!(fixed, mem + CHUNK, "MAP_FIXED over a chunk left two placeholders: errno {:?}", io::Error::last_os_error().raw_os_error());
+        assert_eq!(byte(fixed + half), 0);
+        // SAFETY: the new mapping.
+        unsafe { ptr::write_volatile((fixed + half) as *mut u8, 0x66) };
+        assert_eq!(byte(fixed + half), 0x66);
+        // SAFETY: our mappings, whole; closes the user end.
+        unsafe {
+            assert_eq!(crate::munmap(mem as *mut c_void, len as usize), 0);
+            ws::closesocket(sock(user));
+        }
+    }
+
+    /// A chunk's second view whose unmap Windows refuses once its first is
+    /// gone (a test refusal) ends the VMM with a line naming it and an
+    /// abort (0xC0000409): the chunk is half mapped. Review B1. In a
+    /// process of its own.
+    #[test]
+    fn test_a_chunk_whose_second_unmap_is_refused_aborts_named() {
+        let (code, text) = run_child("second_unmap_refused_child", None);
+        assert!(text.contains("could not be unmapped once its first was"), "{text}");
+        assert!(!text.contains("UNMAPPED"), "{text}");
+        assert_eq!(code, Some(0xC000_0409_u32.cast_signed()), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_chunk_whose_second_unmap_is_refused_aborts_named in a process of its own"]
+    fn second_unmap_refused_child() {
+        let len = 2 * CHUNK;
+        // SAFETY: a new anonymous mapping.
+        let mem = unsafe {
+            crate::mmap(ptr::null_mut(), len as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0)
+        };
+        assert_ne!(mem, crate::MAP_FAILED);
+        let mem = mem as u64;
+        let (ctx, _user) = create(0, false, true).unwrap();
+        register(ctx, mem, len).unwrap();
+        unregister(ctx, mem, len).unwrap();
+        *crate::windows_mm::REFUSE_CHUNK_UNMAP.lock().unwrap() = Some((mem as usize, 1));
+        // SAFETY: our mapping's first chunk, its second view's unmap refused.
+        let r = unsafe { crate::munmap(mem as *mut c_void, CHUNK as usize) };
+        std::println!("UNMAPPED: {r}");
+    }
+
+    /// UFFDHALF, a record: the register of a 1 GiB range (512 chunks, each
+    /// two views since review B1, one before: UFFDCHUNK b measured 5.43 us a
+    /// chunk for the sections and views alone) and the whole-chunk discard
+    /// of 100 of its chunks (`uffd_swap_chunk`; UFFDCHUNK b: 8.7 us a swap
+    /// of one view each), in microseconds a chunk, three rounds; then the
+    /// munmap of the range.
+    #[test]
+    #[ignore = "a record: run alone on Windows with --ignored --nocapture (CI's WHP step)"]
+    fn test_a_chunks_views_cost_on_record() {
+        let len = 512 * CHUNK;
+        for round in 0..3 {
+            // SAFETY: a new anonymous mapping, committed at first touch.
+            let mem = unsafe {
+                crate::mmap(
+                    ptr::null_mut(),
+                    len as usize,
+                    crate::PROT_READ | crate::PROT_WRITE,
+                    crate::MAP_PRIVATE | crate::MAP_ANONYMOUS | crate::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(mem, crate::MAP_FAILED);
+            let mem = mem as u64;
+            let (ctx, user) = create(0, false, true).unwrap();
+            let t = std::time::Instant::now();
+            register(ctx, mem, len).unwrap();
+            let registered = t.elapsed();
+            let t = std::time::Instant::now();
+            for c in 0..100 {
+                // SAFETY: registered memory of ours, a chunk whole.
+                assert_eq!(unsafe { crate::madvise((mem + c * CHUNK) as *mut c_void, CHUNK as usize, crate::MADV_DONTNEED) }, 0);
+            }
+            let swapped = t.elapsed();
+            let t = std::time::Instant::now();
+            // SAFETY: closes the user end, then unmaps our mapping.
+            unsafe {
+                ws::closesocket(sock(user));
+                assert_eq!(crate::munmap(mem as *mut c_void, len as usize), 0);
+            }
+            let unmapped = t.elapsed();
+            std::eprintln!(
+                "UFFDHALF round {round}: register of 512 chunks {:.2} us a chunk; whole-chunk discard of 100 {:.2} us a chunk; munmap {:.2} us a chunk",
+                registered.as_secs_f64() * 1e6 / 512.0,
+                swapped.as_secs_f64() * 1e6 / 100.0,
+                unmapped.as_secs_f64() * 1e6 / 512.0
+            );
         }
     }
 
@@ -5458,7 +5873,7 @@ mod tests {
         }
         let gave = {
             let v = &crate::windows_mm::VIEWREC;
-            (v[2].load(Ordering::SeqCst) as i64 - v[3].load(Ordering::SeqCst) as i64) / 1024
+            (v[4].load(Ordering::SeqCst) as i64 - v[6].load(Ordering::SeqCst) as i64) / 1024
         };
         let mut held = VIEW_ROOM_TAKEN.lock().unwrap();
         while held.len() < held.capacity() {
