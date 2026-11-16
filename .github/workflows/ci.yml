@@ -71,6 +71,21 @@ jobs:
         run: |
           python3 tools/check-claims.py --selftest
           python3 tools/check-claims.py --strict-windows
+      # The pushed commits' messages: a same-build claim ("Linux and macOS are
+      # unchanged", "trees unchanged") names tools/check-unit-graph.py, and a
+      # "not weaker" its evidence (e756d504's untrue "trees unchanged"). History
+      # is not rewritten: a red run here is corrected by the next commit.
+      - name: Commit messages name the checks of their same-build claims
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        env:
+          BEFORE: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
+        run: |
+          if ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "::error::the pushed range's base $BEFORE is not in this clone (a force-push?): its messages cannot be read"
+            exit 1
+          fi
+          # The documents' checks again, with the range's messages.
+          python3 tools/check-claims.py --strict-windows --commits "$BEFORE..HEAD"
       - name: Compatibility matrix progress and counts are current
         run: python3 -I tools/compat-counts.py --check docs/COMPATIBILITY.md
       # The numbers the docs derive from the tree that the two checks above

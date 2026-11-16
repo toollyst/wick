@@ -11,7 +11,7 @@ or another test script (`tools/linux/integration-tests.sh`). A claim nobody
 can rerun is how a doc ends up describing what a probe once showed rather
 than what the product does.
 
-    tools/check-claims.py [--strict-windows]
+    tools/check-claims.py [--strict-windows] [--commits RANGE]
 
 Cells of a Windows column are reported as warnings unless --strict-windows
 is given (docs/ROADMAP.md, M5, tracks making them errors); all other cells
@@ -68,6 +68,16 @@ an entry of that file names a tracked tool and gives a reason (audit 5: the
 table lacked tools/clean.sh and tools/check-background-loops.py, which every
 test script and CI run). The tools' helpers in subdirectories (integration/,
 vhost-user-blk/) are not tools of their own.
+A claim that a build is the same is checked, not written from intent: in
+every document, and with --commits RANGE in the commit messages of a pushed
+range (CI's patches job), a sentence saying trees, binaries, builds,
+dependencies, units, crates or Cargo.lock are unchanged, a host's build
+unchanged ("Linux and macOS are unchanged") or the same crates as upstream's
+names tools/check-unit-graph.py, the check that shows it; one saying "not
+weaker" names its evidence: a test, a tool, or a source (a file of the
+source it compares, or file:line). Audit 5: e756d504's "Linux's and
+macOS's binaries' trees unchanged" was untrue (CI run 43790310601; the unit
+graph check shows the two crates).
 Every heading a document or a source comment cites as `<DOC>.md, "<heading>"`
 (or without the comma) must be one of that document's headings, bold labels
 or table rows' first cells, or a part of one (audit 5: boot-test.ps1 cited
@@ -118,6 +128,18 @@ NOT_TESTS = {"test_results"}
 TOOL = re.compile(r"^tools/(?:(?:linux|macos|windows)/)?[^/]+\.(?:sh|py|ps1|c|rs)$")
 TABLE_TOOL = re.compile(r"\]\(\.\./(tools/[^)#\s]+)\)")
 UNLISTED = "tools/README-unlisted.txt"
+SAME_BUILD = re.compile(
+    r"\b(?:trees?|binar(?:y|ies)|builds?|dependenc(?:y|ies)|units|crates|Cargo\.lock)(?:'s?)?\s+"
+    r"(?:(?:is|are|stay|stays|remain|remains|was|were)\s+)?unchanged\b"
+    r"|\bsame (?:units|crates|dependencies|tree|binar(?:y|ies)) as upstream(?:'s)?"
+    r"|\b(?:Linux|macOS|Windows)(?:'s)?(?: and (?:Linux|macOS|Windows)(?:'s)?)? (?:builds? |binar(?:y|ies) )?"
+    r"(?:are|is|stay|stays) unchanged\b", re.I)
+# A phrase quoted is named, not claimed ("The same units as upstream" is the check's result).
+QUOTED = re.compile(r'"[^"]*"|\u201c[^\u201d]*\u201d')
+NOT_WEAKER = re.compile(r"\bnot weaker\b", re.I)
+SOURCE_NAMED = re.compile(r"`test_\w+`|`(?:boot|jailer)-test[^`]*`|\btools/[\w/.-]+|\b[\w/.-]+\.(?:rs|py|sh|ps1|c|h)\b"
+                          r"|\b[\w/.-]+:\d+\b")
+SENTENCE_END = re.compile(r"(?<=[.;!?])\s+|\s*\|\s*|\n\s*\n")
 
 
 def plain(text):
@@ -199,6 +221,43 @@ def check_tools_table(tracked, readme, unlisted):
     for t in sorted(tools - table - listed):
         errors.append(f"error: {t} is in neither docs/README.md's tools table nor {UNLISTED} (with why)")
     return errors
+
+
+def check_same_claims(name, text):
+    """A sentence claiming the same build names tools/check-unit-graph.py; one
+    saying "not weaker" names a test, tool or source."""
+    errors = []
+    line_of = 1
+    pos = 0
+    for sentence in SENTENCE_END.split(text):
+        start = text.find(sentence, pos)
+        if start >= 0:
+            line_of = text.count("\n", 0, start) + 1
+            pos = start + len(sentence)
+        flat = " ".join(sentence.split())
+        bare = QUOTED.sub("", flat)
+        m = SAME_BUILD.search(bare)
+        if m and "check-unit-graph.py" not in flat:
+            errors.append(f"error: {name}:{line_of} says \"{m.group(0)}\" without naming tools/check-unit-graph.py, "
+                          f"the check that shows it")
+        m = NOT_WEAKER.search(bare)
+        if m and not SOURCE_NAMED.search(flat):
+            errors.append(f"error: {name}:{line_of} says \"not weaker\" without naming its evidence (a test, a tool, "
+                          f"or the source it compares: file or file:line): {flat[:90]}...")
+    return errors
+
+
+def commit_messages(repo, rng):
+    """(name, message) of each non-merge commit in RANGE."""
+    out = git(repo, "log", "--no-merges", "--format=%h%x00%B%x01", rng)
+    if out.returncode != 0:
+        raise SystemExit(f"check-claims: git log {rng}: {out.stderr.strip()}")
+    msgs = []
+    for rec in out.stdout.split("\x01"):
+        if "\x00" in rec:
+            h, body = rec.strip("\n").split("\x00", 1)
+            msgs.append((f"commit {h}", body))
+    return msgs
 
 
 def cells(path):
@@ -453,6 +512,22 @@ def selftest():
         f"error: tools/check-background-loops.py is in neither docs/README.md's tools table nor {UNLISTED} (with why)",
         f"error: tools/clean.sh is in neither docs/README.md's tools table nor {UNLISTED} (with why)",
     ], errors
+    # Audit 5's finding (e756d504) and the other same-build claims of past
+    # messages that named no check (d460d926, 7fd38e70), and the sentences
+    # that do.
+    errors = check_same_claims("msg", "vmm-sys-util's Windows epoll takes it by path, and patch 0051 locks it "
+                                      "(no new crate from crates.io; Linux's and macOS's binaries' trees unchanged)\n\n"
+                                      "Linux and macOS are unchanged: the change is in crates/compat/os's Windows "
+                                      "module.\n\non macOS 27 one pointer bucket instead of four, not weaker than musl\n")
+    assert [e.split('"')[1] for e in errors] == [
+        "trees unchanged", "Linux and macOS are unchanged", "not weaker"], errors
+    errors = check_same_claims("doc", "Linux's and macOS's builds are unchanged (tools/check-unit-graph.py).\n"
+                                      "| x | not weaker than Linux (musl src/malloc/mallocng/meta.h `size_to_class`) |\n"
+                                      "the snapshot format is unchanged; the VMM's own sandbox unchanged.\n"
+                                      "Tools work unchanged: the binary is still `firecracker`. \"The same units as "
+                                      "upstream\" is this check's result. upstream's suites, unchanged but for one "
+                                      "patch, against the Windows build\n")
+    assert errors == [], errors
     print("check-claims: selftest ok")
 
 
@@ -518,6 +593,15 @@ def main():
                 errors += 1
             else:
                 warnings += 1
+    for name in documents:
+        for line in check_same_claims(name, (ROOT / name).read_text()):
+            print(line)
+            errors += 1
+    if "--commits" in sys.argv[1:]:
+        for name, body in commit_messages(repo, sys.argv[sys.argv.index("--commits") + 1]):
+            for line in check_same_claims(name, body):
+                print(line)
+                errors += 1
     for line in check_tools_table(tracked, (ROOT / "docs/README.md").read_text(),
                                   (ROOT / UNLISTED).read_text() if (ROOT / UNLISTED).is_file() else ""):
         print(line)
