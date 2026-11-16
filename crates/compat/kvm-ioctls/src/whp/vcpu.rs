@@ -3315,8 +3315,9 @@ impl VcpuFd {
 /// or update without telling anything. On record: 47.2 KiB, every
 /// MOVEUNDERVCPU run call and STACKCALL's first write to `MAP_NORESERVE`
 /// guest RAM, in CI's windows job at e6c08999 (Windows Server 2025 26100
-/// on an AMD EPYC): 2 x 47.2 + 16 = 110.4, so 112. Windows Server 2022
-/// 20348 and the PC (a Ryzen 9 7900) have no mark yet. The tests that print the mark assert it within half of this
+/// on an AMD EPYC): 2 x 47.2 + 16 = 110.4, so 112; at 112, in CI's windows
+/// job at 80589c69 (the same host), 47.2 again, within half of it (56).
+/// Windows Server 2022 20348 and the PC (a Ryzen 9 7900) have no mark yet. The tests that print the mark assert it within half of this
 /// (`within_half`). The overflow's own room, the thread's guarantee
 /// (20 KiB, std's `SetThreadStackGuarantee`), is beyond it.
 ///
@@ -3330,8 +3331,9 @@ impl VcpuFd {
 /// page), the call 13 to 16 KiB below the stack's base: at 96 KiB, 111.2
 /// KiB resident a vCPU after a boot (VMMGROW, CI's windows job at
 /// e6c08999), where a booted guest's held 48 to 52 KiB before (VMMSTACK,
-/// CI run 43881982686); at 112, about 16 more, not measured yet (the VMM
-/// memory row of docs/COMPATIBILITY.md).
+/// CI run 43881982686); at 112, 127.5 KiB after a boot and 126.9 with the
+/// hlt-loop guest (VMMGROW, CI's windows job at 80589c69; the VMM memory
+/// row of docs/COMPATIBILITY.md).
 ///
 /// If the commit is refused at the first run (a job already at its limit
 /// when the VMM boots or restores), the stack filter ends the VMM with 137

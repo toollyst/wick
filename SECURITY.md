@@ -756,7 +756,8 @@ upstream Firecracker and its jailer.
   (`test_a_vcpu_threads_stack_is_committed_before_its_first_run`, at 96 KiB in CI's windows jobs at 57b122f9 and
   e6c08999: 97 KiB committed below the frame that called run after the first run, from 5; MOVEUNDERVCPU is the proof
   under a move, and passed in both, every round moved at the limit and no value lost, its marks printed at e6c08999;
-  at 112 KiB neither run in CI yet). An interim until the stack reclaim (the memory.max row); it covers no other thread: the
+  at 112 KiB, in CI's windows job at 80589c69, 112 KiB committed below that frame after the first run, from 4, and
+  MOVEUNDERVCPU 40 of 40 rounds moved at the limit, no value lost, its deepest mark 47.2 KiB again). An interim until the stack reclaim (the memory.max row); it covers no other thread: the
   userfaultfd serve thread's stack, refused inside ntdll's heap code at the limit, still ends the VMM with 137. Where the move's
   map is refused once it gave that charge back and another commit has taken the room meanwhile, the move is not made
   and the chunk owes the charge (the map into the move slot needs no room, so only a test's refusal, `REFUSE_SLOT_MAP`,
