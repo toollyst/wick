@@ -11,9 +11,14 @@
 //!   changes a running vCPU either).
 //! - While it is on, every debug exception exits to the host
 //!   (`hv_vcpu_set_trap_debug_exceptions`, KVM's `MDCR_EL2.TDE`). Measured
-//!   (agent-state probe `hvf_debug.c`, macOS 27.2): BRK (EC 0x3C), a
-//!   breakpoint (0x30), a software step (0x32) and a watchpoint (0x34) all
-//!   exit with it, none without it.
+//!   with a standalone probe on macOS 27.2: BRK (EC 0x3C), a breakpoint
+//!   (0x30), a software step (0x32) and a watchpoint (0x34) all exit with
+//!   it, none without it. The tests keep the exits with it
+//!   (`test_brk_exits_as_kvm_debug_with_guest_debugging`,
+//!   `test_hw_breakpoint_exits_at_its_address`,
+//!   `test_single_step_exits_after_one_instruction`,
+//!   `test_watchpoint_exit_gives_the_address`) and BRK's without it
+//!   (`test_brk_is_the_guests_without_guest_debugging`).
 //! - Around each run the guest's MDSCR_EL1 and PSTATE.SS are kept and the
 //!   debug bits set (`save_guest_debug_regs`, `restore_guest_debug_regs`):
 //!   `SINGLESTEP` sets MDSCR_EL1.SS and PSTATE.SS before every run (after a

@@ -1078,7 +1078,7 @@ mod macos {
 
             let (to, from) = UnixStream::pair().unwrap();
             // A guard against a hang only: the collector ran within 20 ms in
-            // 50 of 50 runs of agent-state/mac3/probes/inflight-listener.c.
+            // 50 of 50 runs of a standalone C probe of the same steps.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             for round in 0.. {
                 assert!(std::time::Instant::now() < deadline, "the collector did not run in 30 s");

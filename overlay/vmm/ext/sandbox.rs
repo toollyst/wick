@@ -4105,8 +4105,8 @@ mod macos {
                 // 3 children of test_unfiltered_syscalls_are_limited_by_their_rule
                 // to it; on macOS 27.2 32 processes opening 300 terminals
                 // each lost 36 opens, all errno -6, with 36 "vn_open_auth:
-                // reached max_retries error -6" kernel lines
-                // (agent-state/mac9/ptyrace/race3.c). So the test processes
+                // reached max_retries error -6" kernel lines (a standalone
+                // C probe). So the test processes
                 // open their terminals one at a time, under an flock on one
                 // path for every process (not under TMPDIR, which the
                 // children of that test set differently): with it the same

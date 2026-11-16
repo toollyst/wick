@@ -173,8 +173,10 @@ def main():
 
 
 def selftest():
-    """The signature rules on synthetic reports (design: agent-state's
-    compare-signatures-design.md, point 5)."""
+    """The signature rules on synthetic reports: an entry's signature
+    matches only its phase's message at its line, a teardown's listed memory
+    error is no problem beside a matched call, and an entry without a
+    signature matches by its id alone."""
     T = "integration_tests/functional/test_x.py"
 
     def phase(message, line):
