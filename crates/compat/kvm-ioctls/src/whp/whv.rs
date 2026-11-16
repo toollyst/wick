@@ -689,6 +689,30 @@ pub(crate) unsafe fn WHvSetVirtualProcessorRegisters(
     }
 }
 
+/// `WHvSetVirtualProcessorState` from `winhvplatform.dll`, loaded at first
+/// use. Only the TIMEGET record sets the local APIC's state with it
+/// (`WHvVirtualProcessorStateTypeInterruptControllerState2`); the backend
+/// does not.
+///
+/// # Safety
+/// As the Windows function.
+#[cfg(test)]
+pub(crate) unsafe fn WHvSetVirtualProcessorState(
+    partition: WHV_PARTITION_HANDLE,
+    vpindex: u32,
+    statetype: WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+    buffer: *const core::ffi::c_void,
+    buffersizeinbytes: u32,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(WHV_PARTITION_HANDLE, u32, WHV_VIRTUAL_PROCESSOR_STATE_TYPE, *const core::ffi::c_void, u32) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvSetVirtualProcessorState")) {
+        // SAFETY: the address of `WHvSetVirtualProcessorState`, whose signature `F` is.
+        Some(p) => unsafe { std::mem::transmute::<usize, F>(p)(partition, vpindex, statetype, buffer, buffersizeinbytes) },
+        None => unavailable(Dll::Platform),
+    }
+}
+
 /// `WHvSetVirtualProcessorXsaveState` from `winhvplatform.dll`, loaded at first use.
 ///
 /// # Safety

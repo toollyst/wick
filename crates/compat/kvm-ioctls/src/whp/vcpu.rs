@@ -13336,6 +13336,362 @@ mod fpu_tests {
         assert!(failed_control.is_empty(), "a get was refused with nothing else made: {failed_control:?}");
     }
 
+    /// What WHP answers a VP's state calls made while the partition's time
+    /// is suspended, or while it is being suspended or resumed (TIMEGET
+    /// lines). CANCELGET found the legacy interrupt controller state get and
+    /// set refused with WHV_E_INVALID_VP_STATE (0x80370308) on a VP while
+    /// another thread suspends and resumes time in a loop, and the State2 get
+    /// and `IA32_APIC_BASE` never; it is how x2storm's vCPU 3 failed: its own
+    /// exit handler's get, made while vCPU 1 held the VM with time suspended
+    /// (`with_time_stopped`, which holds vCPUs out of the guest, not out of
+    /// their exit handlers). This tells apart, before the fix is chosen:
+    /// - steady: thread A suspends time once and keeps it so; N of each call
+    ///   are made before, while suspended, and after the resume, by another
+    ///   thread, and then by the suspending thread itself (x2storm's vCPU 1
+    ///   made 10000 gets under its own suspension, every one answered);
+    /// - transitions: A suspends and resumes in a loop (CANCELGET's arm),
+    ///   each Suspend and Resume call timed;
+    /// - phases: A keeps each of running and suspended for 1 ms, and each
+    ///   call is counted by the phase A was in when it began and when it
+    ///   ended (in the Suspend call, suspended, in the Resume call, running).
+    ///
+    /// The calls, on vCPU 0 (run to an exit first) and vCPU 1 (never run),
+    /// with no VP running, as Learn requires for the suspension: the legacy
+    /// interrupt controller state get and set (the backend's), the State2
+    /// get and set, `IA32_APIC_BASE` get and set, RIP get and set, the TSC
+    /// get, the XSAVE state get and set, `WHvRequestInterrupt` (a fixed
+    /// interrupt to the VP) and `WHvTranslateGva`. A set writes back what
+    /// was read at the start. Each is counted by HRESULT, with the least,
+    /// median and greatest time of a call. Every case runs unloaded and with
+    /// a spinning thread for each logical processor. Asserted: nothing is
+    /// refused with nothing else made. The rest is printed.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_state_calls_against_time_suspension_on_record() {
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicBool, AtomicU8};
+        use std::time::{Duration, Instant};
+        const N: usize = 2000;
+        const SPAN: Duration = Duration::from_millis(1500);
+        const CALLS: usize = 13;
+        const NAMES: [&str; CALLS] = [
+            "legacy get",
+            "legacy set",
+            "State2 get",
+            "State2 set",
+            "APIC_BASE get",
+            "APIC_BASE set",
+            "RIP get",
+            "RIP set",
+            "TSC get",
+            "XSAVE get",
+            "XSAVE set",
+            "WHvRequestInterrupt",
+            "WHvTranslateGva",
+        ];
+        const PHASES: [&str; 4] = ["running", "in Suspend", "suspended", "in Resume"];
+        #[derive(Clone, Copy)]
+        #[repr(C, align(16))]
+        struct Value(whv::WHV_REGISTER_VALUE);
+        struct Tally {
+            answers: [BTreeMap<i32, u64>; CALLS],
+            ns: [Vec<u64>; CALLS],
+        }
+        impl Tally {
+            fn new() -> Self {
+                Self { answers: Default::default(), ns: std::array::from_fn(|_| Vec::new()) }
+            }
+            fn refused(&self) -> bool {
+                self.answers.iter().any(|m| m.keys().any(|h| *h != 0))
+            }
+        }
+        fn spread(ns: &mut [u64]) -> String {
+            if ns.is_empty() {
+                return "-".into();
+            }
+            ns.sort_unstable();
+            format!("{}/{}/{} ns", ns[0], ns[ns.len() / 2], ns[ns.len() - 1])
+        }
+        fn tally(m: &BTreeMap<i32, u64>) -> String {
+            m.iter().map(|(h, n)| if *h == 0 { format!("ok {n}") } else { format!("{:#010x} {n}", h.cast_unsigned()) }).collect::<Vec<_>>().join(", ")
+        }
+        fn described(t: &mut Tally) -> String {
+            (0..CALLS).map(|i| format!("{}: {} ({})", NAMES[i], tally(&t.answers[i]), spread(&mut t.ns[i]))).collect::<Vec<_>>().join("; ")
+        }
+        // `out 0x80, al` and a jump back to it.
+        let (vm, mut zero, m) = mmio_guest(&[0xE6, 0x80, 0xEB, 0xFC]);
+        let one = vm.create_vcpu(1).unwrap();
+        let part = zero.part();
+        let first = super::super::ffi::quietly(|| match zero.run() {
+            Ok(VcpuExit::IoOut(0x80, _)) => "out 0x80".to_string(),
+            Ok(e) => format!("{e:?}"),
+            Err(e) => format!("errno {}", e.errno()),
+        });
+        assert_eq!(first, "out 0x80", "vCPU 0's guest");
+        // Each VP's state as it is at the start, for the sets.
+        struct Start {
+            page: Box<[u8; LAPIC_PAGE]>,
+            page_size: u32,
+            two: Box<[u8; 4096]>,
+            two_size: u32,
+            base: u64,
+            rip: u64,
+            xsave: Vec<u8>,
+        }
+        let start: Vec<Start> = (0..2u32)
+            .map(|vp| {
+                let mut s = Start {
+                    page: Box::new([0u8; LAPIC_PAGE]),
+                    page_size: 0,
+                    two: Box::new([0u8; 4096]),
+                    two_size: 0,
+                    base: 0,
+                    rip: 0,
+                    xsave: vec![0u8; 64 * 1024],
+                };
+                // SAFETY: output buffers of the sizes passed.
+                unsafe {
+                    assert_eq!(
+                        whv::WHvGetVirtualProcessorInterruptControllerState(part, vp, s.page.as_mut_ptr().cast(), LAPIC_PAGE as u32, &mut s.page_size),
+                        0
+                    );
+                    assert_eq!(
+                        whv::WHvGetVirtualProcessorState(
+                            part,
+                            vp,
+                            whv::WHvVirtualProcessorStateTypeInterruptControllerState2,
+                            s.two.as_mut_ptr().cast(),
+                            4096,
+                            &mut s.two_size
+                        ),
+                        0
+                    );
+                    let mut written = 0u32;
+                    assert_eq!(
+                        whv::WHvGetVirtualProcessorXsaveState(part, vp, s.xsave.as_mut_ptr().cast(), u32::try_from(s.xsave.len()).unwrap(), &mut written),
+                        0
+                    );
+                    s.xsave.truncate(written as usize);
+                }
+                let reg = |name| super::super::ffi::as_u64(&super::super::ffi::get_register(part, vp, name).unwrap());
+                s.base = reg(whv::WHvX64RegisterApicBase);
+                s.rip = reg(whv::WHvX64RegisterRip);
+                s
+            })
+            .collect();
+        // Call `i` on `vp`: its HRESULT and time.
+        let call = |i: usize, vp: u32| -> (i32, u64) {
+            let s = &start[vp as usize];
+            let mut page = [0u8; LAPIC_PAGE];
+            let mut xsave = vec![0u8; 64 * 1024];
+            let mut written = 0u32;
+            let get = |name: whv::WHV_REGISTER_NAME| {
+                let mut value = Value(super::super::ffi::reg64(0));
+                // SAFETY: one name and one 16-aligned value.
+                unsafe { whv::WHvGetVirtualProcessorRegisters(part, vp, &name, 1, std::ptr::addr_of_mut!(value).cast()) }
+            };
+            let set = |name: whv::WHV_REGISTER_NAME, v: u64| {
+                let value = Value(super::super::ffi::reg64(v));
+                // SAFETY: one name and one 16-aligned value.
+                unsafe { whv::WHvSetVirtualProcessorRegisters(part, vp, &name, 1, std::ptr::addr_of!(value).cast()) }
+            };
+            let control = super::super::irqchip::interrupt_control(0xFEE0_0000 | (u64::from(vp) << 12), 0x30);
+            let t = Instant::now();
+            // SAFETY: the VM's partition and VPs; every buffer is as large as passed.
+            let h = unsafe {
+                match i {
+                    0 => whv::WHvGetVirtualProcessorInterruptControllerState(part, vp, page.as_mut_ptr().cast(), LAPIC_PAGE as u32, &mut written),
+                    1 => whv::WHvSetVirtualProcessorInterruptControllerState(part, vp, s.page.as_ptr().cast(), s.page_size),
+                    2 => whv::WHvGetVirtualProcessorState(
+                        part,
+                        vp,
+                        whv::WHvVirtualProcessorStateTypeInterruptControllerState2,
+                        page.as_mut_ptr().cast(),
+                        4096,
+                        &mut written,
+                    ),
+                    3 => whv::WHvSetVirtualProcessorState(
+                        part,
+                        vp,
+                        whv::WHvVirtualProcessorStateTypeInterruptControllerState2,
+                        s.two.as_ptr().cast(),
+                        s.two_size,
+                    ),
+                    4 => get(whv::WHvX64RegisterApicBase),
+                    5 => set(whv::WHvX64RegisterApicBase, s.base),
+                    6 => get(whv::WHvX64RegisterRip),
+                    7 => set(whv::WHvX64RegisterRip, s.rip),
+                    8 => get(whv::WHvX64RegisterTsc),
+                    9 => whv::WHvGetVirtualProcessorXsaveState(part, vp, xsave.as_mut_ptr().cast(), u32::try_from(xsave.len()).unwrap(), &mut written),
+                    10 => whv::WHvSetVirtualProcessorXsaveState(part, vp, s.xsave.as_ptr().cast(), u32::try_from(s.xsave.len()).unwrap()),
+                    11 => whv::WHvRequestInterrupt(part, &control, u32::try_from(std::mem::size_of_val(&control)).unwrap()),
+                    _ => {
+                        let mut result: whv::WHV_TRANSLATE_GVA_RESULT = std::mem::zeroed();
+                        let mut gpa = 0u64;
+                        whv::WHvTranslateGva(part, vp, 0, whv::WHvTranslateGvaFlagValidateRead, &mut result, &mut gpa)
+                    }
+                }
+            };
+            (h, u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX))
+        };
+        let round = |vp: u32, t: &mut Tally| {
+            for i in 0..CALLS {
+                let (h, ns) = call(i, vp);
+                *t.answers[i].entry(h).or_default() += 1;
+                t.ns[i].push(ns);
+            }
+        };
+        let some = |vp: u32| {
+            let mut t = Tally::new();
+            for _ in 0..N {
+                round(vp, &mut t);
+            }
+            t
+        };
+        let suspend = || {
+            // SAFETY: the VM's partition, no VP running.
+            let h = unsafe { whv::WHvSuspendPartitionTime(part) };
+            assert_eq!(h, 0, "WHvSuspendPartitionTime");
+        };
+        let resume = || {
+            // SAFETY: the VM's partition, its time suspended by this test.
+            let h = unsafe { whv::WHvResumePartitionTime(part) };
+            assert_eq!(h, 0, "WHvResumePartitionTime");
+        };
+        let mut failed_control = Vec::new();
+        let stop = AtomicBool::new(false);
+        let phase = AtomicU8::new(0);
+        for load in [false, true] {
+            let loaded = if load { "a spinner on every processor" } else { "unloaded" };
+            let spin = AtomicBool::new(load);
+            std::thread::scope(|s| {
+                let spinners = if load { std::thread::available_parallelism().map_or(4, |n| n.get()) } else { 0 };
+                for _ in 0..spinners {
+                    s.spawn(|| {
+                        while spin.load(Ordering::Relaxed) {
+                            std::hint::spin_loop();
+                        }
+                    });
+                }
+                for (vp, state) in [(0u32, "after an exit"), (1, "never run")] {
+                    // Steady, by another thread and by the suspending one.
+                    for own in [false, true] {
+                        let mut before = some(vp);
+                        suspend();
+                        let mut during = if own { some(vp) } else { {
+                            let some = &some;
+                            s.spawn(move || some(vp)).join().unwrap()
+                        } };
+                        resume();
+                        let mut after = some(vp);
+                        let line = format!(
+                            "TIMEGET steady, target {vp} ({state}), {loaded}, calls by {}: before: {}; | suspended: {}; | after: {}",
+                            if own { "the suspending thread" } else { "another thread" },
+                            described(&mut before),
+                            described(&mut during),
+                            described(&mut after)
+                        );
+                        eprintln!("{line}");
+                        if before.refused() {
+                            failed_control.push(line);
+                        }
+                    }
+                    // Transitions: A suspends and resumes in a loop.
+                    stop.store(false, Ordering::SeqCst);
+                    let a = s.spawn(|| {
+                        let (mut sus, mut res) = (Vec::new(), Vec::new());
+                        let (mut sus_h, mut res_h) = (BTreeMap::<i32, u64>::new(), BTreeMap::<i32, u64>::new());
+                        while !stop.load(Ordering::Relaxed) {
+                            let t = Instant::now();
+                            // SAFETY: the VM's partition, no VP running.
+                            let h = unsafe { whv::WHvSuspendPartitionTime(part) };
+                            sus.push(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                            *sus_h.entry(h).or_default() += 1;
+                            if h == 0 {
+                                let t = Instant::now();
+                                // SAFETY: as above, time suspended here.
+                                let h = unsafe { whv::WHvResumePartitionTime(part) };
+                                res.push(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                                *res_h.entry(h).or_default() += 1;
+                            }
+                        }
+                        format!("Suspend {} ({}), Resume {} ({})", tally(&sus_h), spread(&mut sus), tally(&res_h), spread(&mut res))
+                    });
+                    let mut t = Tally::new();
+                    let mut rounds = 0u64;
+                    let begun = Instant::now();
+                    while begun.elapsed() < SPAN {
+                        round(vp, &mut t);
+                        rounds += 1;
+                    }
+                    stop.store(true, Ordering::SeqCst);
+                    let a_calls = a.join().unwrap();
+                    eprintln!("TIMEGET transitions, target {vp} ({state}), {loaded}: {rounds} rounds; {}; | A: {a_calls}", described(&mut t));
+                    // Phases: A keeps each of running and suspended for 1 ms.
+                    stop.store(false, Ordering::SeqCst);
+                    let a = s.spawn(|| {
+                        let hold = |d: Duration| {
+                            let t = Instant::now();
+                            while t.elapsed() < d {
+                                std::hint::spin_loop();
+                            }
+                        };
+                        while !stop.load(Ordering::Relaxed) {
+                            phase.store(1, Ordering::SeqCst);
+                            // SAFETY: the VM's partition, no VP running.
+                            let h = unsafe { whv::WHvSuspendPartitionTime(part) };
+                            assert_eq!(h, 0, "WHvSuspendPartitionTime");
+                            phase.store(2, Ordering::SeqCst);
+                            hold(Duration::from_millis(1));
+                            phase.store(3, Ordering::SeqCst);
+                            // SAFETY: as above, time suspended here.
+                            let h = unsafe { whv::WHvResumePartitionTime(part) };
+                            assert_eq!(h, 0, "WHvResumePartitionTime");
+                            phase.store(0, Ordering::SeqCst);
+                            hold(Duration::from_millis(1));
+                        }
+                    });
+                    // (call, phase at its start, at its end) -> answers.
+                    let mut by_phase: BTreeMap<(usize, u8, u8), BTreeMap<i32, u64>> = BTreeMap::new();
+                    let begun = Instant::now();
+                    while begun.elapsed() < SPAN {
+                        for i in 0..CALLS {
+                            let p0 = phase.load(Ordering::SeqCst);
+                            let (h, _) = call(i, vp);
+                            let p1 = phase.load(Ordering::SeqCst);
+                            *by_phase.entry((i, p0, p1)).or_default().entry(h).or_default() += 1;
+                        }
+                    }
+                    stop.store(true, Ordering::SeqCst);
+                    a.join().unwrap();
+                    let refusals = by_phase
+                        .iter()
+                        .filter(|(_, m)| m.keys().any(|h| *h != 0))
+                        .map(|((i, p0, p1), m)| format!("{} {}->{}: {}", NAMES[*i], PHASES[*p0 as usize], PHASES[*p1 as usize], tally(m)))
+                        .collect::<Vec<_>>();
+                    let mut calls_by_phase: BTreeMap<(u8, u8), u64> = BTreeMap::new();
+                    for ((_, p0, p1), m) in &by_phase {
+                        *calls_by_phase.entry((*p0, *p1)).or_default() += m.values().sum::<u64>();
+                    }
+                    let calls_by_phase =
+                        calls_by_phase.iter().map(|((p0, p1), n)| format!("{}->{} {n}", PHASES[*p0 as usize], PHASES[*p1 as usize])).collect::<Vec<_>>();
+                    eprintln!(
+                        "TIMEGET phases, target {vp} ({state}), {loaded}: calls by phase: {}; refused (call phase->phase: answers): {}",
+                        calls_by_phase.join(", "),
+                        if refusals.is_empty() { "none".to_string() } else { refusals.join("; ") }
+                    );
+                }
+                spin.store(false, Ordering::Relaxed);
+            });
+        }
+        drop(one);
+        drop(zero);
+        drop(vm);
+        // SAFETY: the test's memory, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        assert!(failed_control.is_empty(), "a call was refused with nothing else made: {failed_control:?}");
+    }
+
     // String port I/O and device memory with a second operand in RAM, as
     // Firecracker's devices see them and as the guest's memory and
     // registers are left. Asserted, each as KVM does it (Linux v6.1

@@ -1554,6 +1554,16 @@ jobs:
           # to each exit, with and without a spinner on every processor.
           # Only the calls made with nothing else are asserted.
           alone whp::vcpu::fpu_tests::test_state_gets_against_cancels_on_record
+          # What WHP answers a VP's state calls while the partition's time is
+          # suspended, or while it is being suspended or resumed (TIMEGET
+          # lines, by HRESULT, with each call's time): CANCELGET found the
+          # legacy interrupt controller state get and set refused only while
+          # another thread suspends and resumes time. The legacy and State2
+          # get and set, APIC_BASE, RIP, the TSC, XSAVE, WHvRequestInterrupt
+          # and WHvTranslateGva, by another thread and by the suspending
+          # one, steady and in transition, by the phase they began and ended
+          # in. Only the calls made with nothing else are asserted.
+          alone whp::vcpu::fpu_tests::test_state_calls_against_time_suspension_on_record
           # Which WHP call it is that commits a vCPU thread's stack: every
           # call a thread makes, with the stack committed before and after
           # it (STACKCALL lines), for what a booting Linux guest does and
