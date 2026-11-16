@@ -68,15 +68,16 @@
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
 #   cpu-template-helper: 30 tests; 25 pass, 5 fail (no-hvf).
-#   compat-kvm-ioctls: 64 tests; 24 pass, 40 fail, all no-hvf (Error(1) at
-#   hv_vm_create; counted again with the guest-debug tests, with PV time's
-#   (the attribute's refusal where PV time is not offered is checked
-#   without a VM: test_the_attribute_is_enxio_where_pv_time_is_not_offered,
-#   which passes on the runners, macOS 26), and with the
-#   vCPU thread's latency tier: test_a_wfi_ends_when_its_timer_is_due
-#   fails on a runner before it makes its VM, at its own requirement of a
-#   foreground process, since the runners' processes are coalesced as
-#   background ones: timer-coalescing.py's output in the same job).
+#   compat-kvm-ioctls: 99 tests; 34 pass, 58 fail, 7 ignored (counted again
+#   on 2026-11-17 by check-unit-tests.py --crate compat-kvm-ioctls), all
+#   no-hvf: 57 with Error(1) at hv_vm_create, and the vCPU thread's latency
+#   tier's test_a_wfi_ends_when_its_timer_is_due, which fails on a runner
+#   before it makes its VM, at its own requirement of a foreground process,
+#   since the runners' processes are coalesced as background ones
+#   (timer-coalescing.py's output in the same job). PV time's refusal where
+#   it is not offered is checked without a VM
+#   (test_the_attribute_is_enxio_where_pv_time_is_not_offered, which passes
+#   on the runners, macOS 26).
 #   Pass (names, a name in two of a crate's binaries counted once):
 #   acpi-tables 22, clippy-tracing 17, firecracker 89, rebase-snap 3,
 #   snapshot-editor 6, utils 16, wick-ext 1, wick-version 2, compat-libc 30,
@@ -127,6 +128,7 @@ no-hvf compat-kvm-ioctls hvf::smccc_tests::test_trng_calls_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::vcpu::tests::test_kvm_ptp_counters
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_fill_in_a_removed_slots_page_maps_nothing_for_the_guest
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_new_vcpu_has_kvms_reset_values
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_store_to_a_read_only_slot_is_still_mmio
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_a_wfi_ends_when_its_timer_is_due
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_an_eventfd_is_one_irqfd_of_a_vm
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_an_irqfd_write_of_another_process_is_raised_by_the_irqfd_thread
