@@ -26,7 +26,8 @@ every backend and every gap. This page is the summary.
   the user's, not run yet). In CI run 43688550565 (6a2c1705) the root step ran and the stage
   failed as it must there, but the job failed after it: its check reads `kern.hv_support`, which that runner does
   not have ("sysctl: unknown oid"), so the checks that the results are the user's and that no root-owned file is
-  left did not run; the job's fix is in progress.
+  left did not run. Since 4c3e4683 the job takes a missing `kern.hv_support` (a kernel built without HYPERVISOR,
+  as that virtual Mac's) as no Hypervisor.framework; not run yet.
   `boot-test.ps1 <stage>` is a stage of [`tools/windows/boot-test.ps1`](../tools/windows/boot-test.ps1) on a PC
   with the Windows Hypervisor Platform (WHP).
 - `jailer-test <stage>` is [`tools/macos/jailer-test.sh`](../tools/macos/jailer-test.sh): run by the user, it builds
