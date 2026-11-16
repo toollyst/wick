@@ -170,7 +170,8 @@ $BootArgs = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i804
     'root=/dev/vda ro rootfstype=squashfs init=/bin/sh'
 
 # What upstream Firecracker does that wick does not do on Windows yet
-# (docs/ROADMAP.md, "Platform status"); listed in the summary, not run.
+# (docs/PORTING.md, "Where behaviour is not the same yet"); listed in the
+# summary, not run.
 # (The leading comma keeps a one-entry list a list of pairs.)
 # The jailer has its own test, tools\windows\jailer-test.ps1.
 $NotImplemented = @()

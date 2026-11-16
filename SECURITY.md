@@ -393,7 +393,9 @@ upstream Firecracker and its jailer.
   (`test_a_chunk_with_one_dead_page_at_the_limit`; the memory.max row, on Windows Server 2022 20348, and on Windows
   Server 2025 in CI runs 43680983973 and 43688550565). Under a running vCPU it is not shown yet: the test of that,
   MOVEUNDERVCPU, moved no chunk in those runs, its fill at the limit a discarded page's, which takes nothing new;
-  with a fresh page's fill since, it has not run yet (the memory.max row). Where another
+  with a fresh page's fill since, it ran in CI runs 43784960688 and 43790310601 and failed: a thread's stack page was
+  refused at the limit before any chunk moved (exit 137, the stack filter's line), with no reclaim first where
+  Linux's memory cgroup reclaims for a stack page too; fix in progress (stack reclaim; the memory.max row). Where another
   commit takes that room before the move maps, the move is not made and the chunk owes the charge: the job then holds
   up to 12 KiB more than it is charged, for one chunk at a time, said on standard error, with every userfaultfd fill
   refused until the charge is taken again (`test_a_move_whose_room_is_taken_owes_its_charge`); a bounded
@@ -408,7 +410,8 @@ upstream Firecracker and its jailer.
   reclaim first (`ENOMEM`, or the process ends: a thread whose stack must grow ends it with 137 and a line, its
   refused commit told from a stack used up by the thread's TEB in an unhandled-exception filter, which bypasses
   Windows Error Reporting on purpose, as an end at the limit is not a crash; a stack used up still reaches it,
-  `test_a_stack_that_must_grow_at_the_limit_ends_with_137`, `test_a_stack_overflow_at_the_reserves_end_is_still_one`),
+  `test_a_stack_that_must_grow_at_the_limit_ends_with_137`, `test_a_stack_overflow_at_the_reserves_end_is_still_one`,
+  on Windows Server 2022 20348; on Server 2025 26100 a thread-pool thread's overflow ended its child with 0, open),
   not done yet for the reclaim; the limit holds either way. A move holds its live
   pages in two sections for its
   time; a 2 MiB move budget of private `PAGE_NOACCESS` commit, made at the first registration, is the cover the

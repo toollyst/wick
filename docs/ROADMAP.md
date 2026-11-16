@@ -144,8 +144,9 @@ dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `
 - Memory at `memory.max` under a userfaultfd restore: a reclaim of the pages discarded inside a 2 MiB chunk
   before a charge is refused, as Linux's memory cgroup reclaims, by moving their chunks into new sections, with no
   room left in the job: each move gives back part of its own dead pages' charge for its maps first (Windows Server
-  2022 20348, and Windows Server 2025 in CI runs 43680983973 and 43688550565; MOVEUNDERVCPU needs WHP: not run since
-  its test was fixed, CI or the PC next). A charge a move could not take back owes up to 12 KiB, stated. Left, each stated in docs/COMPATIBILITY.md's `memory.max` row: the discarded pages of a released range,
+  2022 20348, and Windows Server 2025 in CI runs 43680983973 and 43688550565; MOVEUNDERVCPU, run in CI runs 43784960688 and
+  43790310601, failed: a thread's stack page refused at the limit before any move, with no reclaim first; fix in
+  progress, stack reclaim). A charge a move could not take back owes up to 12 KiB, stated. Left, each stated in docs/COMPATIBILITY.md's `memory.max` row: the discarded pages of a released range,
   a reclaim before a refused allocation of the VMM's own (its heap, a thread's stack), and before a commit made at
   once that is refused (`MAP_POPULATE`, a private file mapping's read, a `MAP_FIXED` recommit, a discard of private
   memory that is not lazy, a committing `mprotect`), which fails with `ENOMEM` today: not done yet.
