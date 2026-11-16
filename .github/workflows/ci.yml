@@ -96,6 +96,14 @@ jobs:
         run: |
           python3 -I -B tools/check-derived.py --selftest
           python3 -I -B tools/check-derived.py
+      # No tracked file points into the agents' notes, which are not in the
+      # repository, and every docs table row has its header's cells and ends
+      # in `|` (5859a449's COMPATIBILITY row did not, and every other check
+      # passed).
+      - name: Tracked files and docs tables
+        run: |
+          python3 -I -B tools/check-tree.py --selftest
+          python3 -I -B tools/check-tree.py
       - name: Cleanup script
         run: |
           bash -n tools/clean.sh
