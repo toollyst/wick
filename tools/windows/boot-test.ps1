@@ -446,13 +446,71 @@ namespace Wick {
             errPump.Join(ms);
         }
 
+        // The answer patches/0050 gives a request the VMM can no longer
+        // serve: Firecracker is exiting by itself, and writes its reason
+        // after that answer (Ending).
+        public const string VmmEnded = "The VMM has ended and Firecracker is exiting";
+
+        // How long a Firecracker that answered VmmEnded has to exit; one
+        // that does not is a failure of its own (Ending).
+        public static int ExitBoundMs = 10000;
+
+        // Called when the harness starts waiting for an exit it was told of
+        // (-SelfTest's hook: it then lets its stand-in go on).
+        public static Action WaitingExit;
+
+        // Killed by the harness while it ran (Kill): its output, and the
+        // log file below, end where the kill came.
+        public bool KilledAlive;
+
+        // Firecracker's --log-path file, where Kill records a kill of a
+        // running process too (set by Start-Vm).
+        public string LogFile;
+
+        // Waits up to ExitBoundMs for a Firecracker that answered VmmEnded,
+        // and says how it ended, its last lines included: it answers before
+        // it writes its reason (upstream's run_with_api drops the VMM's
+        // channel ends, which makes the answer, then joins the API thread,
+        // and main logs the error after), so a stage that killed it on the
+        // answer cut its log there (macOS's harness, CI run 43823078930's
+        // macos-15-root-vmnet). One that does not exit within the bound is
+        // killed, which its logs record, and is a failure of its own.
+        public string Ending() {
+            var hook = WaitingExit;
+            if (hook != null) hook();
+            if (!p.WaitForExit(ExitBoundMs)) {
+                Kill();
+                throw new Failure("Firecracker said it was exiting and did not within " + (ExitBoundMs / 1000) +
+                                  " s; killed by the harness while alive; " + ExitReason());
+            }
+            p.WaitForExit();
+            outPump.Join(5000);
+            errPump.Join(5000);
+            return "then it exited: " + ExitReason();
+        }
+
+        // Ends the process. One still running is killed, which its console
+        // log and its Firecracker log record after the last line each got,
+        // so that a log cut short says why (KilledAlive; a failed stage's
+        // summary names it too).
         public void Kill() {
             TakeHandles();
-            try { if (!p.HasExited) p.Kill(); } catch (InvalidOperationException) { } catch (System.ComponentModel.Win32Exception) { }
+            bool alive = false;
+            try { if (!p.HasExited) { alive = true; p.Kill(); } } catch (InvalidOperationException) { } catch (System.ComponentModel.Win32Exception) { }
             p.WaitForExit(5000);
             outPump.Join(2000);
             errPump.Join(2000);
-            lock (text) { try { log.Dispose(); } catch (Exception) { } }
+            const string line = "boot-test: killed by the harness while alive; its output ends above\n";
+            if (alive) {
+                KilledAlive = true;
+                if (!string.IsNullOrEmpty(LogFile)) {
+                    try { File.AppendAllText(LogFile, line, NoBom); } catch (Exception) { }
+                }
+            }
+            lock (text) {
+                if (alive) { try { log.Write(line); } catch (Exception) { } }
+                try { log.Dispose(); } catch (Exception) { }
+            }
         }
     }
 
@@ -1493,6 +1551,36 @@ namespace Wick {
             }
         }
 
+        // A stand-in for Firecracker's API server that answers one request
+        // with `status` and `body`, on a thread of its own; joined by the
+        // caller, it has closed its socket.
+        public static Thread AnswerOnce(string sock, int status, string body) {
+            try { File.Delete(sock); } catch (Exception) { }
+            var listener = USock.Listen(sock);
+            var server = new Thread(delegate() {
+                try {
+                    using (var c = listener.Accept(10000)) {
+                        var req = new StringBuilder();
+                        var buf = new byte[4096];
+                        while (req.ToString().IndexOf("\r\n\r\n", StringComparison.Ordinal) < 0) {
+                            int n = c.Recv(buf, 0, buf.Length, 5000);
+                            if (n <= 0) break;
+                            req.Append(Encoding.UTF8.GetString(buf, 0, n));
+                        }
+                        c.SendAll(Encoding.ASCII.GetBytes("HTTP/1.1 " + status + " \r\nContent-Type: application/json\r\nContent-Length: " +
+                                                          Encoding.UTF8.GetByteCount(body) + "\r\n\r\n" + body));
+                    }
+                } catch (Exception) {
+                } finally {
+                    listener.Dispose();
+                    try { File.Delete(sock); } catch (Exception) { }
+                }
+            });
+            server.IsBackground = true;
+            server.Start();
+            return server;
+        }
+
         // Api.Call against a stand-in for Firecracker's API server, which
         // answers in two writes as micro_http may.
         public static string ApiTest(string dir) {
@@ -1955,7 +2043,40 @@ function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api, [st
     $vm | Add-Member -NotePropertyName ApiSock -NotePropertyValue $sock
     $vm | Add-Member -NotePropertyName LogPath -NotePropertyValue $logPath
     $vm | Add-Member -NotePropertyName StageName -NotePropertyValue $name
+    $vm.LogFile = $logPath
     return $vm
+}
+
+# The names of a stage's VMs the harness killed while they ran (Wick.Vm.Kill,
+# KilledAlive), now or earlier in the stage: their logs end where the kill came.
+function Get-KilledAlive($vms, [string]$stage) {
+    foreach ($vm in $vms) {
+        if ($vm -is [Wick.Vm] -and $vm.KilledAlive) {
+            if ($vm.StageName -and $vm.StageName -ne $stage) { "$stage/$($vm.StageName)" } else { $stage }
+        }
+    }
+}
+
+# A failed stage's detail, its first line (the summary's) naming the VMs the
+# harness killed while they ran.
+function Add-KilledAlive([string]$detail, $killed) {
+    if (@($killed).Count -eq 0) { return $detail }
+    $first, $rest = $detail -split "`n", 2
+    $line = "$first; killed by the harness while alive: $(@($killed) -join ', ')"
+    if ($null -ne $rest) { return "$line`n$rest" }
+    return $line
+}
+
+# One API request: [Wick.Api]::Call, and after patches/0050's answer that the
+# VMM ended, the process's own exit (`Wick.Vm.Ending`), whose reason and last
+# lines are added to the body: a caller's failure then says why the VMM ended,
+# and the stage's cleanup no longer kills a Firecracker that is writing it.
+function Invoke-ApiCall($vm, [string]$method, [string]$path, $json, [int]$ms, [ref]$status) {
+    $out = [Wick.Api]::Call($vm.ApiSock, $method, $path, $json, $ms, $status)
+    if ($status.Value -eq 500 -and $out.Contains([Wick.Vm]::VmmEnded)) {
+        $out = "$out; $($vm.Ending())"
+    }
+    return $out
 }
 
 # One API request; fails unless the status is 2xx. Returns the body.
@@ -1963,7 +2084,7 @@ function Invoke-Api($vm, [string]$method, [string]$path, $body = $null) {
     Check ([bool]$vm.ApiSock) "$method $path`: the VM was started without -Api"
     $json = if ($null -ne $body) { $body | ConvertTo-Json -Depth 8 -Compress } else { $null }
     $status = 0
-    $out = [Wick.Api]::Call($vm.ApiSock, $method, $path, $json, 120000, [ref]$status)
+    $out = Invoke-ApiCall $vm $method $path $json 120000 ([ref]$status)
     # The body names which request it was (PUT /actions: the action).
     $sent = if ($null -ne $json -and $json.Length -le 200) { " $json" } else { '' }
     Check ($status -ge 200 -and $status -lt 300) "$method $path$sent -> $status $out"
@@ -2898,7 +3019,7 @@ function Stage-ApiProcess {
     $info = Invoke-Api $vm 'GET' '/'
     Check ($info -match '"state":"Running"') "instance information through the API process: $info"
     $status = 0
-    [void][Wick.Api]::Call($vm.ApiSock, 'PUT', '/nothing-here', '{}', 30000, [ref]$status)
+    [void](Invoke-ApiCall $vm 'PUT' '/nothing-here' '{}' 30000 ([ref]$status))
     Check ($status -eq 400) "an unknown path: $status"
     Stop-Process -Id $api -Force
     $until = [DateTime]::UtcNow.AddSeconds(15)
@@ -3517,7 +3638,7 @@ function Stage-Tools {
         $vm = Start-Vm "tools-$($case[0] -replace '\W', '')" $null -Api
         $status = 0
         $body = [ordered]@{ snapshot_path = $f; mem_backend = [ordered]@{ backend_type = 'File'; backend_path = $mem } } | ConvertTo-Json -Compress
-        $out = [Wick.Api]::Call($vm.ApiSock, 'PUT', '/snapshot/load', $body, 30000, [ref]$status)
+        $out = (Invoke-ApiCall $vm 'PUT' '/snapshot/load' $body 30000 ([ref]$status))
         Check ($status -eq 400 -and $out.Contains($case[2])) "a state file with $($case[0]): $status $out"
         $until = [DateTime]::UtcNow.AddSeconds(10)
         while (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
@@ -3536,7 +3657,7 @@ function Stage-ForeignSnapshot {
     $vm = Start-Vm 'foreign-snapshot' $null -Api
     $status = 0
     $body = [ordered]@{ snapshot_path = (Resolve-Path $ForeignState).Path; mem_backend = [ordered]@{ backend_type = 'File'; backend_path = (Join-Path $Scratch 'none.mem') } } | ConvertTo-Json -Compress
-    $out = [Wick.Api]::Call($vm.ApiSock, 'PUT', '/snapshot/load', $body, 30000, [ref]$status)
+    $out = (Invoke-ApiCall $vm 'PUT' '/snapshot/load' $body 30000 ([ref]$status))
     Check ($status -eq 400 -and $out -match 'Failed to load snapshot state from file') "PUT /snapshot/load of $ForeignState`: $status $out"
     $until = [DateTime]::UtcNow.AddSeconds(10)
     while (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
@@ -3565,7 +3686,7 @@ function Start-WithTemplate([string]$name, $cfg, $template) {
     Invoke-Api $vm 'PUT' '/machine-config' $cfg['machine-config'] | Out-Null
     Invoke-Api $vm 'PUT' '/cpu-config' $template | Out-Null
     $status = 0
-    $out = [Wick.Api]::Call($vm.ApiSock, 'PUT', '/actions', '{"action_type":"InstanceStart"}', 120000, [ref]$status)
+    $out = (Invoke-ApiCall $vm 'PUT' '/actions' '{"action_type":"InstanceStart"}' 120000 ([ref]$status))
     return @($vm, $status, $out)
 }
 
@@ -3716,7 +3837,7 @@ function Stage-DiffNoSpace {
         $body = [ordered]@{ snapshot_type = 'Diff'; snapshot_path = $state; mem_file_path = $mem } | ConvertTo-Json -Compress
         Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
         $status = 0
-        $out = [Wick.Api]::Call($vm.ApiSock, 'PUT', '/snapshot/create', $body, 120000, [ref]$status)
+        $out = (Invoke-ApiCall $vm 'PUT' '/snapshot/create' $body 120000 ([ref]$status))
         Check ($status -eq 400 -and $out -match 'os error 112') "a diff snapshot with $([math]::Round($left / 1MB)) MiB free: $status $out"
         $why = ([regex]::Match($out, '"fault_message":\s*"(.*)"')).Groups[1].Value
         Check (-not $vm.Exited) "Firecracker after the failed snapshot: $($vm.ExitReason())"
@@ -3790,7 +3911,7 @@ function Stage-LinuxSnapshot {
         mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = (Resolve-Path $mem).Path }
         resume_vm     = $true
     } | ConvertTo-Json -Compress
-    $out = [Wick.Api]::Call($vm.ApiSock, 'PUT', '/snapshot/load', $body, 120000, [ref]$status)
+    $out = (Invoke-ApiCall $vm 'PUT' '/snapshot/load' $body 120000 ([ref]$status))
     if ($status -lt 200 -or $status -ge 300) {
         $until = [DateTime]::UtcNow.AddSeconds(10)
         while (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
@@ -4209,6 +4330,55 @@ if ($SelfTest) {
         switch = { [Wick.SelfTest]::SwitchTest($dir) }
         vsock  = { [Wick.SelfTest]::VsockTest($dir) }
         api    = { [Wick.SelfTest]::ApiTest($dir) }
+        ending = {
+            # A Firecracker that answered patches/0050's 500 ("The VMM has
+            # ended and Firecracker is exiting") writes its reason after the
+            # answer: the harness waits for its exit, so both of its exit
+            # lines are in its log and the failure says how it exited (macOS's
+            # harness killed it on the answer: CI run 43823078930); one that
+            # never exits fails at the bound, killed, its logs saying so and
+            # the stage's summary naming it. The stand-in (cmd.exe) writes its
+            # two lines and exits 1 only once it reads a line, which the
+            # harness's hook sends when it starts to wait (Wick.Vm.WaitingExit).
+            $sock = Join-Path $dir 'end.api'
+            $body = '{"fault_message":"The VMM has ended and Firecracker is exiting; its log and standard error say why."}'
+            $standIn = '/d /c "set /p x= & echo RunWithApiError error: the stand-in''s & echo Firecracker exiting with error. exit_code=1 & exit 1"'
+            $got = @{}
+            foreach ($case in 'ended', 'stuck') {
+                $server = [Wick.SelfTest]::AnswerOnce($sock, 500, $body)
+                $fcLog = Join-Path $dir "$case-firecracker.log"
+                $console = Join-Path $dir "$case-console.txt"
+                Set-Content -Encoding ASCII $fcLog ''
+                $vm = New-Object Wick.Vm("$env:SystemRoot\System32\cmd.exe", $standIn, $console)
+                $vm | Add-Member -NotePropertyName ApiSock -NotePropertyValue $sock
+                $vm | Add-Member -NotePropertyName StageName -NotePropertyValue $case
+                $vm.LogFile = $fcLog
+                if ($case -eq 'ended') { [Wick.Vm]::WaitingExit = [Action] { $vm.Send('go') } } else { [Wick.Vm]::ExitBoundMs = 1000 }
+                $f = $null
+                try {
+                    try { Invoke-Api $vm 'GET' '/' | Out-Null } catch { $f = Get-Failure $_; if (-not $f) { throw } }
+                } finally {
+                    [Wick.Vm]::WaitingExit = $null
+                    [Wick.Vm]::ExitBoundMs = 10000
+                    $vm.Kill()
+                    $server.Join(5000) | Out-Null
+                }
+                $got[$case] = @{ Failure = $(if ($f) { $f.Message } else { '' }); Killed = $vm.KilledAlive; Console = [IO.File]::ReadAllText($console); Log = [IO.File]::ReadAllText($fcLog); Vm = $vm }
+            }
+            $e = $got['ended']
+            foreach ($want in 'RunWithApiError error: the stand-in', 'Firecracker exiting with error. exit_code=1') {
+                Check ($e.Console.Contains($want)) "ended: the log lacks '$want' (the harness did not wait for the exit): $($e.Console)"
+            }
+            Check ($e.Failure.Contains('-> 500') -and $e.Failure.Contains('then it exited: exit 1')) "ended: failure '$($e.Failure)'"
+            Check (-not $e.Killed -and -not $e.Console.Contains('killed by the harness')) "ended: killed by the harness: $($e.Console)"
+            $s = $got['stuck']
+            Check ($s.Failure.StartsWith('Firecracker said it was exiting and did not within 1 s; killed by the harness while alive')) "stuck: failure '$($s.Failure)'"
+            Check ($s.Killed -and $s.Console.Contains('boot-test: killed by the harness while alive') -and $s.Log.Contains('boot-test: killed by the harness while alive')) "stuck: killed $($s.Killed), console '$($s.Console)', log '$($s.Log)'"
+            $named = @(Get-KilledAlive @($e.Vm, $s.Vm) 'end')
+            Check (($named -join ',') -eq 'end/stuck') "the stage's killed VMs: $($named -join ',')"
+            Check ((Add-KilledAlive "a`nb" $named) -eq "a; killed by the harness while alive: end/stuck`nb") 'Add-KilledAlive does not name the kill on the summary''s line'
+            return 'ending: a Firecracker that answered that its VMM ended is waited for (both exit lines logged, exit 1); one that never exits fails at the bound, killed, its logs and the summary saying so'
+        }
         pipe   = { [Wick.PipeSelfTest]::Run() }
         relay  = {
             # The gdb stage's TCP relay, against a stand-in for the gdb stub.
@@ -4550,8 +4720,10 @@ foreach ($name in $selected) {
                 [void]$HandleRecs.Add("NOFILEREC $which`: $($vm.HandleRecord)")
             }
         }
+        $killed = @(Get-KilledAlive $Vms $name)
         $Vms = @()
     }
+    if ($result -eq 'FAIL') { $detail = Add-KilledAlive $detail $killed }
     $color = switch ($result) { 'PASS' { 'Green' } 'N/A' { 'Yellow' } default { 'Red' } }
     Write-Host ("   {0} ({1:N1} s): {2}" -f $result, $sw.Elapsed.TotalSeconds, $detail) -ForegroundColor $color
     [void]$Summary.Add([pscustomobject]@{ Result = $result; Stage = $name; Detail = $detail })

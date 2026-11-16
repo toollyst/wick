@@ -71,13 +71,30 @@ function Assert-SockPath([string]$sock) {
     Check ($n -le $SockBound) "the socket path $sock is $n bytes, and an AF_UNIX path holds $SockBound"
 }
 
+# The processes the harness killed while they ran (Stop-Alive), in order: a
+# failed stage's summary line names those of the stage, whose output ends
+# where the kill came.
+$KilledAlive = New-Object Collections.ArrayList
+
+# Kills each of `procs` still running, and records it (KilledAlive, and a
+# line on the host's output), as boot-test.ps1 records a kill of a live VM.
+function Stop-Alive($procs) {
+    foreach ($p in @($procs)) {
+        if (-not $p -or $p.HasExited) { continue }
+        $what = "$($p.ProcessName) pid $($p.Id)"
+        try { $p | Stop-Process -Force -ErrorAction Stop } catch { if (-not $p.HasExited) { throw } }
+        [void]$KilledAlive.Add($what)
+        Write-Host "   jailer-test: killed by the harness while alive: $what ($($p.Path))"
+    }
+}
+
 # Firecracker first: its jailer then exits as after a guest shutdown and
 # removes the jail's drive.
 function Stop-Jailed {
-    Get-Process firecracker, jail-probe -ErrorAction SilentlyContinue | Stop-Process -Force
+    Stop-Alive (Get-Process firecracker, jail-probe -ErrorAction SilentlyContinue)
     $t = [DateTime]::Now.AddSeconds(5)
     while ((Get-Process jailer -ErrorAction SilentlyContinue) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
-    Get-Process jailer -ErrorAction SilentlyContinue | Stop-Process -Force
+    Stop-Alive (Get-Process jailer -ErrorAction SilentlyContinue)
 }
 
 # Ends the jailers a stage started and still runs: their jailed processes
@@ -87,9 +104,9 @@ function Stop-Jailed {
 # left its drive mapped for the logon session (run 43428124115's parent
 # stage: Y: and Z:).
 function Stop-Jailers([object[]]$jailers) {
-    Get-Process firecracker, jail-probe -ErrorAction SilentlyContinue | Stop-Process -Force
+    Stop-Alive (Get-Process firecracker, jail-probe -ErrorAction SilentlyContinue)
     foreach ($j in $jailers) {
-        if ($j -and -not $j.WaitForExit(10000)) { $j.Kill() }
+        if ($j -and -not $j.WaitForExit(10000)) { Stop-Alive $j }
     }
 }
 
@@ -528,7 +545,7 @@ function Stage-Daemonize {
         Check ($answer -match ' 200$') "the detached Firecracker's API: $answer"
         # Ending Firecracker lets its detached jailer exit cleanly and remove
         # the jail's drive, as a guest shutdown does.
-        $fcp | Stop-Process -Force
+        Stop-Alive $fcp
         $t = [DateTime]::Now.AddSeconds(5)
         while ((Get-Process jailer -ErrorAction SilentlyContinue) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
         "the launcher returned 0 in $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s; a detached Firecracker (pid $written, in the pid file) ran with no console and answered its API"
@@ -673,9 +690,37 @@ function Invoke-Api([string]$sock, [string]$method, [string]$path, $body = $null
     (& curl.exe @a) -join "`n"
 }
 
-# `Invoke-Api` that fails unless the status is 2xx; returns the body.
+# The answer patches/0050 gives a request the VMM can no longer serve.
+$VmmEnded = 'The VMM has ended and Firecracker is exiting'
+# How long a jailed Firecracker that gave that answer has to exit.
+$ExitBoundSec = 10
+
+# A jailed Firecracker that answered that its VMM ended (on `sock`) is exiting
+# by itself and writes its reason after the answer: waits for it, up to
+# $ExitBoundSec, and says how it ended, so that the stage's cleanup does not
+# kill it while it writes (macOS's harness did: CI run 43823078930). One that
+# does not exit within the bound is killed, recorded (Stop-Alive), and is a
+# failure of its own.
+function Wait-Ending([string]$sock) {
+    $root = Split-Path (Split-Path $sock)
+    $fc = @(Get-Process firecracker -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$root*" })
+    foreach ($p in $fc) { $null = $p.Handle }
+    foreach ($p in $fc) {
+        if (-not $p.WaitForExit($ExitBoundSec * 1000)) {
+            Stop-Alive $p
+            throw [Failure]::new("Firecracker said it was exiting and did not within $ExitBoundSec s; killed by the harness while alive")
+        }
+    }
+    $codes = @($fc | ForEach-Object { "pid $($_.Id) exit $($_.ExitCode)" })
+    "then it exited: $(if ($codes) { $codes -join ', ' } else { 'already gone' })"
+}
+
+# `Invoke-Api` that fails unless the status is 2xx; returns the body. After
+# patches/0050's answer, the failure comes once the jail's Firecracker has
+# exited (Wait-Ending).
 function Invoke-ApiOk([string]$sock, [string]$method, [string]$path, $body = $null) {
     $r = Invoke-Api $sock $method $path $body
+    if ($r -match ' 500$' -and $r.Contains($VmmEnded)) { $r = "$r; $(Wait-Ending $sock)" }
     Check ($r -match ' 2\d\d$') "$method $path -> $r"
     $r -replace ' \d{3}$', ''
 }
@@ -766,7 +811,7 @@ function Stage-Isolation {
         Check ($op -match ' allowed$') "operator: $op"
         $other.Send('reboot -ff')
         # Its Firecracker: the jailer then exits and removes the drive.
-        Get-Process firecracker | Where-Object { $_.Path -like "$base*\api\root*" } | Stop-Process -Force
+        Stop-Alive (Get-Process firecracker | Where-Object { $_.Path -like "$base*\api\root*" })
         [void]$api.WaitForExit(10000)
         "jailed: no user files, nothing outside its jail, no other jail, API socket or process (the operator's, another microVM's); the operator reaches the API socket ($($expect.Count) checks)"
     } finally {
@@ -1200,7 +1245,7 @@ function Stage-Pidns {
         Check ($r[0] -ne 0) "--new-pid-ns with a jail that cannot be built: the jailer exited 0: $($r[1])"
         Remove-Item $plain -ErrorAction SilentlyContinue
         # Ending Firecracker ends its keeper, which removes the jail's drive.
-        $fcp | Stop-Process -Force
+        Stop-Alive $fcp
         $t = [DateTime]::Now.AddSeconds(5)
         while ((Get-Process jailer -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $other.Jailer.Id }) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
         "the control reaches every process ($($ctl.Count) checks); jailed, nothing ($($checks.Count) checks and a console control event: the user's process survives); the console's mode stays with API-only jails and is raw only once the jailed process asks, typed keys reach it through the relay as bytes, none reach an API-only jail, and the mode is back after ($($timeline -join '; ')); --new-pid-ns: the jailer returned 0 in $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s with Firecracker running (pid file), refused a jail it could not build; a pid's existence still shows ($oracle)"
@@ -2091,6 +2136,7 @@ $Stage = @($Stage | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 foreach ($s in $Stage) {
     Write-Host "== $s"
     $sw = [Diagnostics.Stopwatch]::StartNew()
+    $killedBefore = $KilledAlive.Count
     try {
         $msg = if ($Stage.Count -gt 1 -and $OwnConsole -contains $s) { Invoke-InOwnConsole $s } else { & "Stage-$((Get-Culture).TextInfo.ToTitleCase($s))" }
         $Results[$s] = "PASS  ${s}: $msg"
@@ -2100,6 +2146,10 @@ foreach ($s in $Stage) {
     } catch {
         $Results[$s] = "FAIL  ${s}: $($_.Exception.Message)"
         Stop-Jailed
+        # The processes this stage's cleanup, or the stage, killed while they
+        # ran: their output ends where the kill came.
+        $killed = @($KilledAlive | Select-Object -Skip $killedBefore)
+        if ($killed.Count) { $Results[$s] += "; killed by the harness while alive: $($killed -join ', ')" }
     }
     Write-Host "   $($Results[$s]) ($([math]::Round($sw.Elapsed.TotalSeconds, 1)) s)"
 }
