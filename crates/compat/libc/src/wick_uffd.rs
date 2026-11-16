@@ -243,6 +243,75 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
     }
     LOCK.lock().unwrap()
 }
+/// Changes of memory under way without [`LOCK`]: an `munmap`, `MAP_FIXED`
+/// mapping, `mprotect` or discard that found no registered range in reach
+/// ([`unlocked_change`]).
+static UNLOCKED_CHANGES: AtomicUsize = AtomicUsize::new(0);
+/// Registers under way ([`register`]).
+static REGISTERING: AtomicUsize = AtomicUsize::new(0);
+/// Where a register waits for [`UNLOCKED_CHANGES`] to reach 0.
+static DRAINED: (Mutex<()>, std::sync::Condvar) = (Mutex::new(()), std::sync::Condvar::new());
+
+/// A change of memory running without [`LOCK`]; ends when dropped.
+struct UnlockedChange;
+
+impl Drop for UnlockedChange {
+    fn drop(&mut self) {
+        end_unlocked_change();
+    }
+}
+
+fn end_unlocked_change() {
+    if UNLOCKED_CHANGES.fetch_sub(1, Ordering::SeqCst) == 1 && REGISTERING.load(Ordering::SeqCst) > 0 {
+        let _drained = DRAINED.0.lock().unwrap_or_else(|e| e.into_inner());
+        DRAINED.1.notify_all();
+    }
+}
+
+/// Whether a change of `[start, end)` (an `munmap`, a `MAP_FIXED` mapping,
+/// an `mprotect`, a discard) may run without [`LOCK`]: when it touches no
+/// registered range (`touches` is false) and no register is under way. On
+/// Linux the mm's lock orders such a change and a register: either the
+/// register finds the memory as the change left it, or the change takes the
+/// registration with it. Here the change counts itself in
+/// [`UNLOCKED_CHANGES`] and then reads [`REGISTERING`]; a register counts
+/// itself in [`REGISTERING`] and then waits for [`UNLOCKED_CHANGES`] to be 0
+/// before it reads the mappings ([`register`]). Both are `SeqCst`, so of a
+/// change and a register that overlap in time at least one sees the other
+/// (Dekker's order): either the change takes [`LOCK`] and so runs before or
+/// after the whole register, or the register waits until the change is
+/// done. A register waits only for changes already running without the
+/// lock; changes that begin while it waits take [`LOCK`], so it cannot be
+/// starved.
+///
+/// The two orders: (1) the change's increment comes first in the single
+/// order of `SeqCst` operations. Then the register's wait reads a count
+/// above 0 and waits until the change has dropped it, after its system
+/// call, and only then reads the mappings. (2) The register's increment
+/// comes first. Then the change reads [`REGISTERING`] above 0 and diverts:
+/// it drops its own count before it takes [`LOCK`] (so the register it saw
+/// is not left waiting on it), and under the lock it decides again whether
+/// it touches a registered range; unmapping, protecting and
+/// discarding_or_refusing each do, by walking the ranges under the lock
+/// (`slots`, or `RANGES` in discarding) rather than by reusing the
+/// lock-free read. The wait is on a `Mutex` and `Condvar`, which a signal
+/// handler must not take: none of the three is reached from one. The
+/// handler (`on_signal`) calls only `asked_allows`, `fault` and the
+/// previous handler, and `fault` waits on a Mach semaphore; the raw
+/// `protect` is wick_uffd's own `mprotect`, not the compatibility one.
+/// Returns the change's count, ended when dropped, or `None`: take
+/// [`LOCK`].
+fn unlocked_change(touches: impl FnOnce() -> bool) -> Option<UnlockedChange> {
+    UNLOCKED_CHANGES.fetch_add(1, Ordering::SeqCst);
+    if REGISTERING.load(Ordering::SeqCst) == 0 && !touches() {
+        #[cfg(test)]
+        tests::change_hook();
+        return Some(UnlockedChange);
+    }
+    end_unlocked_change();
+    None
+}
+
 static INIT: Once = Once::new();
 static OLD_SIGBUS: AtomicPtr<libc::sigaction> = AtomicPtr::new(ptr::null_mut());
 static OLD_SIGSEGV: AtomicPtr<libc::sigaction> = AtomicPtr::new(ptr::null_mut());
@@ -687,7 +756,7 @@ pub fn protecting(start: u64, len: u64, prot: c_int, apply: impl Fn(u64, u64) ->
     let Some(end) = end.filter(|_| host != 0 && len != 0 && start.is_multiple_of(host)) else {
         return apply(start, len);
     };
-    if slots(start, end).next().is_none() {
+    if let Some(_unlocked) = unlocked_change(|| slots(start, end).next().is_some()) {
         return apply(start, len);
     }
     let _guard = lock();
@@ -961,6 +1030,25 @@ fn release(r: &Range) {
 pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     let end = validate_range(start, len).map_err(errno_err)?;
     let huge = crate::linux_items::HUGE_PAGE;
+    // Changes of memory already under way without the lock end first, so
+    // that the mappings read below are the ones they left
+    // ([`unlocked_change`]).
+    REGISTERING.fetch_add(1, Ordering::SeqCst);
+    struct Registering;
+    impl Drop for Registering {
+        fn drop(&mut self) {
+            REGISTERING.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let _registering = Registering;
+    {
+        let mut drained = DRAINED.0.lock().unwrap_or_else(|e| e.into_inner());
+        while UNLOCKED_CHANGES.load(Ordering::SeqCst) > 0 {
+            #[cfg(test)]
+            tests::REGISTER_WAITS.fetch_add(1, Ordering::SeqCst);
+            drained = DRAINED.1.wait(drained).unwrap_or_else(|e| e.into_inner());
+        }
+    }
     let _guard = lock();
     let entries = mapped_entries(start, end);
     let Some(&(first, first_end, _)) = entries.first() else {
@@ -1367,12 +1455,14 @@ pub fn discarding_or_refusing(
     let end = start.saturating_add(len);
     let mut done = Vec::new();
     let mut refused = None;
-    let touches = ps != 0
-        && RANGES.iter().any(|r| {
-            let s = r.start.load(Ordering::Acquire);
-            s != 0 && start < r.end.load(Ordering::Acquire) && s < end
-        });
-    if !touches {
+    let touches = || {
+        ps != 0
+            && RANGES.iter().any(|r| {
+                let s = r.start.load(Ordering::Acquire);
+                s != 0 && start < r.end.load(Ordering::Acquire) && s < end
+            })
+    };
+    if let Some(_unlocked) = unlocked_change(touches) {
         return discard(&mut done, &mut refused);
     }
     let _guard = lock();
@@ -1493,12 +1583,14 @@ fn refused_event(a: u64, b: u64) -> Option<(usize, [u64; 4])> {
 pub fn unmapping<T>(start: u64, len: u64, mapped_anew: bool, change: impl FnOnce() -> T, made: impl Fn(&T) -> bool) -> T {
     let host = page_size();
     let end = start.saturating_add(len);
-    let touches = host != 0
-        && RANGES.iter().any(|r| {
-            let s = r.start.load(Ordering::Acquire);
-            s != 0 && start < r.end.load(Ordering::Acquire) && s < end
-        });
-    if !touches {
+    let touches = || {
+        host != 0
+            && RANGES.iter().any(|r| {
+                let s = r.start.load(Ordering::Acquire);
+                s != 0 && start < r.end.load(Ordering::Acquire) && s < end
+            })
+    };
+    if let Some(_unlocked) = unlocked_change(touches) {
         return change();
     }
     let _guard = lock();
@@ -2153,6 +2245,21 @@ mod tests {
     /// How many times a caller found [`LOCK`] held ([`lock`]).
     pub(super) static LOCK_WAITS: AtomicUsize = AtomicUsize::new(0);
 
+    /// How many times a register waited for changes running without the
+    /// lock ([`register`]).
+    pub(super) static REGISTER_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+    /// What a change running without the lock calls between its lock-free
+    /// check and the change ([`unlocked_change`]): a race test's register.
+    static CHANGE_HOOK: Mutex<Option<fn()>> = Mutex::new(None);
+
+    pub(super) fn change_hook() {
+        let hook = *CHANGE_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// What [`unmapping`] calls between the change of the mapping and the
     /// unregistration, with the range: a test's own, for its own range.
     type Hook = fn(u64, u64);
@@ -2519,6 +2626,152 @@ mod tests {
         assert_eq!(zeropage(a, mem + ps, ps, true), Err((libc::ENOENT, 0)));
         register(a, next, ps).unwrap();
         close(&[ua, ub]);
+    }
+
+    /// The register a race test runs inside a change of memory: its
+    /// userfaultfd and range, taken by the first change that runs without
+    /// the lock.
+    static RACE_REGISTER: Mutex<Option<(usize, u64, u64)>> = Mutex::new(None);
+    /// The register's thread, with its result.
+    static RACE_THREAD: Mutex<Option<std::thread::JoinHandle<io::Result<()>>>> = Mutex::new(None);
+
+    /// The change hook of the race tests: starts the register on a thread of
+    /// its own and returns once it waits for this change ([`register`]), or
+    /// once it is done (without the counts it does not wait).
+    fn register_in_the_change() {
+        let Some((ctx, start, len)) = RACE_REGISTER.lock().unwrap().take() else {
+            return;
+        };
+        let waits = REGISTER_WAITS.load(Ordering::SeqCst);
+        let thread = std::thread::spawn(move || register(ctx, start, len));
+        until("the register waits or ends", || REGISTER_WAITS.load(Ordering::SeqCst) > waits || thread.is_finished());
+        *RACE_THREAD.lock().unwrap() = Some(thread);
+    }
+
+    /// Runs `change`, a change of memory no userfaultfd has registered, with
+    /// a register of `[start, start + len)` by `ctx` started between its
+    /// lock-free check and the change itself; the register's result.
+    fn register_racing(ctx: usize, start: u64, len: u64, change: impl FnOnce()) -> io::Result<()> {
+        *RACE_REGISTER.lock().unwrap() = Some((ctx, start, len));
+        *CHANGE_HOOK.lock().unwrap() = Some(register_in_the_change);
+        change();
+        *CHANGE_HOOK.lock().unwrap() = None;
+        let thread = RACE_THREAD.lock().unwrap().take().expect("the change did not run without the lock");
+        thread.join().unwrap()
+    }
+
+    /// A register that starts while an `munmap` of the memory runs without
+    /// the lock (it found no registered range) finds the memory gone:
+    /// `EINVAL`, nothing registered, as on Linux, where the mm's lock orders
+    /// the two and a register over no vma is `EINVAL` (fs/userfaultfd.c,
+    /// v6.12, `userfaultfd_register` :1294 to :1299). Without the order, the
+    /// register published its range before the `munmap`, which then left it
+    /// registered over memory that is gone. In a process of its own, so that
+    /// nothing else maps in the hole.
+    #[test]
+    fn test_a_register_racing_a_munmap_leaves_nothing_registered() {
+        if !in_own_process("wick_uffd::tests::test_a_register_racing_a_munmap_leaves_nothing_registered") {
+            return;
+        }
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(2);
+        let r = register_racing(a, mem, 2 * ps, || {
+            // SAFETY: the test's mapping.
+            assert_eq!(unsafe { crate::linux_items::munmap(mem as *mut _, (2 * ps) as usize) }, 0);
+        });
+        assert!(slots(mem, mem + 2 * ps).next().is_none(), "registered over memory that is gone ({r:?})");
+        assert_eq!(r.map_err(|e| e.raw_os_error()), Err(Some(libc::EINVAL)));
+        close(&[ua]);
+    }
+
+    /// A register that starts while a `MAP_FIXED` mapping over the memory
+    /// runs without the lock registers the new memory: its pages missing,
+    /// a fill lands in it. Without the order the register took the old
+    /// memory (a written page present, the alias over the old pages), and
+    /// the mapping then replaced it under the registration.
+    #[test]
+    fn test_a_register_racing_a_map_fixed_registers_the_new_memory() {
+        if !in_own_process("wick_uffd::tests::test_a_register_racing_a_map_fixed_registers_the_new_memory") {
+            return;
+        }
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(2);
+        // SAFETY: the test's mapping, before any register.
+        unsafe { ptr::write_volatile(mem as *mut u8, 1) };
+        let r = register_racing(a, mem, 2 * ps, || {
+            let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED;
+            // SAFETY: over the test's mapping.
+            let p = unsafe { crate::linux_items::mmap(mem as *mut _, (2 * ps) as usize, RW, flags, -1, 0) };
+            assert_eq!(p as u64, mem);
+        });
+        assert!(r.is_ok(), "{r:?}");
+        assert!(is_missing(mem) && is_missing(mem + ps), "the new memory is not what was registered");
+        let data = std::vec![0x5au8; ps as usize];
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        // SAFETY: filled just now.
+        assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0x5a, "the fill went elsewhere");
+        assert_eq!(unregister(a, mem, 2 * ps), Ok(()));
+        close(&[ua]);
+    }
+
+    /// A register that starts while an `mprotect` of the memory runs without
+    /// the lock keeps its pages missing and inaccessible, with the
+    /// protection asked recorded. Without the order the `mprotect` came
+    /// after the register and opened its missing page. The `mprotect` asks
+    /// read and write again, as [`register`] refuses memory that is not
+    /// readable and writable (`EPERM`, where Linux would take it).
+    #[test]
+    fn test_a_register_racing_an_mprotect_keeps_its_pages_missing() {
+        if !in_own_process("wick_uffd::tests::test_a_register_racing_an_mprotect_keeps_its_pages_missing") {
+            return;
+        }
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(1);
+        let r = register_racing(a, mem, ps, || {
+            // SAFETY: the test's mapping.
+            assert_eq!(unsafe { crate::linux_items::mprotect(mem as *mut _, ps as usize, RW) }, 0);
+        });
+        assert!(r.is_ok(), "{r:?}");
+        assert!(is_missing(mem));
+        assert_eq!(prot_of(mem) & RW, 0, "a missing page left accessible");
+        assert_eq!(unregister(a, mem, ps), Ok(()));
+        assert_eq!(prot_of(mem) & RW, RW, "the protection asked");
+        close(&[ua]);
+    }
+
+    /// A register that starts while a `MADV_DONTNEED` of the memory runs
+    /// without the lock registers the pages the discard left: missing, and a
+    /// fill lands in them. Without the order the register took the written
+    /// page, present, and the discard then replaced it under the
+    /// registration.
+    #[test]
+    fn test_a_register_racing_a_discard_fills_the_new_pages() {
+        if !in_own_process("wick_uffd::tests::test_a_register_racing_a_discard_fills_the_new_pages") {
+            return;
+        }
+        let (a, ua) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(1);
+        // SAFETY: the test's mapping, before any register.
+        unsafe { ptr::write_volatile(mem as *mut u8, 1) };
+        let r = register_racing(a, mem, ps, || {
+            // SAFETY: the test's mapping.
+            let r = unsafe { crate::linux_items::madvise(mem as *mut _, ps as usize, libc::MADV_DONTNEED) };
+            assert_eq!(r, 0);
+        });
+        assert!(r.is_ok(), "{r:?}");
+        assert!(is_missing(mem), "the discarded page is not missing");
+        let data = std::vec![0x5au8; ps as usize];
+        // SAFETY: `data` holds a page.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
+        // SAFETY: filled just now.
+        assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0x5a, "the fill went elsewhere");
+        assert_eq!(unregister(a, mem, ps), Ok(()));
+        close(&[ua]);
     }
 
     /// How registered memory is replaced: unmapped and mapped again in the

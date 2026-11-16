@@ -301,6 +301,27 @@ has the per-control details and results.
   (`proc_info` for this process, `mincore`) run under Firecracker's run-phase profile, with `MADV_DONTNEED` and
   `MADV_FREE` of anonymous and registered memory, and the child ends by its own exit
   (`test_discards_run_under_the_run_phase_profile`; with `mincore` out of the profile's list the sandbox kills it).
+- **macOS: a register racing a change of memory in no registration could register the memory the change then
+  replaced** (to the commit that brought `unlocked_change`). Each of these calls first checks, without the
+  userfaultfd's lock, whether its range touches a registered range, and runs without the lock when it does not; a
+  register of the same memory that started between that check and the system call registered the old memory, and
+  the change then went on as if nothing were registered. Per call, from the commit that brought its check:
+  - a discard (`MADV_DONTNEED`, and `MADV_FREE` since it takes that path), from 6c4320c5, the first compatibility
+    `libc`, already public: the new pages were present under the registration and a fill went to the old ones
+    through the alias;
+  - `mprotect`, from 56082145 (before it, `mprotect` did not look at registrations at all, the plugged virtio-mem slot
+    defect above): a missing page was left accessible;
+  - `munmap` and `mmap` with `MAP_FIXED`, from 0dc4cb4b (before it, neither looked at registrations, the userfaultfd's
+    release defect above): after an `munmap` the range stayed registered over memory that was gone, which a later
+    release would open; after a `MAP_FIXED` mapping the new pages were present and a fill went to the old ones.
+  On Linux the mm's lock orders the two. Firecracker does not reach it, as read from the code: its only register is
+  of guest memory it has just made and no other thread has yet (lib/firecracker/src/vmm/src/persist.rs:563 and
+  :582). Now the change and the register are ordered by two counts, each sequentially consistent, so that at least
+  one sees the other: the register waits for the changes already running without the lock, and a change that sees a
+  register takes the lock (`test_a_register_racing_a_munmap_leaves_nothing_registered`,
+  `test_a_register_racing_a_map_fixed_registers_the_new_memory`,
+  `test_a_register_racing_an_mprotect_keeps_its_pages_missing`, `test_a_register_racing_a_discard_fills_the_new_pages`;
+  each fails with neither count; docs/ARCHITECTURE.md, "Memory calls on registered memory").
 
 ## Not at parity yet
 
