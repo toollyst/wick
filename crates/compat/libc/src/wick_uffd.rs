@@ -1921,13 +1921,64 @@ mod tests {
 
     use super::*;
 
+    /// The host's page size, for every test and test helper. The module's
+    /// `page_size()` is 0 until `init`, and a test run in a process of its
+    /// own that read it first called every range empty: the replaced-memory
+    /// tests' first records (4c92edaa) were their own `len` of 0, not the
+    /// product's. So this sets the libc up first and refuses a size of 0, and
+    /// `test_the_tests_take_the_page_size_from_their_helper` keeps a bare
+    /// call out of this module.
+    fn test_page_size() -> u64 {
+        init().unwrap();
+        let size = super::page_size();
+        assert_ne!(size, 0, "the page size is 0 after init");
+        size
+    }
+
+    /// The bare calls of the module's page size in `text`, a module's source:
+    /// the line of each call in its tests that is neither a method's
+    /// (`r.page_size()`), nor the helper's own (`super::`, `test_`), nor in a
+    /// comment.
+    fn bare_page_size_calls(text: &str) -> Vec<usize> {
+        let needle = ["page", "_size()"].concat();
+        let Some(tests) = text.find("\nmod tests {") else {
+            return Vec::new();
+        };
+        text[tests..]
+            .match_indices(needle.as_str())
+            .filter(|&(at, _)| {
+                let before = &text[..tests + at];
+                let line = &before[before.rfind('\n').map_or(0, |n| n + 1)..];
+                !(before.ends_with('.')
+                    || before.ends_with("super::")
+                    || before.ends_with("test_")
+                    || line.trim_start().starts_with("//"))
+            })
+            .map(|(at, _)| text[..tests + at].lines().count())
+            .collect()
+    }
+
+    /// Every test and test helper takes the page size from
+    /// [`test_page_size`], never from the module's `page_size()`, which is 0
+    /// before `init`.
+    #[test]
+    fn test_the_tests_take_the_page_size_from_their_helper() {
+        let call = ["page", "_size()"].concat();
+        let case = std::format!(
+            "fn f() {{}}\nmod tests {{\n    let ps = {call};\n    r.{call};\n    super::{call};\n    // `{call}`\n}}\n"
+        );
+        assert_eq!(bare_page_size_calls(&case), [3]);
+        let bad = bare_page_size_calls(include_str!("wick_uffd.rs"));
+        assert!(bad.is_empty(), "wick_uffd.rs's tests call the page size bare, at lines {bad:?}: use test_page_size()");
+    }
+
     fn map(pages: u64) -> u64 {
         init().unwrap();
         // SAFETY: a fresh anonymous mapping.
         let p = unsafe {
             libc::mmap(
                 ptr::null_mut(),
-                (pages * page_size()) as usize,
+                (pages * test_page_size()) as usize,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANON,
                 -1,
@@ -2079,7 +2130,7 @@ mod tests {
     fn test_ranges_that_wrap() {
         // A range whose end wraps around is EINVAL, as Linux's validate_range.
         let (ctx, user) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(2);
         register(ctx, mem, 2 * ps).unwrap();
         let wrap = 0u64.wrapping_sub(ps);
@@ -2103,7 +2154,7 @@ mod tests {
         // Linux's validate_range: past the address space is EINVAL, before
         // anything sized by the length.
         let (ctx, user) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(4);
         for len in [1 << 62, TASK_SIZE - mem + ps, (u64::MAX - mem) & !(ps - 1)] {
             let e = register(ctx, mem, len).unwrap_err();
@@ -2140,7 +2191,7 @@ mod tests {
             return;
         }
         let (ctx, user) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         // Parts of two pages, holes of one: no alias `register` makes (one
         // per part, its size) fits in a hole.
         let mem = map(8);
@@ -2196,7 +2247,7 @@ mod tests {
     fn test_register_and_unregister_as_linux() {
         let (a, ua) = create(0, false, true).unwrap();
         let (b, ub) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(3);
         register(a, mem, 2 * ps).unwrap();
         assert_eq!(zeropage(a, mem, ps, true), Ok(ps));
@@ -2253,7 +2304,7 @@ mod tests {
     fn replaced(how: Replace) -> (usize, c_int, usize, c_int, c_int, u64) {
         let (a, ua) = create(0, false, true).unwrap();
         let (b, ub) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(2);
         let chan = channel(ua);
         let data = std::vec![0x5au8; ps as usize];
@@ -2309,9 +2360,9 @@ mod tests {
     #[test]
     #[ignore = "fails until munmap and MAP_FIXED over registered memory remove its registration"]
     fn test_memory_replaced_while_registered_is_in_no_registration() {
-        let ps = page_size();
         for how in replace_cases("wick_uffd::tests::test_memory_replaced_while_registered_is_in_no_registration") {
             let (a, ua, _b, ub, chan, mem) = replaced(how);
+            let ps = test_page_size();
             assert!(!is_missing(mem) && !is_missing(mem + ps), "{how:?}: the new memory is registered");
             assert_eq!(zeropage(a, mem + ps, ps, true), Err((libc::ENOENT, 0)), "{how:?}");
             close(&[chan, ua, ub]);
@@ -2326,12 +2377,12 @@ mod tests {
     #[test]
     #[ignore = "fails until munmap and MAP_FIXED over registered memory remove its registration"]
     fn test_memory_replaced_while_registered_registers_anew() {
-        let ps = page_size();
-        let data = std::vec![0x5au8; ps as usize];
         for how in replace_cases("wick_uffd::tests::test_memory_replaced_while_registered_registers_anew") {
             // Its userfaultfd again: both pages are missing, and a fill lands
             // in the new memory, not in the pages the old one had.
             let (a, ua, _b, ub, chan, mem) = replaced(how);
+            let ps = test_page_size();
+            let data = std::vec![0x5au8; ps as usize];
             register(a, mem, 2 * ps).unwrap();
             assert!(is_missing(mem) && is_missing(mem + ps), "{how:?}: the new pages are not missing");
             // SAFETY: `data` holds a page.
@@ -2360,9 +2411,9 @@ mod tests {
     #[test]
     #[ignore = "fails until munmap and MAP_FIXED over registered memory remove its registration"]
     fn test_a_discard_of_memory_replaced_while_registered_is_ordinary() {
-        let ps = page_size();
         for how in replace_cases("wick_uffd::tests::test_a_discard_of_memory_replaced_while_registered_is_ordinary") {
             let (_a, ua, _b, ub, chan, mem) = replaced(how);
+            let ps = test_page_size();
             // SAFETY: the new memory, read and writable.
             unsafe { ptr::write_volatile(mem as *mut u8, 7) };
             // SAFETY: the new memory.
@@ -2398,7 +2449,7 @@ mod tests {
             return;
         }
         let (ctx, user) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(2);
         register(ctx, mem, 2 * ps).unwrap();
         assert!(is_missing(mem) && is_missing(mem + ps));
@@ -2473,7 +2524,7 @@ mod tests {
     #[test]
     fn test_mprotect_of_registered_missing_pages_keeps_them_missing() {
         let (a, ua) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(2);
         let data = std::vec![0x5au8; ps as usize];
         register(a, mem, 2 * ps).unwrap();
@@ -2497,7 +2548,7 @@ mod tests {
         let mut event = [0u8; proto::RECORD];
         assert!(read_full(user, &mut event), "the userfaultfd closed");
         let w = words(&event);
-        let ps = page_size();
+        let ps = test_page_size();
         let page = std::vec![fill; ps as usize];
         // SAFETY: `page` holds a page.
         assert_eq!(unsafe { copy(ctx, page.as_ptr(), w[1] - w[1] % ps, ps, true) }, Ok(ps));
@@ -2518,7 +2569,7 @@ mod tests {
     #[test]
     fn test_plug_after_a_uffd_restore() {
         let (ctx, user) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let slot_len = 4 * ps;
         let mem = map(8);
         register(ctx, mem, 2 * slot_len).unwrap();
@@ -2559,7 +2610,7 @@ mod tests {
     #[test]
     fn test_mprotect_of_a_filled_page_does_not_make_it_missing() {
         let (a, ua) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(1);
         let data = std::vec![0x5au8; ps as usize];
         register(a, mem, ps).unwrap();
@@ -2581,7 +2632,7 @@ mod tests {
     #[test]
     fn test_a_filled_page_takes_the_protection_asked_while_it_was_missing() {
         let (a, ua) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(2);
         let data = std::vec![0x5au8; ps as usize];
         register(a, mem, 2 * ps).unwrap();
@@ -2613,7 +2664,7 @@ mod tests {
     #[test]
     fn test_a_slot_unplugged_and_plugged_again_is_filled_through_its_alias() {
         let (a, ua) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(2);
         let data = std::vec![0x5au8; ps as usize];
         register(a, mem, 2 * ps).unwrap();
@@ -2639,7 +2690,7 @@ mod tests {
     #[test]
     fn test_an_unregistered_page_takes_the_protection_asked_while_it_was_missing() {
         let (a, ua) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(1);
         register(a, mem, ps).unwrap();
         mprotect(mem, ps, libc::PROT_READ);
@@ -2656,7 +2707,7 @@ mod tests {
     #[test]
     fn test_a_released_page_takes_the_protection_asked_while_it_was_missing() {
         let (a, ua) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(1);
         register(a, mem, ps).unwrap();
         mprotect(mem, ps, libc::PROT_READ);
@@ -2724,7 +2775,7 @@ mod tests {
         // SAFETY: plain alarm.
         unsafe { libc::alarm(10) };
         let (a, ua) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(1);
         register(a, mem, ps).unwrap();
         mprotect(mem, ps, prot);
@@ -2757,7 +2808,7 @@ mod tests {
     #[ignore = "fails until MADV_FREE of registered pages goes through discarding()"]
     fn test_madv_free_of_registered_pages_makes_them_missing() {
         let (a, ua) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(1);
         let data = std::vec![0x5au8; ps as usize];
         register(a, mem, ps).unwrap();
@@ -2775,7 +2826,7 @@ mod tests {
     #[test]
     fn test_a_partial_unregister_keeps_the_rest_registered() {
         let (a, ua) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(3);
         register(a, mem, 3 * ps).unwrap();
         assert_eq!(unregister(a, mem + ps, ps), Ok(()));
@@ -2791,7 +2842,7 @@ mod tests {
     #[test]
     fn test_register_takes_a_private_file_mapping() {
         let (ctx, user) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let path = std::env::temp_dir().join(std::format!("wick-uffd-file-{}", std::process::id()));
         let file = std::fs::File::options()
             .create(true)
@@ -2824,7 +2875,7 @@ mod tests {
     fn test_register_needs_read_write_memory() {
         // Fills write through the alias, which has the memory's protection.
         let (ctx, user) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(3);
         for (page, prot) in [(1, libc::PROT_NONE), (2, libc::PROT_READ)] {
             // SAFETY: a page of the mapping above.
@@ -2853,7 +2904,7 @@ mod tests {
             return;
         }
         let (ctx, user) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(2);
         let chan = channel(user);
         register(ctx, mem, 2 * ps).unwrap();
@@ -2881,7 +2932,7 @@ mod tests {
     #[test]
     fn test_copy_from_a_handler() {
         let (ctx, user) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         // More than two pieces of copied data.
         let pages = (2 << 20) / ps + 3;
         let mem = map(pages);
@@ -2936,7 +2987,7 @@ mod tests {
     #[test]
     fn test_discarded_pages_are_filled_through_the_new_alias() {
         let (ctx, user) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(4);
         register(ctx, mem, 4 * ps).unwrap();
         let page = mem + ps;
@@ -2968,7 +3019,7 @@ mod tests {
         use crate::linux_items::{HUGE_PAGE, MAP_HUGETLB, MAP_HUGE_2MB};
         let _alone = huge_mapping_test();
         let (ctx, user) = create(0, false, true).unwrap();
-        let host = page_size();
+        let host = test_page_size();
         let len = 3 * HUGE_PAGE;
         // SAFETY: a huge page mapping of the compatibility mmap, unmapped at the end.
         let mem = unsafe {
@@ -3066,7 +3117,7 @@ mod tests {
     #[test]
     fn test_system_calls_wait_for_missing_pages() {
         let (ctx, user) = create(0, false, true).unwrap();
-        let ps = page_size();
+        let ps = test_page_size();
         let mem = map(2);
         register(ctx, mem, 2 * ps).unwrap();
         let chan = channel(user);
