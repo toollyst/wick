@@ -276,7 +276,12 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   user's `firecracker-net`, removed after it: the check fails on a file left
   there that `tools/macos/unit-test-litter.txt` does not list with the test
   that leaves it (two of upstream's net tests `mem::forget` their devices), and
-  on a listed one no longer left. With `--out DIR` it keeps each
+  on a listed one no longer left. A plain `cargo test -p vmm --lib` still
+  makes those four files (`net-device0` and `net-device1`, each socket and its
+  `.lock`) in `$(getconf DARWIN_USER_TEMP_DIR)firecracker-net`, beside your
+  own microVMs' endpoints; give it a directory of its own instead:
+  `d=$(mktemp -d) && WICK_TEST_ENDPOINT_DIR=$d cargo test -p vmm --lib; rm -r "$d"`.
+  With `--out DIR`, check-unit-tests.py keeps each
   crate's output and every test's result by name (`tests.tsv`); CI's `macos`
   job uploads them as the `macos-unit-tests` artifact.
 - On Windows, `tools/windows/check-unit-tests.py` runs every package's unit
