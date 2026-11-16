@@ -68,9 +68,9 @@
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
 #   cpu-template-helper: 30 tests; 25 pass, 5 fail (no-hvf).
-#   compat-kvm-ioctls: 109 tests; 34 pass, 74 fail, 1 ignored (counted again
+#   compat-kvm-ioctls: 110 tests; 34 pass, 75 fail, 1 ignored (counted again
 #   on 2026-11-17 by check-unit-tests.py --crate compat-kvm-ioctls), all
-#   no-hvf: 73 with Error(1) at hv_vm_create, and the vCPU thread's latency
+#   no-hvf: 74 with Error(1) at hv_vm_create, and the vCPU thread's latency
 #   tier's test_a_wfi_ends_when_its_timer_is_due, which fails on a runner
 #   before it makes its VM, at its own requirement of a launcher that raised
 #   no timer coalescing, since the runners' processes are coalesced as
@@ -157,6 +157,7 @@ no-hvf compat-kvm-ioctls hvf::vm::tests::test_memory_mapped_where_slot_memory_wa
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_msi_data_names_no_spi
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_no_guest_store_lands_after_a_host_mprotect_returned
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_no_guest_store_lands_on_old_pages_after_a_discard_returned
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_one_change_across_pieces_mapped_apart_reaches_each
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_os_lock_is_a_register_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_psci_version_is_the_vms
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_ptrauth_is_a_vcpu_feature

@@ -235,7 +235,13 @@ has the per-control details and results.
   (`test_a_slot_made_while_another_is_removed_takes_a_protection_changed_meanwhile`). A stage-2 protect that takes a
   permission away and fails ends the process with a line naming the range, the flags and the return, as a failed
   unmap does; one that gives a permission and fails is `KVM_RUN`'s error, never retried silently. No test can make
-  Hypervisor.framework fail a protect, so this rule is not shown failing. No running vCPU is made to leave its run, as
+  Hypervisor.framework fail a protect, so this rule is not shown failing. The stage-2 calls are made by runs of
+  contiguous pages, one call a run, also across pieces that separate calls mapped and over part of one mapping
+  (`test_one_change_across_pieces_mapped_apart_reaches_each`). The memory lock is held for the whole call, and a
+  vCPU that faults meanwhile waits for it: over 1 GiB of a slot, every page in stage 2, optimized as a release
+  build (M1 Pro, macOS 27.2, three runs), an `mprotect` held it 3.7 to 4.0 ms and an `munmap` 28.9 to 30.3 ms, of
+  which one `hv_vm_unmap` of the GiB took 25.7 to 27.0 ms; page by page it was 31 to 33 ms and 36 to 51 ms
+  (`test_the_memory_lock_held_by_a_hook_over_a_gib`, run by name). No running vCPU is made to leave its run, as
   none is on Linux on arm64: KVM's stage-2 unmap ends in a broadcast TLB invalidation that is complete on every CPU
   when it returns (arch/arm64/kvm/hyp/pgtable.c, v6.12, `stage2_unmap_put_pte` :846 to :867; hyp/vhe/tlb.c
   `__kvm_tlb_flush_vmid_ipa` :92 to :120, `tlbi ipas2e1is` then `dsb ish`), and arm64's
@@ -268,8 +274,14 @@ has the per-control details and results.
   - The backend's own store to guest memory (the stolen-time record, `write_guest`) checks the page's protection and
     then stores, not in one step: a host `mprotect` or `munmap` of that page on another thread can land between the
     two, and the store then takes the host's fault and ends the VMM, where Linux's `put_user` returns `EFAULT`. It is
-    never a refused store that lands. Reaching it needs the VMM to `mprotect` or `munmap` guest RAM in a live slot while a vCPU runs, which
-    Firecracker does not (below; its `MAP_FIXED` replacement is waited for, as a guest fault waits for it).
+    never a refused store that lands. Reaching it needs the VMM to `mprotect` or `munmap` guest RAM in a live slot
+    while a vCPU runs, which Firecracker does not (below; its `MAP_FIXED` replacement is waited for, as a guest
+    fault waits for it).
+  - The memory lock is held over the whole range of a call. Linux's MMU notifier holds `mmu_lock` for write over
+    the range too (virt/kvm/kvm_main.c, v6.12, :646; a stage-2 fault takes it for read, arch/arm64/kvm/mmu.c
+    :1624), but lets a waiter in between blocks of it when the call may block (mmu.c `stage2_apply_range` :56 to
+    :80, `cond_resched_rwlock_write` :76; a block is 32 MiB with 16 KiB pages, 1 GiB with 4 KiB). Here a vCPU's fault
+    waits for the whole call: about 4 ms for an `mprotect` of 1 GiB and 30 ms for its `munmap` (above).
   As Linux already before: a guest store to a read-only memory slot exits as MMIO, also with the slot's memory
   `PROT_READ` (`test_a_store_to_a_read_only_slot_is_still_mmio`). Firecracker reached none of the cases above, as read from the
   code: it changes the protection of guest memory only outside a live slot (virtio-mem's `update_slot`,

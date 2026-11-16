@@ -190,7 +190,8 @@ mapping: every slot page of it in stage 2 is then unmapped first, as a protectio
 replacement), which reads the range's protection, with the userfaultfd's registrations,
 under the VM's memory lock (`wick_uffd::host_protections`), brings each slot page to it (unmapped where the mapping
 went, mapped with the new pages where one was made, the permissions changed otherwise; each run mapped with its final
-permissions), with no vCPU made to leave its run, as arm64 KVM makes none leave (its stage-2 change ends in a
+permissions; one Hypervisor.framework call a run of pages, the lock held for the whole call: over 1 GiB about 4 ms
+for an `mprotect` and 30 ms for an `munmap`, where Linux lets a waiting fault in between 32 MiB blocks, SECURITY.md), with no vCPU made to leave its run, as arm64 KVM makes none leave (its stage-2 change ends in a
 broadcast TLB invalidation; relied on here is that `hv_vm_protect` and `hv_vm_unmap` have invalidated a running
 vCPU's translations when they return, which hv_vm.h does not say and two tests measure: docs/PORTING.md); a guest abort is
 checked against the page's host protection before a userfaultfd is asked (`VmInner::host_fault`). A stage-2

@@ -468,6 +468,11 @@ static BOUND_HIGH: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static PROTECTED_PAST_BOUND: AtomicUsize = AtomicUsize::new(0);
 
+/// Tests: the stage-2 calls [`Follow::apply`] made, in order: the kind, the
+/// IPA and the size of each run.
+#[cfg(test)]
+static FOLLOW_APPLIED: Mutex<Vec<(&'static str, u64, u64)>> = Mutex::new(Vec::new());
+
 /// Tests: how long each protection hook held the memory lock, in order, and
 /// in it its protection read and its stage-2 calls ([`Follow::apply`]).
 #[cfg(test)]
@@ -676,6 +681,15 @@ fn guest_protected(host: u64, len: u64, replaced: bool) {
 /// protects; all under the memory lock, each against the host's state as
 /// stored, so the order across pages changes nothing a vCPU can see: what
 /// is taken away was already the host's, and what is given the host gives.
+///
+/// A run can span pieces that separate `hv_vm_map` calls put in stage 2
+/// (a slot's map, a replacement's, a hook's), and can be part of one:
+/// `test_one_change_across_pieces_mapped_apart_reaches_each` makes one
+/// protect and one unmap over a run of a slot's map and three pieces mapped
+/// after it, one at a time, and checks the guest's access to each page after
+/// each. Of the other tests, a protect over part of one map is in most (an
+/// mprotect of some pages of a slot); none had a run across pieces mapped
+/// apart.
 #[derive(Default)]
 struct Follow {
     unmaps: Vec<(u64, u64)>,
@@ -715,6 +729,13 @@ impl Follow {
     /// away (in any page of the run) and fails ends the process; one that
     /// gives and fails is the guest's next fault's error (`stale_fault`).
     fn apply(self, slot: &Slot) {
+        #[cfg(test)]
+        {
+            let mut applied = FOLLOW_APPLIED.lock().unwrap();
+            applied.extend(self.unmaps.iter().map(|&(ipa, size)| ("unmap", ipa, size)));
+            applied.extend(self.maps.iter().map(|&(_, ipa, size)| ("map", ipa, size)));
+            applied.extend(self.protects.iter().map(|&(ipa, size, _, _)| ("protect", ipa, size)));
+        }
         for (ipa, size) in self.unmaps {
             // SAFETY: unmapping a run of a slot we mapped.
             let ret = unsafe { hv_vm_unmap(ipa, size as usize) };
@@ -3487,6 +3508,84 @@ mod tests {
         assert_eq!(PROTECTED_PAST_BOUND.load(Ordering::SeqCst), before + 1, "the control: an mprotect of slot memory");
         // SAFETY: the test's mapping.
         unsafe { libc::munmap(other, page as usize) };
+    }
+
+    /// One stage-2 call over a run that spans pieces mapped apart and part of
+    /// one map ([`Follow`]): a slot of 8 pages (one `hv_vm_map`), whose
+    /// pages 2, 3 and 4 are each unmapped and mapped again with `MAP_FIXED`
+    /// and new contents (three more `hv_vm_map` calls, one a piece); then one
+    /// mprotect to `PROT_READ` of pages 1 to 5, one back to read and write,
+    /// and one munmap of them. Each is one call over the five pages (the
+    /// record of [`Follow::apply`]), and after each the guest's store and
+    /// load of every page 0 to 6 is what the host's protection allows: a
+    /// failed call ends the process, which no run here does.
+    #[test]
+    fn test_one_change_across_pieces_mapped_apart_reaches_each() {
+        let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
+        let page = host_page_size();
+        let host = extra_slot(&vm, 8, 0x11, libc::PROT_READ | libc::PROT_WRITE, 0);
+        let (store, load) = (GUEST_BASE, GUEST_BASE + 16);
+        let fill = |n: u64| -> u64 { u64::from_ne_bytes([match n { 2 => 0x22, 3 => 0x33, 4 => 0x44, _ => 0x11 }; 8]) };
+        for n in 2..5u64 {
+            let at = host + n * page;
+            // SAFETY: a page of the test's slot memory.
+            assert_eq!(unsafe { libc::munmap(at as *mut _, page as usize) }, 0);
+            // SAFETY: over the hole just made.
+            let p = unsafe {
+                libc::mmap(
+                    at as *mut _,
+                    page as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            assert_eq!(p as u64, at);
+            // SAFETY: the page just mapped.
+            unsafe { std::ptr::write_bytes(p.cast::<u8>(), [0, 0, 0x22, 0x33, 0x44][n as usize], page as usize) };
+        }
+        for n in 0..7 {
+            assert_eq!(access(&mut vcpu, load, EXTRA + n * page, 0), Ok(Some(fill(n))), "the control: page {n}");
+        }
+        let run = (EXTRA + page, 5 * page);
+        let mut wrong = Vec::new();
+        let mut each = |what: &str, store_ok: bool, load_ok: bool, vcpu: &mut VcpuFd| {
+            for n in 0..7 {
+                let inside = (1..6).contains(&n);
+                let at = EXTRA + n * page;
+                let (s, l) = if inside { (store_ok, load_ok) } else { (true, true) };
+                let got = access(vcpu, store, at, 0x5a00 + n);
+                let expected = if s { Ok(Some(0x5a00 + n)) } else { Err(libc::EFAULT) };
+                if got != expected {
+                    wrong.push(format!("{what}: page {n}'s store {got:?}, not {expected:?}"));
+                }
+                let got = access(vcpu, load, at, 0);
+                let expected = match (s, l) {
+                    (true, _) => Ok(Some(0x5a00 + n)),
+                    (false, true) => Ok(Some(fill(n))),
+                    (false, false) => Err(libc::EFAULT),
+                };
+                if got != expected {
+                    wrong.push(format!("{what}: page {n}'s load {got:?}, not {expected:?}"));
+                }
+            }
+        };
+        let calls = |kind: &str| FOLLOW_APPLIED.lock().unwrap().drain(..).filter(|c| c.0 == kind).map(|c| (c.1, c.2)).collect::<Vec<_>>();
+        FOLLOW_APPLIED.lock().unwrap().clear();
+        protect((host + page) as *mut _, 5 * page, libc::PROT_READ);
+        assert_eq!(calls("protect"), [run], "one protect over the five pages");
+        each("PROT_READ", false, true, &mut vcpu);
+        protect((host + page) as *mut _, 5 * page, libc::PROT_READ | libc::PROT_WRITE);
+        assert_eq!(calls("protect"), [run], "one protect back over the five pages");
+        // The read-only round's loads read each page's fill: its stores did
+        // not land. Now they do.
+        each("back to read and write", true, true, &mut vcpu);
+        // SAFETY: pages of the test's slot memory, no longer used.
+        assert_eq!(unsafe { libc::munmap((host + page) as *mut _, 5 * page as usize) }, 0);
+        assert_eq!(calls("unmap"), [run], "one unmap over the five pages");
+        each("unmapped", false, false, &mut vcpu);
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// How long the protection hook holds the memory lock over 1 GiB of a
