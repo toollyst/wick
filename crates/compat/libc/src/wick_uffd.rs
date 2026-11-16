@@ -1341,16 +1341,39 @@ fn realias(r: &Range, a: u64, b: u64) -> Result<(), std::string::String> {
 /// page aligned start and rounds the end down); pages the discard did not
 /// reach keep their contents, as on Linux when it stops at an error.
 pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)>) -> c_int) -> c_int {
+    discarding_or_refusing(start, len, |done, _| discard(done))
+}
+
+/// [`discarding`] for a discard that may also refuse a piece after its
+/// remove event, as Linux's `MADV_FREE` refuses memory that is not private
+/// anonymous only after `userfaultfd_remove` (v6.12 mm/madvise.c
+/// `madvise_dontneed_free` :894, `madvise_free_single_vma` :797): the
+/// discard sets the piece in `refused` and stops there, and the piece's
+/// pages keep their contents. The piece is a run of macOS map entries
+/// alike (one backing and protection, joined by `linux_items::dontneed`),
+/// which is not a vma: where it holds pages of different registrations, or
+/// registered and unregistered ones, Linux has several vmas there, as vmas
+/// of different userfaultfd contexts or flags do not merge (mm/vma.c
+/// `is_mergeable_vma` :24 and :28), and its walk stops at the first one's
+/// error (mm/madvise.c `madvise_walk_vmas` :1275 to :1276). So only the
+/// first vma's event is posted ([`refused_event`]). The events go out in
+/// address order, as Linux's walk of the vmas posts them.
+pub fn discarding_or_refusing(
+    start: u64,
+    len: u64,
+    discard: impl FnOnce(&mut Vec<(u64, u64)>, &mut Option<(u64, u64)>) -> c_int,
+) -> c_int {
     let ps = page_size();
     let end = start.saturating_add(len);
     let mut done = Vec::new();
+    let mut refused = None;
     let touches = ps != 0
         && RANGES.iter().any(|r| {
             let s = r.start.load(Ordering::Acquire);
             s != 0 && start < r.end.load(Ordering::Acquire) && s < end
         });
     if !touches {
-        return discard(&mut done);
+        return discard(&mut done, &mut refused);
     }
     let _guard = lock();
     let mut runs = Vec::new();
@@ -1359,7 +1382,8 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
         // Missing pages hold zeros: let the discard reach them.
         let _ = protect(s, l, libc::PROT_READ | libc::PROT_WRITE);
     }
-    let ret = discard(&mut done);
+    let ret = discard(&mut done, &mut refused);
+    let mut events = Vec::new();
     for r in RANGES.iter() {
         let s = r.start.load(Ordering::Acquire);
         let e = r.end.load(Ordering::Acquire);
@@ -1392,7 +1416,7 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
                 }
             }
             if first < last && remove {
-                post(ctx, [proto::EVENT_REMOVE, s + first * ps, s + last * ps, 0]);
+                events.push((ctx, [proto::EVENT_REMOVE, s + first * ps, s + last * ps, 0]));
             }
         }
         // Every missing page of the range in reach is inaccessible again:
@@ -1406,7 +1430,40 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
             stage2(a, l, false);
         }
     }
+    if let Some((a, b)) = refused {
+        events.extend(refused_event(a, b));
+    }
+    events.sort_by_key(|&(_, [_, at, _, _])| at);
+    for (ctx, event) in events {
+        post(ctx, event);
+    }
     ret
+}
+
+/// The remove event of a refused piece `[a, b)` (see
+/// [`discarding_or_refusing`]): Linux's first vma there, the run of pages
+/// from `a` that one userfaultfd has registered, over adjacent ranges of the
+/// same userfaultfd, which Linux would have merged into one vma, up to the
+/// first page that is unregistered or another's; none when `a` itself is
+/// in no registration (`userfaultfd_remove` posts nothing for a vma with no
+/// context, fs/userfaultfd.c, v6.12, :777 to :779) or the userfaultfd did not
+/// ask for remove events. Called with [`LOCK`] held. A refused piece is never
+/// in a huge page range (`MADV_FREE` refuses those before any event).
+fn refused_event(a: u64, b: u64) -> Option<(usize, [u64; 4])> {
+    let mut ctx = None;
+    let mut at = a;
+    while at < b {
+        let Some((r, page)) = find(at) else { break };
+        let c = r.ctx.load(Ordering::Acquire);
+        if !Range::test(&r.tracked, page) || ctx.is_some_and(|x| x != c) {
+            break;
+        }
+        ctx = Some(c);
+        at += r.page_size();
+    }
+    let ctx = ctx?;
+    (CTXS[ctx].features.load(Ordering::Acquire) & FEATURE_EVENT_REMOVE != 0)
+        .then_some((ctx, [proto::EVENT_REMOVE, a, at.min(b), 0]))
 }
 
 /// Wraps a change of the mapping of `[start, start + len)` that ends what
@@ -3336,7 +3393,6 @@ mod tests {
     /// as it is, its `MADV_FREE` (5) frees lazily and the page reads zeros
     /// later with no fault.
     #[test]
-    #[ignore = "fails until MADV_FREE of registered pages goes through discarding()"]
     fn test_madv_free_of_registered_pages_makes_them_missing() {
         let (a, ua) = create(0, false, true).unwrap();
         let ps = test_page_size();
@@ -3350,6 +3406,198 @@ mod tests {
         assert_eq!(r, 0);
         assert!(is_missing(mem), "MADV_FREE left a registered page present");
         assert_eq!(unregister(a, mem, ps), Ok(()));
+        close(&[ua]);
+    }
+
+    /// `MADV_FREE` takes the pieces of its range in order, as Linux walks
+    /// the vmas (v6.12 mm/madvise.c `madvise_walk_vmas`): private anonymous
+    /// memory is freed (here at once: missing, with its remove event); shared
+    /// memory is `EINVAL` after its remove event (`madvise_dontneed_free`
+    /// :894 posts it through `userfaultfd_remove`, then
+    /// `madvise_free_single_vma` :797 refuses a vma that is not anonymous),
+    /// its pages as they were; the events in address order.
+    #[test]
+    fn test_madv_free_of_registered_shared_memory_is_einval_after_its_remove_event() {
+        let (a, ua) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(3);
+        // SAFETY: shared memory over the test's second and third pages.
+        let shared = unsafe {
+            libc::mmap(
+                (mem + ps) as *mut _,
+                (2 * ps) as usize,
+                RW,
+                libc::MAP_SHARED | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(shared as u64, mem + ps);
+        register(a, mem, 3 * ps).unwrap();
+        let data = std::vec![0x5au8; 2 * ps as usize];
+        // SAFETY: `data` holds two pages.
+        assert_eq!(unsafe { copy(a, data.as_ptr(), mem, 2 * ps, true) }, Ok(2 * ps));
+        // SAFETY: the test's mapping.
+        let r = unsafe { crate::linux_items::madvise(mem as *mut _, (3 * ps) as usize, libc::MADV_FREE) };
+        assert_eq!((r, io::Error::last_os_error().raw_os_error()), (-1, Some(libc::EINVAL)));
+        let mut rec = [0u8; proto::RECORD];
+        assert!(readable(ua) && read_full(ua, &mut rec), "no event");
+        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem, mem + ps], "the private page's event");
+        assert!(readable(ua) && read_full(ua, &mut rec), "no event for the refused shared pages");
+        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem + ps, mem + 3 * ps], "the shared pages' event");
+        assert!(is_missing(mem), "the private page was not freed");
+        assert!(!is_missing(mem + ps), "the refused shared page was discarded");
+        // SAFETY: present, as before the call.
+        assert_eq!(unsafe { ptr::read_volatile((mem + ps) as *const u8) }, 0x5a);
+        assert!(is_missing(mem + 2 * ps));
+        assert_eq!(prot_of(mem + 2 * ps) & RW, 0, "a missing page left accessible");
+        assert_eq!(unregister(a, mem, 3 * ps), Ok(()));
+        close(&[ua]);
+        // SAFETY: the test's mapping.
+        unsafe { libc::munmap(mem as *mut _, (3 * ps) as usize) };
+    }
+
+    /// Shared memory for the `MADV_FREE` tests below: `pages` pages of one
+    /// `MAP_SHARED` anonymous mapping.
+    fn map_shared(pages: u64) -> u64 {
+        init().unwrap();
+        // SAFETY: a fresh shared anonymous mapping.
+        let p = unsafe {
+            libc::mmap(ptr::null_mut(), (pages * test_page_size()) as usize, RW, libc::MAP_SHARED | libc::MAP_ANON, -1, 0)
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        p as u64
+    }
+
+    /// Whether `fd` stays with nothing to read for 200 ms.
+    fn nothing_to_read(fd: c_int) -> bool {
+        let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one pollfd.
+        unsafe { libc::poll(&mut p, 1, 200) == 0 }
+    }
+
+    /// `MADV_FREE` of shared memory whose two halves two userfaultfds have
+    /// registered: `EINVAL`, and a remove event for the first half only, to
+    /// its userfaultfd. Linux's walk of the vmas stops at the first error
+    /// (mm/madvise.c, v6.12, `madvise_walk_vmas` :1275 to :1276), and the
+    /// halves are two vmas, as vmas of different userfaultfd contexts do not
+    /// merge (mm/vma.c `is_mergeable_vma` :28): the first gets its event
+    /// (`userfaultfd_remove`, :894) and is refused (:797); the second is not
+    /// reached.
+    #[test]
+    fn test_madv_free_refused_over_two_userfaultfds_posts_one_event() {
+        let (a, ua) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let (b, ub) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map_shared(4);
+        register(a, mem, 2 * ps).unwrap();
+        register(b, mem + 2 * ps, 2 * ps).unwrap();
+        // SAFETY: the test's mapping.
+        let r = unsafe { crate::linux_items::madvise(mem as *mut _, (4 * ps) as usize, libc::MADV_FREE) };
+        assert_eq!((r, io::Error::last_os_error().raw_os_error()), (-1, Some(libc::EINVAL)));
+        let mut rec = [0u8; proto::RECORD];
+        assert!(readable(ua) && read_full(ua, &mut rec), "no event for the first half");
+        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem, mem + 2 * ps]);
+        assert!(nothing_to_read(ua), "a second event for the first userfaultfd");
+        assert!(nothing_to_read(ub), "an event for the second half, which Linux's walk does not reach");
+        assert_eq!(unregister(a, mem, 2 * ps), Ok(()));
+        assert_eq!(unregister(b, mem + 2 * ps, 2 * ps), Ok(()));
+        close(&[ua, ub]);
+        // SAFETY: the test's mapping.
+        unsafe { libc::munmap(mem as *mut _, (4 * ps) as usize) };
+    }
+
+    /// `MADV_FREE` of shared memory whose first page no userfaultfd has
+    /// registered and the rest one has: `EINVAL` with no remove event, as
+    /// Linux's first vma has no context (`userfaultfd_remove` posts nothing,
+    /// fs/userfaultfd.c, v6.12, :777 to :779) and is refused (mm/madvise.c
+    /// :797), where the walk stops (:1275 to :1276).
+    #[test]
+    fn test_madv_free_refused_from_an_unregistered_page_posts_no_event() {
+        let (a, ua) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map_shared(3);
+        register(a, mem + ps, 2 * ps).unwrap();
+        // SAFETY: the test's mapping.
+        let r = unsafe { crate::linux_items::madvise(mem as *mut _, (3 * ps) as usize, libc::MADV_FREE) };
+        assert_eq!((r, io::Error::last_os_error().raw_os_error()), (-1, Some(libc::EINVAL)));
+        assert!(nothing_to_read(ua), "an event for a vma Linux's walk does not reach");
+        assert!(is_missing(mem + ps) && is_missing(mem + 2 * ps));
+        assert_eq!(unregister(a, mem + ps, 2 * ps), Ok(()));
+        close(&[ua]);
+        // SAFETY: the test's mapping.
+        unsafe { libc::munmap(mem as *mut _, (3 * ps) as usize) };
+    }
+
+    /// `MADV_FREE` of a huge page mapping is `EINVAL` with no remove event,
+    /// as Linux refuses it for a hugetlb vma before `userfaultfd_remove`
+    /// (v6.12 mm/madvise.c `madvise_dontneed_free_valid_vma` :864, checked
+    /// at :888); its pages are as they were. The same without a userfaultfd.
+    #[test]
+    fn test_madv_free_of_a_huge_page_mapping_is_einval_with_no_remove_event() {
+        use crate::linux_items::{HUGE_PAGE, MAP_HUGETLB, MAP_HUGE_2MB};
+        let _alone = huge_mapping_test();
+        let (a, ua) = create(FEATURE_EVENT_REMOVE, true, true).unwrap();
+        let len = 2 * HUGE_PAGE;
+        // SAFETY: a huge page mapping of the compatibility mmap, unmapped at the end.
+        let mem = unsafe {
+            crate::linux_items::mmap(
+                ptr::null_mut(),
+                len as usize,
+                RW,
+                libc::MAP_PRIVATE | libc::MAP_ANON | MAP_HUGETLB | MAP_HUGE_2MB,
+                -1,
+                0,
+            )
+        } as u64;
+        assert_ne!(mem, libc::MAP_FAILED as u64);
+        let free = |at: u64, len: u64| {
+            // SAFETY: the test's mapping.
+            let r = unsafe { crate::linux_items::madvise(at as *mut _, len as usize, libc::MADV_FREE) };
+            (r, io::Error::last_os_error().raw_os_error())
+        };
+        // SAFETY: the test's mapping, not registered yet.
+        unsafe { ptr::write_volatile((mem + HUGE_PAGE) as *mut u8, 7) };
+        assert_eq!(free(mem + HUGE_PAGE, HUGE_PAGE), (-1, Some(libc::EINVAL)), "unregistered");
+        // SAFETY: as above.
+        assert_eq!(unsafe { ptr::read_volatile((mem + HUGE_PAGE) as *const u8) }, 7);
+        register(a, mem, len).unwrap();
+        let page = std::vec![3u8; HUGE_PAGE as usize];
+        // SAFETY: `page` holds a huge page.
+        assert_eq!(unsafe { copy(a, page.as_ptr(), mem, HUGE_PAGE, true) }, Ok(HUGE_PAGE));
+        assert_eq!(free(mem, len), (-1, Some(libc::EINVAL)), "registered");
+        let mut p = libc::pollfd { fd: ua, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one pollfd; events are posted before the call returns.
+        assert_eq!(unsafe { libc::poll(&mut p, 1, 0) }, 0, "a remove event was posted");
+        assert!(!is_missing(mem) && is_missing(mem + HUGE_PAGE));
+        // SAFETY: filled above.
+        assert_eq!(unsafe { ptr::read_volatile((mem + 5) as *const u8) }, 3);
+        assert_eq!(unregister(a, mem, len), Ok(()));
+        close(&[ua]);
+        // SAFETY: the mapping made above, through the compatibility munmap
+        // (see test_huge_page_ranges_fault_and_fill_whole_pages).
+        assert_eq!(unsafe { crate::linux_items::munmap(mem as *mut _, len as usize) }, 0);
+    }
+
+    /// The remove events of one discard go out in address order, as Linux's
+    /// walk of the vmas posts them, whatever order the ranges were
+    /// registered in.
+    #[test]
+    fn test_the_remove_events_of_one_discard_go_out_in_address_order() {
+        let (a, ua) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(3);
+        register(a, mem + 2 * ps, ps).unwrap();
+        register(a, mem, ps).unwrap();
+        // SAFETY: the test's mapping.
+        let r = unsafe { crate::linux_items::madvise(mem as *mut _, (3 * ps) as usize, libc::MADV_DONTNEED) };
+        assert_eq!(r, 0);
+        let mut rec = [0u8; proto::RECORD];
+        assert!(readable(ua) && read_full(ua, &mut rec), "no event");
+        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem, mem + ps]);
+        assert!(readable(ua) && read_full(ua, &mut rec), "no second event");
+        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem + 2 * ps, mem + 3 * ps]);
+        assert_eq!(unregister(a, mem, 3 * ps), Ok(()));
         close(&[ua]);
     }
 

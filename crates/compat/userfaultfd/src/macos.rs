@@ -812,7 +812,6 @@ mod tests {
     /// `userfaultfd_remove(vma, start, end)` for both, so the handler gets a
     /// REMOVE event for the range and the pages are missing afterwards.
     #[test]
-    #[ignore = "fails until MADV_FREE of registered pages goes through discarding()"]
     fn test_madv_free_of_registered_pages_posts_a_remove_event() {
         let ps = page();
         let uffd = UffdBuilder::new()

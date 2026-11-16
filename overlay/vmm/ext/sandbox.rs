@@ -3839,6 +3839,94 @@ mod macos {
             println!("CHILD-SURVIVED");
         }
 
+        // The compatibility madvise under the run-phase profile (balloon and
+        // virtio-mem discards): MADV_DONTNEED and MADV_FREE of private
+        // anonymous memory, MADV_DONTNEED of a private file mapping with a
+        // copied page (EINVAL, nothing changed), and both of memory a
+        // userfaultfd has registered, with their remove events. The calls
+        // these make: mmap, munmap, mprotect, madvise and mincore
+        // (SYSCALLS), proc_info's PROC_PIDREGIONPATHINFO of this process
+        // (UNFILTERED_SYSCALLS, `process-info*` with `(target self)`),
+        // mach_vm_region and mach_vm_remap_external (MIG_ROUTINES), getpid
+        // (SYSCALLS), and the userfaultfd's socket writes and reads
+        // (SYSCALLS). The child must end by its own exit.
+        #[test]
+        fn test_discards_run_under_the_run_phase_profile() {
+            let (out, reason) = child_reason("discard_child", &[]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("DISCARDS-OK"), "{}", text(&out));
+            assert!(out.status.success() && !sandbox_kill(reason) && !denied(&out), "{}", text(&out));
+        }
+
+        #[test]
+        #[ignore = "run by test_discards_run_under_the_run_phase_profile in a separate process"]
+        fn discard_child() {
+            use libc::wick_uffd::{self, proto};
+            const LEN: usize = 4 << 20;
+            let rw = libc::PROT_READ | libc::PROT_WRITE;
+            let map = |flags: libc::c_int, fd: libc::c_int| {
+                // SAFETY: a fresh mapping.
+                let p = unsafe { libc::mmap(std::ptr::null_mut(), LEN, rw, flags, fd, 0) };
+                assert_ne!(p, libc::MAP_FAILED);
+                p.cast::<u8>()
+            };
+            let errno = || std::io::Error::last_os_error().raw_os_error();
+            // Made in the setup phase, as Firecracker makes its guest memory
+            // and its userfaultfd: anonymous memory, a file of 0x11 mapped
+            // private, and registered memory.
+            // SAFETY: a plain call; the descriptor is owned by the File.
+            let file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(libc::memfd_create(c"m".as_ptr(), 0)) };
+            file.set_len(LEN as u64).unwrap();
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+            let shared = map(libc::MAP_SHARED, fd);
+            // SAFETY: inside the mapping, then unmapping it.
+            unsafe {
+                std::ptr::write_bytes(shared, 0x11, LEN);
+                libc::munmap(shared.cast(), LEN);
+            }
+            let anon = map(libc::MAP_PRIVATE | libc::MAP_ANON, -1);
+            let private = map(libc::MAP_PRIVATE, fd);
+            let registered = map(libc::MAP_PRIVATE | libc::MAP_ANON, -1) as u64;
+            let (ctx, user) = wick_uffd::create(wick_uffd::FEATURE_EVENT_REMOVE, false, true).unwrap();
+            wick_uffd::register(ctx, registered, LEN as u64).unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            narrow().unwrap();
+            println!("NARROWED");
+            for advice in [libc::MADV_DONTNEED, libc::MADV_FREE] {
+                // SAFETY: inside the mapping; then the whole of it.
+                unsafe {
+                    std::ptr::write_bytes(anon, 0x5a, LEN);
+                    assert_eq!(libc::madvise(anon.cast(), LEN, advice), 0, "anonymous, advice {advice}: {:?}", errno());
+                    assert_eq!((*anon, *anon.add(LEN - 1)), (0, 0), "anonymous, advice {advice}");
+                }
+            }
+            // SAFETY: a page of the mapping copied; then the whole of it.
+            unsafe {
+                *private = 0x22;
+                assert_eq!(libc::madvise(private.cast(), LEN, libc::MADV_DONTNEED), -1, "private file");
+                assert_eq!(errno(), Some(libc::EINVAL), "private file");
+                assert_eq!((*private, *private.add(LEN - 1)), (0x22, 0x11), "private file changed");
+            }
+            let data = vec![0x33u8; LEN];
+            for advice in [libc::MADV_DONTNEED, libc::MADV_FREE] {
+                // SAFETY: `data` holds the range.
+                assert_eq!(unsafe { wick_uffd::copy(ctx, data.as_ptr(), registered, LEN as u64, true) }, Ok(LEN as u64));
+                // SAFETY: registered memory, filled.
+                let r = unsafe { libc::madvise(registered as *mut _, LEN, advice) };
+                assert_eq!(r, 0, "registered, advice {advice}: {:?}", errno());
+                let mut record = [0u8; proto::RECORD];
+                // SAFETY: reads one record into a local buffer.
+                let n = unsafe { libc::read(user, record.as_mut_ptr().cast(), proto::RECORD) };
+                assert_eq!(usize::try_from(n).ok(), Some(proto::RECORD), "registered, advice {advice}: no event");
+                let word = |i: usize| u64::from_le_bytes(record[i * 8..i * 8 + 8].try_into().unwrap());
+                assert_eq!([word(0), word(1), word(2)], [proto::EVENT_REMOVE, registered, registered + LEN as u64]);
+                assert!(wick_uffd::is_missing(registered), "registered, advice {advice}");
+            }
+            wick_uffd::unregister(ctx, registered, LEN as u64).unwrap();
+            println!("DISCARDS-OK");
+        }
+
         // fcntl: after narrow(), the commands of FCNTL_COMMANDS run and any
         // other one is a denial, as upstream's fcntl rules trap every
         // command but F_SETFD and F_ADD_SEALS (Seatbelt's system-fcntl,

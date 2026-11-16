@@ -442,9 +442,10 @@ enum Backing {
     Shared,
     /// Private memory with no file under it.
     Anonymous,
-    /// A private file mapping with no private (copied-on-write) pages yet.
+    /// A private file mapping (`vm_entry`), or a piece of one with no private
+    /// (copied-on-write) pages (`dontneed`).
     File,
-    /// A private file mapping that has private pages.
+    /// A piece of a private file mapping that has private pages.
     FileCopied,
 }
 
@@ -465,67 +466,108 @@ unsafe extern "C" {
 /// after `addr`.
 fn vm_entry(addr: u64) -> Option<(u64, u64, Backing, c_int)> {
     const VM_REGION_BASIC_INFO_64: c_int = 9;
-    const VM_REGION_EXTENDED_INFO: c_int = 13;
     const VM_INHERIT_SHARE: u32 = 0;
-    let region = |flavor: c_int| {
-        let (mut start, mut size, mut object) = (addr, 0u64, 0);
-        let mut info = [0 as c_int; 16];
-        let mut count = 9u32;
-        // SAFETY: valid output buffers; `info` is larger than both flavors.
-        let ret = unsafe {
-            mach_vm_region(
-                mach_task_self_,
-                &mut start,
-                &mut size,
-                flavor,
-                info.as_mut_ptr(),
-                &mut count,
-                &mut object,
-            )
-        };
-        (ret == 0).then_some((start, size, info))
+    let (mut start, mut size, mut object) = (addr, 0u64, 0);
+    let mut basic = [0 as c_int; 16];
+    let mut count = 9u32;
+    // SAFETY: valid output buffers; `basic` is larger than the flavor.
+    let ret = unsafe {
+        mach_vm_region(
+            mach_task_self_,
+            &mut start,
+            &mut size,
+            VM_REGION_BASIC_INFO_64,
+            basic.as_mut_ptr(),
+            &mut count,
+            &mut object,
+        )
     };
-    let (start, size, basic) = region(VM_REGION_BASIC_INFO_64)?;
-    let (_, _, ext) = region(VM_REGION_EXTENDED_INFO)?;
+    if ret != 0 {
+        return None;
+    }
     // vm_region_basic_info_64: protection, max_protection, inheritance, ...
     // (VM_PROT_* bits are PROT_* bits).
     let protection = basic[0];
     let inheritance = basic[2] as u32;
-    // vm_region_extended_info: ... ref_count (word 6), then shadow_depth (u16),
-    // external_pager (u8), share_mode (u8) packed in word 7.
-    let word = ext[7] as u32;
-    let shadow_depth = word & 0xffff;
-    let external_pager = (word >> 16) & 0xff;
     let backing = if inheritance == VM_INHERIT_SHARE {
         Backing::Shared
-    } else if external_pager != 0 {
+    } else if file_under(start) {
         Backing::File
-    } else if shadow_depth > 0 && file_under(start) {
-        Backing::FileCopied
     } else {
         Backing::Anonymous
     };
     Some((start, start + size, backing, protection))
 }
 
-/// Whether a file backs the entry at `addr` (somewhere in its shadow chain).
-fn file_under(addr: u64) -> bool {
-    let mut path = [0u8; 1024];
-    // SAFETY: valid buffer; the call writes at most `path.len()` bytes.
-    let len = unsafe {
-        libc::proc_regionfilename(
-            libc::getpid(),
-            addr,
-            path.as_mut_ptr().cast(),
-            path.len() as u32,
-        )
-    };
-    len > 0
+/// `struct proc_regioninfo` of <sys/proc_info.h>.
+#[repr(C)]
+struct ProcRegionInfo {
+    /// `pri_protection` to `pri_flags`.
+    _head: [u32; 4],
+    _offset: u64,
+    /// `pri_behavior` to `pri_depth`.
+    _counts: [u32; 14],
+    address: u64,
+    size: u64,
 }
 
-/// `madvise` with the Linux meaning of `MADV_DONTNEED`: afterwards private
-/// anonymous memory reads as zeros and its pages are released, and shared
-/// memory keeps its contents (the pages are only dropped from this mapping).
+/// `struct proc_regionwithpathinfo` of <sys/proc_info.h>.
+#[repr(C)]
+struct ProcRegionWithPathInfo {
+    region: ProcRegionInfo,
+    vnode: libc::vnode_info_path,
+}
+
+/// The SDK's `sizeof(struct proc_regionwithpathinfo)`, which `proc_pidinfo`
+/// checks.
+const _: () = assert!(core::mem::size_of::<ProcRegionWithPathInfo>() == 1272);
+
+/// Whether a file backs the entry at `addr`, somewhere in its shadow chain:
+/// `PROC_PIDREGIONPATHINFO` names the vnode of the entry itself (its
+/// `pri_address` is the entry's start). Not `proc_regionfilename`, whose
+/// flavour (`PROC_PIDREGIONPATHINFO2`) looks for the next entry with a
+/// vnode at or after `addr`, so it names a file for anonymous memory below
+/// a file mapping (measured, macOS 27.2). The shadow chain's own depth and
+/// external pager do not tell either: once every page of a private file
+/// mapping is copied, its entry reports a shadow depth of 0 and no
+/// external pager, as anonymous memory does (measured).
+fn file_under(addr: u64) -> bool {
+    const PROC_PIDREGIONPATHINFO: c_int = 8;
+    // SAFETY: an all-zero struct of integers is valid.
+    let mut info: ProcRegionWithPathInfo = unsafe { core::mem::zeroed() };
+    let size = core::mem::size_of::<ProcRegionWithPathInfo>() as c_int;
+    // SAFETY: a valid output buffer of `size` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            PROC_PIDREGIONPATHINFO,
+            addr,
+            (&mut info as *mut ProcRegionWithPathInfo).cast(),
+            size,
+        )
+    };
+    let region = &info.region;
+    n == size && region.address <= addr && addr - region.address < region.size && info.vnode.vip_vi.vi_type != 0
+}
+
+/// Whether any page of `[start, end)`, part of a private file mapping, has
+/// been copied (written, and so private), as `mincore` reports it.
+fn copied(start: u64, end: u64) -> bool {
+    const MINCORE_COPIED: u8 = 0x40;
+    const MINCORE_ANONYMOUS: u8 = 0x80;
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let mut state = std::vec![0u8; (end - start).div_ceil(page) as usize];
+    // SAFETY: one byte a page of a mapped range.
+    let r = unsafe { libc::mincore(start as *mut c_void, (end - start) as size_t, state.as_mut_ptr().cast()) };
+    // A query that fails is taken as copied: refused, not discarded wrongly.
+    r != 0 || state.iter().any(|s| s & (MINCORE_COPIED | MINCORE_ANONYMOUS) != 0)
+}
+
+/// `madvise` with the Linux meaning of `MADV_DONTNEED` and `MADV_FREE`:
+/// after a `MADV_DONTNEED` private anonymous memory reads as zeros and its
+/// pages are released, and shared memory keeps its contents (the pages are
+/// only dropped from this mapping).
 ///
 /// macOS's own `MADV_DONTNEED` is only a hint, so a private anonymous range
 /// gets fresh zero pages: an anonymous `MAP_FIXED` mapping with its
@@ -548,6 +590,22 @@ fn file_under(addr: u64) -> bool {
 /// with the parts before it discarded) and the end is rounded down to a huge
 /// page.
 ///
+/// `MADV_FREE` is taken as Linux takes it (v6.12 mm/madvise.c
+/// `madvise_vma_behavior` :1046, with `MADV_DONTNEED` to
+/// `madvise_dontneed_free` :880): the range is checked as above, and the
+/// pieces are taken in order. A huge page mapping is `EINVAL`
+/// (`madvise_dontneed_free_valid_vma` :864, before any remove event);
+/// memory that is not private anonymous (shared memory, a file mapping) is
+/// `EINVAL` after the remove event a userfaultfd that registered it asked
+/// for (`userfaultfd_remove` :894, then `madvise_free_single_vma` :797),
+/// its pages unchanged; private anonymous memory is discarded as by
+/// `MADV_DONTNEED`. Linux frees such pages lazily: until reclaim takes them
+/// they may keep their contents, and once taken they read as zeros, or, a
+/// userfaultfd's, are missing; freeing them at once is the second of those
+/// outcomes. macOS's own `MADV_FREE` (5) is not used: it frees lazily too,
+/// but a registered page it frees reads as zeros with no fault, where
+/// Linux's would fault to the userfaultfd.
+///
 /// `MADV_HUGEPAGE` and `MADV_NOHUGEPAGE` (Firecracker's `huge_pages:
 /// Transparent`) are advice on Linux too: with transparent huge pages set to
 /// `never` the call succeeds and the range stays on small pages. macOS gives
@@ -567,7 +625,8 @@ pub unsafe fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
         return -1;
     }
     let thp = advice == MADV_HUGEPAGE || advice == MADV_NOHUGEPAGE;
-    if advice != libc::MADV_DONTNEED && !thp {
+    let free = advice == libc::MADV_FREE;
+    if advice != libc::MADV_DONTNEED && !free && !thp {
         // SAFETY: forwarded unchanged.
         return unsafe { libc::madvise(addr, len, advice) };
     }
@@ -587,8 +646,10 @@ pub unsafe fn madvise(addr: *mut c_void, len: size_t, advice: c_int) -> c_int {
     }
     // Pages registered with a userfaultfd become missing (and a remove event
     // is queued), as on Linux.
-    // SAFETY: the caller's contract.
-    crate::wick_uffd::discarding(addr as u64, len as u64, |done| unsafe { dontneed(addr, len, done) })
+    crate::wick_uffd::discarding_or_refusing(addr as u64, len as u64, |done, refused| {
+        // SAFETY: the caller's contract.
+        unsafe { dontneed(addr, len, free, done, refused) }
+    })
 }
 
 /// `MADV_HUGEPAGE` or `MADV_NOHUGEPAGE` over the page aligned `[start, end)`:
@@ -608,9 +669,16 @@ fn thp_advice(start: u64, end: u64) -> c_int {
     0
 }
 
-/// The `MADV_DONTNEED` of [`madvise`] over a page aligned range; the pieces
-/// discarded are added to `done`.
-unsafe fn dontneed(addr: *mut c_void, len: size_t, done: &mut std::vec::Vec<(u64, u64)>) -> c_int {
+/// The `MADV_DONTNEED`, or with `free` the `MADV_FREE`, of [`madvise`] over a
+/// page aligned range; the pieces discarded are added to `done`, and the
+/// piece a `MADV_FREE` refuses after its remove event is `refused`.
+unsafe fn dontneed(
+    addr: *mut c_void,
+    len: size_t,
+    free: bool,
+    done: &mut std::vec::Vec<(u64, u64)>,
+    refused: &mut Option<(u64, u64)>,
+) -> c_int {
     let (start, end) = (addr as u64, addr as u64 + len as u64);
     // The mapped pieces, and whether there are unmapped pages between them.
     let mut entries = std::vec::Vec::new();
@@ -626,11 +694,13 @@ unsafe fn dontneed(addr: *mut c_void, len: size_t, done: &mut std::vec::Vec<(u64
             unmapped = true;
             pos = entry_start;
         }
-        if backing == Backing::FileCopied {
+        let piece_end = entry_end.min(end);
+        let backing = if backing == Backing::File && copied(pos, piece_end) { Backing::FileCopied } else { backing };
+        // A `MADV_FREE` refuses it in its turn, below.
+        if backing == Backing::FileCopied && !free {
             set_errno(libc::EINVAL);
             return -1;
         }
-        let piece_end = entry_end.min(end);
         // Adjacent entries alike (a guest range split by earlier discards
         // or protections) are discarded as one piece.
         match entries.last_mut() {
@@ -642,6 +712,15 @@ unsafe fn dontneed(addr: *mut c_void, len: size_t, done: &mut std::vec::Vec<(u64
     for (mut piece_start, piece_end, backing, prot) in entries {
         while piece_start < piece_end {
             let (seg_end, huge) = crate::wick_uffd::huge_segment(piece_start, piece_end);
+            // Linux's `MADV_FREE` (see [`madvise`]): no huge pages, before
+            // any remove event; then anonymous memory only, after it.
+            if free && (huge || backing != Backing::Anonymous) {
+                if !huge {
+                    *refused = Some((piece_start, seg_end));
+                }
+                set_errno(libc::EINVAL);
+                return -1;
+            }
             let (from, to) = if huge {
                 if !piece_start.is_multiple_of(HUGE_PAGE) {
                     set_errno(libc::EINVAL);
@@ -1858,6 +1937,159 @@ mod tests {
         unsafe { p.cast::<u8>().write_volatile(7) };
         // SAFETY: unmapping our own mapping.
         unsafe { libc::munmap(p, LEN) };
+    }
+
+    /// `MADV_DONTNEED` of a private file mapping: Linux drops its private
+    /// (copied) pages, which then read as the file's contents again
+    /// (mm/memory.c `zap_page_range_single`); macOS has no call that does, so
+    /// a piece holding a copied page is `EINVAL` with nothing changed, a
+    /// piece with none is discarded and still reads as the file. A copied
+    /// page is seen whether some pages of the mapping or all of them were
+    /// copied: once all were, macOS reports the entry with no file pager and
+    /// no shadow, as it does anonymous memory (measured), so the file is
+    /// found through the entry's vnode.
+    #[test]
+    fn test_madvise_dontneed_of_a_private_file_mapping_with_copied_pages_is_einval() {
+        const LEN: usize = 1 << 20;
+        const RW: c_int = libc::PROT_READ | libc::PROT_WRITE;
+        let file = std::fs::File::from(memfd_file());
+        file.set_len(LEN as u64).unwrap();
+        let errno = || std::io::Error::last_os_error().raw_os_error();
+        // SAFETY: a fresh mapping of the file, written, then unmapped.
+        unsafe {
+            let shared =
+                libc::mmap(core::ptr::null_mut(), LEN, RW, libc::MAP_SHARED, file.as_raw_fd(), 0);
+            assert_ne!(shared, libc::MAP_FAILED);
+            core::ptr::write_bytes(shared.cast::<u8>(), 0x11, LEN);
+            libc::munmap(shared, LEN);
+        }
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        for copied in [0, 1, LEN / page] {
+            // SAFETY: a fresh private mapping of the file.
+            let p = unsafe {
+                libc::mmap(core::ptr::null_mut(), LEN, RW, libc::MAP_PRIVATE, file.as_raw_fd(), 0)
+            };
+            assert_ne!(p, libc::MAP_FAILED);
+            // SAFETY: inside the mapping.
+            unsafe { core::ptr::write_bytes(p.cast::<u8>(), 0x22, copied * page) };
+            // SAFETY: the whole mapping.
+            let r = unsafe { madvise(p, LEN, libc::MADV_DONTNEED) };
+            // SAFETY: inside the mapping.
+            let (first, last) = unsafe { (*p.cast::<u8>(), *p.cast::<u8>().add(LEN - 1)) };
+            if copied == 0 {
+                assert_eq!((r, first, last), (0, 0x11, 0x11), "none copied");
+            } else {
+                assert_eq!((r, errno()), (-1, Some(libc::EINVAL)), "{copied} pages copied");
+                let kept = if copied == 1 { 0x11 } else { 0x22 };
+                assert_eq!((first, last), (0x22, kept), "{copied} pages copied: changed");
+            }
+            // SAFETY: unmapping our own mapping.
+            unsafe { libc::munmap(p, LEN) };
+        }
+    }
+
+    /// `MADV_DONTNEED` of private anonymous memory a copy-on-write copy has
+    /// been made of (its entry then has a shadow) reads as zeros, as any
+    /// private anonymous memory: no file is under it, though a file mapping
+    /// follows it, which `proc_regionfilename` names for it.
+    #[test]
+    fn test_madvise_dontneed_of_anonymous_memory_with_a_copy_reads_zeros() {
+        unsafe extern "C" {
+            fn mach_vm_remap(
+                target: libc::mach_port_t,
+                address: *mut u64,
+                size: u64,
+                mask: u64,
+                flags: c_int,
+                source: libc::mach_port_t,
+                source_address: u64,
+                copy: c_int,
+                cur: *mut c_int,
+                max: *mut c_int,
+                inheritance: u32,
+            ) -> c_int;
+        }
+        const LEN: usize = 1 << 20;
+        const VM_FLAGS_ANYWHERE: c_int = 1;
+        const RW: c_int = libc::PROT_READ | libc::PROT_WRITE;
+        let file = std::fs::File::from(memfd_file());
+        file.set_len(LEN as u64).unwrap();
+        // Anonymous memory, a reservation, then a private file mapping.
+        // SAFETY: a fresh reservation, then mappings inside it.
+        let (base, p) = unsafe {
+            let anon = libc::MAP_PRIVATE | libc::MAP_ANON;
+            let base = libc::mmap(core::ptr::null_mut(), 3 * LEN, libc::PROT_NONE, anon, -1, 0);
+            assert_ne!(base, libc::MAP_FAILED);
+            let p = libc::mmap(base, LEN, RW, anon | libc::MAP_FIXED, -1, 0);
+            let at = base.cast::<u8>().add(2 * LEN).cast();
+            let f = libc::mmap(at, LEN, RW, libc::MAP_PRIVATE | libc::MAP_FIXED, file.as_raw_fd(), 0);
+            assert_eq!((p, f), (base, at));
+            (base, p)
+        };
+        let mut path = [0u8; 1024];
+        // SAFETY: valid buffer; the call writes at most `path.len()` bytes.
+        let named = unsafe { libc::proc_regionfilename(libc::getpid(), p as u64, path.as_mut_ptr().cast(), 1024) };
+        assert!(named > 0, "no file named for the anonymous memory: the test would not tell");
+        // SAFETY: inside the mapping.
+        unsafe { core::ptr::write_bytes(p.cast::<u8>(), 0x33, LEN) };
+        let (mut copy, mut cur, mut max) = (0u64, 0, 0);
+        // SAFETY: a copy-on-write copy of our mapping, anywhere.
+        let kr = unsafe {
+            let task = mach_task_self_;
+            mach_vm_remap(task, &mut copy, LEN as u64, 0, VM_FLAGS_ANYWHERE, task, p as u64, 1, &mut cur, &mut max, 1)
+        };
+        assert_eq!(kr, 0);
+        // SAFETY: inside the mapping; the write gives it a shadow.
+        unsafe { *p.cast::<u8>() = 0x44 };
+        // SAFETY: the whole mapping.
+        assert_eq!(unsafe { madvise(p, LEN, libc::MADV_DONTNEED) }, 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: inside the mapping and the copy.
+        assert_eq!(unsafe { (*p.cast::<u8>(), *(copy as *const u8)) }, (0, 0x33));
+        // SAFETY: unmapping our own mappings.
+        unsafe {
+            libc::munmap(base, 3 * LEN);
+            libc::munmap(copy as *mut c_void, LEN);
+        }
+    }
+
+    /// `MADV_FREE` as Linux takes it (v6.12 mm/madvise.c): private anonymous
+    /// memory is freed, here at once, so it reads as zeros, one of the two
+    /// outcomes Linux allows (`madvise_free_single_vma` frees lazily); shared
+    /// memory and a file mapping are `EINVAL` (:797, not anonymous) and keep
+    /// their contents; the range is checked as for any advice.
+    #[test]
+    fn test_madv_free_frees_private_anonymous_memory_only() {
+        const LEN: usize = 1 << 20;
+        let file = std::fs::File::from(memfd_file());
+        file.set_len(LEN as u64).unwrap();
+        let errno = || std::io::Error::last_os_error().raw_os_error();
+        for (flags, fd, freed) in [
+            (libc::MAP_PRIVATE | libc::MAP_ANON, -1, true),
+            (libc::MAP_SHARED | libc::MAP_ANON, -1, false),
+            (libc::MAP_SHARED, file.as_raw_fd(), false),
+            (libc::MAP_PRIVATE, file.as_raw_fd(), false),
+        ] {
+            // SAFETY: a fresh mapping.
+            let p = unsafe { libc::mmap(core::ptr::null_mut(), LEN, libc::PROT_READ | libc::PROT_WRITE, flags, fd, 0) };
+            assert_ne!(p, libc::MAP_FAILED);
+            // SAFETY: inside the mapping.
+            unsafe { core::ptr::write_bytes(p.cast::<u8>(), 0x5a, LEN) };
+            // SAFETY: the whole mapping.
+            let r = unsafe { madvise(p, LEN, libc::MADV_FREE) };
+            let expected = if freed { (0, 0) } else { (-1, 0x5a) };
+            // SAFETY: inside the mapping.
+            let byte = unsafe { *p.cast::<u8>().add(LEN - 1) };
+            assert_eq!((r, byte), expected, "flags {flags:#x}");
+            if !freed {
+                assert_eq!(errno(), Some(libc::EINVAL), "flags {flags:#x}");
+            }
+            // SAFETY: refused before anything is changed.
+            assert_eq!(unsafe { madvise(p.cast::<u8>().add(1).cast(), 1, libc::MADV_FREE) }, -1);
+            assert_eq!(errno(), Some(libc::EINVAL));
+            // SAFETY: unmapping our own mapping.
+            unsafe { libc::munmap(p, LEN) };
+        }
     }
 
     #[test]

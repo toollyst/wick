@@ -284,6 +284,23 @@ has the per-control details and results.
   registrations takes (`test_an_unmapping_and_its_unregistration_are_one_step`,
   `test_memory_unmapped_while_registered_leaves_no_registration_behind`, docs/ARCHITECTURE.md, "Memory calls on
   registered memory").
+- **macOS: `MADV_DONTNEED` took private file mappings and anonymous memory for each other** (from 6c4320c5 to the
+  commit that brought `MADV_FREE` as Linux takes it). It told a private file mapping by the VM entry's file pager and
+  shadow, and asked `proc_regionfilename`, which names the next file mapping at or after the address, whether a file
+  was under it. Three cases went wrong (macOS 27.2): a private file mapping with some pages copied went to macOS's own
+  `MADV_DONTNEED`, which keeps the copies (measured by a C probe), where Linux's show the file again; one with every
+  page copied, whose entry macOS then reports with no file pager and no shadow (measured), was taken for anonymous
+  memory and read as zeros; and anonymous memory with a copy-on-write copy, followed by any file mapping, was refused
+  with `EINVAL` (`test_madvise_dontneed_of_anonymous_memory_with_a_copy_reads_zeros`, "left: -1 right: 0" under the
+  old check).
+  Firecracker reaches none of them: it remaps a private file mapping instead of discarding it (`discard_range`,
+  lib/firecracker/src/vmm/src/vstate/memory.rs:745) and makes no copy of its anonymous memory, as read from the code.
+  Now the file is found through the entry's own vnode (`PROC_PIDREGIONPATHINFO`) and copied pages through `mincore`:
+  a piece holding one is `EINVAL` with nothing changed, as macOS has no call that shows the file again
+  (`test_madvise_dontneed_of_a_private_file_mapping_with_copied_pages_is_einval`, docs/PORTING.md). The new calls
+  (`proc_info` for this process, `mincore`) run under Firecracker's run-phase profile, with `MADV_DONTNEED` and
+  `MADV_FREE` of anonymous and registered memory, and the child ends by its own exit
+  (`test_discards_run_under_the_run_phase_profile`; with `mincore` out of the profile's list the sandbox kills it).
 
 ## Not at parity yet
 
@@ -612,11 +629,6 @@ upstream Firecracker and its jailer.
   jail that can make pipes could, once the first reader has gone, take the log or metrics another jail of the same
   user wrote meanwhile (up to 64 KiB), if it knows the name. Run each jail's pipes under names the others cannot
   guess, or run tenants under different accounts.
-- **macOS: `MADV_FREE` of userfaultfd-registered memory not yet as Linux's; fix in progress.** On memory a userfaultfd
-  has registered (`mem_backend` `Uffd`), `MADV_FREE` of registered pages neither makes them missing nor posts a remove
-  event, where Linux takes it as `MADV_DONTNEED` for the userfaultfd. Firecracker uses no `MADV_FREE`, as read from
-  the code. Its tests are ignored until the fix (docs/ARCHITECTURE.md, "Memory calls on registered memory":
-  `test_madv_free_of_registered_pages_makes_them_missing`, `test_madv_free_of_registered_pages_posts_a_remove_event`).
 - **Windows: `munmap` and `mmap(MAP_FIXED)` of userfaultfd-registered memory leave the registration; fix in
   progress.** On Linux the registration belongs to the vma and goes with it (mm/vma.c, v6.12, `do_vmi_align_munmap`
   :1332; mm/mmap.c `__mmap_region` :1361). On Windows both calls change the mapping and leave the range registered
