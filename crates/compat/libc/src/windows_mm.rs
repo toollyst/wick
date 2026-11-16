@@ -1664,9 +1664,9 @@ pub(crate) static SAY_FILTER_FRAMES: std::sync::atomic::AtomicBool = std::sync::
 /// `RaiseFailFastException` given the exception's own record and context
 /// (Learn: it "bypasses all exception handlers (frame or vector based)",
 /// terminates the process and invokes Windows Error Reporting "if Windows
-/// Error Reporting is enabled"), for the record of the end that gives: its
-/// exit status, with and without `SEM_NOGPFAULTERRORBOX`, in a job of the
-/// jailer's limits or not.
+/// Error Reporting is enabled"), in a job of the jailer's limits too, where
+/// [`end_with`] uses `TerminateProcess`: the record of what that end would
+/// give there.
 #[cfg(test)]
 pub(crate) static FAIL_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1677,6 +1677,58 @@ fn fail_fast_for_the_record(info: *const windows_sys::Win32::System::Diagnostics
         say_at_the_limit(format_args!("FILTERREC RaiseFailFastException with the exception's record"));
         // SAFETY: the system's exception pointers.
         unsafe { windows_sys::Win32::System::Diagnostics::Debug::RaiseFailFastException((*info).ExceptionRecord, (*info).ContextRecord, 0) };
+    }
+}
+
+/// FAILFASTSTACK, set by a test's child (a KiB count, `usize::MAX` for
+/// none): at a stack overflow at the reserve's end the stack filter first
+/// takes that many KiB more of the thread's stack, in 1 KiB frames, says
+/// how many bytes are then left above the reserve's low end
+/// (DeallocationStack), and ends with `RaiseFailFastException` given a copy
+/// of the record with the code [`FAIL_FAST_PROBE`]: the process ends with
+/// that code only if the call had the stack it needs, so the least left at
+/// which it does is what the call takes there.
+#[cfg(test)]
+pub(crate) static FAIL_FAST_EAT_KIB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// [`FAIL_FAST_EAT_KIB`]'s code.
+#[cfg(test)]
+pub(crate) const FAIL_FAST_PROBE: u32 = 0xE057_1C4F;
+
+/// [`FAIL_FAST_EAT_KIB`]'s end, if it is set.
+#[cfg(test)]
+fn fail_fast_after_eating(info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) {
+    #[inline(never)]
+    fn eat(n: usize, info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) {
+        let frame = [0u8; 1024];
+        core::hint::black_box(&frame);
+        if n > 0 {
+            eat(n - 1, info);
+        } else {
+            at_the_bottom(info);
+        }
+        core::hint::black_box(&frame);
+    }
+    #[inline(never)]
+    fn at_the_bottom(info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) {
+        let (_, reserve, _) = this_threads_stack();
+        let sp: usize;
+        // SAFETY: reads the stack pointer.
+        unsafe { core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+        say_at_the_limit(format_args!(
+            "FAILFASTSTACK {} KiB taken, {} bytes left above the reserve's low end; RaiseFailFastException with code {FAIL_FAST_PROBE:#x}",
+            FAIL_FAST_EAT_KIB.load(std::sync::atomic::Ordering::SeqCst),
+            sp - reserve
+        ));
+        // SAFETY: a copy of the system's exception record, its code changed.
+        let mut record = unsafe { *(*info).ExceptionRecord };
+        record.ExceptionCode = FAIL_FAST_PROBE.cast_signed();
+        // SAFETY: a record and the system's context; does not return.
+        unsafe { windows_sys::Win32::System::Diagnostics::Debug::RaiseFailFastException(&record, (*info).ContextRecord, 0) };
+    }
+    let k = FAIL_FAST_EAT_KIB.load(std::sync::atomic::Ordering::SeqCst);
+    if k != usize::MAX {
+        eat(k, info);
     }
 }
 
@@ -1855,18 +1907,20 @@ impl core::fmt::Display for Utf16<'_> {
 /// out-of-memory kill leaves no core either).
 ///
 /// A stack overflow at the reserve's end gets its line here too (the
-/// thread, the reserve left, its guarantee), on every kind of thread. In a
-/// job of the jailer's limits (`JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`,
-/// [`in_a_job_that_dies_on_unhandled_exceptions`]) the process then ends
-/// here with `STATUS_STACK_OVERFLOW` (0xC00000FD): there Windows Error
-/// Reporting is not called and the end is left to the filters' caller, and
-/// a thread pool's worker took the overflow and went on running callbacks,
-/// the process alive with whatever the callback held
-/// (`test_a_stack_overflow_at_the_reserves_end_is_still_one`; CI run
-/// 43823078930's windows job). Out of such a job it is passed on to
-/// Windows Error Reporting, which ends the process with 0xC00000FD and its
-/// dump (the pool's thread too), as Linux's SIGSEGV default action ends it
-/// with a core. Either way the filter this one replaced is not called for
+/// thread, the reserve left, its guarantee), on every kind of thread, and
+/// the process ends here with `STATUS_STACK_OVERFLOW` (0xC00000FD)
+/// ([`end_with`]): in a job of the jailer's limits
+/// (`JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`,
+/// [`in_a_job_that_dies_on_unhandled_exceptions`]) by `TerminateProcess`,
+/// out of one by `RaiseFailFastException` with the exception's record,
+/// which Windows Error Reporting reports if it is enabled, with its dump,
+/// as Linux's SIGSEGV default action ends it with a core. Passed on, a
+/// thread pool's worker took the overflow and went on running callbacks,
+/// the process alive with whatever the callback held, wherever the process
+/// had `SEM_NOGPFAULTERRORBOX`: in such a job (CI run 43823078930's windows
+/// job), and alone at error mode 3, as CI's runner starts its children (CI
+/// run 43881982686; `test_a_stack_overflow_at_the_reserves_end_is_still_one`,
+/// at error mode 0 and 3). Either way the filter this one replaced is not called for
 /// it, as on Linux Firecracker's SIGSEGV handler is not run for one:
 /// vmm-sys-util registers it without `SA_ONSTACK` (0.15.0,
 /// src/linux/signal.rs, `sa_flags = libc::SA_SIGINFO`), so the kernel
@@ -1876,8 +1930,9 @@ impl core::fmt::Display for Utf16<'_> {
 /// (kernel/signal.c:2904 `force_sigsegv`, :1696, :1674 `HANDLER_SIG_DFL`):
 /// Firecracker's log line and metric for it are not written there either.
 /// Every other exception goes on to that filter (vmm-sys-util's, which
-/// runs the handler registered for its fault signal), and one it passes on
-/// too to [`last_filter`].
+/// runs the handler registered for its fault signal), and one it does not
+/// resume (`EXCEPTION_CONTINUE_EXECUTION`) to [`last_filter`], which ends
+/// the process.
 unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
@@ -1915,35 +1970,71 @@ unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::
             let len = this_threads_description(&mut name);
             say_at_the_limit(format_args!(
                 "wick: a thread's stack overflowed at its reserve's end, {} KiB of it left (thread {} \"{}\", its guarantee \
-                 {guarantee} bytes); {} with STATUS_STACK_OVERFLOW (0xC00000FD)",
+                 {guarantee} bytes); {} with STATUS_STACK_OVERFLOW (0xC00000FD){}",
                 left >> 10,
                 // SAFETY: plain call.
                 unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
                 Utf16(&name[..len]),
-                if jailed { "in a job that dies on unhandled exceptions, the process ends" } else { "Windows Error Reporting ends the process" }
+                if jailed { "in a job that dies on unhandled exceptions, the process ends" } else { "the process ends" },
+                if jailed { "" } else { ", reported by Windows Error Reporting if it is enabled" }
             ));
         }
         #[cfg(test)]
         filter_frames("stack_filter, a stack overflow at the reserve's end");
         #[cfg(test)]
         fail_fast_for_the_record(info);
-        if !jailed {
-            // Windows Error Reporting ends it, with its dump, as Linux's
-            // SIGSEGV default action ends it with a core.
-            return windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
-        }
-        // SAFETY: ends this process at once, as an unhandled stack overflow does.
-        unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), STACK_OVERFLOW.cast_unsigned()) };
-        std::process::abort();
+        #[cfg(test)]
+        fail_fast_after_eating(info);
+        // SAFETY: the system's exception pointers.
+        unsafe { end_with(info, STACK_OVERFLOW.cast_unsigned(), jailed) };
     }
     // SAFETY: the system's exception pointers, passed on.
     let r = unsafe { call_filter(PREVIOUS_FILTER.load(std::sync::atomic::Ordering::SeqCst), info) };
-    if r == windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH {
+    if r == windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION {
+        r
+    } else {
+        // Nothing above ended it nor resumes it: whatever the filters below
+        // said (a chain that reached the last filter ends there, so this is
+        // one that did not), the last filter ends it.
         // SAFETY: as above.
         unsafe { last_filter(info) }
-    } else {
-        r
     }
+}
+
+/// How the filters end the process for an exception nothing handles, with
+/// `code`, its own: in a job of the jailer's limits
+/// ([`in_a_job_that_dies_on_unhandled_exceptions`]) by `TerminateProcess`,
+/// as before (the job forces `SEM_NOGPFAULTERRORBOX`: no Windows Error
+/// Reporting, so no report and no dump of a jailed VMM's memory, which
+/// holds its guest's; FILTERREC: `RaiseFailFastException` invoked it even
+/// there, about 2 s); out of such a job by `RaiseFailFastException` with
+/// the exception's own record and context, which Learn says "bypasses all
+/// exception handlers (frame or vector based)", ends the process with the
+/// record's code, and invokes Windows Error Reporting "if Windows Error
+/// Reporting is enabled" (and a just-in-time debugger if one is set), so the
+/// report, and the dump the host's settings ask for, are as a process
+/// Windows Error Reporting ended has them; a frame handler below the filters
+/// gets no second look at it. That second look is what kept a pool going:
+/// the thread pool's worker calls `UnhandledExceptionFilter` from its own
+/// exception filter (FILTERREC's frames: `ntdll!TppWorkerThread$filt$5`,
+/// `TppWorkerpInnerExceptionFilter`, on Windows Server 2022 20348 then
+/// `TppExceptionFilter`, `KernelBase!UnhandledExceptionFilter`), which under
+/// `SEM_NOGPFAULTERRORBOX` (the job's, an inherited error mode, or the
+/// process's own) does not invoke Windows Error Reporting and returns
+/// `EXCEPTION_EXECUTE_HANDLER` (Learn, SetErrorMode and
+/// UnhandledExceptionFilter); its handler then took a stack overflow and
+/// went on running callbacks on that thread (FILTERREC, CI run 43881982686).
+///
+/// # Safety
+/// `info` is the system's exception pointers.
+unsafe fn end_with(info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS, code: u32, jailed: bool) -> ! {
+    if !jailed {
+        // SAFETY: the system's exception record and context; does not return.
+        unsafe { windows_sys::Win32::System::Diagnostics::Debug::RaiseFailFastException((*info).ExceptionRecord, (*info).ContextRecord, 0) };
+    }
+    // SAFETY: ends this process at once, as the job's limit asks.
+    unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), code) };
+    std::process::abort();
 }
 
 /// Calls the unhandled-exception filter `f` (a value
@@ -1978,8 +2069,8 @@ static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// immediate job is asked (Learn, QueryInformationJobObject: "If the job is
 /// nested, the immediate job of the calling process is used"), which is
 /// the jail's own in the jailer's nesting; a job with the flag around one
-/// without it does not reach that job's processes either: they end through
-/// Windows Error Reporting with the exception's code, as in no job
+/// without it does not reach that job's processes either: they end as in
+/// no job, by `RaiseFailFastException` with the exception's code
 /// (`test_a_job_nested_in_one_that_dies_on_unhandled_exceptions_ends_by_its_own_limits`).
 fn in_a_job_that_dies_on_unhandled_exceptions() -> bool {
     use windows_sys::Win32::System::JobObjects::{
@@ -2007,24 +2098,26 @@ fn in_a_job_that_dies_on_unhandled_exceptions() -> bool {
 /// (vmm-sys-util's for the fault signals Firecracker registers handlers
 /// for, [`stack_filter`]) has it below. An exception that no handler and no
 /// filter above took gets a line here, written without allocating, that
-/// names its code, its address and the thread. Then, in a job of the
-/// jailer's limits ([`in_a_job_that_dies_on_unhandled_exceptions`]), the
-/// process ends here with the exception's code: Learn,
+/// names its code, its address and the thread. Then the process ends here
+/// with the exception's code ([`end_with`]), whatever the error mode: in a
+/// job of the jailer's limits ([`in_a_job_that_dies_on_unhandled_exceptions`])
+/// by `TerminateProcess`, out of one by `RaiseFailFastException` with the
+/// exception's record, which Windows Error Reporting reports if it is
+/// enabled, with its dump, as Linux's default action for a fault signal
+/// with no handler ends it with a core
+/// (`test_an_unhandled_exception_ends_the_process_with_its_code`, at error
+/// mode 0 and 3). The end is not left to the filters' caller: Learn,
 /// `JOBOBJECT_BASIC_LIMIT_INFORMATION`, says of
 /// `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION` that
 /// `UnhandledExceptionFilter` then returns `EXCEPTION_EXECUTE_HANDLER`,
 /// and "Normally, this will cause termination of the process with the
-/// exception code as the exit status", which leaves the end to the
-/// filters' caller: a thread pool's worker took a stack overflow so and
-/// went on running callbacks
-/// (`test_a_stack_overflow_at_the_reserves_end_is_still_one`). Out of
-/// such a job it is passed on (`EXCEPTION_CONTINUE_SEARCH`: "Proceed with
-/// normal execution of UnhandledExceptionFilter", SetUnhandledExceptionFilter),
-/// and Windows Error Reporting ends the process with its code and its
-/// dump, as Linux's default action for a fault signal with no handler ends
-/// it with a core (`test_an_unhandled_exception_ends_the_process_with_its_code`).
+/// exception code as the exit status", and so it does under any
+/// `SEM_NOGPFAULTERRORBOX`; that leaves it to whoever called the filters,
+/// and a thread pool's worker, which calls them from its own exception
+/// filter, took a stack overflow so and went on running callbacks
+/// (`test_a_stack_overflow_at_the_reserves_end_is_still_one`).
 ///
-/// Before either, the filter it replaced ([`REPLACED_AT_START`]) is called
+/// Before that, the filter it replaced ([`REPLACED_AT_START`]) is called
 /// with the exception, as every filter here calls the one below it: the
 /// Visual C++ runtime's, which its startup installs before the C++
 /// initializers (MSVC 14.44.35207 crt/src/vcruntime/exe_common.inl:231,
@@ -2036,7 +2129,12 @@ fn in_a_job_that_dies_on_unhandled_exceptions() -> bool {
 /// `PER_IS_MSVC_PURE_OR_NATIVE_EH`) and passes on everything else
 /// (`test_the_last_filter_keeps_the_filter_it_replaced`,
 /// `test_a_cxx_exception_nothing_catches_ends_through_the_runtimes_filter`).
-/// The line says which of the ends it is.
+/// Of its answers only `EXCEPTION_CONTINUE_EXECUTION` (it resumed the
+/// thread) is passed on; `EXCEPTION_CONTINUE_SEARCH` and
+/// `EXCEPTION_EXECUTE_HANDLER` end the process here: the second is the
+/// answer that lets the pool's worker go on, from
+/// `ntdll!TppWorkerThread$filt$5` through `TppWorkerpInnerExceptionFilter`
+/// (FILTERREC's frames, [`end_with`]). The line says which of the ends it is.
 ///
 /// # Safety
 /// `info` is the system's exception pointers.
@@ -2068,7 +2166,7 @@ unsafe extern "system" fn last_filter(info: *const windows_sys::Win32::System::D
             } else if jailed {
                 "in a job that dies on unhandled exceptions, the process ends with its code"
             } else {
-                "Windows Error Reporting ends the process"
+                "the process ends with its code, reported by Windows Error Reporting if it is enabled"
             }
         ));
     }
@@ -2078,12 +2176,13 @@ unsafe extern "system" fn last_filter(info: *const windows_sys::Win32::System::D
     fail_fast_for_the_record(info);
     // SAFETY: the system's exception pointers, passed on.
     let r = unsafe { call_filter(replaced, info) };
-    if r != windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH || !jailed {
+    if r == windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_EXECUTION {
         return r;
     }
-    // SAFETY: ends this process at once.
-    unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), code) };
-    std::process::abort();
+    // EXCEPTION_EXECUTE_HANDLER is not passed on: it is the answer that
+    // let a pool's worker go on (`end_with`).
+    // SAFETY: the system's exception pointers.
+    unsafe { end_with(info, code, jailed) }
 }
 
 /// A hexadecimal number shown without allocating; nothing for none.

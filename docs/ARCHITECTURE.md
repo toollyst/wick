@@ -391,7 +391,12 @@ semantics on Win32. The details are in the comments of each
   C++ initializers, which ends an unhandled C++ exception with
   `terminate()`) and, in a job that dies on unhandled exceptions (the
   jailer's; the process's immediate job is asked), ends the process with its
-  code; out of one Windows Error Reporting ends it, with its dump. Console control events are `SIGINT`, `SIGQUIT` and `SIGHUP`.
+  code by `TerminateProcess`; out of one by `RaiseFailFastException` with the
+  exception's record, which Windows Error Reporting reports, with its dump,
+  where it is enabled. It passes on only a filter's
+  `EXCEPTION_CONTINUE_EXECUTION`: under `SEM_NOGPFAULTERRORBOX` a thread
+  pool's worker took the `EXCEPTION_EXECUTE_HANDLER` the system's filter
+  gives and went on. Console control events are `SIGINT`, `SIGQUIT` and `SIGHUP`.
 - **mmap = placeholder virtual memory (Windows 10 1803+).** One mapping is one
   Windows allocation, tracked in a table. So that partial `munmap` and
   `MAP_FIXED` behave as on Linux, reservations are placeholders

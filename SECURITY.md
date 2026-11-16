@@ -255,7 +255,7 @@ has the per-control details and results.
   kind of thread, pool and job included (`test_an_unhandled_exception_ends_the_process_with_its_code`, run before its
   fix). Now the stack filter, and below every filter the last one (`windows_mm::last_filter`, installed before `main`
   in all three binaries), write a line naming the exception and, in such a job, end the process with its code; out
-  of such a job Windows Error Reporting ends it, with its dump, as before. The last filter keeps the filter it
+  of such a job Windows Error Reporting ended it, with its dump, until the next entry's fix. The last filter keeps the filter it
   replaces, the Visual C++ runtime's, and calls it after its line, so an unhandled C++ exception still ends as the
   runtime ends it (`terminate()`, exit 0xC0000409), jailed or not
   (`test_a_cxx_exception_nothing_catches_ends_through_the_runtimes_filter`). Per process kind:
@@ -272,6 +272,43 @@ has the per-control details and results.
     jailed VMM kept running is not measured. The binary-level measurement is not run: needs WHP's DLLs (the PC);
     the libc and vmm-sys-util code it runs is the tests' above.
   - the API process: the same polling callbacks on pool threads. Not run: needs WHP's DLLs (the PC).
+
+- **Windows: a thread pool could keep an unjailed process running after one of its threads used up its stack**
+  (since 50021416, which left the end out of a jail to Windows Error Reporting; fixed by the commit that adds this
+  entry). Out of a job of the jailer's limits the stack filter and the last filter passed the exception on
+  (`EXCEPTION_CONTINUE_SEARCH`), expecting Windows Error Reporting to end the process. Under
+  `SEM_NOGPFAULTERRORBOX`, which a process inherits from its parent (Learn, SetErrorMode), the system's
+  `UnhandledExceptionFilter` invokes no Windows Error Reporting and returns `EXCEPTION_EXECUTE_HANDLER`, and a
+  thread pool's worker, which calls it from its own exception filter (`ntdll!TppWorkerThread$filt$5`,
+  `TppWorkerpInnerExceptionFilter`, on Windows Server 2022 20348 then `TppExceptionFilter`: FILTERREC, named by cdb
+  with Microsoft's public symbols), took a stack overflow so and ran its next callback on the overflowed thread,
+  the process exiting 0. CI's runner gives its children error mode 3: CI run 43881982686's two libc failures
+  (`test_a_stack_overflow_at_the_reserves_end_is_still_one` alone, and
+  `test_a_job_nested_in_one_that_dies_on_unhandled_exceptions_ends_by_its_own_limits` in a job without the flag);
+  on Windows Server 2022 20348 and 2025 26100 at error mode 3, exit 0 in 22 ms, the next callback on the same
+  thread, where error mode 0 ended 0xC00000FD through Windows Error Reporting; an access violation was never taken
+  so. Now both filters end the process themselves, for every exception they get, at every error mode: in a job of
+  the jailer's limits by `TerminateProcess` with the exception's code, as before; out of one by
+  `RaiseFailFastException` with the exception's own record and context, which bypasses every handler and ends the
+  process with that code, invoking Windows Error Reporting if it is enabled (Learn, RaiseFailFastException). Of the
+  filter the last one replaced (the Visual C++ runtime's) only `EXCEPTION_CONTINUE_EXECUTION` is passed on. The
+  three tests run each child at error mode 0 and 3 and assert the exception's own code and that the pool's next
+  callback did not run; they failed before the fix at error mode 3 on both hosts (the pool's overflow, alone and in
+  a job without the flag, nested or not: exit 0) and pass after it, and an access violation on a pool thread is the
+  control (0xC0000005 before and after; with the end given no record, the mutation, every case ends
+  STATUS_FAIL_FAST_EXCEPTION, 0xC0000602, the control too). `RaiseFailFastException` ended the process with the
+  record's code with as little as 6784 to 9136 bytes left above the reserve's low end on each kind of thread
+  (FAILFASTSTACK; below that the record's own 1 KiB frames faulted first); a pool thread enters the filter with
+  9136 bytes left, a Rust thread, with its 20 KiB guarantee, with 22480. Code of wick's and Firecracker's that runs
+  on a thread pool's thread, read from the code:
+  - the VMM and its API process: polling's wait callback (crates/compat/polling, `WaitHandle`'s callback of
+    `RegisterWaitForSingleObject`: it takes the source's lock, marks it idle and posts a completion packet), for
+    each eventfd, console, pipe, nested epoll and other waitable handle an epoll watches (crates/compat/vmm-sys-util
+    windows/epoll.rs); nothing else of either submits work to a pool;
+  - the jailer: none (it has no epoll); its pool threads run the system's work only.
+  A report out of a jail is what Windows Error Reporting makes of any crash on that host: where the host has its
+  dumps enabled, a dump of an unjailed VMM holds the guest's memory, as a Linux core of Firecracker does where the
+  host allows cores; in a jail none is made (the job's flag: no Windows Error Reporting).
 
 - **Windows: a userfaultfd could be refused to a process whose pid a killed process had used** (since b0dfb35b,
   which made the userfaultfd kernel side; fixed by the commit that adds this entry). Its two ends are an AF_UNIX pair
@@ -392,6 +429,17 @@ upstream Firecracker and its jailer.
   every page table of the VMM's memory is the VMM's own commit, in its job, so the VMM reaches its limit sooner by
   those tables. Firecracker's handler is a process of the operator's, which the jailer does not put in the VMM's
   cgroup.
+- **Windows: a pending interrupt in a restored local APIC state is not delivered.** A vector made pending by
+  `KVM_SET_LAPIC` (its IRR bit, written at the right word of WHP's page) is read back by `KVM_GET_LAPIC` but the
+  guest never takes it, where one made pending by `WHvRequestInterrupt` is; KVM delivers it (`kvm_apic_set_state`
+  recomputes the APIC's state and requests the event). So a snapshot taken with an interrupt pending in a vCPU's
+  IRR may lose it at restore: a virtio or timer interrupt the guest then waits for. Two tests fail on it in CI's
+  WHP step (CI's windows job at e6d9a981): `test_a_kvm_lapic_state_is_in_kvms_layout` ("set: IRR 0x41 read back
+  true, then the guest [out 0x85] (KVM: out 0x81, out 0x85)") and
+  `test_a_restored_lapic_state_is_read_in_the_layout_its_xsave_area_names` (the same end after its marked state is
+  taken); the layout itself is right both ways in their LAPICLAYOUT and XSAVEMARK lines. They stay in the WHP step
+  and fail until the fix; the cause (the test or WHP), the documentation and a fix are being worked on.
+
 - **Windows: a reclaim's move, or the swap of a chunk discarded whole, ends the VMM with 137 when another thread's
   commit takes a view's page table room between its unmap and its map.** Both put a new section in the place of a
   2 MiB chunk's old one in its two views, the alias's and then the guest's: each view is unmapped, keeping its
@@ -673,7 +721,7 @@ upstream Firecracker and its jailer.
   pages in two sections for its
   time; a 2 MiB move budget of private `PAGE_NOACCESS` commit, made at the first registration, is the cover the
   jailer's count takes off for them, so the count, and the bound it enforces, stays exact during a move
-  (`test_the_jailers_count_does_not_rise_during_a_move`; passed in CI runs 43680983973 and 43688550565). A page discarded while a system
+  (`test_the_jailers_count_does_not_rise_during_a_move`; its runs in the memory.max row). A page discarded while a system
   call copies it (a guest that balloons a buffer a device is still using) would fail that call, where Linux's copy
   faults the page in again: so a discard waits for the calls in flight on its range, and a call that may wait without
   end (a blocking socket's or pipe's) copies through a buffer of its own, so that no discard waits on it (the

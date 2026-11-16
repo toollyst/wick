@@ -4137,19 +4137,31 @@ mod tests {
 
     /// A stack overflow at the reserve's end is still one, with the stack
     /// filter in place: the filter says so (its line, with how much of the
-    /// reserve was left, the thread and its guarantee) and the process ends
-    /// with `STATUS_STACK_OVERFLOW` (0xC00000FD), on each kind of thread
-    /// ([`Kind`]), with room left; each child alone (the error mode it
-    /// inherits), where the filter passes it on and Windows Error Reporting
-    /// ends it, and in a job as the jailer makes Firecracker's
+    /// reserve was left, the thread and its guarantee) and ends the process
+    /// with `STATUS_STACK_OVERFLOW` (0xC00000FD) itself, on each kind of
+    /// thread ([`Kind`]), with room left, and no thread pool's callback runs
+    /// after it (no FILTERREC "the next callback ran" line); each child at
+    /// error mode 0 (the system's default) and 3 (`SEM_FAILCRITICALERRORS |
+    /// SEM_NOGPFAULTERRORBOX`, what CI's runner gives its children), alone,
+    /// where the filter ends it with `RaiseFailFastException` and the
+    /// exception's record (Windows Error Reporting reports it if enabled),
+    /// and in a job as the jailer makes Firecracker's
     /// (`JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION`, which Learn says
     /// forces `SEM_NOGPFAULTERRORBOX` on each process of the job: Windows
     /// Error Reporting is not called, and the unhandled-exception filter's
-    /// caller handles the exception), where the filter ends it itself and
-    /// says so in its line. There a pool thread's overflow, passed on, was
-    /// taken by its pool, which went on running callbacks, the process with
-    /// it (exit 0, on Windows Server 2022 20348 and 2025 26100 alike), where
-    /// a Rust or `CreateThread` thread's ended the process with 0xC00000FD.
+    /// caller handles the exception), where it ends it with
+    /// `TerminateProcess`. Each line says which. Before, a pool thread's
+    /// overflow passed on (`EXCEPTION_CONTINUE_SEARCH`) under
+    /// `SEM_NOGPFAULTERRORBOX` (the job's, or error mode 3 alone) was taken
+    /// by the pool's own handler, which went on running callbacks on that
+    /// thread, the process with it (exit 0: in the job on Windows Server
+    /// 2022 20348 and 2025 26100 alike; alone at error mode 3 in CI run
+    /// 43881982686 and FILTERREC). A control: an access violation on a pool
+    /// thread at error mode 0 and 3 alone, which the pool's handler never
+    /// took (0xC0000005 before and after); under the mutation that ends the
+    /// process by `RaiseFailFastException` without the exception's record
+    /// (STATUS_FAIL_FAST_EXCEPTION, 0xC0000602, in place of its code) it
+    /// fails, with the overflow's cases.
     /// Each child waits for its thread by the thread's own
     /// structure, with no timeout ([`stack_overflow`]): a child whose
     /// process went on says how, and ends 0.
@@ -4166,18 +4178,40 @@ mod tests {
         let mut not_ended = std::vec::Vec::new();
         for child in ["stack_overflow_rust_child", "stack_overflow_createthread_child", "stack_overflow_pool_child"] {
             for jailed in [false, true] {
-                let (code, text, ended) = run_child_watched(child, &[], jailed);
-                let how = if jailed { "in a job as the jailer's" } else { "alone" };
-                std::eprintln!("STACKEND {child} {how}: {code:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
-                let said = text.contains("wick: a thread's stack overflowed at its reserve's end")
-                    && (!jailed || text.contains("in a job that dies on unhandled exceptions, the process ends with STATUS_STACK_OVERFLOW"));
-                if !said || code != Some(0xC000_00FD_u32.cast_signed()) {
-                    not_ended.push(std::format!("{child} {how} ({code:?}): {text}"));
+                for mode in ["0", "3"] {
+                    let (code, text, ended) = run_child_watched(child, &[("WICK_TEST_ERROR_MODE", mode)], jailed);
+                    let how = if jailed { "in a job as the jailer's" } else { "alone" };
+                    std::eprintln!("STACKEND {child} {how}, error mode {mode}: {code:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
+                    let said = text.contains("wick: a thread's stack overflowed at its reserve's end")
+                        && text.contains(if jailed { ENDS_JAILED_OVERFLOW } else { ENDS_OVERFLOW });
+                    if !said || code != Some(0xC000_00FD_u32.cast_signed()) || text.contains(NEXT_RAN) {
+                        not_ended.push(std::format!("{child} {how}, error mode {mode} ({code:?}): {text}"));
+                    }
                 }
             }
         }
-        assert!(not_ended.is_empty(), "not ended by the filter with its line and 0xC00000FD: {not_ended:#?}");
+        // The control: a pool thread's access violation, alone.
+        for mode in ["0", "3"] {
+            let env = [("WICK_TEST_FAULT", "av"), ("WICK_TEST_LAZY", "1"), ("WICK_TEST_ERROR_MODE", mode)];
+            let (code, text, ended) = run_child_watched("unhandled_pool_child", &env, false);
+            std::eprintln!("STACKEND control unhandled_pool_child av alone, error mode {mode}: {code:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
+            if !text.contains(ENDS) || code != Some(0xC000_0005_u32.cast_signed()) || text.contains(NEXT_RAN) {
+                not_ended.push(std::format!("the control, a pool thread's access violation, error mode {mode} ({code:?}): {text}"));
+            }
+        }
+        assert!(not_ended.is_empty(), "not ended by the filter with its line and the exception's code: {not_ended:#?}");
     }
+
+    /// The line [`on_a_thread_and_wait`]'s next callback writes: a pool went
+    /// on after the exception.
+    const NEXT_RAN: &str = "FILTERREC the next callback ran";
+    /// How the filters' lines end: out of a job of the jailer's limits, and
+    /// in one; for the last filter, and for a stack overflow at the
+    /// reserve's end (the stack filter's).
+    const ENDS: &str = "the process ends with its code, reported by Windows Error Reporting if it is enabled";
+    const ENDS_JAILED: &str = "in a job that dies on unhandled exceptions, the process ends with its code";
+    const ENDS_OVERFLOW: &str = "the process ends with STATUS_STACK_OVERFLOW (0xC00000FD), reported by Windows Error Reporting if it is enabled";
+    const ENDS_JAILED_OVERFLOW: &str = "in a job that dies on unhandled exceptions, the process ends with STATUS_STACK_OVERFLOW (0xC00000FD)";
 
     /// An unbounded recursion on a new thread of `kind`, waited for by the
     /// thread's own structure ([`on_a_thread_and_wait`]): the overflow either
@@ -4247,6 +4281,9 @@ mod tests {
         if std::env::var_os("WICK_TEST_FAIL_FAST").is_some() {
             crate::windows_mm::FAIL_FAST.store(true, Ordering::SeqCst);
         }
+        if let Some(k) = std::env::var("WICK_TEST_FAIL_FAST_EAT_KIB").ok().and_then(|k| k.parse::<usize>().ok()) {
+            crate::windows_mm::FAIL_FAST_EAT_KIB.store(k, Ordering::SeqCst);
+        }
         // SAFETY: plain call.
         std::println!("the child's error mode: {:#x}", unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode() });
     }
@@ -4293,6 +4330,44 @@ mod tests {
                     text.trim().replace('\n', " | ")
                 );
             }
+        }
+    }
+
+    /// FAILFASTSTACK, a record: how much stack `RaiseFailFastException`
+    /// takes when the stack filter calls it at a stack overflow at the
+    /// reserve's end (the filters' end out of a job, `windows_mm::end_with`),
+    /// on each kind of thread, alone at error mode 3: the filter first takes
+    /// 0, 1, 2, ... KiB more of the stack ([`crate::windows_mm::FAIL_FAST_EAT_KIB`])
+    /// and says the bytes then left above the reserve's low end; the child
+    /// ends with [`crate::windows_mm::FAIL_FAST_PROBE`] while the call had
+    /// the stack it needs. Per kind, the least left that still ended so and
+    /// the most that did not.
+    #[test]
+    #[ignore = "a record, run by hand"]
+    fn test_how_much_stack_fail_fast_takes_at_the_reserves_end_on_record() {
+        let probe = crate::windows_mm::FAIL_FAST_PROBE.cast_signed();
+        for child in ["stack_overflow_rust_child", "stack_overflow_createthread_child", "stack_overflow_pool_child"] {
+            let (mut ended, mut not) = (usize::MAX, 0usize);
+            for k in 0..=40 {
+                let kib = std::format!("{k}");
+                let env = [("WICK_TEST_ERROR_MODE", "3"), ("WICK_TEST_FAIL_FAST_EAT_KIB", kib.as_str())];
+                let (code, text, _) = run_child_watched(child, &env, false);
+                let left = text
+                    .split("KiB taken, ")
+                    .nth(1)
+                    .and_then(|t| t.split(' ').next())
+                    .and_then(|n| n.parse::<usize>().ok());
+                std::eprintln!("FAILFASTSTACK {child} took {k} KiB more: {code:?}, {left:?} bytes left before the call");
+                match (code == Some(probe), left) {
+                    (true, Some(l)) => ended = ended.min(l),
+                    (false, Some(l)) => not = not.max(l),
+                    _ => {}
+                }
+                if code != Some(probe) && left.is_none() {
+                    break;
+                }
+            }
+            std::eprintln!("FAILFASTSTACK {child}: ended with the record's code with {ended} bytes left at least; not with {not} at most");
         }
     }
 
@@ -4412,17 +4487,19 @@ mod tests {
 
     /// An exception that nothing handles gets a line that names it, its
     /// address and its thread (the last unhandled-exception filter,
-    /// `windows_mm::last_filter`), and ends the process with its code, on
-    /// every kind of thread ([`Kind`]), alone and in a job of the jailer's
-    /// limits, with lazy memory mapped (the stack filter above it, as in a
-    /// VMM) and, for the access violation, without (as in the API process
-    /// or the jailer): in the job the filter ends the process itself, where
-    /// the end is left to the filters' caller, which for a pool thread's
-    /// stack overflow was its pool, going on
-    /// ([`test_a_stack_overflow_at_the_reserves_end_is_still_one`]); alone,
-    /// Windows Error Reporting ends it, with its dump, as Linux's default
-    /// action for a fault signal no handler is registered for ends a
-    /// process with a core. No time is asserted.
+    /// `windows_mm::last_filter`), and the filter ends the process with its
+    /// code, with no pool callback after it (no [`NEXT_RAN`] line), on
+    /// every kind of thread ([`Kind`]), at error mode 0 and 3, alone and in
+    /// a job of the jailer's limits, with lazy memory mapped (the stack
+    /// filter above it, as in a VMM) and, for the access violation, without
+    /// (as in the API process or the jailer): in the job by
+    /// `TerminateProcess`, where the end is left to the filters' caller,
+    /// which for a pool thread's stack overflow was its pool, going on
+    /// ([`test_a_stack_overflow_at_the_reserves_end_is_still_one`]); alone by
+    /// `RaiseFailFastException` with the exception's record, which Windows
+    /// Error Reporting reports if it is enabled, as Linux's default action
+    /// for a fault signal no handler is registered for ends a process with
+    /// a core. No time is asserted.
     #[test]
     fn test_an_unhandled_exception_ends_the_process_with_its_code() {
         let mut not_ended = std::vec::Vec::new();
@@ -4433,13 +4510,19 @@ mod tests {
                 }
                 for child in ["unhandled_rust_child", "unhandled_createthread_child", "unhandled_pool_child"] {
                     for jailed in [false, true] {
-                        let (got, text, ended) = run_child_watched(child, &[("WICK_TEST_FAULT", fault), ("WICK_TEST_LAZY", lazy)], jailed);
-                        let how = if jailed { "in a job as the jailer's" } else { "alone" };
-                        std::eprintln!("UNHANDLED {child} {fault} lazy {lazy} {how}: {got:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
-                        let said = text.contains(&std::format!("wick: an unhandled exception {code:#x}"))
-                            && (!jailed || text.contains("in a job that dies on unhandled exceptions, the process ends with its code"));
-                        if !said || got != Some(code.cast_signed()) {
-                            not_ended.push(std::format!("{child} {fault} lazy {lazy} {how} ({got:?}): {text}"));
+                        for mode in ["0", "3"] {
+                            let env = [("WICK_TEST_FAULT", fault), ("WICK_TEST_LAZY", lazy), ("WICK_TEST_ERROR_MODE", mode)];
+                            let (got, text, ended) = run_child_watched(child, &env, jailed);
+                            let how = if jailed { "in a job as the jailer's" } else { "alone" };
+                            std::eprintln!(
+                                "UNHANDLED {child} {fault} lazy {lazy} {how}, error mode {mode}: {got:?} after {ended:?}; {}",
+                                text.trim().replace('\n', " | ")
+                            );
+                            let said = text.contains(&std::format!("wick: an unhandled exception {code:#x}"))
+                                && text.contains(if jailed { ENDS_JAILED } else { ENDS });
+                            if !said || got != Some(code.cast_signed()) || text.contains(NEXT_RAN) {
+                                not_ended.push(std::format!("{child} {fault} lazy {lazy} {how}, error mode {mode} ({got:?}): {text}"));
+                            }
                         }
                     }
                 }
@@ -4508,10 +4591,11 @@ mod tests {
     /// Its immediate job's query (what the filters ask) shows no flag;
     /// a pool thread's stack overflow and an access violation, on a pool
     /// thread and a `CreateThread` thread, end the process with their code
-    /// through Windows Error Reporting, as with the inner job alone, where
-    /// in a job with the flag the overflow passed on was taken by the pool
-    /// ([`test_a_stack_overflow_at_the_reserves_end_is_still_one`]).
-    /// NESTJOB: each child's end, nested and with the inner job alone.
+    /// by the filters' `RaiseFailFastException`, the line out of such a job
+    /// said, as with the inner job alone, and no pool callback runs after
+    /// it (no [`NEXT_RAN`] line), at error mode 0 and 3 (the outer job's
+    /// flag forces no error mode on the inner job's process). NESTJOB: each
+    /// child's end, nested and with the inner job alone.
     #[test]
     fn test_a_job_nested_in_one_that_dies_on_unhandled_exceptions_ends_by_its_own_limits() {
         use windows_sys::Win32::System::JobObjects::{JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE};
@@ -4523,13 +4607,18 @@ mod tests {
             ("unhandled_createthread_child", &[("WICK_TEST_FAULT", "av"), ("WICK_TEST_LAZY", "1")][..]),
         ] {
             let code: u32 = if child.starts_with("stack") { 0xC000_00FD } else { 0xC000_0005 };
+            let ends = if child.starts_with("stack") { ENDS_OVERFLOW } else { ENDS };
             for nested in [false, true] {
-                let (got, text, ended) = run_child_in_jobs(child, env, if nested { &jobs[..] } else { &jobs[1..] });
-                let how = if nested { "inner job (no flag) in an outer one with the flag" } else { "one job, no flag" };
-                std::eprintln!("NESTJOB {child} {how}: {got:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
-                let flags = std::format!("the child's immediate job: query 1, limit flags {JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:#x}");
-                if !text.contains(&flags) || !text.contains("Windows Error Reporting ends the process") || got != Some(code.cast_signed()) {
-                    wrong.push(std::format!("{child} {how} ({got:?}): {text}"));
+                for mode in ["0", "3"] {
+                    let mut e = env.to_vec();
+                    e.push(("WICK_TEST_ERROR_MODE", mode));
+                    let (got, text, ended) = run_child_in_jobs(child, &e, if nested { &jobs[..] } else { &jobs[1..] });
+                    let how = if nested { "inner job (no flag) in an outer one with the flag" } else { "one job, no flag" };
+                    std::eprintln!("NESTJOB {child} {how}, error mode {mode}: {got:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
+                    let flags = std::format!("the child's immediate job: query 1, limit flags {JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:#x}");
+                    if !text.contains(&flags) || !text.contains(ends) || got != Some(code.cast_signed()) || text.contains(NEXT_RAN) {
+                        wrong.push(std::format!("{child} {how}, error mode {mode} ({got:?}): {text}"));
+                    }
                 }
             }
         }
