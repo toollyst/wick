@@ -1575,6 +1575,33 @@ fn this_threads_description(out: &mut [u16]) -> usize {
     n
 }
 
+/// STACK137FRAMES (tests): the return addresses on the stack of a thread
+/// whose stack could not grow, from the filter down through the exception
+/// dispatcher into the frames that faulted (`RtlCaptureStackBackTrace`),
+/// each as an offset in this executable (`__ImageBase`) where it is one,
+/// for a debugger to name (`cdb -z <exe>`, `ln`); written without
+/// allocating, in 256 bytes of stack.
+#[cfg(test)]
+#[inline(never)]
+fn stack_137_frames() {
+    unsafe extern "C" {
+        static __ImageBase: u8;
+    }
+    let mut frames = [core::ptr::null_mut::<c_void>(); 32];
+    // SAFETY: room for 32 addresses.
+    let n = unsafe { windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(0, 32, frames.as_mut_ptr(), core::ptr::null_mut()) };
+    // The linker's symbol for this image's base (its address only).
+    let base = core::ptr::addr_of!(__ImageBase) as usize;
+    for (i, f) in frames[..usize::from(n)].iter().enumerate() {
+        let a = *f as usize;
+        if a >= base && a - base < 64 << 20 {
+            say_at_the_limit(format_args!("STACK137FRAMES {i} image+{:#x}", a - base));
+        } else {
+            say_at_the_limit(format_args!("STACK137FRAMES {i} {a:#x}"));
+        }
+    }
+}
+
 /// UTF-16 shown without allocating (a character that is not valid as `?`).
 struct Utf16<'a>(&'a [u16]);
 
@@ -1634,6 +1661,8 @@ unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::
                 unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
                 Utf16(&name[..len])
             ));
+            #[cfg(test)]
+            stack_137_frames();
             // SAFETY: ends this process at once, as SIGKILL does.
             unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), OOM_EXIT) };
             unreachable!("the process ended");

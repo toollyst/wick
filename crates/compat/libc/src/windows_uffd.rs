@@ -2733,6 +2733,22 @@ mod tests {
     fn take_every_page() -> std::vec::Vec<usize> {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         let mut held = std::vec::Vec::with_capacity(1 << 16);
+        // From here the job has no room: the locks are taken as the product
+        // takes them. The watch's frames and its record's lines are deeper
+        // than the product's, and a thread whose committed stack ends just
+        // below the product's path (the userfaultfd's serve thread in
+        // `destroy`, through `uffd_lazy` and the region table's search)
+        // needed a new page for them, which the limit refused: 10 of 480
+        // fills at the limit ended so with the watch (9 with 137, 1 with
+        // STATUS_HEAP_CORRUPTION), 0 of 480 with the watch off for the whole
+        // test, and 2 of 480 with it off from here (Windows Server 2022
+        // 20348, STACK137FRAMES). Those two are the product's own: the same
+        // thread in `destroy`, growing its Vec of missing runs, was refused
+        // a stack page inside ntdll's heap code (RtlpAllocateHeap under
+        // RtlReAllocateHeap). That end is open (COMPATIBILITY.md, the
+        // memory.max row); the watch is off here so that it is the
+        // product's frames this test runs at the limit.
+        crate::windows_stacklock::WATCHING.store(false, Ordering::SeqCst);
         while held.len() < held.capacity() {
             // SAFETY: new private memory of ours.
             let p = unsafe { VirtualAlloc(ptr::null(), PAGE as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
