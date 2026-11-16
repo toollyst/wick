@@ -677,6 +677,14 @@ fn carve(t: &mut Table, start: usize, end: usize) -> bool {
 /// Turns the whole region at `base` back into a placeholder.
 fn to_placeholder(t: &mut Table, base: usize) -> bool {
     let r = t.get_mut(&base).unwrap();
+    // A view's pages leave the released ranges' records before the view
+    // goes, as in [`release`] and `munmap`: a first access resolving one of
+    // them holds the records' lock from its check that the page is
+    // committed to its protection, so the view stays while it does (the
+    // view is counted out of its record by [`unalias`] once it is gone).
+    if matches!(r.kind, Kind::View { .. }) {
+        released_forget(base, r.len);
+    }
     // SAFETY: frees our allocation or view, keeping the address space.
     let ok = unsafe {
         match r.kind {
@@ -1068,19 +1076,19 @@ impl Touched {
 
 /// A new lazy allocation at `base`: no page committed.
 fn touched_add(base: usize, len: usize) {
-    TOUCHED.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(base, Arc::new(Touched::new(len)));
+    TOUCHED.write().unwrap().insert(base, Arc::new(Touched::new(len)));
 }
 
 /// The lazy allocation at `base` is gone, or no longer lazy.
 fn touched_remove(base: usize) {
-    TOUCHED.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&base);
+    TOUCHED.write().unwrap().remove(&base);
 }
 
 /// Sets (or clears) the bits of the pages `[start, start + len)` overlaps,
 /// in whichever lazy allocations it lies.
 fn touched_mark(start: usize, len: usize, set: bool) {
     let end = start.saturating_add(len);
-    let map = TOUCHED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let map = TOUCHED.read().unwrap();
     if map.is_empty() {
         return;
     }
@@ -1124,7 +1132,7 @@ pub(crate) fn zero_runs(addr: usize, len: usize, mut f: impl FnMut(usize, usize,
         }
     };
     {
-        let map = TOUCHED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = TOUCHED.read().unwrap();
         let mut at = addr;
         while at < end {
             let found = map.range(..=at).next_back().filter(|(b, t)| at < **b + t.len);
@@ -3811,8 +3819,27 @@ fn released_resolve(addr: usize, write: bool, grain: usize) -> Option<(Access, c
         unsafe { std::ptr::write_bytes((r.alias + (page - r.start)) as *mut u8, 0, PAGE) };
         #[cfg(test)]
         resolve_pause();
+        // `PAGE_READONLY` or `PAGE_READWRITE` (`PAGE_NOACCESS` returned
+        // above), for a page found committed under the records' lock in a
+        // read-write view of its section: no view goes while the lock is
+        // held (every unmap and map-over forgets the view's pages first:
+        // `munmap`, [`release`], [`to_placeholder`]), so the change cannot be
+        // refused. The charge taken above is no extra: a committed section
+        // page is charged (`wick_uffd::discarding` keeps a discarded page's
+        // charge), and committing a committed charge page charges nothing
+        // more ("an attempt to commit a page that is already committed does
+        // not cause the function to fail", Microsoft Learn, VirtualAlloc).
+        // Refused all the same, the invariant is broken, and the VMM
+        // ends, named, where a return would fault an access to a page that
+        // is still pending.
         if !protect(page, PAGE, prot) {
-            return Some((Access::NotLazy, 0..0));
+            // SAFETY: plain call.
+            let err = unsafe { GetLastError() };
+            say_at_the_limit(format_args!(
+                "wick: guest memory: a released userfaultfd page at {page:#x}, committed in its view, could not be \
+                 given its protection {prot:#x} (error {err}): the VMM aborts"
+            ));
+            std::process::abort();
         }
         touched_mark(page, PAGE, true);
         r.resolved(page);

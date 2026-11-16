@@ -4661,7 +4661,6 @@ mod tests {
     /// is (`windows_mm::resolve_pause_arm`). In a process of its own (the
     /// park is the process's).
     #[test]
-    #[ignore = "until a view leaves the released ranges' records before it goes"]
     fn test_a_fixed_mapping_over_a_page_being_resolved_waits_for_it() {
         let (code, text) = run_child("resolve_under_a_fixed_mapping_child", None);
         assert!(text.contains("RESOLVE the view while parked: committed"), "{text}");
@@ -4720,7 +4719,6 @@ mod tests {
     /// vectored handler, which cannot unwind. A bug's end, named. In a
     /// process of its own.
     #[test]
-    #[ignore = "until a poisoned lock ends the process, named"]
     fn test_a_poisoned_lock_on_the_access_path_aborts_named() {
         let (code, text) = run_child("poisoned_access_child", None);
         assert!(text.contains("wick: the lock RELEASED was poisoned"), "{text}");

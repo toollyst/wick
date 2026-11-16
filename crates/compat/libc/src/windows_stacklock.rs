@@ -39,7 +39,9 @@
 //! probe will have to cover. With [`Probing::Guard`] a lock probes first
 //! and such a page fails the test, naming the lock.
 
-use std::sync::{LockResult, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+#[cfg(test)]
+use std::sync::PoisonError;
+use std::sync::{LockResult, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// The stack committed below the caller before a lock: the deepest use of
 /// the stack while one of these locks is held, nested ones included, with a
@@ -296,17 +298,20 @@ impl<G: core::ops::DerefMut> core::ops::DerefMut for Probed<G> {
 
 impl<'a, T> Probed<MutexGuard<'a, T>> {
     /// [`std::sync::Condvar::wait`] on this guard's mutex: the stack probed
-    /// before the lock stays committed through the wait.
+    /// before the lock stays committed through the wait. Never `Err`: a
+    /// mutex poisoned meanwhile ends the process ([`poisoned`]).
+    #[track_caller]
     pub(crate) fn wait_on(self, cv: &std::sync::Condvar) -> LockResult<Self> {
         let Probed { guard, _held } = self;
         match cv.wait(guard) {
             Ok(guard) => Ok(Probed { guard, _held }),
-            Err(p) => Err(PoisonError::new(Probed { guard: p.into_inner(), _held })),
+            Err(_) => poisoned("the mutex of a condition variable's wait", core::panic::Location::caller()),
         }
     }
 }
 
-/// Takes the lock with `take`, keeping its poison; in tests, if this
+/// Takes the lock with `take`, a poisoned one ending the process
+/// ([`poisoned`]): never `Err`; in tests, if this
 /// thread holds none of these locks yet, watched first (see [`Probing`]).
 #[track_caller]
 fn probed<G>(name: &'static str, take: impl FnOnce() -> LockResult<G>) -> LockResult<Probed<G>> {
@@ -340,8 +345,24 @@ fn probed<G>(name: &'static str, take: impl FnOnce() -> LockResult<G>) -> LockRe
     };
     match take() {
         Ok(guard) => Ok(Probed { guard, _held: held }),
-        Err(p) => Err(PoisonError::new(Probed { guard: p.into_inner(), _held: held })),
+        Err(_) => poisoned(name, core::panic::Location::caller()),
     }
+}
+
+/// A lock of this module found poisoned: a thread panicked while it held
+/// it, so what it guards (the region table, the charges, the released
+/// ranges' records, ...) is in a state no caller can know. The process
+/// aborts, the lock named, without allocating; never a panic, which in the
+/// exception handler's path (a first access of lazy or released memory)
+/// would be a panic inside an exception's dispatch.
+#[cold]
+#[inline(never)]
+fn poisoned(name: &str, at: &core::panic::Location<'_>) -> ! {
+    crate::windows_mm::say_at_the_limit(format_args!(
+        "wick: the lock {name} was poisoned (a thread panicked while it held it), taken again at {at}: what it guards \
+         is in a state not known; the process aborts"
+    ));
+    std::process::abort()
 }
 
 /// A mutex of this crate's Windows code, locked with its stack committed first.
@@ -355,7 +376,8 @@ impl<T> ProbedMutex<T> {
         Self { name, inner: Mutex::new(value) }
     }
 
-    /// [`Mutex::lock`], after [`PROBE`] bytes of stack are committed.
+    /// [`Mutex::lock`], after [`PROBE`] bytes of stack are committed (in
+    /// tests). Never `Err`: a poisoned mutex ends the process ([`poisoned`]).
     #[track_caller]
     pub(crate) fn lock(&self) -> LockResult<Probed<MutexGuard<'_, T>>> {
         probed(self.name, || self.inner.lock())
