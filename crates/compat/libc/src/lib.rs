@@ -72,6 +72,12 @@ pub mod wick_uffd;
 #[cfg(windows)]
 #[path = "windows_nofile.rs"]
 pub mod wick_nofile;
+/// The heap's allocator for wick's Windows binaries, which reclaims and
+/// then ends the VMM with 137 at the memory limit (a wick API, not part of
+/// `libc`).
+#[cfg(windows)]
+#[path = "windows_alloc.rs"]
+pub mod wick_alloc;
 #[cfg(windows)]
 mod windows_errno;
 // Explicit, so they take precedence over the CRT values of `upstream`.

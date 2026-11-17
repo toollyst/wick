@@ -1574,7 +1574,7 @@ pub(crate) fn fill_out_of_memory(dst: u64, len: u64, filled: u64, err: u32, wait
 
 /// Says `line` on standard error, allocating nothing, and ends the process
 /// with [`OOM_EXIT`], as the cgroup OOM killer's SIGKILL ends the VMM.
-fn end_at_the_limit(line: core::fmt::Arguments<'_>) -> ! {
+pub(crate) fn end_at_the_limit(line: core::fmt::Arguments<'_>) -> ! {
     let rescue = RESCUE.swap(0, std::sync::atomic::Ordering::SeqCst);
     if rescue != 0 {
         // SAFETY: frees the block set aside for this.
@@ -1586,6 +1586,44 @@ fn end_at_the_limit(line: core::fmt::Arguments<'_>) -> ! {
     // TerminateProcess of this process does not return; were it to, no
     // unwinding in an exception's dispatch (`__fastfail`, no allocation).
     std::process::abort();
+}
+
+std::thread_local! {
+    /// How deep this thread is in [`on_exception`] (a fault in the handler
+    /// nests): no destructor, a plain read of the thread's TLS.
+    static IN_THE_HANDLER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread in [`on_exception`] while it lives: two writes of the
+/// thread's TLS an exception.
+struct InTheHandler;
+
+impl InTheHandler {
+    fn new() -> Self {
+        IN_THE_HANDLER.set(IN_THE_HANDLER.get() + 1);
+        InTheHandler
+    }
+}
+
+impl Drop for InTheHandler {
+    fn drop(&mut self) {
+        IN_THE_HANDLER.set(IN_THE_HANDLER.get() - 1);
+    }
+}
+
+/// Whether this thread runs the process's exception handler now
+/// ([`on_exception`]), which allocates nothing by design: the heap's
+/// allocator ends the process at a refusal there with no reclaim
+/// (`wick_alloc`).
+pub(crate) fn in_the_handler() -> bool {
+    IN_THE_HANDLER.get() > 0
+}
+
+/// Tests: runs `f` as if in the exception handler.
+#[cfg(test)]
+pub(crate) fn as_if_in_the_handler<T>(f: impl FnOnce() -> T) -> T {
+    let _in = InTheHandler::new();
+    f()
 }
 
 std::thread_local! {
@@ -1686,6 +1724,7 @@ unsafe extern "system" fn on_exception(
     info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
 ) -> i32 {
     const ACCESS_VIOLATION: i32 = 0xC000_0005_u32 as i32;
+    let _in_the_handler = InTheHandler::new();
     // SAFETY: the system passes valid exception pointers.
     let rec = unsafe { &*(*info).ExceptionRecord };
     #[cfg(all(test, target_arch = "x86_64"))]
@@ -5452,7 +5491,7 @@ static RELEASED_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 pub(crate) fn released_reserve(start: usize, len: usize) -> Result<usize, c_int> {
     let words = (len / PAGE).div_ceil(64);
     let mut bits = Vec::new();
-    bits.try_reserve_exact(3 * words).map_err(|_| crate::ENOMEM)?;
+    crate::wick_alloc::fallible(|| bits.try_reserve_exact(3 * words)).map_err(|_| crate::ENOMEM)?;
     bits.resize(3 * words, 0u64);
     let mut records = RELEASED.lock().unwrap();
     let i = records.iter().position(|r| r.state == RecordState::Free).ok_or(crate::ENOMEM)?;
@@ -6335,7 +6374,11 @@ pub(crate) fn reserve_discards() -> bool {
     let mut f = IN_FLIGHT.lock().unwrap();
     let more = ROOM.saturating_sub(f.discards.capacity() - f.discards.len());
     let moves = (ROOM + FILL_CLAIMS).saturating_sub(f.moves.capacity() - f.moves.len());
-    (more == 0 || f.discards.try_reserve(more).is_ok()) && (moves == 0 || f.moves.try_reserve(moves).is_ok())
+    // Under the fallible guard: a refusal is answered (`ENOMEM`), not the
+    // process's end (`wick_alloc`).
+    crate::wick_alloc::fallible(|| {
+        (more == 0 || f.discards.try_reserve(more).is_ok()) && (moves == 0 || f.moves.try_reserve(moves).is_ok())
+    })
 }
 
 /// The most chunks one fill refused at the job's limit claims at once

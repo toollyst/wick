@@ -191,6 +191,11 @@ Firecracker's code runs (`test_another_value_is_refused`, `ext::malloc_config` u
 (`test_firecracker_gets_libmallocs_configuration_from_the_jailer`) and the jailed Firecracker's own (`jailer-test
 jail`).
 
+On Windows Firecracker's heap is the process heap (`HeapAlloc`, Rust's `System`), with no type isolation either,
+through wick's allocator (`libc::wick_alloc`), which changes only what a refusal at the memory limit does: a reclaim,
+then the end with 137 (Fixed defects below; `test_the_heaps_allocator_is_wicks`, and Firecracker's start line,
+which `boot-test.ps1 boot` checks).
+
 Every planned mechanism above has been measured on its host with a probe
 ([`tools/windows/winprobe.c`](tools/windows/winprobe.c) on Windows); the [roadmap](docs/ROADMAP.md), milestone M5,
 has the per-control details and results.
@@ -689,6 +694,26 @@ has the per-control details and results.
   close; 15 of its checks failed on the code before, and the register again failed with the slot freed). A reopening
   that fails too ends the process with a line (`test_a_register_whose_reopening_fails_ends_the_process`). Linux's
   register changes no page's protection and has no such failure. Windows Server 2022 20348 and 2025 26100.
+- **Windows: a heap allocation the memory limit refused ended the VMM with 0xC0000409, with no reclaim** (from the
+  Windows port's start; found by reading, review of the MOVEUNDERVCPU test, not observed in a VMM). Rust's allocation
+  error calls `std::process::abort` (`__fastfail`), where Linux's memory cgroup reclaims and then kills the VMM with
+  SIGKILL at the page it cannot charge (v6.1 mm/memcontrol.c `try_charge_memcg` :2681, :2705 to :2706, :2729;
+  mm/memory.c `do_anonymous_page` :4117 charges a heap page at its first touch). Now every Windows binary that
+  links the VMM has wick's allocator (`libc::wick_alloc`, `vmm::ext::allocator`): at a refusal the reclaim runs
+  once and the allocation is asked again if it gave something back, else the VMM ends with 137 and a line naming
+  the size and what the reclaim gave back; no reclaim runs with a lock of wick's memory layer held, in the
+  exception handler or on the reclaim's own thread, where the VMM ends at once
+  (`test_a_heap_allocation_refused_at_the_limit_ends_with_137_and_a_line` for an allocation, a zeroed one and a
+  reallocation, `test_a_heap_allocation_refused_at_the_limit_is_made_after_the_reclaim`,
+  `test_a_heap_allocation_refused_where_no_reclaim_may_run_ends_with_137`; each failed with 0xC0000409 on the code
+  without the wrapper, and the last made its allocations after a reclaim with its check taken out). wick's own
+  `try_reserve` sites (a register's record bitmaps, the reclaim's lists and discard guards) answer `ENOMEM` as
+  before (`test_a_guarded_fallible_site_answers_enomem_at_the_limit`, which ended with 137 with the guard taken
+  out). Upstream's and std's fallible growth (`fs::read_to_string` of the config file, the metadata file and a CPU
+  template; `read_to_end` of a snapshot's state and of the seccomp filters) now ends the VMM with 137 at the limit
+  where it returned an out-of-memory error, as Linux's memory cgroup kills there. Firecracker says at its start
+  which allocator its heap runs with (`boot-test.ps1 boot`; `test_the_heaps_allocator_is_wicks`). Windows Server
+  2022 20348 and 2025 26100.
 - **Windows: a register that could not give a page holding memory its protection returned with the page more open
   than `mprotect` made it** (from b0dfb35b, the Windows userfaultfd's start; found by reading, review of the fix
   above, not observed). The section's view is mapped read-write and each run of pages that holds memory gets its

@@ -17,6 +17,8 @@
 // rustdoc step); upstream's modules keep upstream's lint levels.
 #![deny(rustdoc::broken_intra_doc_links)]
 
+#[cfg(windows)]
+pub mod allocator;
 pub mod api_process;
 pub mod fifo;
 pub mod jail;
@@ -139,6 +141,8 @@ static EXTENSION: OnceLock<Box<dyn Extension>> = OnceLock::new();
 
 /// Registers the process-wide extension. Only the first call takes effect.
 pub fn register(extension: Box<dyn Extension>) -> Result<(), ExtError> {
+    #[cfg(windows)]
+    allocator::say();
     EXTENSION
         .set(extension)
         .map_err(|_| ExtError("an extension is already registered".to_string()))

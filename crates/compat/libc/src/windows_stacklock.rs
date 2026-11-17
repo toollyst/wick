@@ -432,7 +432,8 @@ mod tests {
 
     /// This crate's Windows modules, each read by
     /// [`test_wicks_memory_locks_are_all_probed`].
-    const MODULES: [(&str, &str); 11] = [
+    const MODULES: [(&str, &str); 12] = [
+        ("windows_alloc.rs", include_str!("windows_alloc.rs")),
         ("windows_errno.rs", include_str!("windows_errno.rs")),
         ("windows_fd.rs", include_str!("windows_fd.rs")),
         ("windows_items.rs", include_str!("windows_items.rs")),

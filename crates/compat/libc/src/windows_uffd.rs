@@ -2540,7 +2540,7 @@ fn reserve_reclaim(chunks: usize) -> io::Result<()> {
         let mut l = list.lock().unwrap();
         if l.capacity() < want {
             let more = want - l.len();
-            l.try_reserve_exact(more).map_err(|_| errno_err(crate::ENOMEM))?;
+            crate::wick_alloc::fallible(|| l.try_reserve_exact(more)).map_err(|_| errno_err(crate::ENOMEM))?;
         }
     }
     if !crate::windows_mm::reserve_discards() {
@@ -8073,7 +8073,8 @@ mod tests {
         unsafe { ws::closesocket(sock(user)) };
     }
 
-    /// The test binary's allocator: the system's, counting the allocations
+    /// The test binary's allocator: the product's (`wick_alloc`, so that a
+    /// child at a job limit ends as the VMM would), counting the allocations
     /// a thread makes while [`COUNTING_ALLOCATIONS`] is set on it
     /// (`test_a_reclaim_allocates_nothing`), and, while [`COUNTING_KINDS`]
     /// is set, those of every thread marked with a kind ([`KIND`]: the
@@ -8183,20 +8184,29 @@ mod tests {
         }
     }
 
-    // SAFETY: the system allocator's calls, as they are; the counts are
-    // thread-local cells and atomics, which allocate nothing.
+    // SAFETY: the calls of wick's heap allocator (`wick_alloc`, the
+    // product's), as they are; the counts are thread-local cells and
+    // atomics, which allocate nothing.
     unsafe impl std::alloc::GlobalAlloc for Counting {
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            if COUNTING_ALLOCATIONS.with(core::cell::Cell::get) {
+                ALLOCATIONS.with(|a| a.set(a.get() + 1));
+            }
+            count_for_the_kind(layout.size());
+            // SAFETY: the caller's contract.
+            unsafe { crate::wick_alloc::Allocator.alloc_zeroed(layout) }
+        }
         unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
             if COUNTING_ALLOCATIONS.with(core::cell::Cell::get) {
                 ALLOCATIONS.with(|a| a.set(a.get() + 1));
             }
             count_for_the_kind(layout.size());
             // SAFETY: the caller's contract.
-            unsafe { std::alloc::System.alloc(layout) }
+            unsafe { crate::wick_alloc::Allocator.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
             // SAFETY: the caller's contract.
-            unsafe { std::alloc::System.dealloc(ptr, layout) }
+            unsafe { crate::wick_alloc::Allocator.dealloc(ptr, layout) }
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
             if COUNTING_ALLOCATIONS.with(core::cell::Cell::get) {
@@ -8204,7 +8214,7 @@ mod tests {
             }
             count_for_the_kind(new_size);
             // SAFETY: the caller's contract.
-            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+            unsafe { crate::wick_alloc::Allocator.realloc(ptr, layout, new_size) }
         }
     }
 
@@ -8218,6 +8228,203 @@ mod tests {
         let r = f();
         COUNTING_ALLOCATIONS.with(|c| c.set(false));
         (ALLOCATIONS.with(core::cell::Cell::get), r)
+    }
+
+    /// HEAPEND: a heap allocation the job's limit refuses, with nothing to
+    /// reclaim (no range registered), ends the process with 137 and a line
+    /// naming the size and what the reclaim gave back (`wick_alloc`), for
+    /// each of the allocator's calls: an allocation (`Vec::with_capacity`),
+    /// a zeroed one (`vec![0; n]`) and a reallocation (`reserve_exact`).
+    /// Without the wrapper Rust's allocation error ends it with 0xC0000409.
+    /// In a process of its own, under a job limit, with the product's
+    /// allocator as the test binary's ([`Counting`]).
+    #[test]
+    fn test_a_heap_allocation_refused_at_the_limit_ends_with_137_and_a_line() {
+        let mut failed = std::vec::Vec::new();
+        for (child, kind) in [("heap_end_alloc_child", "an allocation"), ("heap_end_zeroed_child", "a zeroed allocation"), ("heap_end_realloc_child", "a reallocation")] {
+            let (code, text) = run_child(child, Some(96 << 20));
+            for l in text.lines().filter(|l| l.starts_with("wick:") || l.starts_with("HEAP") || l.contains("memory allocation")) {
+                std::eprintln!("{child}: {l}");
+            }
+            let line = std::format!("wick: heap: {kind} of 1048576 bytes");
+            if code != Some(137) || !text.contains(&line) || !text.contains("the reclaim gave back 0 bytes") {
+                failed.push(std::format!("{child}: exit {code:x?}, the line {}", text.contains(&line)));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    /// [`test_a_heap_allocation_refused_at_the_limit_ends_with_137_and_a_line`]'s
+    /// three children: no room left, then the allocation.
+    fn heap_end(kind: &str) {
+        watchdog(60);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut small: std::vec::Vec<u8> = std::vec::Vec::with_capacity(16);
+        small.push(1);
+        let held = no_room_left();
+        let v: std::vec::Vec<u8> = match kind {
+            "zeroed" => std::vec![0u8; 1 << 20],
+            "realloc" => {
+                small.reserve_exact((1 << 20) - small.len());
+                small
+            }
+            _ => std::vec::Vec::with_capacity(1 << 20),
+        };
+        crate::windows_mm::say_at_the_limit(format_args!("HEAPEND {kind}: the allocation was made ({} bytes)", v.capacity()));
+        core::hint::black_box((v, held));
+    }
+
+    #[test]
+    #[ignore = "run by test_a_heap_allocation_refused_at_the_limit_ends_with_137_and_a_line in a job of its own"]
+    fn heap_end_alloc_child() {
+        heap_end("alloc");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_heap_allocation_refused_at_the_limit_ends_with_137_and_a_line in a job of its own"]
+    fn heap_end_zeroed_child() {
+        heap_end("zeroed");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_heap_allocation_refused_at_the_limit_ends_with_137_and_a_line in a job of its own"]
+    fn heap_end_realloc_child() {
+        heap_end("realloc");
+    }
+
+    /// HEAPRECLAIM: a heap allocation the job's limit refuses where the
+    /// reclaim has dead pages to give back (the reclaim tests' start: 8
+    /// chunks half dead) is made once the reclaim ran, and the process goes
+    /// on, as Linux's memory cgroup charges again after a reclaim that freed
+    /// pages (v6.1 mm/memcontrol.c :2705 to :2706). Without the wrapper it
+    /// ends with 0xC0000409.
+    #[test]
+    fn test_a_heap_allocation_refused_at_the_limit_is_made_after_the_reclaim() {
+        let (code, text) = run_child("heap_reclaim_child", Some(96 << 20));
+        for l in text.lines().filter(|l| l.starts_with("wick:") || l.starts_with("HEAP") || l.contains("memory allocation")) {
+            std::eprintln!("{l}");
+        }
+        assert!(text.contains("HEAPRECLAIM the allocation was made"), "{code:x?} {text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_heap_allocation_refused_at_the_limit_is_made_after_the_reclaim in a job of its own"]
+    fn heap_reclaim_child() {
+        watchdog(60);
+        let (_ctx, user, _mem, _) = fill_to_the_limit_and_discard_in_part();
+        let mut held = no_room_left();
+        let moved = MOVES_MADE.load(Ordering::Relaxed);
+        let v: std::vec::Vec<u8> = std::vec![0x77u8; 1 << 20];
+        let moved = MOVES_MADE.load(Ordering::Relaxed) - moved;
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "HEAPRECLAIM the allocation was made ({} bytes, {moved} chunks moved for it)",
+            v.len()
+        ));
+        assert!(moved > 0, "no chunk moved: the allocation was not refused");
+        drop(v);
+        give_back_every_page(&mut held);
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// HEAPGUARD: wick's own fallible sites still answer `ENOMEM` under the
+    /// wrapper (`wick_alloc::fallible`): a register at the job's limit
+    /// whose record's bitmaps (1.5 MiB for 16 GiB) cannot be had is
+    /// `ENOMEM`, and the process lives. The same without the wrapper; with
+    /// it and no guard, the process ended with 137 (the commit says where).
+    #[test]
+    fn test_a_guarded_fallible_site_answers_enomem_at_the_limit() {
+        let (code, text) = run_child("heap_guard_child", Some(96 << 20));
+        for l in text.lines().filter(|l| l.starts_with("wick:") || l.starts_with("HEAP")) {
+            std::eprintln!("{l}");
+        }
+        assert!(text.contains("HEAPGUARD the register at the limit: ENOMEM"), "{code:x?} {text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_guarded_fallible_site_answers_enomem_at_the_limit in a job of its own"]
+    fn heap_guard_child() {
+        watchdog(60);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (a, ua) = create(0, false, true).unwrap();
+        let len = 16u64 << 30;
+        let mem = map_noreserve(len as usize);
+        let mut held = no_room_left();
+        let r = register(a, mem, len);
+        let errno = r.as_ref().err().and_then(io::Error::raw_os_error);
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "HEAPGUARD the register at the limit: {}",
+            if errno == Some(crate::ENOMEM) { "ENOMEM" } else if r.is_ok() { "made" } else { "another error" }
+        ));
+        give_back_every_page(&mut held);
+        assert_eq!(errno, Some(crate::ENOMEM), "{r:?}");
+        release(a, ua);
+        assert_eq!(munmap_of(mem, len), 0);
+    }
+
+    /// HEAPNORECLAIM: a heap allocation refused at the job's limit on a
+    /// thread that holds a lock of wick's memory layer (the released-page
+    /// records'), as if in the exception handler, or as if on the
+    /// reclaim's own thread, ends with 137 and a line naming why no reclaim
+    /// ran, with no wait: the reclaim takes those locks and that thread. With
+    /// registered dead pages, so that a reclaim would have work to do. A
+    /// watchdog ends a child that hangs (exit 3).
+    #[test]
+    fn test_a_heap_allocation_refused_where_no_reclaim_may_run_ends_with_137() {
+        let mut failed = std::vec::Vec::new();
+        for (child, why) in [
+            ("heap_under_a_lock_child", "with a lock of wick's memory layer held"),
+            ("heap_in_the_handler_child", "in the exception handler"),
+            ("heap_on_the_reclaimer_child", "on the reclaim's own thread"),
+        ] {
+            let (code, text) = run_child(child, Some(96 << 20));
+            for l in text.lines().filter(|l| l.starts_with("wick:") || l.starts_with("HEAP") || l.starts_with("WATCHDOG") || l.contains("memory allocation")) {
+                std::eprintln!("{child}: {l}");
+            }
+            if code != Some(137) || !text.contains(why) || !text.contains("so no reclaim ran") {
+                failed.push(std::format!("{child}: exit {code:x?}, the reason said {}", text.contains(why)));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    /// The three children of
+    /// [`test_a_heap_allocation_refused_where_no_reclaim_may_run_ends_with_137`].
+    fn heap_where_no_reclaim(how: &str) {
+        watchdog(60);
+        let (_ctx, _user, _mem, _) = fill_to_the_limit_and_discard_in_part();
+        let held = no_room_left();
+        let make = || std::vec![0x77u8; 1 << 20];
+        let v = match how {
+            "lock" => crate::windows_mm::with_released_held(make),
+            "handler" => crate::windows_mm::as_if_in_the_handler(make),
+            _ => {
+                ON_THE_RECLAIMER.set(true);
+                make()
+            }
+        };
+        crate::windows_mm::say_at_the_limit(format_args!("HEAPNORECLAIM {how}: the allocation was made ({} bytes)", v.len()));
+        core::hint::black_box((v, held));
+    }
+
+    #[test]
+    #[ignore = "run by test_a_heap_allocation_refused_where_no_reclaim_may_run_ends_with_137 in a job of its own"]
+    fn heap_under_a_lock_child() {
+        heap_where_no_reclaim("lock");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_heap_allocation_refused_where_no_reclaim_may_run_ends_with_137 in a job of its own"]
+    fn heap_in_the_handler_child() {
+        heap_where_no_reclaim("handler");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_heap_allocation_refused_where_no_reclaim_may_run_ends_with_137 in a job of its own"]
+    fn heap_on_the_reclaimer_child() {
+        heap_where_no_reclaim("reclaimer");
     }
 
     /// A reclaim allocates nothing: it runs when the job has refused commit,
