@@ -10,8 +10,15 @@
 //! Linux's `UFFDIO_*` would leave it in: a copy or zeropage fills exactly the
 //! missing pages it reports, with the data sent, and touches nothing else;
 //! a register makes the pages that were not resident missing; an unregister
-//! makes them ordinary zero pages. When the handler closes its descriptors,
-//! the userfaultfd is released and no descriptor it was sent stays open.
+//! makes them ordinary zero pages. A mirror request (`OP_MIRROR`, with any
+//! words after the op, which no request reads) answers with the waiter
+//! mirror's size and exactly one descriptor: a read-only shared memory
+//! object of that size (opened read-only; its mapping cannot be made
+//! writable), whose words show no waiter waiting (this target makes no page
+//! fault), the same size for every request, and nothing in the arena
+//! changes. Every other op is refused as unknown (`-EINVAL`). When the
+//! handler closes its descriptors, the userfaultfd is released and no
+//! descriptor it was sent stays open.
 //!
 //! Registering memory outside the arena would make the fuzzer's own memory
 //! fault, so registers name the arena, or lengths past the address space
@@ -260,6 +267,119 @@ mod imp {
         (w(0) as i64, w(1))
     }
 
+    /// The reply to `OP_MIRROR`: its words and the descriptors that came
+    /// with its bytes (`SCM_RIGHTS`).
+    fn read_reply_with_fds(fd: c_int) -> (i64, [u64; 3], Vec<c_int>) {
+        let mut buf = [0u8; proto::RECORD];
+        let mut done = 0;
+        let mut fds = Vec::new();
+        // Room for more descriptors than the reply should carry, so that an
+        // extra one is seen, not truncated away.
+        // SAFETY: a size computation.
+        let space = unsafe { libc::CMSG_SPACE((4 * 4) as u32) } as usize;
+        while done < buf.len() {
+            let mut control = vec![0u8; space];
+            let mut iov = libc::iovec {
+                iov_base: buf[done..].as_mut_ptr().cast(),
+                iov_len: buf.len() - done,
+            };
+            // SAFETY: a msghdr over a valid buffer and control area.
+            let n = unsafe {
+                let mut msg: libc::msghdr = std::mem::zeroed();
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = control.as_mut_ptr().cast();
+                msg.msg_controllen = space as _;
+                let n = libc::recvmsg(fd, &mut msg, 0);
+                if n > 0 {
+                    assert_eq!(msg.msg_flags & libc::MSG_CTRUNC, 0, "mirror reply: control truncated");
+                    let mut c = libc::CMSG_FIRSTHDR(&msg);
+                    while !c.is_null() {
+                        assert_eq!(
+                            ((*c).cmsg_level, (*c).cmsg_type),
+                            (libc::SOL_SOCKET, libc::SCM_RIGHTS),
+                            "mirror reply: unexpected control message"
+                        );
+                        let data = libc::CMSG_DATA(c);
+                        let count = ((*c).cmsg_len as usize - (data as usize - c as usize)) / 4;
+                        for k in 0..count {
+                            fds.push(std::ptr::read_unaligned(data.cast::<c_int>().add(k)));
+                        }
+                        c = libc::CMSG_NXTHDR(&msg, c);
+                    }
+                }
+                n
+            };
+            if n < 0 && interrupted() {
+                continue;
+            }
+            assert!(n > 0, "no reply to a request");
+            done += n as usize;
+        }
+        let w = |i: usize| u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
+        (w(0) as i64, [w(1), w(2), w(3)], fds)
+    }
+
+    /// What a mirror reply must be: `result` is the mirror's size, the other
+    /// words 0, and `fds` exactly one descriptor of a read-only object of
+    /// that size whose words show no waiter waiting. Closes `fds`. Returns
+    /// the size, for the next request's reply to match.
+    fn check_mirror(
+        head: [u64; 4],
+        result: i64,
+        rest: [u64; 3],
+        fds: &[c_int],
+        ps: u64,
+        earlier: Option<u64>,
+    ) -> u64 {
+        let size = proto::mirror_bytes(ps as usize) as u64;
+        assert_eq!(result, size as i64, "{head:x?}: mirror reply size");
+        assert_eq!(rest, [0; 3], "{head:x?}: mirror reply words");
+        assert_eq!(fds.len(), 1, "{head:x?}: mirror reply descriptors {fds:?}");
+        if let Some(earlier) = earlier {
+            assert_eq!(size, earlier, "{head:x?}: mirror size changed between requests");
+        }
+        let fd = fds[0];
+        // SAFETY: plain calls on the descriptor the reply carried, and a
+        // mapping of it that is unmapped before the descriptor is closed.
+        unsafe {
+            // Opened read-only, and of the size the reply says.
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            assert!(flags >= 0, "{head:x?}: mirror descriptor not open");
+            assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY, "{head:x?}: mirror not read-only");
+            let mut st: libc::stat = std::mem::zeroed();
+            assert_eq!(libc::fstat(fd, &mut st), 0);
+            assert_eq!(st.st_size as u64, size, "{head:x?}: mirror object size");
+            // Neither a writable mapping nor a resize.
+            let w = libc::mmap(
+                std::ptr::null_mut(),
+                size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            assert_eq!(w, libc::MAP_FAILED, "{head:x?}: mirror mapped writable");
+            assert_ne!(libc::ftruncate(fd, (size * 2) as libc::off_t), 0, "{head:x?}: mirror resized");
+            // A read-only mapping whose protection cannot be raised.
+            let r = libc::mmap(std::ptr::null_mut(), size as usize, libc::PROT_READ, libc::MAP_SHARED, fd, 0);
+            assert_ne!(r, libc::MAP_FAILED, "{head:x?}: mirror not mappable read-only");
+            assert_ne!(
+                libc::mprotect(r, size as usize, libc::PROT_READ | libc::PROT_WRITE),
+                0,
+                "{head:x?}: mirror mapping made writable"
+            );
+            // No waiter waits: this target never faults on a registered page.
+            let words = std::slice::from_raw_parts(r as *const u64, proto::MIRROR_WORDS);
+            for (i, word) in words.iter().enumerate() {
+                assert_eq!(word & proto::TAG_WAITING, 0, "{head:x?}: mirror word {i} waiting: {word:x}");
+            }
+            assert_eq!(libc::munmap(r, size as usize), 0);
+            libc::close(fd);
+        }
+        size
+    }
+
     fn socketpair() -> [c_int; 2] {
         let mut fds = [0; 2];
         // SAFETY: creates two descriptors.
@@ -332,6 +452,8 @@ mod imp {
         // Kept open until the serving thread certainly holds its copy (see
         // the userfaultfd crate's `Channel`).
         let mut sent = vec![theirs];
+        // The mirror's size in this run's first mirror reply.
+        let mut mirror_size: Option<u64> = None;
 
         for op in input.ops.iter().take(48) {
             let before = arena.snapshot();
@@ -372,7 +494,11 @@ mod imp {
                 }
                 Op::Wake { at, len } => [proto::OP_WAKE, arena.addr(at), arena.len(len), 0],
                 Op::Other { op, a, b, c } => {
-                    if (1..=5).contains(op) {
+                    // The range requests have variants of their own, which
+                    // keep their addresses in the arena. Anything else goes
+                    // as it is: OP_MIRROR (with any words after it), HELLO
+                    // on the channel, and every unknown op.
+                    if (proto::OP_COPY..=proto::OP_UNREGISTER).contains(op) {
                         continue;
                     }
                     [*op, *a, *b, *c]
@@ -413,6 +539,16 @@ mod imp {
                 msg.resize(msg.len() + head[2] as usize, fill.unwrap().2);
             }
             assert!(write_all(chan, &msg));
+            if head[0] == proto::OP_MIRROR {
+                let (result, rest, fds) = read_reply_with_fds(chan);
+                for fd in sent.drain(..) {
+                    // SAFETY: descriptors sent to the serving thread, which holds its copies.
+                    unsafe { libc::close(fd) };
+                }
+                mirror_size = Some(check_mirror(head, result, rest, &fds, ps, mirror_size));
+                assert_eq!(before, arena.snapshot(), "{head:x?}: pages changed");
+                continue;
+            }
             let (result, count) = read_reply(chan);
             for fd in sent.drain(..) {
                 // SAFETY: descriptors sent to the serving thread, which holds its copies.
@@ -471,8 +607,10 @@ mod imp {
             let e = (-result) as i32;
             assert!(KNOWN.contains(&e), "{head:x?}: errno {e}");
         }
+        // The range requests (OP_MIRROR is answered by check_mirror, and
+        // any other op must be refused, below).
         let aligned = a.is_multiple_of(ps) && b.is_multiple_of(ps) && b != 0;
-        if ok || result == -(libc::EAGAIN as i64) {
+        if (proto::OP_COPY..=proto::OP_UNREGISTER).contains(&op) && (ok || result == -(libc::EAGAIN as i64)) {
             assert!(aligned, "{head:x?}: unaligned request accepted");
         }
         match op {
