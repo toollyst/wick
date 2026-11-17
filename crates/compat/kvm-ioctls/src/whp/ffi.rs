@@ -1388,6 +1388,10 @@ mod tests {
         assert_eq!(registers(&names, None), "0x80000000, 0x10");
         assert_eq!(registers(&names, Some(&[reg64(0x3_0007), reg64(0x1000)])), "0x80000000=0x30007, 0x10=0x1000");
         assert_eq!(hr_of("WHvRunVirtualProcessor", 0x8007_0057u32 as i32, || "vp 0".into()).unwrap_err().errno(), libc::EINVAL);
-        assert!(quietly(|| hr_of("WHvRunVirtualProcessor", 0x8037_0305u32 as i32, || unreachable!())).is_err());
+        // `quietly` suppresses the report, not the detail: in a test build
+        // `hr_of` always evaluates the detail to store `LAST_FAILURE` (which a
+        // quiet probe still reads, `test_a_refused_legacy_get_names_its_caller`),
+        // so the closure must return a value, not be `unreachable!`.
+        assert!(quietly(|| hr_of("WHvRunVirtualProcessor", 0x8037_0305u32 as i32, || "vp 0".into())).is_err());
     }
 }
