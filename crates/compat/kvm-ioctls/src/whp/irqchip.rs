@@ -26,8 +26,8 @@
 //! device that registers `irqfd` for GSI *g* is delivered through entry *g*,
 //! and the PIT (IRQ 0) is delivered through entry 0.
 
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use kvm_bindings::{
     kvm_clock_data, kvm_irqchip, kvm_pic_state, kvm_pit_channel_state, kvm_pit_config,
@@ -313,6 +313,10 @@ struct Pit {
     speaker: u8,
     flags: u32,
     timer: Option<PitTimer>,
+    /// The timer thread, once started, waits on a [`FakeClock`] the test
+    /// moves, not on real time.
+    #[cfg(test)]
+    fake_clock: bool,
 }
 
 /// Command to the channel-0 timer thread.
@@ -324,6 +328,20 @@ struct TimerCmd {
     periodic: bool,
     generation: u64,
     stop: bool,
+    #[cfg(test)]
+    fake: Option<FakeClock>,
+}
+
+/// The tests' clock for the timer thread ([`wait_period`]): a period ends
+/// when the test has moved `now_ns` past it, never by real time, so what a
+/// test counts does not depend on how the host schedules the thread. `waits`
+/// counts the thread's waits, a period's or a disarmed one, so a test knows
+/// when the thread has taken in what it did.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct FakeClock {
+    now_ns: u64,
+    waits: u64,
 }
 
 /// Raises IRQ 0 (on the timer thread); false once the VM is gone.
@@ -356,6 +374,8 @@ impl Pit {
             speaker: 0,
             flags,
             timer: None,
+            #[cfg(test)]
+            fake_clock: false,
         }
     }
 
@@ -401,6 +421,8 @@ impl Pit {
                 periodic,
                 generation: 0,
                 stop: false,
+                #[cfg(test)]
+                fake: self.fake_clock.then(FakeClock::default),
             }),
             Condvar::new(),
         ));
@@ -418,7 +440,6 @@ impl Pit {
 /// periodic mode or disarms in a one-shot one. Reprogrammed by bumping the
 /// generation; stops when the VM is gone or `stop` is set.
 fn timer_loop(shared: &Arc<(Mutex<TimerCmd>, Condvar)>, irq0: &Irq0) {
-    use std::time::Duration;
     let (lock, cv) = &**shared;
     loop {
         let (period, generation) = {
@@ -430,19 +451,15 @@ fn timer_loop(shared: &Arc<(Mutex<TimerCmd>, Condvar)>, irq0: &Irq0) {
         };
         if period == 0 {
             // Disabled: wait until reprogrammed.
-            let cmd = lock.lock().unwrap();
+            let mut cmd = lock.lock().unwrap();
+            count_wait(&mut cmd);
             let _unused = cv
                 .wait_while(cmd, |c| c.period_ns == 0 && !c.stop)
                 .unwrap();
             continue;
         }
         // Wait out the period, but wake early if reprogrammed or stopped.
-        let cmd = lock.lock().unwrap();
-        let (cmd, _timeout) = cv
-            .wait_timeout_while(cmd, Duration::from_nanos(period), |c| {
-                c.generation == generation && !c.stop
-            })
-            .unwrap();
+        let cmd = wait_period(cv, lock.lock().unwrap(), period, generation);
         if cmd.stop {
             return;
         }
@@ -459,6 +476,43 @@ fn timer_loop(shared: &Arc<(Mutex<TimerCmd>, Condvar)>, irq0: &Irq0) {
             return;
         }
     }
+}
+
+/// The timer thread's wait of `period` ns from now, ended early by a
+/// reprogram (a new `generation`) or a stop: real time, or in tests the
+/// [`FakeClock`] when the PIT has one.
+fn wait_period<'a>(
+    cv: &Condvar,
+    cmd: MutexGuard<'a, TimerCmd>,
+    period: u64,
+    generation: u64,
+) -> MutexGuard<'a, TimerCmd> {
+    #[cfg(test)]
+    if let Some(start) = cmd.fake.map(|f| f.now_ns) {
+        let deadline = start.saturating_add(period);
+        let mut cmd = cmd;
+        count_wait(&mut cmd);
+        return cv
+            .wait_while(cmd, |c| {
+                c.generation == generation && !c.stop && c.fake.is_some_and(|f| f.now_ns < deadline)
+            })
+            .unwrap();
+    }
+    cv.wait_timeout_while(cmd, Duration::from_nanos(period), |c| {
+        c.generation == generation && !c.stop
+    })
+    .unwrap()
+    .0
+}
+
+/// Counts a wait of the timer thread on its [`FakeClock`], in tests.
+fn count_wait(cmd: &mut TimerCmd) {
+    #[cfg(test)]
+    if let Some(f) = cmd.fake.as_mut() {
+        f.waits += 1;
+    }
+    #[cfg(not(test))]
+    let _ = cmd;
 }
 
 /// The MSI routes of a GSI routing table (`KVM_SET_GSI_ROUTING`), each
@@ -1063,39 +1117,103 @@ mod tests {
         });
     }
 
+    /// Channel 0's timer thread's command, its waits on the tests' clock
+    /// ([`FakeClock`]).
+    fn timer_of(pit: &Pit) -> Arc<(Mutex<TimerCmd>, Condvar)> {
+        pit.timer.as_ref().expect("no timer thread").shared.clone()
+    }
+
+    /// Waits until the timer thread has begun its `n`th wait. Real time
+    /// bounds only a failure (120 s: a host whose CPUs are all held by
+    /// threads of higher priority ran the thread's first step more than 10 s
+    /// late): what is counted is the thread's own steps, so a loaded host
+    /// makes the test slower, never wrong.
+    #[track_caller]
+    fn until_wait(timer: &Arc<(Mutex<TimerCmd>, Condvar)>, n: u64) {
+        let t = Instant::now();
+        loop {
+            let waits = timer.0.lock().unwrap().fake.unwrap().waits;
+            assert!(waits <= n, "the timer thread waited {waits} times, past {n}");
+            if waits == n {
+                return;
+            }
+            assert!(t.elapsed() < Duration::from_secs(120), "the timer thread's wait {n} not begun in 120 s (at {waits})");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Moves the tests' clock `ns` on.
+    fn advance(timer: &Arc<(Mutex<TimerCmd>, Condvar)>, ns: u64) {
+        let (lock, cv) = &**timer;
+        lock.lock().unwrap().fake.as_mut().unwrap().now_ns += ns;
+        cv.notify_all();
+    }
+
     /// Linux's one-shot PIT clockevent (`pit_set_oneshot`, then a count per
     /// event) gets one IRQ 0 per count, as from KVM's PIT; before, only the
     /// periodic modes raised it and a guest ticking on the PIT in one-shot
-    /// mode stopped taking timer interrupts.
+    /// mode stopped taking timer interrupts. On the tests' clock: the clock
+    /// moved on by many periods after the IRQ raises no other.
     #[test]
     fn test_pit_one_shot_raises_irq0_once_per_count() {
         let mut pit = Pit::new(0);
+        pit.fake_clock = true;
         let irqs = Arc::new(AtomicU32::new(0));
         // 1193 ticks: 1 ms.
         load(&mut pit, 4, 1193, &irqs);
-        std::thread::sleep(Duration::from_millis(200));
+        let timer = timer_of(&pit);
+        let period = pit.channels[0].period_ns();
+        until_wait(&timer, 1);
+        advance(&timer, period);
+        // Disarmed after its IRQ.
+        until_wait(&timer, 2);
         assert_eq!(irqs.load(Ordering::SeqCst), 1, "mode 4: one IRQ 0 per count");
+        advance(&timer, 100 * period);
         load(&mut pit, 4, 1193, &irqs);
-        std::thread::sleep(Duration::from_millis(200));
+        until_wait(&timer, 3);
+        assert_eq!(irqs.load(Ordering::SeqCst), 1, "an IRQ 0 while disarmed");
+        advance(&timer, period);
+        until_wait(&timer, 4);
         assert_eq!(irqs.load(Ordering::SeqCst), 2, "a second count, a second IRQ 0");
         load(&mut pit, 0, 1193, &irqs);
-        std::thread::sleep(Duration::from_millis(200));
+        until_wait(&timer, 5);
+        advance(&timer, period);
+        until_wait(&timer, 6);
         assert_eq!(irqs.load(Ordering::SeqCst), 3, "mode 0 too");
     }
 
+    /// Mode 2 raises IRQ 0 once a period, a period after the last; mode 5
+    /// (hardware-triggered strobe, no gate on channel 0) raises none however
+    /// far the clock moves, until a periodic count is loaded again. On the
+    /// tests' clock ([`FakeClock`]): before, it counted IRQs over 300 ms of
+    /// real time and failed on a loaded host ("mode 2 every 10 ms: 4 IRQs in
+    /// 300 ms", where the timer thread was not run in time).
     #[test]
     fn test_pit_periodic_repeats_and_mode_5_stops() {
         let mut pit = Pit::new(0);
+        pit.fake_clock = true;
         let irqs = Arc::new(AtomicU32::new(0));
         // 11932 ticks: 10 ms.
         load(&mut pit, 2, 11932, &irqs);
-        std::thread::sleep(Duration::from_millis(300));
-        let n = irqs.load(Ordering::SeqCst);
-        assert!(n >= 5, "mode 2 every 10 ms: {n} IRQs in 300 ms");
-        // Mode 5 (hardware-triggered strobe, no gate on channel 0): none.
+        let timer = timer_of(&pit);
+        let period = pit.channels[0].period_ns();
+        for i in 1..=30 {
+            until_wait(&timer, i);
+            assert_eq!(u64::from(irqs.load(Ordering::SeqCst)), i - 1, "mode 2: one IRQ 0 a period");
+            // A period less a nanosecond raises none.
+            advance(&timer, period - 1);
+            advance(&timer, 1);
+        }
+        until_wait(&timer, 31);
+        assert_eq!(irqs.load(Ordering::SeqCst), 30, "mode 2: 30 periods, 30 IRQs");
         load(&mut pit, 5, 11932, &irqs);
-        let n = irqs.load(Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(irqs.load(Ordering::SeqCst) <= n + 1, "mode 5 kept raising IRQ 0");
+        until_wait(&timer, 32);
+        advance(&timer, 100 * period);
+        load(&mut pit, 2, 11932, &irqs);
+        until_wait(&timer, 33);
+        assert_eq!(irqs.load(Ordering::SeqCst), 30, "mode 5 raised IRQ 0");
+        advance(&timer, period);
+        until_wait(&timer, 34);
+        assert_eq!(irqs.load(Ordering::SeqCst), 31, "mode 2 again");
     }
 }
