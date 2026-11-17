@@ -63,6 +63,16 @@ fn module(dll: Dll) -> Loaded {
     })
 }
 
+/// Loads both DLLs now, if this process has not yet ([`module`]), and keeps
+/// what that gave: a jailed Firecracker does before it reverts to the jail's
+/// lockdown token, which may not open them later (`vmm::ext::jail`). A DLL
+/// that does not load is not an error here: the first WHv call returns its
+/// load error, as without the preload ([`unavailable`]).
+pub(crate) fn preload() {
+    let _ = module(Dll::Platform);
+    let _ = module(Dll::Emulation);
+}
+
 /// The Win32 error loading `dll` gave, if it did not load.
 pub(crate) fn load_error(dll: Dll) -> Option<u32> {
     module(dll).err()

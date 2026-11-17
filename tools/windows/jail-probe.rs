@@ -36,6 +36,10 @@
 
 #![allow(non_snake_case, clippy::upper_case_acronyms)]
 
+/// Firecracker's preload before its revert (vmm::ext::jail), the same code.
+#[path = "../../overlay/vmm/ext/jail_preload.rs"]
+mod preload;
+
 use std::ffi::c_void;
 use std::io::{Read, Write};
 
@@ -1387,8 +1391,16 @@ fn main() {
         eprintln!("jail-probe: started as the jail's API process; nothing to serve");
         return;
     }
-    // Firecracker's first step in a jail (vmm::ext::jail): drop the initial
-    // impersonation token. Outside a jail it does nothing.
+    // Firecracker's first steps in a jail (vmm::ext::jail): the preload,
+    // with the jailer's WICK_JAIL only, as Firecracker's, and failing as
+    // Firecracker fails (its line, exit 1); then drop the initial
+    // impersonation token, which outside a jail does nothing.
+    if std::env::var_os("WICK_JAIL").is_some() {
+        if let Err(e) = preload::preload() {
+            eprintln!("jail-probe: {e}");
+            std::process::exit(1);
+        }
+    }
     // SAFETY: plain call.
     unsafe { RevertToSelf() };
     std::hint::black_box(&HANDOVER_MARK);

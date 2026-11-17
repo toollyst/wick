@@ -1214,8 +1214,9 @@ upstream Firecracker and its jailer.
     behind a list of allowed I/O-control numbers.
   - **Not done yet: the jail's own SID as the only restricting SID.** Measured under that token: 13 device namespaces
     (those without `FILE_DEVICE_SECURE_OPEN`) and no RPC endpoint, service pipe, section or name of its own making.
-    It needs every DLL and registry key Firecracker uses to be loaded before `RevertToSelf`, and WHP to work under
-    it. WHP does not, measured: it reports no hypervisor, as `\Device\VidExo` grants Authenticated Users and the
+    It needs every DLL and registry key Firecracker uses to be loaded before `RevertToSelf` (in place: the preload
+    step 1's trace found runs before the revert, and a step that fails stops the start, named), and WHP to work
+    under it. WHP does not, measured: it reports no hypervisor, as `\Device\VidExo` grants Authenticated Users and the
     `hypervisorPlatform` capability, not the jail. A restricted token needed both WHP devices in the records (each
     group that opens one alone failed). Two ways work: a partition made and set up before `RevertToSelf` runs after
     it under the jail's SID alone (option P), and an AppContainer with the `hypervisorPlatform` capability runs WHP

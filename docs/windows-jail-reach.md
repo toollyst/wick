@@ -190,7 +190,11 @@ I/O control: it answered 0xC0000010, 0xC000000D or 0xC0000002, or completed it.
 **What it takes.**
 - Firecracker reverts to the lockdown token first thing in `main` and loads what it needs later. Every DLL and
   registry key it uses after that must move before the revert, under the initial token, as Chromium's sandbox warms
-  up before it locks down. That includes WHP's, Winsock's and anything else loaded lazily.
+  up before it locks down. That includes WHP's, Winsock's and anything else loaded lazily. **In place, before the
+  token changes:** the steps step 1's trace found (Winsock with an `AF_UNIX` socket, a socket made from another's
+  protocol information, Winsock's catalogue, a system error's text, the time zone, `kernel.appcore.dll`, and WHP's
+  two DLLs for the VMM) run before the revert in Firecracker and its API process (overlay/vmm/ext/jail_preload.rs,
+  shared with `jail-probe`). A step that fails stops the start with an error naming it; nothing is skipped.
 - WHP must still work under the new token. Under the jail's SID alone it does not (below, "WHP under the jail's
   SID alone"): either the partition is made before the revert (option P) or the VMM runs in an AppContainer with
   WHP's capability (option Q).

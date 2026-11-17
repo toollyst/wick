@@ -98,6 +98,12 @@ pub const NETNS_ENV: &str = "WICK_NETNS";
 /// payload limit each.
 pub const API_MEMORY_MIB: u32 = 32;
 
+/// What a jailed Firecracker loads and reads before it reverts to the jail's
+/// lockdown token (Windows), shared with tools/windows/jail-probe.rs.
+#[cfg(windows)]
+#[path = "jail_preload.rs"]
+mod preload;
+
 /// The API process's share of a jail's CPU limit, in percent of one CPU:
 /// parsing requests and passing them on.
 pub const API_CPU_PERCENT: u8 = 1;
@@ -132,6 +138,16 @@ pub enum JailError {
     StillPrivileged(String),
     /// Failed to revert to the jail's token: {0}
     Revert(std::io::Error),
+    /// Failed to prepare the jail ({step}) before it locks down: {text} (os error {code})
+    #[cfg(windows)]
+    Preload {
+        /// The preload's step that failed (`preload::STEPS`).
+        step: &'static str,
+        /// The system's error code.
+        code: u32,
+        /// Its text, rendered before the revert.
+        text: String,
+    },
     /// Invalid WICK_JAIL_MEMORY value {0:?}: expected a memory limit in MiB, with WICK_JAIL
     MemoryFormat(String),
     /// The jail's memory limit of {0} MiB leaves too little once the API process has its share of 32 MiB: give it more than 64 MiB, or run with --no-api
@@ -716,7 +732,8 @@ mod imp {
 /// on a restricted token below medium integrity, with an initial impersonation token
 /// (the same with the user's SID) on the main thread so the loader can start
 /// the process, and the jail's root as the current directory (a drive of its
-/// own). Entering the jail is reverting to the process token, then checking
+/// own). Entering the jail is preloading what the lockdown token may not
+/// open later ([`preload`]), reverting to the process token, then checking
 /// that the thread impersonates no more and that the process token is the
 /// jailer's restricted one: a process [`ENV`] reaches otherwise fails instead
 /// of running with the user's identity.
@@ -788,6 +805,19 @@ mod imp {
         unsafe { std::env::remove_var(ENV) };
         let value = value.to_string_lossy().into_owned();
         let Spec { root, .. } = parse(&value)?;
+        // What Firecracker and its API process load or read lazily, done now
+        // on the initial token: the lockdown token may not open it later
+        // (`preload`). A step that fails ends the start, named.
+        super::preload::preload().map_err(|e| JailError::Preload {
+            step: e.step,
+            code: e.code,
+            text: e.text,
+        })?;
+        if !api {
+            // WHP's DLLs, for the VMM only (the API process makes no VM); a
+            // DLL that does not load is reported by `Kvm::new`, as before.
+            kvm_ioctls::preload_whp();
+        }
         // SAFETY: plain call.
         if unsafe { RevertToSelf() } == 0 {
             return Err(JailError::Revert(Error::last_os_error()));
@@ -866,6 +896,17 @@ mod tests {
         for bad in [r"0:0:j\root", r"0:0:\root"] {
             assert!(matches!(parse(bad), Err(JailError::Format(_))), "{bad:?}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_a_preload_error_reads_as_the_preloads() {
+        // Firecracker's line for a step that failed is the one jail-probe
+        // prints for it (the same `preload::PreloadError`).
+        let e = preload::PreloadError { step: "winsock", code: 10093, text: "text".to_string() };
+        let j = JailError::Preload { step: e.step, code: e.code, text: e.text.clone() };
+        assert_eq!(j.to_string(), e.to_string());
+        assert_eq!(j.to_string(), "Failed to prepare the jail (winsock) before it locks down: text (os error 10093)");
     }
 
     #[cfg(windows)]

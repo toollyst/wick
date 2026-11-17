@@ -101,6 +101,14 @@ impl AsRawFd for Handle {
     }
 }
 
+/// Loads the Windows Hypervisor Platform's DLLs now, from System32, if this
+/// process has not yet: a jailed Firecracker calls it before it reverts to
+/// the jail's lockdown token (`vmm::ext::jail`). Where they do not load,
+/// [`Kvm::new`] fails as without it, saying why.
+pub fn preload_whp() {
+    whv::preload();
+}
+
 /// Wrapper over the "KVM system" handle. Checks nothing until a VM is created.
 #[derive(Debug)]
 pub struct Kvm {
