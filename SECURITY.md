@@ -385,8 +385,10 @@ has the per-control details and results.
     jailed VMM kept running is not measured. The binary-level measurement is not run: firecracker.exe did not start
     on a host without the Windows Hypervisor Platform, such as the test VM it was tried on (`STATUS_DLL_NOT_FOUND`
     before `main`: since 527070ed it imported `WHvAdviseGpaRange` at load time, which 03bc63bc loads at first use,
-    `test_no_whp_dll_is_imported_at_load_time`); it can run there now, and has not yet. The libc and vmm-sys-util
-    code it runs is the tests' above.
+    `test_no_whp_dll_is_imported_at_load_time`); it runs there now and, with no platform, `Kvm::new` fails with a
+    line naming the missing feature and the fix before `ENODEV`
+    (`test_kvm_new_fails_with_enodev_where_the_platform_is_absent`), so the stack measurement needs a host with the
+    platform and has not run yet. The libc and vmm-sys-util code it runs is the tests' above.
   - the API process: the same polling callbacks on pool threads. Not run, for the same reason, and not yet since.
 
 - **Windows: a thread pool could keep an unjailed process running after one of its threads used up its stack**
@@ -765,14 +767,15 @@ has the per-control details and results.
   have lasted a second and number at least 64, said as such, with the count and the time (`exit::RamRetries`,
   `test_runs_again_fail_the_run_after_a_second_and_64`; before, after a million, which took 48501 ms for a write and
   23271 ms for a lazy read, the vCPU spinning; on WHP the time is asserted from 1 s to under 10 s by
-  `test_a_guest_ram_access_exit_is_decided_as_kvms`, not run yet with this bound). The most runs again in a row of
+  `test_a_guest_ram_access_exit_is_decided_as_kvms` (its first WHP run: a write kept exiting ran
+  again 19987 times in 1000 ms, a lazy read 43230, each failing the run well inside 10 s). The most runs again in a row of
   one access is said in a RAMRETRY line at each new power of two, which `boot-test.ps1 boot` prints. Until the follow-up (found by reading, review of this fix), a page the commit found there
   already, lazy memory committed before or a released page resolved before, started the count again at each exit,
   the commit answering committed, and ran again without end; the commit now answers it present and it is counted
   (`test_a_lazy_page_committed_before_is_present_when_asked_again`,
   `test_a_released_page_resolved_before_is_present_to_the_commit`, Windows Server 2022 20348 and 2025 26100).
   `test_a_guest_ram_access_exit_is_decided_as_kvms` asserts each case and the runs again it took on WHP, the
-  committed lazy page among them (not run here: its first run is CI's). What stays: an emulated instruction's other operand in RAM is
+  committed lazy page among them (not run here; its first run was CI's, the figures above). What stays: an emulated instruction's other operand in RAM is
   still copied by the host on the vCPU thread, and a page the host refuses there ends the VMM with 0xC0000005
   (docs/COMPATIBILITY.md, `mem_size_mib`).
 - **Windows: a guest's write of `IA32_TSC` or `IA32_TSC_ADJUST` could end its own VMM while another of its vCPUs was
@@ -793,10 +796,13 @@ has the per-control details and results.
   holds it shared for its call alone (`VmInner::state_gate`), so the two never overlap: a legacy exchange waits at
   most for one Suspend call (16 to 218 us unloaded in that run, up to 32 ms with every processor busy), the Suspend
   for the exchanges under way. The legacy exchanges through the backend's own path while another thread holds the
-  VM in a loop are none refused (`test_legacy_apic_exchanges_wait_for_a_suspension_of_time`, which needs WHP and
-  has not run yet: it is to fail first in CI's WHP step on the commit before the gate), and a refused exchange's
-  line now names its caller's line and where partition time was
-  (`test_a_refused_legacy_get_names_its_caller_and_the_suspension`, not run yet either). The documented call
+  VM in a loop are none refused (`test_legacy_apic_exchanges_wait_for_a_suspension_of_time`, its first WHP run: with
+  the gate, 762 holds of time suspended and 29088 legacy gets and 29088 sets made meanwhile, 0 refused; on the commit
+  before the gate the same test did 31019 holds and had 90282 refused, as it must fail first; the holds are fewer with
+  the gate because a hold now waits for the exchanges under way, about 2 ms a hold under a continuous reader), and a
+  refused exchange's line now names its caller's line and where partition time was
+  (`test_a_refused_legacy_get_names_its_caller_and_the_suspension`, its first WHP run: the line names its caller,
+  `vcpu.rs:13513`). The documented call
   (`WHvGetVirtualProcessorState` of `InterruptControllerState2`, never refused in TIMEGET) is the later step.
 
 ## Not at parity yet
@@ -1340,8 +1346,10 @@ upstream Firecracker and its jailer.
   `whp_gp`); the storm's isolation is measured for its costliest #GP, the held LVT timer write below, by
   `jailer-test.ps1 x2storm` (X2STORM lines: a jailed 4-vCPU guest looping 10 s on that write against a port-write
   control, five runs, with the VM's API latency, its CPU with no `cpu.max` and under one CPU's, and a second jailed
-  VM's 1 kHz loop rate), which has not run yet: it needs the x2APIC record build on an AMD host, and its first run is
-  CI's. The exit path itself has run on Windows, in record builds only: GPEXITREC
+  VM's 1 kHz loop rate). It has run on AMD in CI: before the gate the held LVT timer write failed its own legacy
+  get with 0x80370308 in three of three windows-guest runs, always on vp 3; with the gate the storm holds with no
+  refusal, two of three CI acceptance runs passing so far (every storm held, a write up to about 1,520 us), the
+  third in CI and the 10 PC rounds not yet run. The exit path itself has run on Windows, in record builds only: GPEXITREC
   (`test_gp_exits_on_an_x2apic_partition_on_record`, a guest's #GP exits on an x2APIC partition) and
   `boot-test.ps1 x2apic` (a Linux guest booted on such a partition) passed on CI's AMD runners in CI runs 43680983973
   and 43688550565. Its LVT timer write in TSC-deadline mode is the one #GP that
