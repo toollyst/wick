@@ -2646,7 +2646,7 @@ mod tests {
         let tmp = vmm_sys_util::tempdir::TempDir::new().unwrap();
         let dir = tmp.as_path().to_owned();
         let files = Files::create(&dir, Version::V1, State::Thawed, uid()).unwrap();
-        let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let mut child = detached_command("/bin/sleep").arg("30").spawn().unwrap();
         let root = libc::pid_t::try_from(child.id()).unwrap();
         let start = start_time(root).unwrap();
         struct Failing;
@@ -2751,13 +2751,30 @@ mod tests {
         }
     }
 
+    /// A command for a test child that may outlive the test: orphaned (the
+    /// test aborted before reaping it) or SIGSTOP'd and reparented to launchd.
+    /// Such a child must hold none of the test's inherited descriptors, so its
+    /// standard input, output and error are `/dev/null`. A child that kept the
+    /// test's standard error (or output) could hold a parent's pipe open after
+    /// the test was killed: a run driven through `cargo test ... | grep` would
+    /// then never see end-of-file and would hang past its watchdog, which a
+    /// SIGSTOP'd `/usr/bin/yes` from `test_parked_cpu_time_stands_still` did on
+    /// 2026-11-17 (it tied up the shared build lock for over an hour).
+    fn detached_command(program: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new(program);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd
+    }
+
     fn load() -> Load {
         let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         Load(
             (0..cpus * 2)
                 // Each ends with the test process, even one that aborts.
                 .map(|_| {
-                    std::process::Command::new("/bin/sh")
+                    detached_command("/bin/sh")
                         .args(["-c", "while kill -0 $PPID 2>/dev/null; do :; done"])
                         .spawn()
                         .unwrap()
@@ -2774,7 +2791,7 @@ mod tests {
         let busy = load();
         for i in 0..40 {
             // Killed and reaped when dropped, a failed round too.
-            let child = Load(vec![std::process::Command::new("/usr/bin/yes").stdout(std::process::Stdio::null()).spawn().unwrap()]);
+            let child = Load(vec![detached_command("/usr/bin/yes").spawn().unwrap()]);
             let pid = libc::pid_t::try_from(child.0[0].id()).unwrap();
             std::thread::sleep(Duration::from_millis(5));
             // SAFETY: our child.
@@ -2818,7 +2835,7 @@ mod tests {
         for i in 0..200 {
             self_check(&mut os).unwrap_or_else(|e| panic!("round {i}: {e}"));
             // Killed and reaped when dropped, a failed round too.
-            let child = Load(vec![std::process::Command::new("/usr/bin/yes").stdout(std::process::Stdio::null()).spawn().unwrap()]);
+            let child = Load(vec![detached_command("/usr/bin/yes").spawn().unwrap()]);
             let pid = libc::pid_t::try_from(child.0[0].id()).unwrap();
             std::thread::sleep(Duration::from_millis(5));
             os.suspend(pid).unwrap();
@@ -2870,7 +2887,7 @@ mod tests {
     }
 
     fn pid_suspend_binding() {
-        let mut child = std::process::Command::new("/usr/bin/yes").stdout(std::process::Stdio::null()).spawn().unwrap();
+        let mut child = detached_command("/usr/bin/yes").spawn().unwrap();
         let pid = libc::pid_t::try_from(child.id()).unwrap();
         let mut os = RealOs;
         std::thread::sleep(Duration::from_millis(100));
