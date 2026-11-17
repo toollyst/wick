@@ -39,6 +39,14 @@
 # 10 s), what the free-space check is sized by. A test file that does not
 # import does not end the run; the comparison counts it.
 #
+# Run it under an outer wall-clock bound (`gtimeout -k 30 SECONDS
+# tools/macos/integration-tests.sh ...`): a hung test is not always ended by
+# pytest-timeout's own, since that timer is SIGALRM, and upstream's
+# framework/utils.py `Timeout` (host_tools/network.py's SSH close, among
+# others) sets its own SIGALRM handler and then cancels the alarm with
+# `alarm(0)`, so a test that hangs after one has run is never timed out
+# (a balloon inflate that hung the VMM ran for good, 2026-11-17).
+#
 # Runs may overlap, with each other and with the other test scripts: each
 # has its own session (/tmp/wit-*, whose .owner-pid keeps tools/clean.sh
 # off it while the run lives; tools/macos/integration/clean-selftest.sh) and

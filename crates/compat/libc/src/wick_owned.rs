@@ -25,10 +25,14 @@
 //! chunk size matches the Windows registration's 2 MiB section, so the two
 //! hosts reclaim on one granularity (the parity rule).
 //!
-//! This revision makes guest RAM purgeable at allocation ([`allocate`]) and
-//! registers the chunks. The discard of a whole chunk, the partial discard
-//! that zeroes without giving the charge back, and the dead-page reclaim
-//! follow in later revisions; the registry built here is what they act on.
+//! Guest RAM is made purgeable at allocation ([`allocate`]), and its chunks
+//! registered. A discard ([`discard`]) replaces a whole chunk's object (its
+//! charge comes back) or zeroes part of one in place (its charge stays,
+//! counted dead); a chunk half dead is reclaimed (`reclaim_chunk`): its
+//! object replaced by one holding only its live pages. A page a userfaultfd
+//! has not filled (missing, [`crate::wick_uffd`]) is never read and never
+//! charged by any of these: it stays missing, with its protection and the
+//! guest's stage 2 as they were.
 
 use core::ffi::c_void;
 use std::sync::Mutex;
@@ -47,6 +51,19 @@ unsafe extern "C" {
     fn mach_vm_allocate(task: u32, addr: *mut u64, size: u64, flags: c_int) -> c_int;
     fn mach_vm_deallocate(task: u32, addr: u64, size: u64) -> c_int;
     fn mach_vm_protect(task: u32, addr: u64, size: u64, set_maximum: c_int, new_protection: c_int) -> c_int;
+    fn mach_vm_map(
+        task: u32,
+        addr: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: c_int,
+        object: u32,
+        offset: u64,
+        copy: c_int,
+        cur_protection: c_int,
+        max_protection: c_int,
+        inheritance: u32,
+    ) -> c_int;
 }
 
 /// `VM_FLAGS_PURGABLE`: the allocation is a purgeable (owned) object, charged
@@ -62,6 +79,11 @@ const VM_FLAGS_OVERWRITE: c_int = 0x4000;
 const VM_PROT_RW: c_int = libc::PROT_READ | libc::PROT_WRITE;
 /// `KERN_SUCCESS`.
 const KERN_SUCCESS: c_int = 0;
+/// `VM_PROT_ALL`: read, write and execute, the maximum protection
+/// `mach_vm_allocate` gives an allocation.
+const VM_PROT_ALL: c_int = 7;
+/// `VM_INHERIT_DEFAULT` (`VM_INHERIT_COPY`), what `mach_vm_allocate` gives.
+const VM_INHERIT_DEFAULT: u32 = 1;
 /// `MADV_ZERO` (macOS `<sys/mman.h>`): zero the pages in place without
 /// faulting new ones in. On a purgeable object the pages are zeroed and the
 /// object keeps them (its charge stays; own3.c), so a partial discard zeroes
@@ -304,7 +326,7 @@ pub unsafe fn discard(start: u64, len: u64, prot: c_int) -> c_int {
             // move below drops pages by current content, not by this count).
             if o.dead[i as usize] as u64 * 100 >= per_chunk as u64 * RECLAIM_DEAD_RATIO_PERCENT {
                 // SAFETY: chunk `i` of this owned range.
-                if unsafe { reclaim_chunk(cbase, csize, page, prot) } {
+                if unsafe { reclaim_chunk(cbase, csize, page) } {
                     o.dead[i as usize] = 0;
                 }
                 // A failed reclaim leaves the count; the next discard retries.
@@ -337,20 +359,49 @@ fn is_zero(p: u64, len: u64) -> bool {
 /// re-written live page and lose the guest's data. A page the move copies is
 /// taken out before the object is replaced and written back after, all while
 /// the chunk is quiesced, so no guest write can reach the freed object.
+///
+/// A page a userfaultfd has not filled (missing, [`crate::wick_uffd`]) is
+/// never read: it holds nothing by definition (a fill writes the whole page),
+/// so it is dropped without a look and stays missing, its host protection
+/// (`PROT_NONE`) and the guest's stage 2 (no permission, `Slot::map` looks at
+/// `is_missing`) as they were; its next access faults to the handler as
+/// before. Reading it faulted on its `PROT_NONE`, and the fault waited for a
+/// fill that needs [`crate::wick_uffd`]'s lock, which the discard that runs
+/// this holds: the VMM hung (`test_a_reclaim_reads_no_missing_page`). The
+/// fresh object is mapped with no access and each page then gets back the
+/// protection it had, by runs, so no page is more accessible than before at
+/// any time (a fresh object mapped read-write, as before, would make a
+/// missing page read as zeros without a fault). A chunk with a page that is
+/// not missing and that this may not read (`PROT_NONE` guest memory) is not
+/// reclaimed: its dead count stays, its charge stays pinned, and a later
+/// discard tries again (`test_a_reclaim_leaves_a_chunk_with_an_unreadable_page`).
+/// Firecracker never makes part of a chunk so: virtio-mem protects and
+/// discards whole slots, whole chunks (`vstate/memory.rs` `update_slot`).
 /// Returns whether the chunk was replaced (`false` leaves it as it was).
 ///
 /// # Safety
-/// `[cbase, cbase + csize)` is a chunk of a range this process owns.
-unsafe fn reclaim_chunk(cbase: u64, csize: u64, page: u64, prot: c_int) -> bool {
+/// `[cbase, cbase + csize)` is a chunk of a range this process owns. When a
+/// userfaultfd registration may cover it, the caller holds its lock, so
+/// that no page becomes missing or filled meanwhile (the discard path,
+/// `wick_uffd::discarding_or_refusing`).
+unsafe fn reclaim_chunk(cbase: u64, csize: u64, page: u64) -> bool {
+    let npages = (csize / page) as usize;
+    // The pages a userfaultfd has not filled: never read.
+    let mut missing = std::vec![false; npages];
+    crate::wick_uffd::for_each_missing(cbase, csize, |a, l| {
+        for p in (a - cbase) / page..(a + l - cbase) / page {
+            missing[p as usize] = true;
+        }
+    });
+    // Each page's protection as it is now, given back after the replace.
+    let prot = crate::wick_uffd::raw_protections(cbase, cbase + csize);
+    if prot.iter().any(|&p| p < 0) || (0..npages).any(|p| !missing[p] && prot[p] & libc::PROT_READ == 0) {
+        return false;
+    }
     crate::wick_guest::replacing(cbase, csize, false, || {
-        let npages = csize / page;
         // Scan: the offsets (in pages) of the chunk's live (non-zero) pages.
-        let live: Vec<u64> = (0..npages).filter(|&p| !is_zero(cbase + p * page, page)).collect();
+        let live: Vec<usize> = (0..npages).filter(|&p| !missing[p] && !is_zero(cbase + p as u64 * page, page)).collect();
 
-        // Replace the chunk's object with a fresh purgeable one. When the
-        // chunk is wholly zero this is all the reclaim does (the charge goes
-        // back entirely); otherwise the live pages are saved first and written
-        // back after, so only they are charged again.
         // The live pages are saved in a temporary mapping (not `malloc`, whose
         // `free` keeps the memory in its pool and so would hold the charge the
         // reclaim is giving back); `munmap` returns it to the kernel at once.
@@ -368,35 +419,61 @@ unsafe fn reclaim_chunk(cbase: u64, csize: u64, page: u64, prot: c_int) -> bool 
             for (k, &p) in live.iter().enumerate() {
                 // SAFETY: src a live page of the chunk, dst its slot in `t`.
                 unsafe {
-                    core::ptr::copy_nonoverlapping((cbase + p * page) as *const u8, t.cast::<u8>().add(k * page as usize), page as usize)
+                    core::ptr::copy_nonoverlapping((cbase + p as u64 * page) as *const u8, t.cast::<u8>().add(k * page as usize), page as usize)
                 };
             }
             t.cast::<u8>()
         };
 
+        // A fresh purgeable object over the chunk, with no access yet.
         let mut a = cbase;
-        // SAFETY: a fixed purgeable allocation over the chunk's range.
+        // SAFETY: a fixed purgeable mapping over the chunk's range.
         let made = unsafe {
-            mach_vm_allocate(mach_task_self_, &mut a, csize, VM_FLAGS_OVERWRITE | VM_FLAGS_PURGABLE) == KERN_SUCCESS
+            mach_vm_map(
+                mach_task_self_,
+                &mut a,
+                csize,
+                0,
+                VM_FLAGS_OVERWRITE | VM_FLAGS_PURGABLE,
+                0,
+                0,
+                0,
+                libc::PROT_NONE,
+                VM_PROT_ALL,
+                VM_INHERIT_DEFAULT,
+            ) == KERN_SUCCESS
                 && a == cbase
         };
         if made {
-            // Write the live pages back FIRST, while the fresh object is still
-            // the read-write `mach_vm_allocate` made it, THEN restrict the
-            // protection. Protecting first would, for a non-RW `prot`, make the
-            // copy-back store into a read-only mapping and raise SIGBUS. (Owned
-            // ranges are guest RAM, always `VM_PROT_RW`, so the restrict branch
-            // is not reached today; the order is correct for when it is, as in
-            // `allocate` and the whole-chunk discard, where protect is last.)
-            for (k, &p) in live.iter().enumerate() {
-                // SAFETY: src the saved page, dst the fresh page of the chunk.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(tmp.add(k * page as usize), (cbase + p * page) as *mut u8, page as usize)
-                };
-            }
-            if prot != VM_PROT_RW {
-                // SAFETY: over the fresh chunk just made.
-                unsafe { mach_vm_protect(mach_task_self_, cbase, csize, 0, prot) };
+            // Each run of one protection: its live pages written back through
+            // read-write, then the protection it had.
+            let mut k = 0;
+            let mut s = 0;
+            while s < npages {
+                let mut e = s + 1;
+                while e < npages && prot[e] == prot[s] {
+                    e += 1;
+                }
+                let (at, len) = (cbase + s as u64 * page, (e - s) as u64 * page);
+                let writes = k < live.len() && live[k] < e;
+                if writes {
+                    restore(at, len, VM_PROT_RW);
+                    while k < live.len() && live[k] < e {
+                        // SAFETY: src the saved page, dst the fresh page of the chunk.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                tmp.add(k * page as usize),
+                                (cbase + live[k] as u64 * page) as *mut u8,
+                                page as usize,
+                            )
+                        };
+                        k += 1;
+                    }
+                }
+                if prot[s] != libc::PROT_NONE && (!writes || prot[s] != VM_PROT_RW) {
+                    restore(at, len, prot[s]);
+                }
+                s = e;
             }
         }
         if bytes != 0 {
@@ -405,6 +482,20 @@ unsafe fn reclaim_chunk(cbase: u64, csize: u64, page: u64, prot: c_int) -> bool 
         }
         made
     })
+}
+
+/// Gives `[at, at + len)` of a chunk just replaced protection `prot`. The
+/// chunk's pages hold the guest's memory and nothing else has them: a
+/// protection that cannot be given would leave the guest's live pages
+/// unreachable or its missing ones reachable, so the process ends with the
+/// reason, as a guest range that cannot be mapped again does
+/// ([`crate::wick_guest::replacing`]).
+fn restore(at: u64, len: u64, prot: c_int) {
+    // SAFETY: pages of the fresh chunk.
+    if unsafe { mach_vm_protect(mach_task_self_, at, len, 0, prot) } != KERN_SUCCESS {
+        std::eprintln!("wick: owned guest memory at {at:#x}+{len:#x} cannot get back its protection {prot} after a reclaim");
+        std::process::abort();
+    }
 }
 
 #[cfg(test)]

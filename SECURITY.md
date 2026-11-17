@@ -203,6 +203,22 @@ has the per-control details and results.
 
 ## Fixed defects
 
+- **macOS: on a userfaultfd restore, a guest that inflated its balloon past half of a 2 MiB chunk hung its own VMM**
+  (from 632a5574, which added the reclaim of owned guest memory; fixed in the commit that adds this entry). Once a
+  chunk of owned guest memory is half dead (balloon or userfaultfd discards), the reclaim moves its live pages into a
+  fresh object, and it read every page of the chunk to tell live from zero, under the userfaultfd's lock, which the
+  discard holds. A page the handler had not filled yet (missing, `PROT_NONE`) faulted on that read, and the fault
+  waited for the handler's copy, which waited for the lock: the VMM's thread and the handler waited on each other for
+  good, and the guest's vCPUs then stalled on the chunk. Only the guest's own VMM was hit; no other process, and no
+  host memory. Found by Firecracker's `test_uffd.py` (`test_valid_handler`), which hung. Now the reclaim never reads
+  a missing page: it stays missing, `PROT_NONE` on the host and out of the guest's stage 2, and uncharged, and the
+  fresh object is mapped with no access and each page given back the protection it had
+  (`test_a_reclaim_reads_no_missing_page`, which hung until its alarm on the code before;
+  `test_owned_reclaim_leaves_missing_pages_out_of_stage_2` under Hypervisor.framework). Mapped read-write, as
+  before, the fresh object would also have let the chunk's other missing pages read as zeros with no page fault
+  event; the hang came first, so that was not reached. A chunk with a page that is neither missing nor readable is
+  now left as it is (`test_a_reclaim_leaves_a_chunk_with_an_unreadable_page`, whose read ended the VMM with a fault
+  on the code before; Firecracker makes no part of a chunk so, as virtio-mem protects and discards whole slots).
 - **Windows: a userfaultfd copy whose commit the job's limit refused in part filled its later pages from the source's start** (from d0fbafae, which made a fill at the limit go on where it was; fixed in the commit that adds this entry). A fill of a reserved section commits its pages first; refused, it fills the pages that fit and goes on with the rest once a reclaim gave room back. The copy's callback was given each part's destination but not its offset into the source, so every part after the first was filled from the source's first bytes: the guest read another page's contents in those pages, with no error. Only a copy that met the job's memory limit in its middle was hit. Now each part is copied from its own offset (`test_a_copy_whose_commit_is_refused_in_part_fills_each_page_from_its_own_bytes`, which scripts the commit's refusals; it failed on the code before).
 - **macOS: stage 2 did not follow the host's protection of guest memory** (from the macOS backend's start; its tests
   and this entry, then under "Not at parity yet", in 2e942d5a; fixed in the commit that moved it here). On Linux each
@@ -1015,8 +1031,8 @@ upstream Firecracker and its jailer.
   mapping included), so a write through a removed mapping is counted. A balloon or userfaultfd discard gives a whole
   chunk's charge back, or zeroes a partial chunk with `madvise(MADV_ZERO)` and pins it; once a chunk is half dead a
   reclaim, under the quiesce the guest-slot replace hook gives, replaces its object with one holding only the pages
-  that are currently non-zero (the drop decided by content, not by the discard history), so the pinned charge falls
-  to the live set (`crates/compat/libc/src/wick_owned.rs`; `test_owned_*` under Hypervisor.framework, and
+  that are currently non-zero (the drop decided by content, not by the discard history; a page a userfaultfd has not
+  filled is never read, and stays missing, `test_a_reclaim_reads_no_missing_page`), so the pinned charge falls to the live set (`crates/compat/libc/src/wick_owned.rs`; `test_owned_*` under Hypervisor.framework, and
   `test_owned_memory_path_survives_each_profile` under both sandbox profiles). Under memory.max of 96 MiB, the first
   way on a purgeable object is killed, and a userfaultfd that fills 128 MiB on a purgeable object is killed during
   the fills, where the plain fills live (`jailer-test uffd-charge`, whose `uffd-charge-purgeable` case must be

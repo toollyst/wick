@@ -3265,6 +3265,147 @@ mod tests {
         }
     }
 
+    /// The reclaim of an owned chunk a userfaultfd has registered
+    /// (`libc::wick_owned`, a guest's discards pushing a chunk past half dead)
+    /// leaves the pages the userfaultfd has not filled missing: out of the
+    /// guest's stage 2 (a guest read of one raises one page fault event, and
+    /// the handler's copy is what the guest reads), never read by the reclaim
+    /// (no event for them before the touch) and never charged. Before, the
+    /// reclaim read every page of the chunk under the userfaultfd's lock: a
+    /// missing page's read waited for a handler whose copy waited for that
+    /// lock, and the VMM hung (the test ended at its alarm). The live pages
+    /// keep their data and the guest reaches them; the discarded pages'
+    /// charge comes back. The crate-level twin, with every page class's
+    /// protection: `libc` `wick_uffd::tests::test_a_reclaim_reads_no_missing_page`.
+    #[test]
+    fn test_owned_reclaim_leaves_missing_pages_out_of_stage_2() {
+        use libc::wick_uffd::proto;
+        const CHUNK: u64 = 2 << 20;
+        // SAFETY: plain call; a hang ends the test.
+        unsafe { libc::alarm(60) };
+        let page = host_page_size();
+        let pages = CHUNK / page;
+        let (vm, mut vcpu, _c, _l) = vm_with_memory(1, &STORE_THEN_LOAD);
+        // SAFETY: a new anonymous reservation of the test's.
+        let raw = unsafe {
+            libc::mmap(core::ptr::null_mut(), (2 * CHUNK) as usize, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE, -1, 0)
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "reserve");
+        let base = (raw as u64).next_multiple_of(CHUNK);
+        // SAFETY: the reserved, chunk-aligned range; nothing else maps it.
+        let mem = unsafe { libc::wick_owned::allocate(base as *mut core::ffi::c_void, CHUNK as usize, libc::PROT_READ | libc::PROT_WRITE) };
+        assert_eq!(mem as u64, base, "owned allocate returns its range");
+        let (ctx, user) = libc::wick_uffd::create(libc::wick_uffd::FEATURE_EVENT_REMOVE, true, true).unwrap();
+        libc::wick_uffd::register(ctx, base, CHUNK).unwrap();
+        let ipa = GUEST_BASE + (1 << 30);
+        let region = kvm_userspace_memory_region { slot: 1, guest_phys_addr: ipa, memory_size: CHUNK, userspace_addr: base, flags: 0 };
+        // SAFETY: the mapping stays for the test.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+
+        // The handler: copies a page of 0x5a for each page fault, unregisters
+        // each removed range, as Firecracker's example handler does; a copy
+        // refused while a remove is pending (EAGAIN) is tried again after the
+        // events are read.
+        let stop = Arc::new(AtomicBool::new(false));
+        let counts = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let data = vec![0x5au8; page as usize];
+        let handler = {
+            let (stop, counts, data) = (stop.clone(), counts.clone(), data.clone());
+            thread::spawn(move || {
+                let mut deferred: Vec<u64> = Vec::new();
+                while !stop.load(Ordering::SeqCst) {
+                    let mut faults = std::mem::take(&mut deferred);
+                    loop {
+                        let mut rec = [0u8; proto::RECORD];
+                        // SAFETY: reads one record into a local buffer.
+                        let n = unsafe { libc::read(user, rec.as_mut_ptr().cast(), proto::RECORD) };
+                        if n <= 0 {
+                            break;
+                        }
+                        let w: Vec<u64> = rec.chunks(8).map(|b| u64::from_ne_bytes(b.try_into().unwrap())).collect();
+                        if w[0] == proto::EVENT_PAGEFAULT {
+                            counts[0].fetch_add(1, Ordering::SeqCst);
+                            faults.push(w[1] - w[1] % page);
+                        } else if w[0] == proto::EVENT_REMOVE {
+                            counts[1].fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(libc::wick_uffd::unregister(ctx, w[1], w[2] - w[1]), Ok(()));
+                        }
+                    }
+                    for at in faults {
+                        // SAFETY: `data` holds a page.
+                        match unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), at, page, true) } {
+                            Ok(n) => assert_eq!(n, page),
+                            Err((libc::EAGAIN, _)) => deferred.push(at),
+                            Err(e) => panic!("copy of {at:#x}: {e:?}"),
+                        }
+                    }
+                    thread::yield_now();
+                }
+            })
+        };
+
+        // Pages 0 to 3 and 32 to the end filled and written by the guest
+        // (charged by that write), 4 to 31 missing.
+        let start = phys_footprint();
+        let filled: Vec<u64> = (0..4).chain(32..pages).collect();
+        for &i in &filled {
+            // SAFETY: `data` holds a page.
+            assert_eq!(unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), base + i * page, page, false) }, Ok(page));
+            assert_eq!(access(&mut vcpu, GUEST_BASE, ipa + i * page, 0x77), Ok(Some(0x77)), "the guest writes page {i}");
+        }
+        // 32 up to half the chunk discarded a page at a time; the last
+        // crosses half the chunk and reclaims it.
+        let last = 32 + pages / 2 - 1;
+        let mut before = 0;
+        for i in 32..=last {
+            if i == last {
+                assert_eq!(libc::wick_owned::dead_pages(base), (pages / 2 - 1) as u32, "not reclaimed before the last discard");
+                before = phys_footprint();
+            }
+            // SAFETY: a page of the owned, registered chunk.
+            assert_eq!(unsafe { libc::madvise((base + i * page) as *mut _, page as usize, libc::MADV_DONTNEED) }, 0, "discard of page {i}");
+        }
+        let after = phys_footprint();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while counts[1].load(Ordering::SeqCst) < pages / 2 {
+            assert!(std::time::Instant::now() < deadline, "the remove events were not read");
+            thread::yield_now();
+        }
+        assert_eq!(libc::wick_owned::dead_pages(base), 0, "the chunk was reclaimed");
+        assert_eq!(counts[0].load(Ordering::SeqCst), 0, "the reclaim faulted pages nobody touched");
+
+        // The guest's view: the live pages keep their data, and a missing
+        // page is still missing in stage 2 (its read raises one event, and
+        // the handler's copy is what the guest reads).
+        let word = |i: u64| -> u64 {
+            // SAFETY: a present page of the chunk.
+            unsafe { std::ptr::read_volatile((base + i * page + 8) as *const u64) }
+        };
+        for i in (0..4).chain(last + 1..pages) {
+            assert_eq!(access(&mut vcpu, GUEST_BASE + 16, ipa + i * page, 0), Ok(Some(0x77)), "the guest reads live page {i}");
+            assert_eq!(word(i), 0x5a5a_5a5a_5a5a_5a5a, "live page {i} past its first word");
+        }
+        let returned = before as i64 - after as i64;
+        assert!(returned >= ((pages / 2 - 8) * page) as i64, "the reclaim gave back {} KiB, want about {} KiB", returned >> 10, ((pages / 2) * page) >> 10);
+        let live = 4 + (pages - last - 1);
+        let left = after as i64 - start as i64;
+        assert!(left < ((live + 20) * page) as i64, "{} KiB still charged over the start: the live pages are {} KiB, the missing ones {} KiB", left >> 10, (live * page) >> 10, (28 * page) >> 10);
+        assert!(libc::wick_uffd::is_missing(base + 10 * page));
+        assert_eq!(access(&mut vcpu, GUEST_BASE + 16, ipa + 10 * page, 0), Ok(Some(0x5a5a_5a5a_5a5a_5a5a)), "the guest reads the handler's copy");
+        assert_eq!(counts[0].load(Ordering::SeqCst), 1, "one page fault event for the guest's read");
+        assert!(!libc::wick_uffd::is_missing(base + 10 * page));
+        for i in (4..32).filter(|&i| i != 10) {
+            assert!(libc::wick_uffd::is_missing(base + i * page), "page {i} missing after");
+        }
+        stop.store(true, Ordering::SeqCst);
+        handler.join().unwrap();
+        // SAFETY: plain call; the user end.
+        unsafe {
+            libc::alarm(0);
+            libc::close(user);
+        }
+    }
+
     /// A page a userfaultfd fills after its memory slot was removed (an
     /// unplugged virtio-mem slot's: Firecracker removes the slot before it
     /// protects the memory, vstate/memory.rs `update_slot`) stays out of the

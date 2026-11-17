@@ -1850,6 +1850,20 @@ pub fn mapped_protections(start: u64, end: u64) -> Vec<i8> {
     prot
 }
 
+/// The protection of each host page of `[start, end)` (both page aligned)
+/// as XNU has it now (`PROT_*` bits, -1 for a page in no mapping), with no
+/// record looked at: for a caller that gives the pages back exactly what
+/// they had ([`crate::wick_owned`]'s reclaim). Takes no lock.
+pub(crate) fn raw_protections(start: u64, end: u64) -> Vec<c_int> {
+    let host = host_page();
+    let mut prot = std::vec![-1; ((end - start) / host) as usize];
+    for (a, b, p) in mapped_entries(start, end) {
+        let (a, b) = ((a - start) / host, (b - start).div_ceil(host));
+        prot[a as usize..b as usize].fill(p);
+    }
+    prot
+}
+
 /// The protection of the entry of `entries` ([`mapped_entries`]) that
 /// holds `addr`, which one does.
 fn protection_in(entries: &[(u64, u64, c_int)], addr: u64) -> c_int {
@@ -3512,6 +3526,215 @@ mod tests {
         // SAFETY: our copy of the end sent.
         unsafe { libc::close(theirs) };
         mine
+    }
+
+    /// The reclaim of an owned chunk (`wick_owned`: one-page discards push it
+    /// past half dead) under a userfaultfd that asked for remove events, as
+    /// after an on-demand restore whose guest inflates its balloon. Pages of
+    /// every kind in one chunk: live read-write (0, 1), live read-only (2),
+    /// filled with zeros, so dead (3), missing, never touched (4 to 31), and
+    /// live read-write again (the pages after `last`); 32 to `last` (half a
+    /// chunk of pages) filled and read by the host (charged), then discarded
+    /// one at a time, the last crossing half the chunk. A handler thread runs upstream's loop through a request
+    /// channel (uffd_utils.rs: a refused fill deferred, the events read
+    /// again; a remove event unregisters its range). The reclaim must not
+    /// read a missing page: reading one faulted on its `PROT_NONE` and the
+    /// fault waited for a fill that needs [`LOCK`], which the discard holds,
+    /// so the process hung (before the fix, `alarm` ends it here). After it:
+    /// no page fault event; each kind keeps its content and its protection;
+    /// the missing pages are still missing and `PROT_NONE`, uncharged, and a
+    /// later touch of one raises exactly one page fault event and a copy
+    /// fills it; the discarded pages' charge came back. In a process of its
+    /// own, under `alarm(30)`.
+    #[test]
+    fn test_a_reclaim_reads_no_missing_page() {
+        if !in_own_process("wick_uffd::tests::test_a_reclaim_reads_no_missing_page") {
+            return;
+        }
+        // SAFETY: plain call.
+        unsafe { libc::alarm(30) };
+        init().unwrap();
+        let ps = test_page_size();
+        let chunk = crate::wick_owned::CHUNK;
+        let pages = chunk / ps;
+        // SAFETY: a fresh reservation, a chunk past its size to align it.
+        let raw = unsafe {
+            libc::mmap(ptr::null_mut(), (2 * chunk) as usize, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE, -1, 0)
+        };
+        assert_ne!(raw, libc::MAP_FAILED);
+        let base = (raw as u64).next_multiple_of(chunk);
+        // SAFETY: the reserved, chunk-aligned range.
+        let p = unsafe { crate::wick_owned::allocate(base as *mut _, chunk as usize, libc::PROT_READ | libc::PROT_WRITE) };
+        assert_eq!(p as u64, base);
+        let (ctx, user) = create(FEATURE_EVENT_REMOVE, true, true).unwrap();
+        register(ctx, base, chunk).unwrap();
+        let (chan, mine) = (channel(user), channel(user));
+        let ask = move |chan: c_int, head: [u64; 4], payload: &[u8]| {
+            let mut msg = record(head);
+            msg.extend_from_slice(payload);
+            assert!(write_full(chan, &msg));
+            let mut reply = [0u8; proto::RECORD];
+            assert!(read_full(chan, &mut reply));
+            let w = words(&reply);
+            (w[0] as i64, w[1])
+        };
+        let data = std::vec![0x5au8; ps as usize];
+        let zeros = std::vec![0u8; ps as usize];
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let counts = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let handler = {
+            let (stop, counts, data) = (stop.clone(), counts.clone(), data.clone());
+            std::thread::spawn(move || {
+                let mut deferred: Vec<u64> = Vec::new();
+                while !stop.load(Ordering::SeqCst) {
+                    let mut faults: Vec<u64> = std::mem::take(&mut deferred);
+                    loop {
+                        let mut rec = [0u8; proto::RECORD];
+                        // SAFETY: reads one record into a local buffer.
+                        let n = unsafe { libc::read(user, rec.as_mut_ptr().cast(), proto::RECORD) };
+                        if n <= 0 {
+                            break;
+                        }
+                        assert_eq!(n, proto::RECORD as isize);
+                        let w = words(&rec);
+                        if w[0] == proto::EVENT_PAGEFAULT {
+                            counts[0].fetch_add(1, Ordering::SeqCst);
+                            faults.push(w[1] - w[1] % ps);
+                        } else if w[0] == proto::EVENT_REMOVE {
+                            counts[1].fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(ask(chan, [proto::OP_UNREGISTER, w[1], w[2] - w[1], 0], &[]).0, 0);
+                        }
+                    }
+                    for at in faults {
+                        if ask(chan, [proto::OP_COPY, at, ps, 0], &data).0 == err(libc::EAGAIN) {
+                            deferred.push(at);
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let start = phys_footprint();
+        for i in (0..3).chain(32..pages) {
+            assert_eq!(ask(mine, [proto::OP_COPY, base + i * ps, ps, 0], &data).0, ps as i64, "fill {i}");
+        }
+        assert_eq!(ask(mine, [proto::OP_COPY, base + 3 * ps, ps, 0], &zeros).0, ps as i64, "fill 3");
+        // SAFETY: a present page of the chunk; the compatibility mprotect.
+        assert_eq!(unsafe { crate::linux_items::mprotect((base + 2 * ps) as *mut _, ps as usize, libc::PROT_READ) }, 0);
+        // The host reads every filled page (charged by that touch).
+        for i in (0..4).chain(32..pages) {
+            // SAFETY: a present page of the chunk.
+            unsafe { ptr::read_volatile((base + i * ps) as *const u8) };
+        }
+        let at = |i: u64| raw_protections(base + i * ps, base + (i + 1) * ps)[0];
+        for i in 4..32 {
+            assert!(is_missing(base + i * ps) && at(i) == libc::PROT_NONE, "page {i} missing before");
+        }
+        let mut before = 0;
+        let last = 32 + pages / 2 - 1;
+        for i in 32..=last {
+            if i == last {
+                assert_eq!(crate::wick_owned::dead_pages(base), (pages / 2 - 1) as u32, "not reclaimed before the last discard");
+                before = phys_footprint();
+            }
+            // SAFETY: a page of the owned, registered chunk.
+            assert_eq!(unsafe { crate::linux_items::madvise((base + i * ps) as *mut _, ps as usize, libc::MADV_DONTNEED) }, 0, "discard of page {i}");
+        }
+        let after = phys_footprint();
+        until("the remove events read", || counts[1].load(Ordering::SeqCst) == pages / 2);
+        assert_eq!(crate::wick_owned::dead_pages(base), 0, "the chunk was reclaimed");
+        assert_eq!(counts[0].load(Ordering::SeqCst), 0, "the reclaim faulted pages nobody touched");
+        // SAFETY: present pages of the chunk.
+        let word = |i: u64| unsafe { ptr::read_volatile((base + i * ps) as *const u64) };
+        for (i, value, prot) in [(0, 0x5a5a_5a5a_5a5a_5a5a, libc::PROT_READ | libc::PROT_WRITE), (1, 0x5a5a_5a5a_5a5a_5a5a, libc::PROT_READ | libc::PROT_WRITE), (2, 0x5a5a_5a5a_5a5a_5a5a, libc::PROT_READ), (3, 0, libc::PROT_READ | libc::PROT_WRITE)] {
+            assert!(!is_missing(base + i * ps), "page {i} became missing");
+            assert_eq!((word(i), at(i)), (value, prot), "page {i}: content and protection");
+        }
+        for i in 4..32 {
+            assert!(is_missing(base + i * ps) && at(i) == libc::PROT_NONE, "page {i} missing after");
+        }
+        for i in last + 1..pages {
+            assert_eq!((word(i), at(i)), (0x5a5a_5a5a_5a5a_5a5a, libc::PROT_READ | libc::PROT_WRITE), "page {i}: content and protection");
+        }
+        // The discarded pages' charge came back (all but a few pages'), and
+        // the missing pages are not charged: what is left over the start is
+        // the live pages' (4, and the 64 past the discards) and a few of the
+        // test's own, under the 28 missing pages' more.
+        let returned = before as i64 - after as i64;
+        assert!(returned >= ((pages / 2 - 8) * ps) as i64, "the reclaim gave back {} KiB, want about {} KiB", returned >> 10, ((pages / 2) * ps) >> 10);
+        let live = 4 + (pages - last - 1);
+        let left = after as i64 - start as i64;
+        assert!(left < ((live + 20) * ps) as i64, "{} KiB still charged over the start: the live pages are {} KiB, the missing ones {} KiB", left >> 10, (live * ps) >> 10, (28 * ps) >> 10);
+        // A missing page still works as one: a touch raises one page fault
+        // event, and the copy fills it.
+        let toucher = std::thread::spawn(move || {
+            // SAFETY: a missing page of the chunk; waits for the handler.
+            unsafe { ptr::read_volatile((base + 10 * ps) as *const u64) }
+        });
+        assert_eq!(toucher.join().unwrap(), 0x5a5a_5a5a_5a5a_5a5a);
+        assert_eq!(counts[0].load(Ordering::SeqCst), 1, "one page fault event for the touch");
+        assert!(!is_missing(base + 10 * ps));
+        stop.store(true, Ordering::SeqCst);
+        handler.join().unwrap();
+        // SAFETY: plain call.
+        unsafe { libc::alarm(0) };
+        close(&[chan, mine, user]);
+    }
+
+    /// The reclaim of an owned chunk (`wick_owned`) does not read a page the
+    /// process may not read that is not missing (guest memory made
+    /// `PROT_NONE`, which Firecracker does not do to a part of a chunk:
+    /// virtio-mem protects and discards whole slots, whole chunks): it
+    /// leaves the chunk as it was, its dead count kept (the charge stays
+    /// pinned), the page's data and protection unchanged. Before, the reclaim
+    /// read it and the VMM died of the fault.
+    #[test]
+    fn test_a_reclaim_leaves_a_chunk_with_an_unreadable_page() {
+        if !in_own_process("wick_uffd::tests::test_a_reclaim_leaves_a_chunk_with_an_unreadable_page") {
+            return;
+        }
+        // SAFETY: plain call.
+        unsafe { libc::alarm(30) };
+        init().unwrap();
+        let ps = test_page_size();
+        let chunk = crate::wick_owned::CHUNK;
+        let pages = chunk / ps;
+        // SAFETY: a fresh reservation, a chunk past its size to align it.
+        let raw = unsafe {
+            libc::mmap(ptr::null_mut(), (2 * chunk) as usize, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE, -1, 0)
+        };
+        assert_ne!(raw, libc::MAP_FAILED);
+        let base = (raw as u64).next_multiple_of(chunk);
+        // SAFETY: the reserved, chunk-aligned range.
+        let p = unsafe { crate::wick_owned::allocate(base as *mut _, chunk as usize, libc::PROT_READ | libc::PROT_WRITE) };
+        assert_eq!(p as u64, base);
+        for i in 0..pages {
+            // SAFETY: a page of the chunk.
+            unsafe { ptr::write_volatile((base + i * ps) as *mut u64, 0x5a5a_5a5a_5a5a_5a5a) };
+        }
+        // SAFETY: a page of the chunk; the compatibility mprotect.
+        assert_eq!(unsafe { crate::linux_items::mprotect((base + 5 * ps) as *mut _, ps as usize, libc::PROT_NONE) }, 0);
+        let half = pages / 2;
+        for i in 32..32 + half {
+            // SAFETY: a page of the owned chunk.
+            assert_eq!(unsafe { crate::linux_items::madvise((base + i * ps) as *mut _, ps as usize, libc::MADV_DONTNEED) }, 0, "discard of page {i}");
+        }
+        assert_eq!(crate::wick_owned::dead_pages(base), half as u32, "the chunk was left as it was");
+        assert_eq!(raw_protections(base + 5 * ps, base + 6 * ps)[0], libc::PROT_NONE);
+        // SAFETY: a page of the chunk; the compatibility mprotect.
+        assert_eq!(unsafe { crate::linux_items::mprotect((base + 5 * ps) as *mut _, ps as usize, libc::PROT_READ | libc::PROT_WRITE) }, 0);
+        // SAFETY: pages of the chunk.
+        let word = |i: u64| unsafe { ptr::read_volatile((base + i * ps) as *const u64) };
+        assert_eq!(word(5), 0x5a5a_5a5a_5a5a_5a5a, "the unreadable page kept its data");
+        assert_eq!(word(4), 0x5a5a_5a5a_5a5a_5a5a);
+        assert_eq!(word(32), 0, "a discarded page reads zero");
+        // Readable again, the next discard reclaims the chunk.
+        // SAFETY: a page of the owned chunk.
+        assert_eq!(unsafe { crate::linux_items::madvise((base + 31 * ps) as *mut _, ps as usize, libc::MADV_DONTNEED) }, 0);
+        assert_eq!(crate::wick_owned::dead_pages(base), 0, "reclaimed once every page is readable");
+        assert_eq!((word(5), word(4), word(31), word(32)), (0x5a5a_5a5a_5a5a_5a5a, 0x5a5a_5a5a_5a5a_5a5a, 0, 0));
+        // SAFETY: plain call.
+        unsafe { libc::alarm(0) };
     }
 
     fn err(e: c_int) -> i64 {

@@ -188,7 +188,15 @@ guest):
   is unmapped, so a guest access stalls and cannot write the old object), with the live pages copied out to an
   `mmap`/`munmap` temporary and back, so no guest write reaches the freed object
   (`test_owned_reclaim_keeps_rewritten_dead_page_and_drops_zero_pages`,
-  `test_owned_reclaim_racing_guest_write_is_not_lost` over its 24 rounds). The 50% trigger is a macOS difference by
+  `test_owned_reclaim_racing_guest_write_is_not_lost` over its 24 rounds). A page a userfaultfd has not filled
+  (missing) is never read and never charged: it holds nothing yet, so the reclaim drops it without a look and it
+  stays missing, `PROT_NONE` on the host and out of the guest's stage 2, its next touch a page fault event as before.
+  The fresh object is mapped with no access and each page then gets back the protection it had, run by run, so no
+  page is ever more reachable than before (`test_a_reclaim_reads_no_missing_page`, every page class's content and
+  protection before and after, the charge, and a later touch's one event;
+  `test_owned_reclaim_leaves_missing_pages_out_of_stage_2` under Hypervisor.framework). A chunk with a page that is
+  neither missing nor readable is left as it is, its charge pinned, until a later discard finds it readable
+  (`test_a_reclaim_leaves_a_chunk_with_an_unreadable_page`; Firecracker makes no part of a chunk so). The 50% trigger is a macOS difference by
   an OS gap, not by choice: Windows and Linux's memory cgroup reclaim at the commit/charge limit, when an allocation
   is refused; macOS has no refused commit — a purgeable charge grows until jetsam kills — so it reclaims proactively
   at this ratio (the constant is cross-referenced to the Windows dead-chunk reclaim).
