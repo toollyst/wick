@@ -74,7 +74,27 @@ fn rn2(newdir: u64, flags: u32) -> Vec<u8> {
 
 #[test]
 fn test_traversal_corpus() {
-    let mut h = H::new("corpus");
+    traversal_corpus(&mut H::new("corpus"));
+}
+
+/// The corpus against a confined wick-fsd over its socket (Linux): the same
+/// answers, the server never killed, and no layer-2 or layer-3 refusal in
+/// the counters it reports at the end.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_traversal_corpus_confined() {
+    let (base, share, outside) = share_and_outside("corpus-confined", |_| {});
+    let canaries = snapshot(&outside);
+    let Some(r) = remote::confined_over(&share, &base.join("fs.sock")) else {
+        remove(&base);
+        return;
+    };
+    let mut h = H::over(r, base, share, outside, canaries);
+    traversal_corpus(&mut h);
+    remote::finish_clean(&mut h.s);
+}
+
+fn traversal_corpus<L: Link>(h: &mut H<L>) {
     let (f, fh) = h.create(ROOT, b"file").unwrap();
     h.release(f, fh);
     let (x, xh) = h.create(ROOT, b"x").unwrap();
@@ -85,37 +105,37 @@ fn test_traversal_corpus() {
         let valid = Name::new(&n).is_ok();
         let shown = String::from_utf8_lossy(&n).into_owned();
         let mut results: Vec<(&str, i32)> = Vec::new();
-        let mut run = |h: &mut H, what: &'static str, op: Opcode, node: u64, args: &[&[u8]]| {
+        let mut run = |h: &mut H<L>, what: &'static str, op: Opcode, node: u64, args: &[&[u8]]| {
             let (e, _) = h.call(op, node, args);
             results.push((what, e));
             e
         };
-        run(&mut h, "lookup", Opcode::Lookup, ROOT, &[&name(&n)]);
+        run(h, "lookup", Opcode::Lookup, ROOT, &[&name(&n)]);
         // The name without its NUL.
-        run(&mut h, "lookup without NUL", Opcode::Lookup, ROOT, &[&n]);
+        run(h, "lookup without NUL", Opcode::Lookup, ROOT, &[&n]);
         let create = [&le32(2)[..], &le32(0o644), &le32(0), &le32(0)].concat();
-        run(&mut h, "create", Opcode::Create, ROOT, &[&create, &name(&n)]);
-        run(&mut h, "rename away", Opcode::Rename, ROOT, &[&le64(sub), &name(&n), &name(b"moved")]);
-        run(&mut h, "rename back", Opcode::Rename, sub, &[&le64(ROOT), &name(b"moved"), &name(&n)]);
-        run(&mut h, "rename onto", Opcode::Rename, ROOT, &[&le64(ROOT), &name(b"x"), &name(&n)]);
-        run(&mut h, "rename2 noreplace", Opcode::Rename2, ROOT, &[&rn2(ROOT, 1), &name(&n), &name(b"file")]);
-        run(&mut h, "rename2 exchange", Opcode::Rename2, ROOT, &[&rn2(ROOT, 2), &name(&n), &name(b"file")]);
-        run(&mut h, "rename2 exchange back", Opcode::Rename2, ROOT, &[&rn2(ROOT, 2), &name(&n), &name(b"file")]);
-        run(&mut h, "unlink", Opcode::Unlink, ROOT, &[&name(&n)]);
-        run(&mut h, "link", Opcode::Link, ROOT, &[&le64(f), &name(&n)]);
-        run(&mut h, "unlink link", Opcode::Unlink, ROOT, &[&name(&n)]);
-        run(&mut h, "mkdir", Opcode::Mkdir, ROOT, &[&le32(0o755), &le32(0), &name(&n)]);
-        run(&mut h, "mkdir beneath", Opcode::Mkdir, sub, &[&le32(0o755), &le32(0), &name(&n)]);
-        run(&mut h, "rmdir", Opcode::Rmdir, ROOT, &[&name(&n)]);
-        run(&mut h, "rmdir beneath", Opcode::Rmdir, sub, &[&name(&n)]);
+        run(h, "create", Opcode::Create, ROOT, &[&create, &name(&n)]);
+        run(h, "rename away", Opcode::Rename, ROOT, &[&le64(sub), &name(&n), &name(b"moved")]);
+        run(h, "rename back", Opcode::Rename, sub, &[&le64(ROOT), &name(b"moved"), &name(&n)]);
+        run(h, "rename onto", Opcode::Rename, ROOT, &[&le64(ROOT), &name(b"x"), &name(&n)]);
+        run(h, "rename2 noreplace", Opcode::Rename2, ROOT, &[&rn2(ROOT, 1), &name(&n), &name(b"file")]);
+        run(h, "rename2 exchange", Opcode::Rename2, ROOT, &[&rn2(ROOT, 2), &name(&n), &name(b"file")]);
+        run(h, "rename2 exchange back", Opcode::Rename2, ROOT, &[&rn2(ROOT, 2), &name(&n), &name(b"file")]);
+        run(h, "unlink", Opcode::Unlink, ROOT, &[&name(&n)]);
+        run(h, "link", Opcode::Link, ROOT, &[&le64(f), &name(&n)]);
+        run(h, "unlink link", Opcode::Unlink, ROOT, &[&name(&n)]);
+        run(h, "mkdir", Opcode::Mkdir, ROOT, &[&le32(0o755), &le32(0), &name(&n)]);
+        run(h, "mkdir beneath", Opcode::Mkdir, sub, &[&le32(0o755), &le32(0), &name(&n)]);
+        run(h, "rmdir", Opcode::Rmdir, ROOT, &[&name(&n)]);
+        run(h, "rmdir beneath", Opcode::Rmdir, sub, &[&name(&n)]);
         let fifo = [&le32(0o010_644)[..], &le32(0), &le32(0), &le32(0)].concat();
-        run(&mut h, "mknod", Opcode::Mknod, ROOT, &[&fifo, &name(&n)]);
-        run(&mut h, "unlink node", Opcode::Unlink, ROOT, &[&name(&n)]);
-        run(&mut h, "symlink name", Opcode::Symlink, ROOT, &[&name(&n), &name(b"target")]);
-        run(&mut h, "unlink symlink", Opcode::Unlink, ROOT, &[&name(&n)]);
+        run(h, "mknod", Opcode::Mknod, ROOT, &[&fifo, &name(&n)]);
+        run(h, "unlink node", Opcode::Unlink, ROOT, &[&name(&n)]);
+        run(h, "symlink name", Opcode::Symlink, ROOT, &[&name(&n), &name(b"target")]);
+        run(h, "unlink symlink", Opcode::Unlink, ROOT, &[&name(&n)]);
         // A symlink's target is content, stored and never resolved.
         if !n.is_empty() && !n.contains(&0) && n.len() <= 4095 {
-            let e = run(&mut h, "symlink target", Opcode::Symlink, ROOT, &[&name(b"s"), &name(&n)]);
+            let e = run(h, "symlink target", Opcode::Symlink, ROOT, &[&name(b"s"), &name(&n)]);
             if e == 0 {
                 let s = u64_at(&h.lookup(ROOT, b"s").unwrap(), 0);
                 assert_eq!(h.ok(Opcode::Readlink, s, &[]), n, "the target is kept as given");
@@ -123,16 +143,16 @@ fn test_traversal_corpus() {
                 h.ok(Opcode::Unlink, ROOT, &[&name(b"s")]);
             }
         }
-        run(&mut h, "tmpfile", Opcode::Tmpfile, ROOT, &[&create, &name(&n)]);
+        run(h, "tmpfile", Opcode::Tmpfile, ROOT, &[&create, &name(&n)]);
         let set = |n: &[u8]| [&le32(1)[..], &le32(0), n, b"\0", b"v"].concat();
         let get = |n: &[u8]| [&le32(64)[..], &le32(0), n, b"\0"].concat();
         let user = [&b"user."[..], &n].concat();
-        run(&mut h, "setxattr", Opcode::Setxattr, f, &[&set(&n)]);
-        run(&mut h, "setxattr user.", Opcode::Setxattr, f, &[&set(&user)]);
-        run(&mut h, "getxattr", Opcode::Getxattr, f, &[&get(&n)]);
-        run(&mut h, "getxattr user.", Opcode::Getxattr, f, &[&get(&user)]);
-        run(&mut h, "removexattr", Opcode::Removexattr, f, &[&name(&n)]);
-        run(&mut h, "removexattr user.", Opcode::Removexattr, f, &[&name(&user)]);
+        run(h, "setxattr", Opcode::Setxattr, f, &[&set(&n)]);
+        run(h, "setxattr user.", Opcode::Setxattr, f, &[&set(&user)]);
+        run(h, "getxattr", Opcode::Getxattr, f, &[&get(&n)]);
+        run(h, "getxattr user.", Opcode::Getxattr, f, &[&get(&user)]);
+        run(h, "removexattr", Opcode::Removexattr, f, &[&name(&n)]);
+        run(h, "removexattr user.", Opcode::Removexattr, f, &[&name(&user)]);
 
         // Every name-taking request with a name layer 1 refuses fails.
         if !valid {
@@ -166,7 +186,9 @@ fn test_traversal_corpus() {
             assert_eq!(e, -17, "rename2 noreplace {shown:?}");
         }
         // No layer-2 refusal, ever: layer 1 must stop every escape.
-        assert_eq!(h.s.counters().layer_refusals, 0, "after {shown:?}: {results:?}");
+        if let Some(n) = h.s.layer_refusals() {
+            assert_eq!(n, 0, "after {shown:?}: {results:?}");
+        }
         h.canaries_untouched();
         outcomes.push((shown, valid, results));
     }

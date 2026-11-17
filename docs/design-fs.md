@@ -8,7 +8,12 @@ decoder of §6, the reply encoder and layer 1 of row 1 with the escape mapping o
 and its tables, limits, record and cache modes, the `ConfinedDir` interface of the host backends and `MemDir`, a test
 backend; its unit tests and the `fs_session` fuzz target), **its Linux and macOS host directory** (`crates/fs/fsd/src/host`
 and `crates/fs/sys`, the backend of §4.3, and stage 0's share checks, `stage0.rs`; their unit tests and the
-host-directory tests in `crates/fs/fsd/tests`; no confinement or serving loop yet, so no server runs), and the guest kernels of row 21: CI's `guest-kernels` job builds upstream's CI kernel
+host-directory tests in `crates/fs/fsd/tests`), **the `wick-fsd` binary on Linux**: stage 0's one connection and peer
+check, the serving loop and Linux's confinement of §6.1 (`crates/fs/fsd/src/{main,serve}.rs`, `confine/linux.rs`,
+`crates/fs/sys/src/unix/confine.rs`; tests `server.rs` and `confine_probe.rs`, and the corpus and link sequences
+against a confined server; macOS's confinement is not built, so there wick-fsd refuses to start,
+`test_refuses_without_confinement`), and the guest
+kernels of row 21: CI's `guest-kernels` job builds upstream's CI kernel
 (6.1, 6.18) with `CONFIG_VIRTIO_FS=y` (`tools/linux/guest-kernel.sh`), though nothing boots them yet. Nothing a guest
 can use exists yet, and nothing here describes what wick does today:
 today `PUT /extensions/fs` is refused as an unknown extension (`crates/ext/src/lib.rs`,
@@ -48,11 +53,11 @@ documented or measured; **measure** = the fix is designed, a measurement on the 
 | 1 | Guest name escapes the share: `..`, `/`, absolute name in SYMLINK/RENAME/LINK (Kata CVE-2026-47243; virtiofsd name checks only 2026-11-06) | Layer 1, same code on all hosts: every guest name must be one component, not `.`/`..`, no `/` or NUL, at most 255 bytes of UTF-8, and none of the code points the Windows escape writes (U+F001–U+F01F, U+F022, U+F02A, U+F02F, U+F03A, U+F03C, U+F03E, U+F03F, U+F05C, U+F07C; `crates/fs/fsd/src/fuse/name.rs`, `test_every_name_taking_opcode_refuses_what_is_not_a_name`, `test_name_refuses_every_escape_image`), and every operation is relative to a held directory handle. Layer 2: L `openat2 RESOLVE_BENEATH\|NO_SYMLINKS\|NO_MAGICLINKS\|NO_XDEV` / M `O_RESOLVE_BENEATH` + `O_NOFOLLOW_ANY` (on macOS 27.2, 2026-11-13, a test program's `openat(dirfd, name, O_RESOLVE_BENEATH)` returned ENOTCAPABLE for `..`, `/etc/hosts` and `../etc/hosts` and opened `.`; the program is not in the repository) / W `NtCreateFile(RootDirectory, one component, OBJ_DONT_REPARSE)`, rename via `FILE_RENAME_INFORMATION.RootDirectory`. Layer 3: the OS sandbox (row 4) | Traversal corpus over every name-taking opcode, on every CI host, no VM; canaries outside the share untouched; **any refusal from layer 2 or 3 fails the test** (layer 1 must stop it); raw-virtqueue guest replay as in the Kata PoC. Host side: `test_traversal_corpus` (38 names × every name-taking opcode, Linux and macOS) | now (L, M); measure `OBJ_DONT_REPARSE` on W |
 | 2 | Symlink/junction swapped in mid-operation (TOCTOU; CVE-2016-9602) | Never follow links: L `RESOLVE_NO_SYMLINKS` / M `O_NOFOLLOW_ANY` / W `OBJ_DONT_REPARSE` + `FileAttributeTagInformation` after open, so any reparse point is shown as a link object and never traversed. Guest-made symlinks are emulated (regular file + record), so the host never has a real link the guest made | Race suite: host threads swap dirs ↔ symlinks/junctions/mount points for 10⁶ iterations while the harness operates; same assertions as 1. Host side: `test_swap_race` (a directory ↔ a symlink to outside, swapped atomically without pause, 10⁵ rounds of about ten requests) | now (L, M); measure on W |
 | 3 | Aliases: case folding, Unicode normalisation, 8.3 names (`PROGRA~1`), `/.vol`, ADS `file:stream` | Identity by (dev, ino) / FileId, never by name. M: compare the stored name (`fgetattrlist ATTR_CMN_NAME`) with the request, mismatch = ENOENT/EEXIST; never build `/.vol` paths. W: reject `:`; compare `FileNormalizedNameInformation` with the request (catches 8.3) | Corpus entries for each alias form; case/NFD variants (`test_alias_names_refused`, `test_case_collision_is_eexist`) | now (M); measure 8.3 check on W |
-| 4 | The file server itself is taken over (parser bug) | Confine it so a takeover reaches only the share: L user/mount/pid/net namespaces + `pivot_root` into the share + seccomp (crosvm's fs list minus mknod/setresuid/capset) + `no_new_privs` + Landlock when present / M Seatbelt `(deny default)` with `file-read*`/`file-write*` only `(subpath share)`, no network/exec/fork/IOKit / W LPAC token (per-share AppContainer SID) + ACE on the share only + Job (memory, CPU, 1 process, kill on close) + wick's mitigation profile. **If any control cannot be set, wick-fsd does not start** | Per-host sandbox checks (`Seccomp: 2`, `CapEff: 0`; profile test; `TokenIsLessPrivilegedAppContainer`); an outside open from inside the server fails; one test per control proving refusal to start | now (L, M); measure LPAC + AF_UNIX + inherited handles on W |
+| 4 | The file server itself is taken over (parser bug) | Confine it so a takeover reaches only the share: L user/mount/pid/net namespaces + `pivot_root` into the share + seccomp (crosvm's fs list minus mknod/setresuid/capset) + `no_new_privs` + Landlock when present / M Seatbelt `(deny default)` with `file-read*`/`file-write*` only `(subpath share)`, no network/exec/fork/IOKit / W LPAC token (per-share AppContainer SID) + ACE on the share only + Job (memory, CPU, 1 process, kill on close) + wick's mitigation profile. **If any control cannot be set, wick-fsd does not start** | Per-host sandbox checks (`Seccomp: 2`, `CapEff: 0`; profile test; `TokenIsLessPrivilegedAppContainer`); an outside open from inside the server fails; one test per control proving refusal to start. L: `test_confined_status` (`Seccomp: 2`, `NoNewPrivs: 1`, every capability set empty, other namespaces, `/` = the share), `test_outside_open_fails`, `confine_probe` (inside the confined process: `openat`, `socket`, `execve`, `ptrace` and an executable `mmap` killed by SIGSYS; the host's paths not there), and `test_refused_without_unshare`, `_fork`, `_mount`, `_pivot_root`, `_id_drop`, `_capability_drop`, `_no_new_privs`, `_seccomp`, `test_refused_when_landlock_fails`, each under a filter that makes that step's call fail | now (L, M); measure LPAC + AF_UNIX + inherited handles on W |
 | 5 | Taken-over server attacks the VMM | It never gets guest memory (unlike vhost-user) and no handle to the VMM; the VMM validates every reply length/unique and caps frames | `fs_proxy` fuzz target: hostile descriptor chains **and** hostile replies | now |
 | 6 | FUSE parser bugs from guest-controlled lengths | Bounded decoder in its own crate; fuzzed like wick's existing targets | `fs_decode`, `fs_session` fuzz targets on CI (1 min) + nightly | now |
 | 7 | Host device nodes, FIFOs, sockets, setuid files (CVE-2020-35517, CVE-2023-2861, CVE-2022-0358) | Only regular files and directories are ever opened for I/O (`fstat` on the handle first); `mknod` never called; ownership, modes, setuid, devices, FIFOs live in a wick-private metadata record; server has no capabilities | Corpus: host FIFO/device/socket in the share; setuid bit never reaches the host (`test_special_files_never_opened`, `test_host_device_node_never_opened`, `test_setuid_never_reaches_host`) | now |
-| 8 | Open by handle/id escapes (`open_by_handle_at` "shocker", `/.vol`, `FILE_OPEN_BY_FILE_ID`) | Never used; no `CAP_DAC_READ_SEARCH`; OS sandbox still applies | Open-by-id of an outside file from inside the server → denied | now (L); measure M `/.vol`, W open-by-id under LPAC |
+| 8 | Open by handle/id escapes (`open_by_handle_at` "shocker", `/.vol`, `FILE_OPEN_BY_FILE_ID`) | Never used; no `CAP_DAC_READ_SEARCH`; OS sandbox still applies | Open-by-id of an outside file from inside the server → denied. L: `confine_probe`'s `open_by_handle_at` case, killed by the seccomp filter (no capabilities either, `test_confined_status`) | now (L); measure M `/.vol`, W open-by-id under LPAC |
 | 9 | Guest exhausts handles, inodes, CPU, disk | Server caps inode table, open handles, queue depth and READDIR page size (same numbers on all hosts; Windows has no per-process handle limit, so the cap is the server's own); VMM rate limiter = upstream's block-device `RateLimiter`; CPU/memory via cgroup / jetsam + jailer CPU limit / Job; disk: a server byte budget (same on all hosts) | Limit tests: ENFILE/EMFILE/backpressure at the same numbers on every host; queue flood keeps VMM in-flight bytes under the cap | now |
 | 10 | DAX: host truncates a file mapped into the guest → fault in the VMM | Not offered in v1 (ENOSYS) on any host | Guest mount with `dax` fails cleanly | now |
 | 11 | Socket between VMM and server hijacked | Accept once, check the peer (`SO_PEERCRED` / `LOCAL_PEERCRED` / `SIO_AF_UNIX_GETPEERPID` → SID), then unlink | Second connection refused; wrong peer refused | now |
@@ -64,7 +69,7 @@ documented or measured; **measure** = the fix is designed, a measurement on the 
 | 17 | Snapshot with a live FUSE session | v1: snapshot refused with an API error naming virtio-fs (`snapshot_blocker` hook exists). Later: server state saved as paths and re-resolved beneath the root on restore | Snapshot create with fs → API error | now |
 | 18 | Feature off still adds attack surface | Cargo feature `fs`, default off; `wick-fsd` separate binary; no device/process/socket without config | Default build has no fs symbols; a planned boot-test stage `fs-off` shows no virtio device 26 | now |
 | 19 | Older macOS releases lack `O_RESOLVE_BENEATH` | Require the first macOS release that has the flag and refuse loudly on older ones (the same layers on every host, no reduced mode). **Which release that is is unconfirmed:** the flag is in the macOS 27.2 SDK's `sys/fcntl.h` (read 2026-11-13); this research read it in XNU's `bsd/sys/fcntl.h` from xnu-11417 on, which it took to be macOS 15.4; a third-party rsync patch says macOS 15 ([patch](https://sources.suse.com/SUSE:SLFO:1.1:Build/rsync/c0c245c4f613433f762b3dee895547b4/rsync-hardening-0021-syscall-also-use-O_RESOLVE_BENEATH-on-FreeBSD-and-Ma.patch)). 15.4 is used below as that working assumption, not as a settled floor | macOS 15 CI job: fs starts where the flag works and refuses below | measure on macOS 15 |
-| 20 | Linux host with unprivileged user namespaces disabled (Ubuntu AppArmor) | Start wick-fsd from root, which confines and drops to an unprivileged uid with no capabilities, as the jailer does; otherwise refuse loudly | Run with userns disabled: refuses without root, confined with root | now |
+| 20 | Linux host with unprivileged user namespaces disabled (Ubuntu AppArmor) | Start wick-fsd from root, which confines and drops to an unprivileged uid with no capabilities, as the jailer does; otherwise refuse loudly | Run with userns disabled: refuses without root, confined with root. `test_userns_restricted_refused` (as a user where the host restricts user namespaces, as CI's Ubuntu may); the root path is every confined test run as root (CI's fs job's sudo step) | now |
 | 21 | Guest kernel lacks the driver | Upstream CI configs have `CONFIG_FUSE_FS=y`, `# CONFIG_VIRTIO_FS is not set`; wick's guest kernels add `CONFIG_VIRTIO_FS=y` (built: `tools/linux/guest-kernel.sh` with the fragment `tools/linux/guest-kernel-virtio-fs.config`, CI's `guest-kernels` job) | Guest boot with fs mounts the share | now |
 
 | 22 | Performance cost of the separate server | Measured 2026-11-13 on a MacBookPro18,3, macOS 27.2, **load average 53–79** (so upper bounds; re-measure idle with a concurrent control): AF_UNIX round trip 128 B ≈ 7.6–7.9 µs median; 1 MiB through the socket 267–409 µs (≈ 2.6–3.9 GB/s); host `fstatat` 0.8 µs, `openat`+`close` 7.2 µs, create+4 KiB write+close 64 µs; memcpy 41.7 GB/s (benchmark: a C program, not in the repository; AF_UNIX stream socketpair between two processes, medians of 20,000 round trips for 128 B and 4 KiB and of 2,000 for 128 KiB and 1 MiB, two runs; the busy machine also gave p99s from 0.4 to 5.4 ms). Small ops: the hop is about one host open; vhost-user on macOS/Windows also wakes the VMM (no in-kernel ioeventfd: wick's eventfds are pipes, docs/PORTING.md) [inf], so its round-trip cost is similar and the split's real extra is the data copy. Large I/O: replace the socket payload with a fixed-size shared ring between VMM and server (never guest memory; bounded and counted, since shared sections escape the Windows Job limit): one memcpy at ~40 GB/s ≈ 25 µs/MiB, socket only for notifications. Guest page cache and attr/entry timeouts keep repeated lookups in the guest | Benchmarks per host: fio seq 1 MiB read/write, untar of a kernel tree, `git status` on a large repo, `npm install`; split vs virtiofsd (Linux) and vs an in-VMM prototype; acceptance target set from the Linux virtiofsd number | measure |
@@ -344,6 +349,12 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
     the process with the operator's rights: a confined server could not open the peer to read its identity (on
     Windows an LPAC process cannot open the VMM);
   - only then set up the confinement (§6), with the connected socket and the share root its only handles.
+- Built for Linux (`crates/fs/fsd/src/main.rs`): `wick-fsd --share-dir DIR --socket PATH --id ID [--read-only]
+  [--cache auto|never|always] [--cache-timeout-ms N] [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD]
+  [--case-insensitive-ok] [--max-nodes N] [--max-handles N] [--max-bytes N]`. It refuses a socket path that exists
+  (it never removes what it did not make), says it is ready (a byte on `--ready-fd`, else a `ready` line), accepts
+  one connection, closes and unlinks the listener at once, and serves only a peer of `--peer-uid` (default: its own
+  uid). At the end it writes its counters to stderr (layer-2 refusals among them).
 - **Stage 1** (confined): serve the one connection until EOF, then exit. It never accepts. Refusing to start is the
   only answer to a missing control: the server has no "unconfined" flag at all (Kata's failure mode).
 - **Only bytes cross between the VMM and the server.** Neither opens the other. A shared object needed later (a
@@ -361,7 +372,9 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
   - Entries hold a directory handle (dirs), or on Linux and macOS a leaf: the names it is known by, each
     re-verified against the identity at use (§4.3).
 - **Limits, identical on every host:**
-  - inode entries: 8192 by default (`DEFAULT_MAX_NODES`);
+  - inode entries: 8192 by default (`DEFAULT_MAX_NODES`), **provisional**: bound by the descriptors each node holds
+    today, too few for a large checkout, until nodes are bounded by memory and descriptors by a cache of held
+    directories (§10, question 11, decided: before fs v1);
   - open host handles: 1024 by default (`DEFAULT_MAX_HANDLES`; self-limited: Windows has no per-process handle limit
     [meas: `jailer-test.ps1 nofile`]);
   - the descriptors these let the server hold at once, `limits::descriptors`: one per node, one per handle, and 64 spare
@@ -451,16 +464,23 @@ backend implements: Linux, macOS, Windows, and `MemDir`, an in-memory directory 
     in place of the source for overlayfs, and the server never makes device nodes on a host (they are emulated in
     the record, §4.2).
   - Both of `NOREPLACE` and `EXCHANGE`, or an unknown bit, is EINVAL, as Linux.
-  - A file system without the flag gives EINVAL on every host, Linux's answer, with nothing changed
-    (`test_stage0_and_renames_on_other_volumes`, which checks the files: 0 must be a real exchange). Linux: a file
-    system without it refuses it (`renameat2`, EINVAL); vfat has it (exchanged on Linux 7.0.14). macOS: xnu hands
-    `RENAME_SWAP` to the file system (`vn_rename`) [src], and one without it may not refuse it: msdos on macOS 26.7.2
-    returned 0 (CI run 44188936001), where macOS 27.2's msdos and exfat (FSKit modules; Apple's msdos module's
-    `renameItem` takes no swap option [src]) and HFS+ give ENOTSUP [meas: `getattrlist(ATTR_VOL_CAPABILITIES)` and
-    `renameatx_np` on `hdiutil` images, macOS 27.2, 2026-11-18]. So the backend asks the volume once, at start
-    (`sys::rename_swap`: `VOL_CAP_INT_RENAME_SWAP`, reported by APFS, not by HFS+, msdos or exfat, same probe), and
-    never passes the flag to a volume that does not report it. `RENAME_EXCL` needs no such check: xnu refuses an
-    existing target itself (`renameat_internal`) [src], on msdos and exfat too (EEXIST, same probe).
+  - A file system without the flag gives EINVAL on every host, Linux's answer, with both files byte for byte as they
+    were (`test_stage0_and_renames_on_other_volumes`, which reads them: 0 must be a real exchange, EINVAL must leave
+    both). Linux: a file system without it refuses it (`renameat2`, EINVAL); vfat has it (exchanged on Linux 7.0.14, and
+    on GitHub's ubuntu-latest in run 44199005130's record step). macOS: xnu hands `RENAME_SWAP` to the file system
+    (`vn_rename` calls `VNOP_RENAMEX` with the flags, bsd/vfs/kpi_vfs.c, xnu-12377.121.6, :4654 to :4655) [src], and one
+    without it may not refuse it. macOS 26.7.2 (25G332, GitHub's macos-latest, run 44199005130's record step): the msdos
+    volume reports no `VOL_CAP_INT_RENAME_SWAP`, yet `renameatx_np(RENAME_SWAP)` of C and D returned 0 and did a plain
+    rename: C was gone and D held C's bytes, D's own destroyed. macOS 27.2's msdos and exfat (FSKit modules; Apple's
+    msdos module's `renameItem` takes no swap option [src]) and HFS+ give ENOTSUP [meas:
+    `getattrlist(ATTR_VOL_CAPABILITIES)` and `renameatx_np` on `hdiutil` images, macOS 27.2, 2026-11-18]. So the backend
+    asks the volume once, at start (`sys::rename_swap`: `VOL_CAP_INT_RENAME_SWAP`, reported by APFS, not by HFS+, msdos
+    or exfat, same probe), and never the file system: an exchange on a volume that does not report it is EINVAL before
+    any call (SECURITY.md, Fixed defects). The other flags wick-fsd passes on macOS are enforced by xnu above the file
+    system: `RENAME_EXCL` (`renameat_internal` refuses an existing target, bsd/vfs/vfs_syscalls.c :9646) [src], EEXIST
+    on msdos and exfat too (same probe); `O_NOFOLLOW_ANY`, `O_RESOLVE_BENEATH`, `AT_SYMLINK_NOFOLLOW`, `FSOPT_NOFOLLOW`
+    and `XATTR_NOFOLLOW` are path-lookup flags of namei, and stage 0 checks beneath-resolution on the share itself
+    (`probe_beneath`).
 
 **The Linux and macOS backend** (`crates/fs/fsd/src/host/unix.rs`; every system call in `crates/fs/sys`, the
 server's only unsafe code, `wick-fsd` itself forbids it):
@@ -665,7 +685,7 @@ share root with the server user's rights".
 | 14 | **Server access to guest memory** | none in design C | none | none | B would give all of it [doc] |
 | 15 | **Guest-controlled lengths/fields** in FUSE frames | decoder bounds, fuzzing (§11); the VMM caps frames | same | same | |
 | 16 | **Hostile server → VMM** (a compromised wick-fsd) | VMM validates replies (§4.1); the server cannot reach guest memory or the VMM process | same | same; no `PROCESS_DUP_HANDLE` either way | |
-| 17 | **Socket hijack / impersonation** | accept once, `SO_PEERCRED`, unlink | accept once, `LOCAL_PEERCRED` | accept once, `SIO_AF_UNIX_GETPEERPID` → token SID [meas: works across the AppContainer boundary, a probe of Windows sandbox mechanisms on Windows Server 2022 build 20348, 2026-11-10; the probe is not in the repository] | |
+| 17 | **Socket hijack / impersonation** | accept once, `SO_PEERCRED`, unlink (`test_second_connection_refused`, `test_wrong_peer_refused`) | accept once, `LOCAL_PEERCRED` | accept once, `SIO_AF_UNIX_GETPEERPID` → token SID [meas: works across the AppContainer boundary, a probe of Windows sandbox mechanisms on Windows Server 2022 build 20348, 2026-11-10; the probe is not in the repository] | |
 | 18 | **Directory moved out of the share by the host** while the guest holds it | pivot_root does not stop it for held fds, but Landlock checks the hierarchy at access time [inf]; document | Seatbelt `subpath` is evaluated on the current path at access time [inf]; document | the DACL travels with the moved directory, so it **stays reachable**; document | trusted-host action in Firecracker's model |
 | 19 | **Host consumers of guest-written content** (Spotlight/QuickLook, Defender, indexers, IDEs following symlinks) | doc: dedicated dir, exclude it from indexers | doc: `.metadata_never_index`, a dedicated volume | doc; antivirus exclusions weaken the host and are not recommended | residual risk on every host |
 | 20 | **Untrusted server configuration** | operator-only command line; the VMM never forwards guest data into it | same | same | CVE-2026-44210 |
@@ -691,6 +711,33 @@ it means layer 1 let the request through.
     chown(2), setxattr(2), utime(2) ..." ([Landlock docs](https://docs.kernel.org/userspace-api/landlock.html)) [doc].
   - Landlock first appeared in Linux 5.13 [doc], and upstream supports 5.10 hosts (docs/kernel-policy.md) [src], so it
     is an added layer, never the only one.
+  - **As built** (`crates/fs/fsd/src/confine/linux.rs`, the calls in `crates/fs/sys/src/unix/confine.rs`), after
+    stage 0 has accepted the one connection and checked its peer:
+    1. `unshare(CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWNET|CLONE_NEWIPC)`, with `CLONE_NEWUSER` when not root (its own uid
+       and gid mapped 1:1, `setgroups` denied);
+    2. `fork`: the child is pid 1 of the new pid namespace. The parent drops the connection and everything else it
+       holds, waits, and exits as the child did (a child killed by the filter shows as signal 31, SIGSYS, logged);
+    3. the child: `PR_SET_PDEATHSIG` SIGKILL (killing wick-fsd kills it), not dumpable (no ptrace or `/proc/<pid>`
+       access for the host's processes of its uid), every mount private, the share bind-mounted onto itself without
+       what is mounted beneath it, remounted `nosuid,nodev,noexec` (read-only for `--read-only`, and keeping the flags
+       the mount is locked with), `pivot_root` into it and the old root detached;
+    4. `/` opened and checked to be the object stage 0 checked (else refused), and the backend made on it;
+    5. as root, `--uid`/`--gid` (required, never 0) with no supplementary groups, every id checked; not root, no
+       `--uid`;
+    6. every capability dropped (bounding, ambient, effective, permitted, inheritable);
+    7. `no_new_privs`;
+    8. Landlock where the kernel has it: file rights beneath the new root only, never execute or making devices,
+       sockets, FIFOs or symlinks (the server makes regular files only); TCP bind and connect handled with no rule
+       (ABI 4); abstract Unix sockets and signals scoped (ABI 6). Without Landlock the server says so on stderr and
+       goes on (decision Q11, `test_landlock_absent_is_logged`);
+    9. the seccomp filter: `SERVER_SYSCALLS`, each system call with why and its argument rule (`ioctl` only
+       `FS_IOC_GETFLAGS`, `fcntl` only `F_GETFL`/`F_GETFD`, `mmap`/`mprotect` never `PROT_EXEC`, `sendto`/`recvfrom`
+       without an address, `tgkill` only SIGABRT); this architecture only and no x32; anything else
+       `SECCOMP_RET_KILL_PROCESS`. No `openat` (opens are `openat2` beneath a held directory), no `socket`, `clone` or
+       `execve`, no `mknodat`, `setresuid`, `setresgid` or `capset`.
+
+    Only then are the hellos exchanged and a frame read. Each step is required and a failure is a refusal naming it
+    (`test_refused_without_*`); there is no flag that skips one.
 - **Resolution:** `openat2(2)` (Linux 5.6+) with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV`
   and a single component; no fallback (§4.3). Nodes as on macOS (§4.3): directories held open, anything else a
   leaf found by its known names and checked at each use. Not `O_PATH` fds reopened through `/proc/self/fd` as
@@ -895,7 +942,8 @@ it means layer 1 let the request through.
     per inode under a limit raised to `fs.nr_open`, would not. Recommendation: decouple the two, nodes bounded by memory
     (a node is a few hundred bytes) and descriptors by a cache of held directories closed least recently used first and
     reopened by name beneath a held parent as leaves are now, so the descriptor bound stays fixed and the node limit can
-    be 2^20; its own commit, with the leaf tests and the race over it.
+    be 2^20; its own commit, with the leaf tests and the race over it. Decided: required before fs v1, the commit after
+    staging 6; a directory that cannot be found again is the error Linux's FUSE and virtiofsd give for a stale node.
 
 ---
 
@@ -908,7 +956,8 @@ it means layer 1 let the request through.
      stage `fs-off` on each host).
 2. **Traversal corpus (host-side harness, no VM, every CI host).** Exists for Linux and macOS as
    `test_traversal_corpus` (`crates/fs/fsd/tests/corpus.rs`), over the session and the host backend without the
-   frame layer; the confined re-run comes with commits 6 and 7. A Rust harness speaks wick-fsd's frame protocol
+   frame layer, and on Linux as `test_traversal_corpus_confined`, against a confined wick-fsd over its socket, which
+   must end normally with no layer-2 or layer-3 refusal; macOS's confined re-run comes with its confinement. A Rust harness speaks wick-fsd's frame protocol
    and sends every name-taking opcode (LOOKUP, MKNOD, MKDIR, SYMLINK (name *and* target), UNLINK, RMDIR, RENAME,
    RENAME2, LINK, CREATE, TMPFILE, SETXATTR/GETXATTR names). Names:
    - `..`, `.`, `a/b`, `/etc/x`, `../../x`;
@@ -939,11 +988,12 @@ it means layer 1 let the request through.
    from inside the guest, on all three hosts (Windows on the WHP PC).
 7. **Sandbox checks of wick-fsd:**
    - Linux: `/proc/<pid>/status` (`Seccomp: 2`, `NoNewPrivs: 1`, `CapEff: 0`), `/` = the share, an open of an outside
-     path fails;
+     path fails (exist: `test_confined_status`, `test_outside_open_fails`, `confine_probe`);
    - macOS: a profile test like `test_unlisted_syscalls_are_denials`, plus `/.vol` and firmlink-alias opens denied;
    - Windows: `TokenIsLessPrivilegedAppContainer`, Job limits, `GetProcessMitigationPolicy`, outside open and
      open-by-id → `ACCESS_DENIED`;
-   - all hosts: the server refuses to start when any control cannot be installed (one test per control).
+   - all hosts: the server refuses to start when any control cannot be installed (one test per control; Linux's exist,
+     `test_refused_without_*` in `crates/fs/fsd/tests/server.rs`).
 8. **VMM sandbox unchanged:** `tools/macos/sandbox-discovery.sh` with an fs device shows no new entries; the Windows
    profile is identical; Linux seccomp is unchanged.
 9. **Limits:** inode/handle/queue caps produce ENFILE/EMFILE/backpressure with the same numbers on every host;

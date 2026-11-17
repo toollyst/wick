@@ -1272,8 +1272,8 @@ jobs:
         run: cargo test --locked 2>&1 | tee "$RUNNER_TEMP/tests.log"
       # The host-directory tests a user cannot set up alone (CONTRIBUTING.md,
       # Tests): a casefold ext4 directory and a vfat mount for the ignored
-      # tests, and a device node (made as root) for the special-files test,
-      # whose binary runs as root here.
+      # tests, a device node (made as root) for the special-files test, and
+      # wick-fsd's confinement as root; those binaries run as root here.
       - name: Host-directory tests on prepared mounts (Linux, sudo)
         if: runner.os == 'Linux'
         run: |
@@ -1296,6 +1296,13 @@ jobs:
             test_stage0_and_renames_on_other_volumes --nocapture 2>&1 | grep -E "^exchange on|test result"
           bin="$(cargo test --locked --test special --no-run 2>&1 | grep -o 'target/debug/deps/special-[0-9a-f]*' | head -1)"
           sudo "$bin" --exact test_host_device_node_never_opened --nocapture
+          # wick-fsd confined as root (namespaces without a user namespace,
+          # then the drop to 65534): the runner's user may have no user
+          # namespaces, and these tests then check only the refusal.
+          for test in server confine_probe corpus links; do
+            bin="$(cargo test --locked --test "$test" --no-run 2>&1 | grep -o "target/debug/deps/$test-[0-9a-f]*" | head -1)"
+            sudo "$bin"
+          done
           sudo umount "$t/cf" "$t/fat"
       # On record (libtest keeps a passing test's output): what this macOS's
       # msdos does with renameatx_np(RENAME_SWAP), and the backend's

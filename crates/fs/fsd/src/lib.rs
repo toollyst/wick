@@ -18,10 +18,13 @@
 //! port): [`host`]'s `HostDir`, over the system calls of the `wick-fs-sys`
 //! crate, and `stage0`, the share's checks before anything is served.
 //!
-//! Confinement and the serving loop come in later commits; nothing here
-//! serves a guest yet.
+//! The server: [`serve`], the loop over one connection's frames, and
+//! [`confine`], stage 1's confinement (Linux; macOS's comes with its own
+//! commit). The `wick-fsd` binary (`src/main.rs`) puts them together; on a
+//! host without confinement it refuses to start.
 
 pub mod cache;
+pub mod confine;
 pub mod dir;
 pub mod fuse;
 pub mod handles;
@@ -30,6 +33,7 @@ pub mod inodes;
 pub mod limits;
 pub mod memdir;
 pub mod record;
+pub mod serve;
 pub mod session;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod stage0;

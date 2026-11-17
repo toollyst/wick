@@ -21,7 +21,7 @@
 //! 7. [`HostDir::new`]: beneath-resolution present, and names not folded by
 //!    case unless the operator allowed it.
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
 use wick_fs_sys as sys;
@@ -156,6 +156,29 @@ const REMOTE: &[(&str, &str)] = &[
 
 /// Runs the checks and opens the share.
 pub fn open(share: &Share, home: Option<&Path>) -> Result<HostDir, Refusal> {
+    let checked = check(share, home)?;
+    HostDir::new(
+        checked.root,
+        Options {
+            case_insensitive_ok: share.case_insensitive_ok,
+        },
+    )
+}
+
+/// A share that passed checks 1 to 6, for confinement to take over before
+/// check 7 ([`HostDir::new`]) on the confined root.
+#[derive(Debug)]
+pub struct Checked {
+    /// The canonical path.
+    pub canonical: PathBuf,
+    /// The share's root, opened.
+    pub root: OwnedFd,
+    /// Its device and inode: the confined root must be this object.
+    pub id: (u64, u64),
+}
+
+/// Checks 1 to 6 of `share` ([`open`] without [`HostDir::new`]).
+pub fn check(share: &Share, home: Option<&Path>) -> Result<Checked, Refusal> {
     let shown = share.dir.display();
     let canonical = std::fs::canonicalize(&share.dir).map_err(|e| {
         if cfg!(target_os = "macos") && e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -223,12 +246,11 @@ pub fn open(share: &Share, home: Option<&Path>) -> Result<HostDir, Refusal> {
             )));
         }
     }
-    HostDir::new(
+    Ok(Checked {
+        canonical,
         root,
-        Options {
-            case_insensitive_ok: share.case_insensitive_ok,
-        },
-    )
+        id: (st.dev, st.ino),
+    })
 }
 
 #[cfg(test)]

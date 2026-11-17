@@ -23,6 +23,7 @@ use common::*;
 use wick_fs_sys as sys;
 use wick_fsd::fuse::Opcode;
 use wick_fsd::host::unix::{HostDir, Options, NAMES_MAX};
+use wick_fsd::session::Session;
 
 const DIRS: usize = 12;
 const FILES: usize = 24;
@@ -35,7 +36,7 @@ fn descriptors() -> usize {
 
 /// The descriptors held beyond `before` (the root's included there) are at
 /// most the session's nodes but the root, plus its handles.
-fn within(g: &G<HostDir>, before: usize, step: &str) {
+fn within(g: &G<Session<HostDir>>, before: usize, step: &str) {
     let held = descriptors().saturating_sub(before);
     let bound = g.s.nodes() - 1 + g.s.handles_open();
     assert!(held <= bound, "{step}: {held} descriptors held, more than nodes + handles = {bound}");

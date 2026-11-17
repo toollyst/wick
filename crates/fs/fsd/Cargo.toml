@@ -17,5 +17,10 @@ wick-fs-sys = { path = "../sys" }
 [lib]
 bench = false
 
+# fork needs a process with one thread: this test is a plain main.
+[[test]]
+name = "confine_probe"
+harness = false
+
 [lints]
 workspace = true

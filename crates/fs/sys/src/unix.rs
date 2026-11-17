@@ -19,6 +19,9 @@ impl fmt::Debug for HostErrno {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub mod confine;
+
 /// What every call here returns.
 pub type Result<T> = std::result::Result<T, HostErrno>;
 
@@ -1000,9 +1003,10 @@ pub fn xattr_native(fd: BorrowedFd<'_>, probe_name: &[u8]) -> Result<bool> {
 /// `RENAME_SWAP` to the file system (`vn_rename`), which answers for it: a
 /// volume without it may refuse it (msdos and exfat on macOS 27.2, served by
 /// FSKit modules whose `renameItem` takes no swap: ENOTSUP) or, as msdos on
-/// macOS 26.7.2 did (CI run 44188936001), return 0, so the flag is never
-/// passed to a volume that does not report it. `RENAME_EXCL` needs no such
-/// check: xnu's `renameat_internal` refuses an existing target itself.
+/// macOS 26.7.2 (25G332) did in CI run 44199005130, return 0 after a plain
+/// rename that destroys the target, so the flag is never passed to a volume
+/// that does not report it. `RENAME_EXCL` needs no such check: xnu's
+/// `renameat_internal` refuses an existing target itself.
 /// Linux: true, the file system refuses a flag it lacks (EINVAL).
 pub fn rename_swap(fd: BorrowedFd<'_>) -> Result<bool> {
     #[cfg(target_os = "macos")]
@@ -1016,6 +1020,25 @@ pub fn rename_swap(fd: BorrowedFd<'_>) -> Result<bool> {
         let _ = fd;
         Ok(true)
     }
+}
+
+/// Takes the inherited descriptor `fd` (a command line's `--ready-fd`):
+/// EBADF unless it is open, and never one of the standard streams.
+pub fn take_inherited(fd: i32) -> Result<OwnedFd> {
+    if fd <= 2 {
+        return Err(HostErrno(libc::EBADF));
+    }
+    // SAFETY: F_GETFD takes no pointer; it fails with EBADF if fd is not open.
+    check(unsafe { libc::fcntl(fd, libc::F_GETFD) })?;
+    // SAFETY: fd is open (checked above), was inherited for this process to
+    // use, and nothing else in it owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The effective uid of this process.
+pub fn euid() -> u32 {
+    // SAFETY: geteuid cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 /// The real uid of this process.

@@ -8,12 +8,15 @@
 #![allow(dead_code)]
 
 pub mod drive;
+#[cfg(target_os = "linux")]
+pub mod remote;
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use wick_fs_sys as sys;
+use wick_fsd::dir::ConfinedDir;
 use wick_fsd::fuse::encode::request;
 use wick_fsd::fuse::{Errno, Opcode};
 use wick_fsd::host::unix::{HostDir, Options};
@@ -92,14 +95,68 @@ pub fn snapshot(root: &Path) -> BTreeMap<PathBuf, (u32, u64, i64, i64, Vec<u8>)>
     out
 }
 
+/// How the harness reaches a server: a session in this process, or a
+/// confined wick-fsd over its socket (`remote::Remote`).
+pub trait Link {
+    /// A FUSE request with `cap` bytes for the reply: the reply, if any.
+    fn send(&mut self, req: &[u8], cap: usize) -> Option<Vec<u8>>;
+    /// The server's layer-2/3 refusals so far, where the harness can see
+    /// them (a remote server reports them when it ends).
+    fn layer_refusals(&self) -> Option<u64> {
+        None
+    }
+    /// Whether the server holds `nodeid`, where the harness can see it.
+    fn node_held(&self, _nodeid: u64) -> Option<bool> {
+        None
+    }
+}
+
+impl<D: ConfinedDir> Link for Session<D> {
+    fn send(&mut self, req: &[u8], cap: usize) -> Option<Vec<u8>> {
+        let reply = self.handle(req, cap);
+        self.check().unwrap();
+        reply
+    }
+
+    fn layer_refusals(&self) -> Option<u64> {
+        Some(self.counters().layer_refusals)
+    }
+
+    fn node_held(&self, nodeid: u64) -> Option<bool> {
+        Some(self.node_counts(nodeid).is_some())
+    }
+}
+
 /// A session over `<scratch>/share`, canaries in `<scratch>/outside`.
-pub struct H {
-    pub s: Session<HostDir>,
+pub struct H<L: Link = Session<HostDir>> {
+    pub s: L,
     pub base: PathBuf,
     pub share: PathBuf,
     pub outside: PathBuf,
     unique: u64,
-    canaries: BTreeMap<PathBuf, (u32, u64, i64, i64, Vec<u8>)>,
+    canaries: Canaries,
+}
+
+/// A snapshot of the canaries.
+pub type Canaries = BTreeMap<PathBuf, (u32, u64, i64, i64, Vec<u8>)>;
+
+/// `<scratch>/share` and `<scratch>/outside` with its canaries.
+pub fn share_and_outside(tag: &str, prepare: impl FnOnce(&Path)) -> (PathBuf, PathBuf, PathBuf) {
+    let base = scratch(tag);
+    let share = base.join("share");
+    let outside = base.join("outside");
+    std::fs::create_dir(&share).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("secret"), b"canary").unwrap();
+    std::fs::create_dir(outside.join("dir")).unwrap();
+    std::fs::write(outside.join("dir").join("inner"), b"canary 2").unwrap();
+    prepare(&share);
+    (base, share, outside)
+}
+
+/// FUSE_INIT's arguments: 7.47, 1 MiB readahead, every flag offered.
+pub fn init_args() -> Vec<u8> {
+    [&le32(7)[..], &le32(47), &le32(1 << 20), &le32(u32::MAX), &[0; 48]].concat()
 }
 
 impl H {
@@ -109,15 +166,7 @@ impl H {
 
     /// A session with `config`; `prepare` fills the share first.
     pub fn with(tag: &str, config: Config, prepare: impl FnOnce(&Path)) -> H {
-        let base = scratch(tag);
-        let share = base.join("share");
-        let outside = base.join("outside");
-        std::fs::create_dir(&share).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(outside.join("secret"), b"canary").unwrap();
-        std::fs::create_dir(outside.join("dir")).unwrap();
-        std::fs::write(outside.join("dir").join("inner"), b"canary 2").unwrap();
-        prepare(&share);
+        let (base, share, outside) = share_and_outside(tag, prepare);
         let canaries = snapshot(&outside);
         let root = sys::open_root(&share).unwrap();
         // The test volumes of macOS fold case; the backend then checks every
@@ -127,16 +176,22 @@ impl H {
             owner: (UID, GID),
             ..config
         };
+        H::over(Session::new(dir, config).unwrap(), base, share, outside, canaries)
+    }
+}
+
+impl<L: Link> H<L> {
+    /// A harness over `link`, INIT done.
+    pub fn over(link: L, base: PathBuf, share: PathBuf, outside: PathBuf, canaries: Canaries) -> H<L> {
         let mut h = H {
-            s: Session::new(dir, config).unwrap(),
+            s: link,
             base,
             share,
             outside,
             unique: 0,
             canaries,
         };
-        let args = [&le32(7)[..], &le32(47), &le32(1 << 20), &le32(u32::MAX), &[0; 48]].concat();
-        h.ok(Opcode::Init, 0, &[&args]);
+        h.ok(Opcode::Init, 0, &[&init_args()]);
         h
     }
 
@@ -144,9 +199,7 @@ impl H {
     pub fn raw(&mut self, op: u32, nodeid: u64, args: &[&[u8]], cap: usize) -> Option<Vec<u8>> {
         self.unique += 2;
         let bytes = request(op, self.unique, nodeid, (UID, GID), args);
-        let reply = self.s.handle(&bytes, cap);
-        self.s.check().unwrap();
-        reply
+        self.s.send(&bytes, cap)
     }
 
     /// (error, body) of a request.
@@ -263,7 +316,7 @@ impl H {
     }
 }
 
-impl Drop for H {
+impl<L: Link> Drop for H<L> {
     fn drop(&mut self) {
         remove(&self.base);
     }
@@ -324,8 +377,7 @@ pub fn session_over(dir: &Path, options: wick_fsd::host::unix::Options, config: 
     let root = sys::open_root(dir).map_err(|e| format!("{e:?}"))?;
     let d = HostDir::new(root, options).map_err(|r| r.0)?;
     let mut s = Session::new(d, Config { owner: (UID, GID), ..config }).map_err(|e| format!("{e:?}"))?;
-    let args = [&le32(7)[..], &le32(47), &le32(1 << 20), &le32(u32::MAX), &[0; 48]].concat();
-    let init = request(Opcode::Init as u32, 1, 0, (UID, GID), &[&args]);
+    let init = request(Opcode::Init as u32, 1, 0, (UID, GID), &[&init_args()]);
     s.handle(&init, CAP).unwrap();
     Ok(s)
 }

@@ -19,14 +19,14 @@ mod common;
 use common::drive::{FATTR_MODE, FATTR_SIZE, G, RENAME_EXCHANGE};
 use common::*;
 use wick_fs_sys as sys;
-use wick_fsd::dir::ConfinedDir;
 use wick_fsd::fuse::Errno;
 use wick_fsd::host::unix::{HostDir, Options};
 use wick_fsd::memdir::MemDir;
+use wick_fsd::session::Session;
 
 /// A session over a fresh host directory, removed when dropped.
 struct Host {
-    g: G<HostDir>,
+    g: G<Session<HostDir>>,
     base: std::path::PathBuf,
 }
 
@@ -56,16 +56,31 @@ macro_rules! both {
                 let mut h = super::host(concat!("links-", stringify!($name)));
                 super::$name(&mut h.g);
             }
+
+            /// A confined wick-fsd over its socket (Linux).
+            #[cfg(target_os = "linux")]
+            #[test]
+            fn confined() {
+                let base = super::scratch(concat!("links-c-", stringify!($name)));
+                let share = base.join("share");
+                std::fs::create_dir(&share).unwrap();
+                if let Some(r) = super::remote::confined_over(&share, &base.join("fs.sock")) {
+                    let mut g = super::G::over(r);
+                    super::$name(&mut g);
+                    super::remote::finish_clean(&mut g.s);
+                }
+                super::remove(&base);
+            }
         }
     };
 }
 
-fn nlink<D: ConfinedDir>(g: &mut G<D>, n: u64) -> u32 {
+fn nlink<L: Link>(g: &mut G<L>, n: u64) -> u32 {
     g.getattr(n, None).unwrap_or_else(|e| panic!("getattr of node {n}: {e:?}")).nlink
 }
 
 /// LINK a→b, UNLINK a: the node lives on as b, by its id and by the name.
-fn link_then_unlink<D: ConfinedDir>(g: &mut G<D>) {
+fn link_then_unlink<L: Link>(g: &mut G<L>) {
     let (n, fh) = g.create(ROOT, b"a");
     assert_eq!(g.write(n, fh, 0, b"data"), Ok(4));
     g.release(n, fh);
@@ -99,13 +114,13 @@ both!(link_then_unlink);
 
 /// A node first reached by b, then by a, then each of the names removed in
 /// turn.
-fn first_reached_by_another_name<D: ConfinedDir>(g: &mut G<D>) {
+fn first_reached_by_another_name<L: Link>(g: &mut G<L>) {
     let (n, fh) = g.create(ROOT, b"a");
     g.release(n, fh);
     assert_eq!(g.link(n, ROOT, b"b"), Ok(n));
     // CREATE and LINK each counted a lookup: the node is gone after this.
     g.forget(n, 2);
-    assert_eq!(g.s.node_counts(n), None);
+    assert_ne!(g.held(n), Some(true));
     let m = g.lookup(ROOT, b"b").unwrap();
     assert_eq!(g.lookup(ROOT, b"a"), Ok(m));
     g.unlink(ROOT, b"b").unwrap();
@@ -125,7 +140,7 @@ both!(first_reached_by_another_name);
 
 /// One of two links renamed (into another directory), the other removed;
 /// then a link exchanged with another file, where the backend exchanges.
-fn rename_one_of_two_links<D: ConfinedDir>(g: &mut G<D>) {
+fn rename_one_of_two_links<L: Link>(g: &mut G<L>) {
     let d = g.mkdir(ROOT, b"d");
     let (n, fh) = g.create(ROOT, b"a");
     g.release(n, fh);
@@ -177,7 +192,7 @@ both!(rename_one_of_two_links);
 /// More links than a leaf keeps names for, the newest removed first: the
 /// one left is found in the held directories, with and without an open
 /// descriptor of the file.
-fn names_beyond_what_a_node_keeps<D: ConfinedDir>(g: &mut G<D>) {
+fn names_beyond_what_a_node_keeps<L: Link>(g: &mut G<L>) {
     let d = g.mkdir(ROOT, b"d");
     let (n, fh) = g.create(ROOT, b"a");
     g.release(n, fh);
@@ -195,7 +210,7 @@ fn names_beyond_what_a_node_keeps<D: ConfinedDir>(g: &mut G<D>) {
     assert_eq!(g.lookup(ROOT, b"a"), Ok(n));
     // Never opened since it was looked up: no descriptor to fall back on.
     g.forget(n, 1 + u64::from(links) + 1);
-    assert_eq!(g.s.node_counts(n), None);
+    assert_ne!(g.held(n), Some(true));
     assert_eq!(g.lookup(d, b"l1"), Err(Errno::ENOENT));
     let m = g.lookup(ROOT, b"a").unwrap();
     for i in 0..links {
@@ -211,7 +226,7 @@ both!(names_beyond_what_a_node_keeps);
 
 /// An open file renamed by the guest, then its directory renamed and the
 /// file moved out of it: the handle keeps working and the node follows.
-fn open_file_renamed<D: ConfinedDir>(g: &mut G<D>) {
+fn open_file_renamed<L: Link>(g: &mut G<L>) {
     let d = g.mkdir(ROOT, b"d");
     let (n, fh) = g.create(d, b"f");
     assert_eq!(g.write(n, fh, 0, b"one"), Ok(3));
@@ -238,7 +253,7 @@ both!(open_file_renamed);
 
 /// An open file unlinked: I/O through the handles, GETATTR and SETATTR with
 /// and without a handle (nlink 0), a new OPEN of the node, no LINK back.
-fn unlinked_but_open<D: ConfinedDir>(g: &mut G<D>) {
+fn unlinked_but_open<L: Link>(g: &mut G<L>) {
     let (n, fh) = g.create(ROOT, b"f");
     assert_eq!(g.write(n, fh, 0, b"hello"), Ok(5));
     let ro = g.open(n, 0).unwrap();
@@ -265,6 +280,6 @@ fn unlinked_but_open<D: ConfinedDir>(g: &mut G<D>) {
     g.release(n, fh);
     g.release(n, ro);
     g.forget(n, 1);
-    assert_eq!(g.s.node_counts(n), None);
+    assert_ne!(g.held(n), Some(true));
 }
 both!(unlinked_but_open);

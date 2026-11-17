@@ -9,7 +9,7 @@ use wick_fsd::fuse::encode::request;
 use wick_fsd::fuse::{Errno, Opcode};
 use wick_fsd::session::{Config, Session};
 
-use super::{CAP, GID, UID, errno, le32, le64, name, u32_at, u64_at};
+use super::{CAP, GID, Link, UID, errno, init_args, le32, le64, name, u32_at, u64_at};
 
 pub const FATTR_MODE: u32 = 1;
 pub const FATTR_SIZE: u32 = 1 << 3;
@@ -28,13 +28,14 @@ pub struct Attr {
     pub nlink: u32,
 }
 
-pub struct G<D: ConfinedDir> {
-    pub s: Session<D>,
+pub struct G<L: Link> {
+    pub s: L,
     unique: u64,
 }
 
-impl<D: ConfinedDir> G<D> {
-    pub fn new(dir: D) -> G<D> {
+impl<D: ConfinedDir> G<Session<D>> {
+    /// A session over `dir` in this process.
+    pub fn new(dir: D) -> G<Session<D>> {
         let s = Session::new(
             dir,
             Config {
@@ -43,18 +44,28 @@ impl<D: ConfinedDir> G<D> {
             },
         )
         .unwrap();
-        let mut g = G { s, unique: 0 };
-        let args = [&le32(7)[..], &le32(47), &le32(1 << 20), &le32(u32::MAX), &[0; 48]].concat();
-        g.ok(Opcode::Init, 0, &[&args]);
+        G::over(s)
+    }
+}
+
+impl<L: Link> G<L> {
+    /// A driver over `link`, INIT done.
+    pub fn over(link: L) -> G<L> {
+        let mut g = G { s: link, unique: 0 };
+        g.ok(Opcode::Init, 0, &[&init_args()]);
         g
+    }
+
+    /// Whether the server still holds `nodeid` (`None`: it cannot be seen
+    /// from here).
+    pub fn held(&self, nodeid: u64) -> Option<bool> {
+        self.s.node_held(nodeid)
     }
 
     pub fn raw(&mut self, op: Opcode, nodeid: u64, args: &[&[u8]]) -> Option<Vec<u8>> {
         self.unique += 2;
         let bytes = request(op as u32, self.unique, nodeid, (UID, GID), args);
-        let reply = self.s.handle(&bytes, CAP);
-        self.s.check().unwrap();
-        reply
+        self.s.send(&bytes, CAP)
     }
 
     /// The error (0 or a negative errno) and the body.
@@ -131,8 +142,7 @@ impl<D: ConfinedDir> G<D> {
     pub fn forget(&mut self, nodeid: u64, n: u64) {
         self.unique += 2;
         let bytes = request(Opcode::Forget as u32, self.unique, nodeid, (UID, GID), &[&le64(n)]);
-        assert_eq!(self.s.handle(&bytes, 0), None);
-        self.s.check().unwrap();
+        assert_eq!(self.s.send(&bytes, 0), None);
     }
 
     /// GETATTR, through `fh` if given (FUSE_GETATTR_FH, as Linux sends it

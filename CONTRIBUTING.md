@@ -471,7 +471,13 @@ Two Linux tests need a mount a user cannot make and are `#[ignore]`d:
 `WICK_FS_TEST_CASEFOLD_DIR` (an empty directory with ext4's casefold flag)
 and `WICK_FS_TEST_NOXATTR_DIR` (a writable vfat or exfat directory); CI's
 `fs` job makes both with sudo. `WICK_FS_RACE_ITERATIONS` sets
-`test_swap_race`'s rounds (default 100000).
+`test_swap_race`'s rounds (default 100000). On Linux the tests also start
+the `wick-fsd` binary confined (`server.rs`, `confine_probe.rs`, and the
+corpus and link sequences against it): as a user it makes a user
+namespace, and where the host restricts those (Ubuntu's
+`kernel.apparmor_restrict_unprivileged_userns`) the tests check its refusal
+only; run the test binaries as root as well (it then drops to uid 65534),
+as CI's sudo step does.
 
 ## Fuzzing
 

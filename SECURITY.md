@@ -203,6 +203,16 @@ has the per-control details and results.
 
 ## Fixed defects
 
+- **macOS: wick-fsd's exchange (`RENAME_EXCHANGE`) on a volume without one could replace the target with the source and
+  report success** (from 4f7f4673, which added the host directory, to ff3174a1, which fixed it; never reachable from a
+  guest). The backend learned whether a volume exchanges from the error `renameatx_np(RENAME_SWAP)` gave, and macOS
+  26.7.2's msdos (25G332, GitHub's macos-latest; docs/design-fs.md §4.3 names the run) gives none: it reports no
+  `VOL_CAP_INT_RENAME_SWAP`, does a plain rename and returns 0, so the target's bytes would have been lost and the guest
+  told the exchange was done. Now the backend reads the volume's capability once and refuses an exchange on a volume
+  without it with EINVAL before any call (`sys::rename_swap`; `test_stage0_and_renames_on_other_volumes` reads both
+  files after the refusal). No guest could reach it: nothing in the VMM serves wick-fsd to a guest yet (virtio-fs
+  staging 8 and 9), and stage 0 serves msdos and exfat, which keep no extended attributes, read-only, where a rename is
+  EROFS before the backend (docs/design-fs.md §4.3).
 - **macOS: a block request on the Async engine, in flight while a balloon or discard pushed its 2 MiB chunk of guest
   memory past half dead, could lose the guest's data or write zeros to its disk** (from 632a5574, which added the
   reclaim of owned guest memory; fixed in the commit that adds this entry). The Async engine's workers copy a
