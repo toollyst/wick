@@ -1917,16 +1917,31 @@ fn register_range(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     // [`LOCK`], as a fill waits for one ([`wait_and_move`]); one that turns
     // to its copy meanwhile waits for the register. The kernel's copy takes
     // no exception this process could resolve, so a call copying while the
-    // pages were read-only or gone would fail or lose its bytes.
+    // pages were read-only or gone would fail or lose its bytes. The memory
+    // moved is the whole mapping that holds the range
+    // (`windows_mm::uffd_mapping_of`), the range itself if none does (the
+    // move refuses it then): the mapping is read again under the lock, and
+    // claimed again if it changed meanwhile (an `munmap` or a `MAP_FIXED`
+    // that took the lock first).
     if !crate::windows_mm::reserve_discards() {
         return Err(errno_err(crate::ENOMEM));
     }
     #[allow(clippy::cast_possible_truncation)]
-    let Some(claim) = crate::windows_mm::claim_move(start as usize, len as usize) else {
-        return Err(errno_err(crate::ENOMEM));
+    let mapping_of = || crate::windows_mm::uffd_mapping_of(start as usize, len as usize).unwrap_or((start as usize, len as usize));
+    let mut claimed = mapping_of();
+    let (_claim, _guard) = loop {
+        let Some(claim) = crate::windows_mm::claim_move(claimed.0, claimed.1) else {
+            return Err(errno_err(crate::ENOMEM));
+        };
+        claim.wait_for_copies();
+        let guard = lock();
+        let now = mapping_of();
+        if now == claimed {
+            break (claim, guard);
+        }
+        claimed = now;
     };
-    claim.wait_for_copies();
-    let _guard = lock();
+    let (base, end_of_mapping) = (claimed.0 as u64, (claimed.0 + claimed.1) as u64);
     // No mapping in the range: `ENOMEM` if none lies at or above its start,
     // `EINVAL` if the first lies at or past its end, as Linux's
     // (fs/userfaultfd.c, v6.1, `userfaultfd_register` :1323 to :1330).
@@ -1945,7 +1960,12 @@ fn register_range(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         }
         return register_again(r, ctx, start, end);
     }
-    let pages = len / PAGE;
+    // The range is made over the whole mapping: its pages from `first` to
+    // `last` are registered, the others are in no registration, as the rest
+    // of a vma Linux's register splits.
+    let pages = (end_of_mapping - base) / PAGE;
+    let (first, last) = ((start - base) / PAGE, (end - base) / PAGE);
+    let part = |page: u64| page >= first && page < last;
     // The free slot with the least room that fits, else the first free one
     // ([`Range`]): a small range leaves a large slot's arrays to a large one.
     let free = || RANGES.iter().filter(|r| r.start.load(Ordering::Acquire) == 0);
@@ -1959,31 +1979,39 @@ fn register_range(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     // The record its released pages go to, with its bitmaps, taken now: the
     // release runs at the job's limit and cannot fail.
     #[allow(clippy::cast_possible_truncation)]
-    let record = crate::windows_mm::released_reserve(start as usize, len as usize).map_err(errno_err)?;
+    let record = crate::windows_mm::released_reserve(base as usize, (end_of_mapping - base) as usize).map_err(errno_err)?;
     let undo = |e: io::Error| {
         crate::windows_mm::released_unreserve(record);
         e
     };
     // The reclaim's working memory for every chunk registered with this one,
     // reserved now, so that a reclaim at the limit allocates nothing.
-    let chunks = usize::try_from(len.div_ceil(crate::windows_mm::UFFD_CHUNK as u64)).unwrap_or(usize::MAX);
+    let chunks = usize::try_from((end_of_mapping - base).div_ceil(crate::windows_mm::UFFD_CHUNK as u64)).unwrap_or(usize::MAX);
     reserve_reclaim(registered_chunks().saturating_add(chunks)).map_err(undo)?;
     // Each page's protection, in bits 1 (no read) and 2 (no write) of its
     // byte: the alias's view below is mapped read-write. Read under the
-    // lock, which an `mprotect` takes while a register runs. Residency, in
-    // bit 0, decides what is missing: the move reads it once the memory is
-    // closed to writes (`windows_mm::uffd_alias`).
+    // lock, which an `mprotect` takes while a register runs. Bit 0, set by
+    // the move once the memory is closed to writes (`windows_mm::uffd_alias`),
+    // says a page holds memory: in the range, the others are missing;
+    // outside it, the others are no one's and pending (below).
     let mut resident = std::vec![0u8; pages as usize];
     #[allow(clippy::cast_possible_truncation)]
-    crate::windows_mm::uffd_protections(start as usize, len as usize, &mut resident);
+    crate::windows_mm::uffd_protections(base as usize, (end_of_mapping - base) as usize, &mut resident);
     // Marked moving from the move to the end of the register: an access
     // that faults on the memory meanwhile (a write to a page the move made
     // read-only, any access while it is a placeholder, a missing page's
     // before its range is published) waits in [`fault`] and runs again once
     // the register is done, as an access to a chunk the reclaim moves does
     // ([`move_chunk`]); a vCPU's waits on [`LOCK`] (`with_registrations_still`).
-    let _moving = MovingWindow::open(start, end);
-    let (alias, reserved) = crate::windows_mm::uffd_alias(start as usize, len as usize, &mut resident).map_err(|e| undo(errno_err(e)))?;
+    let _moving = MovingWindow::open(base, end_of_mapping);
+    #[allow(clippy::cast_possible_truncation)]
+    let (alias, reserved) = crate::windows_mm::uffd_alias(
+        base as usize,
+        (end_of_mapping - base) as usize,
+        &mut resident,
+        (start as usize, end as usize),
+    )
+    .map_err(|e| undo(errno_err(e)))?;
     if reserved {
         crate::windows_mm::released_alias(record, alias);
     } else {
@@ -1995,45 +2023,71 @@ fn register_range(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     // reads them reads `start` 0 and goes on, or its `gen` moved since it
     // read the range it had ([`lookup`]). The slot's arrays are reset, or
     // made, here too: every page past the range's is no one's and holds no
-    // bit, every page of it the owner `ctx`'s, with its bits set below.
+    // bit, every page of the part the owner `ctx`'s, with its bits set
+    // below, and every other page of the mapping no one's.
     range.record.store(record, Ordering::Release);
     range.reserved.store(reserved, Ordering::Release);
     if within(range.missing.load(Ordering::Acquire), pages - 1) {
         reset_array(range.missing.load(Ordering::Acquire), 1, 0, 0, 0);
-        reset_array(range.owner.load(Ordering::Acquire), 8, pages, owner_of(ctx), NONE);
+        reset_array(range.owner.load(Ordering::Acquire), 8, 0, NONE, NONE);
         reset_array(range.noread.load(Ordering::Acquire), 1, 0, 0, 0);
         reset_array(range.nowrite.load(Ordering::Acquire), 1, 0, 0, 0);
     } else {
         // The old arrays, too small, are kept: a stale reader may hold them.
         let capacity = array_capacity(pages);
-        let owner = alloc_array(capacity, 8, NONE);
-        reset_array(owner, 8, pages, owner_of(ctx), NONE);
         range.missing.store(alloc_array(capacity, 1, 0), Ordering::Release);
-        range.owner.store(owner, Ordering::Release);
+        range.owner.store(alloc_array(capacity, 8, NONE), Ordering::Release);
         range.noread.store(alloc_array(capacity, 1, 0), Ordering::Release);
         range.nowrite.store(alloc_array(capacity, 1, 0), Ordering::Release);
     }
     // The bounds the bits below and the protection runs read: the slot is
     // still free (`start` 0).
-    range.end.store(end, Ordering::Release);
+    range.end.store(end_of_mapping, Ordering::Release);
     range.alias.store(alias, Ordering::Release);
+    // The owner before the missing bit (the order [`Range`]'s doc gives).
+    for page in first..last {
+        range.set_owner(page, owner_of(ctx));
+    }
     for page in 0..pages {
         let b = resident[page as usize];
-        if b & 1 == 0 {
+        if b & 1 == 0 && part(page) {
             Range::set(&range.missing, page, true);
         }
         Range::set(&range.noread, page, b & 2 != 0);
         Range::set(&range.nowrite, page, b & 4 != 0);
     }
+    // A page outside the range that is not resident is no one's and holds
+    // no memory in a reserved section: pending in its record, as a page
+    // unregistered while missing is ([`release_missing`]), so its first
+    // access commits it, zeroed, with its protection, and charges it. In a
+    // section of committed memory it holds its zeros already.
+    let outside_missing = |page: u64| resident[page as usize] & 1 == 0 && !part(page);
+    if reserved {
+        let mut run: Option<u64> = None;
+        for page in 0..=pages {
+            match (page < pages && outside_missing(page), run) {
+                (true, None) => run = Some(page),
+                (false, Some(r)) => {
+                    #[allow(clippy::cast_possible_truncation)]
+                    crate::windows_mm::released_pend(record, alias as usize, (base + r * PAGE) as usize, ((page - r) * PAGE) as usize, |at| {
+                        range.prot((at as u64 - base) / PAGE)
+                    });
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+    }
     // The pages that hold memory get their protection back, in runs of one
-    // protection (the missing ones take it when they are filled, [`fill`]).
+    // protection (the missing ones take it when they are filled, [`fill`];
+    // those pending in the record at their first access).
     let mut held: Option<u64> = None;
     for page in 0..=pages {
-        let holds = page < pages && resident[page as usize] & 1 != 0;
+        let holds = page < pages && (resident[page as usize] & 1 != 0 || (!reserved && outside_missing(page)));
         match (holds, held) {
             (true, None) => held = Some(page),
             (false, Some(h)) => {
-                range.by_prot(start, start + h * PAGE, (page - h) * PAGE, |a, n, prot| {
+                range.by_prot(base, base + h * PAGE, (page - h) * PAGE, |a, n, prot| {
                     if prot == PAGE_READWRITE {
                         return;
                     }
@@ -2056,9 +2110,9 @@ fn register_range(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     }
     // Published: its bounds again, with `start` last, in the slot's window.
     range.changing(|| {
-        range.end.store(end, Ordering::Release);
+        range.end.store(end_of_mapping, Ordering::Release);
         range.alias.store(alias, Ordering::Release);
-        range.start.store(start, Ordering::SeqCst);
+        range.start.store(base, Ordering::SeqCst);
     });
     REGISTERED.fetch_add(1, Ordering::AcqRel);
     // Missing pages fault from now on (in a reserved section they are not
@@ -2068,7 +2122,7 @@ fn register_range(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         for_each_missing(start, len, |s, l| runs.push((s, l)));
         for (i, &(s, l)) in runs.iter().enumerate() {
             if let Err(e) = close_run(i, s, l) {
-                unregister_whole_at_a_failed_close(range, ctx, start, &runs);
+                unregister_whole_at_a_failed_close(range, ctx, base, &runs);
                 return Err(e);
             }
         }
@@ -4059,9 +4113,8 @@ mod tests {
     /// fill across both is `ENOENT`, where Linux merges the second vma with
     /// the first (`userfaultfd_register_range`, `vma_modify_flags_uffd`,
     /// fs/userfaultfd.c, v6.12) and fills across them. Each part fills on
-    /// its own. Two mappings here, as part of a mapping is not registered
-    /// on Windows (SECURITY.md, "Not at parity yet"); on Linux the two are
-    /// one vma.
+    /// its own. Two mappings here, each made a range of its own on Windows
+    /// (SECURITY.md, "Not at parity yet"); on Linux the two are one vma.
     #[test]
     fn test_two_adjacent_registers_are_two_ranges() {
         let (ctx, user) = create(0, false, true).unwrap();
@@ -11275,12 +11328,13 @@ mod tests {
         let (ctx, user) = create(0, false, true).unwrap();
         let mem = map(64 * 1024);
         assert_eq!(register(ctx, mem + 1, PAGE).unwrap_err().raw_os_error(), Some(crate::EINVAL));
-        // Not as Linux, which registers it (`test_part_of_a_mapping_is_registered`,
-        // ignored until it does): part of a mapping is `EINVAL`. The same
-        // range registered again with the same userfaultfd is a success that
-        // changes nothing, as Linux's (v6.12 mm/userfaultfd.c
-        // `userfaultfd_register_range` :1848 to :1853).
-        assert_eq!(register(ctx, mem, PAGE).unwrap_err().raw_os_error(), Some(crate::EINVAL));
+        // Part of a mapping registers, as Linux's
+        // (`test_part_of_a_mapping_is_registered`), and the whole of it after
+        // that with the same userfaultfd; the same range registered again
+        // with the same userfaultfd is a success that changes nothing, as
+        // Linux's (v6.12 mm/userfaultfd.c `userfaultfd_register_range` :1848
+        // to :1853).
+        register(ctx, mem, PAGE).unwrap();
         register(ctx, mem, 64 * 1024).unwrap();
         register(ctx, mem, 64 * 1024).unwrap();
         // A wake checks the range only (fs/userfaultfd.c, v6.1,
@@ -12334,9 +12388,11 @@ mod tests {
     /// Part of a mapping is registered, the rest left as it is, as Linux's
     /// register splits the vma at the range's edges (mm/userfaultfd.c, v6.12,
     /// `userfaultfd_register_range` :1825, `vma_modify_flags_uffd` at :1860).
-    /// The macOS backend's test of the same name. For both kinds.
+    /// The macOS backend's test of the same name. For both kinds. Here the
+    /// register moves the whole mapping into its sections and registers the
+    /// part's pages only. Before, the register of the part was `EINVAL`: the
+    /// check "the register of part of a mapping" fails there.
     #[test]
-    #[ignore = "fails until part of a mapping is registered on Windows (docs/ARCHITECTURE.md, the Windows paragraph under Memory calls on registered memory: not yet)"]
     fn test_part_of_a_mapping_is_registered() {
         for kind in MEM_KINDS {
             let (a, ua) = create(0, false, true).unwrap();
@@ -12357,6 +12413,248 @@ mod tests {
             assert_eq!(zeropage(a, mem + PAGE, 2 * PAGE, true), Ok(2 * PAGE), "{kind}");
             assert_eq!(unregister(a, mem + PAGE, 2 * PAGE), Ok(()), "{kind}");
             release(a, ua);
+        }
+    }
+
+    /// Memory mapped with `MAP_FIXED` over part of a mapping (which keeps it
+    /// one mapping here, its pages committed again in place) registers, and
+    /// is the new memory: its pages missing and filled, the rest of the
+    /// mapping as it was, as Linux's `MAP_FIXED` makes a vma of its own that
+    /// the register takes (mm/mmap.c, v6.12, `mmap_region`). For both kinds.
+    /// Before, the register was `EINVAL`: the check "the register of the
+    /// memory mapped over part of a mapping" fails there.
+    #[test]
+    fn test_memory_mapped_over_part_of_a_mapping_is_registered() {
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let mem = map_pages(kind, 8);
+            for p in 0..8 {
+                // SAFETY: the test's own read-write memory.
+                unsafe { ptr::write_volatile((mem + p * PAGE) as *mut u8, 1) };
+            }
+            assert_eq!(map_fixed(mem + 2 * PAGE, 2 * PAGE, crate::PROT_READ | crate::PROT_WRITE), mem + 2 * PAGE, "{kind}");
+            let r = register(a, mem + 2 * PAGE, 2 * PAGE);
+            assert!(r.is_ok(), "{kind}: the register of the memory mapped over part of a mapping: {r:?}");
+            assert!(is_missing(mem + 2 * PAGE) && is_missing(mem + 3 * PAGE), "{kind}: the new memory is not missing");
+            for p in [0, 1, 4, 5, 6, 7] {
+                assert!(!is_missing(mem + p * PAGE), "{kind}: page {p}, outside the range, is missing");
+                // SAFETY: a page outside the range, ordinary memory still.
+                assert_eq!(unsafe { ptr::read_volatile((mem + p * PAGE) as *const u8) }, 1, "{kind}: page {p}");
+            }
+            // SAFETY: a page.
+            assert_eq!(unsafe { copy(a, page_of(0x5a).as_ptr(), mem + 2 * PAGE, PAGE, true) }, Ok(PAGE), "{kind}");
+            assert_eq!(zeropage(a, mem + 3 * PAGE, PAGE, true), Ok(PAGE), "{kind}");
+            // SAFETY: filled above.
+            unsafe {
+                assert_eq!(ptr::read_volatile((mem + 2 * PAGE) as *const u8), 0x5a, "{kind}");
+                assert_eq!(ptr::read_volatile((mem + 3 * PAGE) as *const u8), 0, "{kind}");
+                ptr::write_volatile((mem + 7 * PAGE) as *mut u8, 2);
+                assert_eq!(ptr::read_volatile((mem + 7 * PAGE) as *const u8), 2, "{kind}");
+            }
+            release(a, ua);
+            assert_eq!(munmap_of(mem, 8 * PAGE), 0, "{kind}");
+        }
+    }
+
+    /// A register of part of a mapping charges what a register of the whole
+    /// mapping charges, at the mapping's start: its resident pages, inside
+    /// the range and out, each copied once into the sections (the move's
+    /// cost); a page outside the range that was not resident is committed
+    /// and charged at its first access, a fill inside it at the fill, as a
+    /// page of a range never filled is after an unregister
+    /// (`test_registered_memory_is_charged_as_it_is_filled`); the charge goes
+    /// with the mapping. For both kinds. Before, the register was `EINVAL`:
+    /// the check "the register of part of the mapping" fails there.
+    #[test]
+    fn test_a_part_registered_is_charged_as_the_whole_mapping_would_be() {
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let len = 64 * PAGE;
+            let mem = map_pages(kind, 64);
+            // SAFETY: the test's own read-write memory: pages 0 and 40,
+            // outside the range below, resident.
+            unsafe {
+                ptr::write_volatile(mem as *mut u8, 7);
+                ptr::write_volatile((mem + 40 * PAGE) as *mut u8, 9);
+            }
+            let r = register(a, mem + 8 * PAGE, 8 * PAGE);
+            assert!(r.is_ok(), "{kind}: the register of part of the mapping: {r:?}");
+            let charged = || crate::windows_mm::charged(mem as usize);
+            if find(mem).is_some_and(|(r, _)| r.reserved.load(Ordering::Acquire)) {
+                assert_eq!(charged(), Some(2 * PAGE as usize), "{kind}: charged at the registration");
+            }
+            assert_eq!(committed(mem, len), 2 * PAGE, "{kind}: committed at the registration");
+            // SAFETY: a page.
+            assert_eq!(unsafe { copy(a, page_of(0x5a).as_ptr(), mem + 8 * PAGE, PAGE, true) }, Ok(PAGE), "{kind}");
+            assert_eq!(committed(mem, len), 3 * PAGE, "{kind}: committed after a fill");
+            // SAFETY: page 20, outside the range and never touched: ordinary
+            // memory, zeros at its first read.
+            assert_eq!(unsafe { ptr::read_volatile((mem + 20 * PAGE) as *const u8) }, 0, "{kind}");
+            assert_eq!(committed(mem, len), 4 * PAGE, "{kind}: committed after a first access outside the range");
+            if find(mem).is_some_and(|(r, _)| r.reserved.load(Ordering::Acquire)) {
+                assert_eq!(charged(), Some(4 * PAGE as usize), "{kind}: charged after a fill and a first access");
+            }
+            // SAFETY: the resident pages outside the range, kept.
+            unsafe {
+                assert_eq!(ptr::read_volatile(mem as *const u8), 7, "{kind}");
+                assert_eq!(ptr::read_volatile((mem + 40 * PAGE) as *const u8), 9, "{kind}");
+            }
+            release(a, ua);
+            assert_eq!(munmap_of(mem, len), 0, "{kind}");
+            assert!(charged().is_none(), "{kind}: the charge outlived the mapping");
+        }
+    }
+
+    /// Parts of one mapping register as Linux's vmas of one mapping do: two
+    /// userfaultfds each on a part of its own; a register over both parts
+    /// is `EBUSY`, as Linux checks every vma first (fs/userfaultfd.c,
+    /// `userfaultfd_register` :1363 to :1366: a vma of another context); a fill through one into the
+    /// other's part is `ENOENT`; a second part of the same userfaultfd; an
+    /// unregister of part of a part leaves its page ordinary memory, which
+    /// registers again holding what was written to it; a released
+    /// userfaultfd's pages are ordinary memory after; the mapping's
+    /// `munmap` frees the range. For both kinds. Before, the first register
+    /// was `EINVAL`: the check "the register of a first part" fails there.
+    #[test]
+    fn test_parts_of_a_mapping_register_with_two_userfaultfds() {
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let (b, ub) = create(0, false, true).unwrap();
+            let mem = map_pages(kind, 8);
+            // SAFETY: the test's own read-write memory.
+            unsafe { ptr::write_volatile(mem as *mut u8, 7) };
+            let r = register(a, mem + PAGE, 2 * PAGE);
+            assert!(r.is_ok(), "{kind}: the register of a first part: {r:?}");
+            let r = register(b, mem + 4 * PAGE, 2 * PAGE);
+            assert!(r.is_ok(), "{kind}: another userfaultfd's register of another part: {r:?}");
+            assert!(is_missing(mem + 4 * PAGE) && is_missing(mem + 5 * PAGE), "{kind}: the other part is not missing");
+            assert!(range_of(b, mem + 4 * PAGE, 2 * PAGE).is_ok(), "{kind}: the other part is not the other userfaultfd's");
+            // SAFETY: a page.
+            assert_eq!(unsafe { copy(a, page_of(1).as_ptr(), mem + 4 * PAGE, PAGE, true) }.map_err(|e| e.0), Err(crate::ENOENT), "{kind}");
+            assert_eq!(register(a, mem + 2 * PAGE, 3 * PAGE).unwrap_err().raw_os_error(), Some(crate::EBUSY), "{kind}: over both parts");
+            let r = register(a, mem + 6 * PAGE, PAGE);
+            assert!(r.is_ok(), "{kind}: a second part: {r:?}");
+            assert!(is_missing(mem + 6 * PAGE), "{kind}: the second part is not missing");
+            assert_eq!(unregister(a, mem + 2 * PAGE, PAGE), Ok(()), "{kind}");
+            assert!(!is_missing(mem + 2 * PAGE) && is_missing(mem + PAGE), "{kind}: after the unregister of part of a part");
+            // SAFETY: ordinary memory now, zeros at its first access.
+            unsafe {
+                assert_eq!(ptr::read_volatile((mem + 2 * PAGE) as *const u8), 0, "{kind}");
+                ptr::write_volatile((mem + 2 * PAGE) as *mut u8, 3);
+            }
+            assert!(register(a, mem + 2 * PAGE, PAGE).is_ok(), "{kind}: the page registered again");
+            assert!(!is_missing(mem + 2 * PAGE), "{kind}: a page written since its unregister is missing");
+            // SAFETY: holds what was written.
+            assert_eq!(unsafe { ptr::read_volatile((mem + 2 * PAGE) as *const u8) }, 3, "{kind}");
+            release(b, ub);
+            assert!(!is_missing(mem + 4 * PAGE), "{kind}: a released userfaultfd's page is missing");
+            // SAFETY: ordinary memory now.
+            assert_eq!(unsafe { ptr::read_volatile((mem + 4 * PAGE) as *const u8) }, 0, "{kind}");
+            assert_eq!(zeropage(a, mem + PAGE, PAGE, true), Ok(PAGE), "{kind}");
+            // SAFETY: a page.
+            assert_eq!(unsafe { copy(a, page_of(0x5a).as_ptr(), mem + 6 * PAGE, PAGE, true) }, Ok(PAGE), "{kind}");
+            // SAFETY: filled, and pages outside every part.
+            unsafe {
+                assert_eq!(ptr::read_volatile((mem + 6 * PAGE) as *const u8), 0x5a, "{kind}");
+                assert_eq!(ptr::read_volatile(mem as *const u8), 7, "{kind}");
+                assert_eq!(ptr::read_volatile((mem + 7 * PAGE) as *const u8), 0, "{kind}");
+            }
+            release(a, ua);
+            assert_eq!(munmap_of(mem, 8 * PAGE), 0, "{kind}");
+            assert!(find(mem).is_none(), "{kind}: the range outlived its mapping");
+        }
+    }
+
+    /// A register of part of a mapping keeps what the rest of the mapping
+    /// holds out of the working set (a page trimmed to the pagefile, which
+    /// `QueryWorkingSetEx` does not count: here the move is told so for
+    /// pages 0 and 5, `windows_mm::OUT_OF_THE_WORKING_SET`, as a trim on the
+    /// runner is not certain): such a page outside the range is read once
+    /// and copied if it holds anything but zeros; one of zeros, or never
+    /// touched, reads zeros at its first access. Linux leaves the rest of
+    /// the split vma as it was, swapped pages included. The pages read are
+    /// the move's cost (MOVEREAD line). For both kinds. Before, the register
+    /// of the part was `EINVAL`: the check "the register of part of the
+    /// mapping" fails there.
+    #[test]
+    fn test_a_part_registered_keeps_the_rest_of_the_mapping_out_of_the_working_set() {
+        let (code, text, _) = run_child_in_jobs("rest_out_of_the_working_set_child", &[], &[]);
+        for l in text.lines().filter(|l| l.starts_with("MOVEREAD") || l.starts_with("WATCHDOG") || l.starts_with("wick:")) {
+            std::eprintln!("{l}");
+        }
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_part_registered_keeps_the_rest_of_the_mapping_out_of_the_working_set in a process of its own"]
+    fn rest_out_of_the_working_set_child() {
+        watchdog(60);
+        let mut c = Checks::new();
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let mem = map_pages(kind, 8);
+            // SAFETY: the test's own read-write memory: pages 0 and 5 hold
+            // data, page 6 zeros written, page 7 is never touched; the
+            // range is pages 2 and 3.
+            unsafe {
+                ptr::write_volatile(mem as *mut u8, 7);
+                ptr::write_volatile((mem + 5 * PAGE + 100) as *mut u8, 9);
+                ptr::write_volatile((mem + 6 * PAGE) as *mut u8, 0);
+            }
+            crate::windows_mm::OUT_OF_THE_WORKING_SET.lock().unwrap().extend([mem as usize, (mem + 5 * PAGE) as usize]);
+            let read_before = crate::windows_mm::PAGES_READ_AT_A_MOVE.load(Ordering::SeqCst);
+            let r = register(a, mem + 2 * PAGE, 2 * PAGE);
+            let read = crate::windows_mm::PAGES_READ_AT_A_MOVE.load(Ordering::SeqCst) - read_before;
+            std::println!("MOVEREAD {kind}: {read} pages outside the range read at the move, of 6");
+            c.check(r.is_ok(), std::format!("{kind}: the register of part of the mapping: {r:?}"));
+            c.check(read >= 2, std::format!("{kind}: {read} pages read, not the two out of the working set"));
+            c.check(is_missing(mem + 2 * PAGE) && is_missing(mem + 3 * PAGE), std::format!("{kind}: the range is not missing"));
+            // SAFETY: pages outside the range, ordinary memory still.
+            unsafe {
+                let p0 = ptr::read_volatile(mem as *const u8);
+                let p5 = ptr::read_volatile((mem + 5 * PAGE + 100) as *const u8);
+                c.check(p0 == 7 && p5 == 9, std::format!("{kind}: pages out of the working set lost their data: {p0}, {p5}"));
+                let p6 = ptr::read_volatile((mem + 6 * PAGE) as *const u8);
+                let p7 = ptr::read_volatile((mem + 7 * PAGE) as *const u8);
+                c.check(p6 == 0 && p7 == 0, std::format!("{kind}: pages of zeros read {p6}, {p7}"));
+            }
+            release(a, ua);
+            munmap_of(mem, 8 * PAGE);
+        }
+        c.done();
+    }
+
+    /// An `munmap` of the registered part of a mapping takes that part only:
+    /// the rest keeps what it held and takes writes, as Linux's `munmap` of
+    /// the registered vma leaves its neighbours; the range goes with the
+    /// last of the mapping. For both kinds. Before, the register was
+    /// `EINVAL`: the check "the register of part of the mapping" fails
+    /// there.
+    #[test]
+    fn test_an_munmap_of_a_registered_part_leaves_the_rest_of_the_mapping() {
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let mem = map_pages(kind, 4);
+            // SAFETY: the test's own read-write memory.
+            unsafe {
+                ptr::write_volatile(mem as *mut u8, 7);
+                ptr::write_volatile((mem + 3 * PAGE) as *mut u8, 8);
+            }
+            let r = register(a, mem + PAGE, 2 * PAGE);
+            assert!(r.is_ok(), "{kind}: the register of part of the mapping: {r:?}");
+            assert_eq!(munmap_of(mem + PAGE, 2 * PAGE), 0, "{kind}");
+            assert!(!is_missing(mem + PAGE), "{kind}: an unmapped page is missing");
+            // SAFETY: the pages outside the part, still mapped.
+            unsafe {
+                assert_eq!(ptr::read_volatile(mem as *const u8), 7, "{kind}");
+                assert_eq!(ptr::read_volatile((mem + 3 * PAGE) as *const u8), 8, "{kind}");
+                ptr::write_volatile((mem + 3 * PAGE) as *mut u8, 9);
+                assert_eq!(ptr::read_volatile((mem + 3 * PAGE) as *const u8), 9, "{kind}");
+            }
+            release(a, ua);
+            assert_eq!(munmap_of(mem, PAGE), 0, "{kind}");
+            assert_eq!(munmap_of(mem + 3 * PAGE, PAGE), 0, "{kind}");
+            assert!(find(mem).is_none(), "{kind}: the range outlived its mapping");
         }
     }
 

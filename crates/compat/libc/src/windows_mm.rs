@@ -3994,7 +3994,16 @@ fn spans_outside(s: usize, e: usize, done: &[(u64, u64)]) -> Vec<(usize, usize)>
 /// not in the working set, or a first touch of a lazy page, made a page
 /// that was taken as missing and not copied, and the write was lost
 /// (`test_a_write_made_as_a_register_starts_its_move_is_kept`).
-pub(crate) fn uffd_alias(start: usize, len: usize, pages: &mut [u8]) -> Result<(usize, bool), c_int> {
+///
+/// `part` is the registered range, `[part.0, part.1)` within the mapping:
+/// the rest of the mapping is in no registration, and must keep what it
+/// holds, as the rest of a vma Linux's register splits does. A page there
+/// that is committed and readable but not in the working set (trimmed from
+/// it, or never touched) is read, and taken as holding memory, so copied,
+/// unless it is all zeros ([`written_out_of_the_working_set`]); a page
+/// taken as not holding memory reads zeros at its first access, as both
+/// would.
+pub(crate) fn uffd_alias(start: usize, len: usize, pages: &mut [u8], part: (usize, usize)) -> Result<(usize, bool), c_int> {
     let mut t = table().lock().unwrap();
     match t.get(&start) {
         Some(r)
@@ -4011,6 +4020,16 @@ pub(crate) fn uffd_alias(start: usize, len: usize, pages: &mut [u8]) -> Result<(
         reopen_after_the_move(&narrowed);
         return Err(crate::ENOMEM);
     }
+    #[cfg(test)]
+    for at in OUT_OF_THE_WORKING_SET.lock().unwrap().drain(..) {
+        if at >= start && at < start + len {
+            pages[(at - start) / PAGE] &= !1;
+        }
+    }
+    written_out_of_the_working_set(start, pages, |page| {
+        let at = start + page * PAGE;
+        at < part.0 || at >= part.1
+    });
     let moved = uffd_alias_closed(&mut t, start, len, pages);
     // The private allocation is still there if the move failed before it
     // was given back; after, the table holds placeholders there.
@@ -4038,6 +4057,69 @@ fn release_for_the_move(start: usize, len: usize) -> bool {
     // SAFETY: gives the private allocation back as a placeholder.
     unsafe { VirtualFree(start as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0 }
 }
+
+/// The private anonymous mapping that holds all of `[start, start + len)`,
+/// as its start and length: the memory a register of that part moves into
+/// its sections whole ([`uffd_alias`] takes a whole mapping), as Linux's
+/// register splits the vma and leaves the rest of it as it was. `None` if
+/// the part is not inside one such mapping (two mappings, a view, a file's
+/// memory, a placeholder), which the register refuses as before.
+pub(crate) fn uffd_mapping_of(start: usize, len: usize) -> Option<(usize, usize)> {
+    let t = table().lock().unwrap();
+    let b = *overlapping(&t, start, start + len).first()?;
+    let r = &t[&b];
+    (b <= start && start + len <= b + r.len && matches!(r.kind, Kind::Private { file: None })).then_some((b, r.len))
+}
+
+/// Sets bit 0 of `pages[i]` (page `i` from `start`) for each page `which`
+/// picks that is not in the working set (bit 0 clear) but committed,
+/// readable (bit 1 clear, no `PAGE_GUARD`) and not all zeros: a page that
+/// holds data the working set does not show (trimmed to the pagefile or the
+/// standby list), which a read brings back. A page never touched reads as
+/// zeros, as does one whose data is zeros, and is left clear: either reads
+/// zeros at its next access. One read of each such page, counted for the
+/// tests ([`PAGES_READ_AT_A_MOVE`]); a page read is brought into the working
+/// set until the private allocation is given back. Under the region table's
+/// lock, with the mapping closed to writes ([`uffd_alias`]).
+fn written_out_of_the_working_set(start: usize, pages: &mut [u8], which: impl Fn(usize) -> bool) {
+    let end = start + pages.len() * PAGE;
+    let mut at = start;
+    while at < end {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            return;
+        }
+        let run_end = (mbi.BaseAddress as usize + mbi.RegionSize).min(end);
+        let readable = mbi.State == MEM_COMMIT && mbi.Protect & PAGE_GUARD == 0 && !matches!(mbi.Protect & 0xff, 0 | PAGE_NOACCESS | PAGE_EXECUTE);
+        if readable {
+            for a in (at..run_end).step_by(PAGE) {
+                let i = (a - start) / PAGE;
+                if pages[i] & 1 != 0 || pages[i] & 2 != 0 || !which(i) {
+                    continue;
+                }
+                #[cfg(test)]
+                PAGES_READ_AT_A_MOVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // SAFETY: a committed, readable page of our mapping.
+                let page = unsafe { std::slice::from_raw_parts(a as *const u64, PAGE / 8) };
+                if page.iter().any(|&w| w != 0) {
+                    pages[i] |= 1;
+                }
+            }
+        }
+        at = run_end;
+    }
+}
+
+/// Tests: pages [`uffd_alias`]'s next move takes as out of the working set
+/// whatever the query said (as trimmed to the pagefile), taken as it runs.
+#[cfg(test)]
+pub(crate) static OUT_OF_THE_WORKING_SET: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Tests: the pages [`written_out_of_the_working_set`] read.
+#[cfg(test)]
+pub(crate) static PAGES_READ_AT_A_MOVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Tests: a function run inside [`uffd_alias`] once the resident pages are
 /// copied and before the private allocation is given back (a write landing

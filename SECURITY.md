@@ -1539,13 +1539,23 @@ upstream Firecracker and its jailer.
   both pages then, failed: "a resident page is missing"). Firecracker registers guest memory it has just mapped
   (src/vmm/src/persist.rs `guest_memory_from_uffd`: `memory::anonymous`, then `register` of each region), so no
   page of it is resident and closed then.
-- **Windows: part of a mapping, and memory mapped over part of a registered one, are not registered.** A register
-  of part of a mapping is `EINVAL`, where Linux splits the vma (`test_part_of_a_mapping_is_registered`, ignored citing
-  this entry); `MAP_FIXED` over part of a registered mapping is `EINVAL`, where Linux maps it
+- **Windows: memory mapped over part of a registered mapping is not registered, and a range must lie in one
+  mapping.** `MAP_FIXED` over part of a registered mapping is `EINVAL`, where Linux maps it
   (`test_a_page_mapped_over_and_registered_again_is_filled_in_the_new_memory`, ignored citing this entry); a register
-  that overlaps a registered range without lying inside it, or holds a page of it that was unmapped or mapped over,
-  is `EBUSY`, where Linux registers the new vma: the register takes a whole private mapping, and a range is one
-  section with its alias, kept until all of its memory is unmapped. Memory registered once registers again, with any
+  that spans two mappings is `EINVAL`, and one that overlaps a registered range without lying inside it, or holds a
+  page of it that was unmapped or mapped over, is `EBUSY`, where Linux registers each vma: a range is one section
+  with its alias, made over one whole private mapping and kept until all of its memory is unmapped. Part of a
+  mapping is registered, as Linux's register splits the vma, since the commit that changed this entry: the register
+  moves the whole mapping into its sections and registers the part's pages only; the rest of the mapping is in no
+  registration and keeps what it holds, a page outside the working set included
+  (`test_part_of_a_mapping_is_registered`, `test_memory_mapped_over_part_of_a_mapping_is_registered`,
+  `test_a_part_registered_is_charged_as_the_whole_mapping_would_be`,
+  `test_parts_of_a_mapping_register_with_two_userfaultfds`,
+  `test_an_munmap_of_a_registered_part_leaves_the_rest_of_the_mapping`,
+  `test_a_part_registered_keeps_the_rest_of_the_mapping_out_of_the_working_set`; first run: CI). Its cost: one copy
+  of each page of the mapping that holds memory, and one read of each committed page outside the range that is not
+  in the working set. Inside the range a page outside the working set is still taken as missing (the entry on a
+  resident `PROT_NONE` page above has the same root; open). Memory registered once registers again, with any
   userfaultfd, after an unregister of any part of it or a release (an owner a page, the range's slot kept until its
   memory is unmapped: the `mem_backend: Uffd` row of docs/COMPATIBILITY.md, `test_memory_unregistered_whole_registers_again`,
   `test_memory_replaced_while_registered_registers_anew`; before, `EINVAL` on Windows Server 2022 20348 and 2025
