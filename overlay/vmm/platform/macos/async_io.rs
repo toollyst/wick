@@ -12,7 +12,8 @@
 //! - `submit` moves the queued operations to the job list of the process's
 //!   worker threads, which every queue shares;
 //! - a worker runs one `pread`, `pwrite` or `F_FULLFSYNC`, appends the result
-//!   to its queue's completion list and writes the completion [`EventFd`].
+//!   to its queue's completion list and writes the completion [`EventFd`],
+//!   before a waiter in `submit_and_wait_all` can see the operation done.
 //!
 //! The workers are the process's, not a queue's: a queue made after the
 //! sandbox has narrowed (the block device's new ring when a drive's file is
@@ -232,13 +233,18 @@ fn worker() {
             }
         };
         let res = execute(&shared.files, &job);
-        {
-            let mut state = shared.lock();
-            state.completions.push_back((res, job.key));
-            state.running -= 1;
-        }
-        shared.done.notify_all();
+        // Posted as io_uring posts a completion: the entry, where `pop`
+        // finds it, then the event, then the waiters (Linux v6.1
+        // io_uring/io_uring.c: `__io_cq_unlock_post` :590 to :596 commits the
+        // entry, then `io_cqring_ev_posted` :584 to :588 signals the eventfd,
+        // `io_commit_cqring_flush`, before `io_cqring_wake`). `running`,
+        // which `submit_and_wait_all` waits on, drops after the event, so
+        // the event is readable once it returns; before, a waiter could
+        // return and find it unread (`EAGAIN`).
+        shared.lock().completions.push_back((res, job.key));
         shared.notify_completion();
+        shared.lock().running -= 1;
+        shared.done.notify_all();
     }
 }
 
@@ -469,6 +475,61 @@ mod tests {
         assert_eq!(cqe.user_data(), 7);
         drop(q2);
         assert_eq!(pool().threads, threads);
+    }
+
+    /// The completion event is readable once `submit_and_wait_all` returns:
+    /// a worker writes it before the waiter can see the operation done.
+    /// Rounds of a write and the wait, with a thread spinning on every CPU so
+    /// that a worker is put off between its steps; nothing waits for time.
+    /// With the event written after the waiter was told, 331, 16 and 71 of
+    /// 2000 rounds found it unread on Windows Server 2022 20348, and 28, 274
+    /// and 25 on 2025 26100.
+    #[test]
+    fn test_the_completion_event_is_readable_once_submit_and_wait_all_returns() {
+        const ROUNDS: u32 = 2000;
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(4096).unwrap();
+        let evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut q: Queue<u32> = AsyncIo::new(4, vec![&file], vec![], Some(&evt)).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spinners: Vec<_> = (0..std::thread::available_parallelism().map_or(2, |n| n.get()))
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        let src = [0x5au8; 512];
+        let mut unreadable = 0;
+        for round in 0..ROUNDS {
+            q.push(Operation::write(0, src.as_ptr() as usize, 512, 0, round))
+                .unwrap();
+            assert_eq!(q.submit_and_wait_all().unwrap(), 1);
+            match evt.read() {
+                Ok(n) => assert!(n >= 1),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    unreadable += 1;
+                    // The worker's write comes: taken, so the next round
+                    // starts from an unread event of 0.
+                    while evt.read().is_err() {
+                        std::hint::spin_loop();
+                    }
+                }
+                Err(e) => panic!("round {round}: {e}"),
+            }
+            assert_eq!(q.pop().unwrap().map(|c| c.user_data()), Some(round));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for s in spinners {
+            s.join().unwrap();
+        }
+        println!(
+            "ASYNCEVT {unreadable} of {ROUNDS} rounds found the completion event unreadable once submit_and_wait_all returned"
+        );
+        assert_eq!(unreadable, 0);
     }
 
     #[test]

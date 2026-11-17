@@ -505,7 +505,12 @@ semantics on Win32. The details are in the comments of each
 
 - **`async_io`**: the same worker-thread queue as macOS, on the compatibility
   `libc` (`pread`, `pwrite`, `FlushFileBuffers`). It keeps io_uring's
-  submission/completion model, restrictions and queue limits.
+  submission/completion model, restrictions and queue limits. A worker
+  writes the completion event before a waiter in `submit_and_wait_all` can
+  see the operation done, as io_uring signals its eventfd before it wakes
+  its waiters, so the event is readable once the wait returns
+  (`test_the_completion_event_is_readable_once_submit_and_wait_all_returns`,
+  Windows Server 2022 20348 and 2025 26100).
 - **`fs`**: snapshot memory files are made sparse by `keep_holes`, and holes
   of unwritten ranges are restored. NTFS allocates sparse files in 64 KiB
   units, so after restoring it checks that unwritten ranges are holes again,
