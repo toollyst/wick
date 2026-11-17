@@ -43,7 +43,7 @@ impl Errno {
     pub const EEXIST: Errno = Errno(libc::EEXIST);
     /// Not found (not a registered range).
     pub const ENOENT: Errno = Errno(libc::ENOENT);
-    /// Busy (a range registered twice).
+    /// Busy (pages another userfaultfd has registered).
     pub const EBUSY: Errno = Errno(libc::EBUSY);
 
     /// The value of the last error of this thread.
@@ -863,9 +863,19 @@ mod tests {
         // Unaligned.
         let e = uffd.register(mem.wrapping_add(1).cast(), PAGE);
         assert!(matches!(e, Err(Error::SystemError(Errno::EINVAL))), "{e:?}");
-        uffd.register(mem.cast(), len).unwrap();
-        // Registered twice.
-        let e = uffd.register(mem.cast(), len);
+        let first = uffd.register(mem.cast(), len).unwrap();
+        // Registered again with the same userfaultfd: nothing to do, with the
+        // same ioctls, as Linux's register of a vma that context has
+        // already (v6.12 mm/userfaultfd.c `userfaultfd_register_range`
+        // :1848 to :1853); with another userfaultfd, EBUSY (v6.12
+        // fs/userfaultfd.c `userfaultfd_register` :1363 to :1366).
+        let again = uffd.register(mem.cast(), len);
+        assert_eq!(again.as_ref().ok(), Some(&first), "{again:?}");
+        let other = UffdBuilder::new().create().unwrap();
+        let e = other.register(mem.cast(), len);
+        assert!(matches!(e, Err(Error::SystemError(Errno::EBUSY))), "{e:?}");
+        // Part of the range too.
+        let e = other.register(mem.wrapping_add(PAGE).cast(), PAGE);
         assert!(matches!(e, Err(Error::SystemError(Errno::EBUSY))), "{e:?}");
     }
 }
