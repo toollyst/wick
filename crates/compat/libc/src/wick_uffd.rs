@@ -80,9 +80,13 @@
 //!   the waiters woken. A reader between sees a missing page that is
 //!   accessible: [`fault`] waits for the wake, or the access, retried, goes
 //!   through.
-//! - discard (`MADV_DONTNEED`, `MADV_FREE`): the pages are replaced, set
-//!   missing (owned pages only), and made `PROT_NONE`; a remove event goes
-//!   to each page's owner ([`vmas`]).
+//! - discard (`MADV_DONTNEED`, `MADV_FREE`): the fills of each userfaultfd
+//!   that will get a remove event are held ([`changing`]), then the pages
+//!   are replaced, set missing (owned pages only), and made `PROT_NONE`;
+//!   then, without the lock, a remove event goes to each page's owner
+//!   ([`vmas`]), each waited for until its reader has read it or the
+//!   userfaultfd is released ([`wait_read`]), as Linux's; then the fills
+//!   go on.
 //!
 //! An unregister takes any userfaultfd's pages in its range, whichever one
 //! it is made through, and wakes their waiters, as Linux 6.12's
@@ -121,7 +125,7 @@
 
 use core::ffi::c_int;
 use core::ptr;
-use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::boxed::Box;
 use std::io;
 use std::sync::{Mutex, Once};
@@ -469,6 +473,26 @@ struct Ctx {
     /// Threads using the mirror or the kernel end ([`enter`]): [`destroy`]
     /// unmaps and closes them once none is left.
     users: AtomicUsize,
+    /// Which userfaultfd the slot holds: raised by each [`create`], so that
+    /// a remove event computed for one is never posted to the next.
+    generation: AtomicU64,
+    /// Bytes of records [`post`] began to write to the kernel end, and bytes
+    /// it wrote: with what the reader has not read yet ([`unread`]), a
+    /// waiter knows when its record was read ([`wait_read`]).
+    posted: AtomicU64,
+    written: AtomicU64,
+    /// What the kernel end may send with nothing in flight, as its
+    /// `EVFILT_WRITE` reports it ([`unread`]).
+    send_buffer: AtomicU64,
+    /// Two kqueues on the kernel end, made with it (the run phase's sandbox
+    /// allows `kevent` and no new kqueue): a level `EVFILT_WRITE` that
+    /// [`unread`] reads, and one with `EV_CLEAR` that each read of the
+    /// reader's wakes ([`wait_read`]). -1: none.
+    query_kq: AtomicI32,
+    wake_kq: AtomicI32,
+    /// Remove events of this userfaultfd under way and not yet read: Linux's
+    /// `mmap_changing`, while which a fill is `EAGAIN` ([`changing`]).
+    changing: AtomicU32,
 }
 
 /// A thread waiting for a page.
@@ -492,6 +516,13 @@ static CTXS: [Ctx; MAX_CTX] = [const {
         mirror: AtomicPtr::new(ptr::null_mut()),
         mirror_fd: AtomicI32::new(-1),
         users: AtomicUsize::new(0),
+        generation: AtomicU64::new(0),
+        posted: AtomicU64::new(0),
+        written: AtomicU64::new(0),
+        send_buffer: AtomicU64::new(0),
+        query_kq: AtomicI32::new(-1),
+        wake_kq: AtomicI32::new(-1),
+        changing: AtomicU32::new(0),
     }
 }; MAX_CTX];
 static WAITERS: [Waiter; MAX_WAITERS] = [const {
@@ -991,10 +1022,15 @@ fn allows(prot: c_int, access: Access) -> bool {
 }
 
 fn post(ctx: usize, record: [u64; 4]) {
-    let fd = CTXS[ctx].fd.load(Ordering::Acquire);
+    let c = &CTXS[ctx];
+    let fd = c.fd.load(Ordering::Acquire);
     if fd < 0 {
         return;
     }
+    // Counted before the write and after it: a waiter's bound is read after
+    // its own write, so it covers every record before its own in the stream
+    // ([`wait_read`]).
+    c.posted.fetch_add(proto::RECORD as u64, Ordering::SeqCst);
     let mut bytes = [0u8; proto::RECORD];
     for (i, w) in record.iter().enumerate() {
         bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
@@ -1011,9 +1047,103 @@ fn post(ctx: usize, record: [u64; 4]) {
             // The handler side is gone: nobody will serve the fault.
             return;
         }
+        c.written.fetch_add(n as u64, Ordering::SeqCst);
         done += n as usize;
     }
 }
+
+/// What the kernel end may send now, from the level `EVFILT_WRITE` of
+/// kqueue `kq`: XNU's `filt_sowrite_common` gives the least of the sender's
+/// send space and the peer's receive space (bsd/kern/uipc_socket.c,
+/// xnu-12377.121.6, :6741 and :6801), and a Unix stream's sender loses send
+/// space for what the peer has not read and gets it back as the peer reads
+/// (bsd/kern/uipc_usrreq.c `uipc_send` :670 to :676, `uipc_rcvd` :469 to
+/// :470). Both buffers are 1 MiB and the low-water mark 1 byte ([`create`]),
+/// so the space is 1 MiB less what is unread, and no event means none.
+/// `None` when the reader's end is closed (`EV_EOF`) or the call fails.
+fn send_space(kq: c_int) -> Option<u64> {
+    // SAFETY: a zeroed kevent to receive one event.
+    let mut ev: libc::kevent = unsafe { core::mem::zeroed() };
+    let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: reads at most one event of the kqueue, without waiting.
+    match unsafe { libc::kevent(kq, ptr::null(), 0, &mut ev, 1, &now) } {
+        0 => Some(0),
+        1 if ev.flags & libc::EV_EOF == 0 => Some(u64::try_from(ev.data).unwrap_or(0)),
+        _ => None,
+    }
+}
+
+/// The bytes posted to userfaultfd `ctx` that its reader has not read, or
+/// more, never fewer: any other limit on the space ([`send_space`]) only
+/// makes it look smaller. `None` when the reader's end is closed. Called
+/// with the userfaultfd held ([`enter`]).
+fn unread(ctx: usize) -> Option<u64> {
+    let c = &CTXS[ctx];
+    let space = send_space(c.query_kq.load(Ordering::SeqCst))?;
+    Some(c.send_buffer.load(Ordering::SeqCst).saturating_sub(space))
+}
+
+/// Waits until the reader of userfaultfd `ctx` has read every byte posted to
+/// it up to `bound` (its record's end, [`post`]), or the userfaultfd is
+/// released, as Linux's `userfaultfd_event_wait_completion` waits until the
+/// event is read or the context released (fs/userfaultfd.c, v6.12, :543 to
+/// :608; `userfaultfd_ctx_read` completes it at the read, :1058): with no
+/// time limit, so a handler that never reads, while another descriptor of
+/// the userfaultfd is open (the VMM's own), keeps the caller waiting, as on
+/// Linux. The caller holds no lock. Each read wakes the wait: XNU's
+/// `uipc_rcvd` wakes the sender's writers (`sowakeup` of its `so_snd`,
+/// uipc_usrreq.c :472), a kqueue `EVFILT_WRITE` with `EV_CLEAR` here, and the
+/// readers' close (`EV_EOF`); the wait also looks again every 100 ms.
+fn wait_read(ctx: usize, generation: u64, bound: u64) {
+    let c = &CTXS[ctx];
+    loop {
+        if enter(ctx).is_none() {
+            break;
+        }
+        if c.generation.load(Ordering::SeqCst) != generation {
+            leave(ctx);
+            break;
+        }
+        // The count of bytes written is read before the count unread: a
+        // write between them only makes the bytes read look fewer.
+        let written = c.written.load(Ordering::SeqCst);
+        // The reader's end closed: every user descriptor is, so the release
+        // is under way.
+        let Some(read) = unread(ctx).map(|u| written.saturating_sub(u)) else {
+            leave(ctx);
+            break;
+        };
+        if read >= bound {
+            leave(ctx);
+            break;
+        }
+        // A read wakes it; it looks again every 100 ms all the same, as
+        // another waiter may have taken the wake. The userfaultfd stays held
+        // through the wait, so that its wake kqueue is not closed, nor its
+        // number given to another descriptor, under it: [`destroy`] closes it
+        // only once no thread holds it, and the readers' close, which starts
+        // the release, ends the wait at once (`EV_EOF`).
+        let timeout = libc::timespec { tv_sec: 0, tv_nsec: 100_000_000 };
+        // SAFETY: a zeroed kevent to receive one event.
+        let mut ev: libc::kevent = unsafe { core::mem::zeroed() };
+        // SAFETY: waits for one event of the userfaultfd's wake kqueue, held
+        // above.
+        unsafe { libc::kevent(c.wake_kq.load(Ordering::SeqCst), ptr::null(), 0, &mut ev, 1, &timeout) };
+        leave(ctx);
+    }
+}
+
+/// Whether a remove event of userfaultfd `ctx` is under way and unread:
+/// Linux's `mmap_changing`, which makes `UFFDIO_COPY` and `UFFDIO_ZEROPAGE`
+/// `EAGAIN`, with `-EAGAIN` in their count, before any other check
+/// (fs/userfaultfd.c, v6.12, :1588 to :1590, :1644 to :1646).
+fn changing(ctx: usize) -> bool {
+    CTXS[ctx].changing.load(Ordering::SeqCst) != 0
+}
+
+/// The reply of a fill refused for [`changing`]: `EAGAIN`, its count
+/// `-EAGAIN` (Linux's `put_user(ret, &...->copy)`, :1589).
+const CHANGING: (c_int, u64) = (libc::EAGAIN, (-(libc::EAGAIN as i64)) as u64);
 
 /// The mirror of userfaultfd `ctx`, held against its release until [`leave`];
 /// `None` if it has none (released). Async-signal-safe.
@@ -1675,6 +1805,43 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
             libc::fcntl(user, libc::F_SETFL, fl | libc::O_NONBLOCK);
         }
     }
+    // What a remove event's waiter counts unread bytes with ([`unread`]):
+    // the reader's receive buffer as large as the kernel end's send buffer,
+    // a low-water mark of 1 byte, and two kqueues on the kernel end, made
+    // now, as the run phase's sandbox makes none ([`Ctx`]). A process that
+    // cannot make them gets no userfaultfd, rather than one whose discards
+    // could not wait for their remove events.
+    // SAFETY: plain socket options and new kqueues.
+    let kqs = unsafe {
+        let low: c_int = 1;
+        libc::setsockopt(user, libc::SOL_SOCKET, libc::SO_RCVBUF, (&buf as *const c_int).cast(), 4);
+        libc::setsockopt(kernel, libc::SOL_SOCKET, libc::SO_SNDLOWAT, (&low as *const c_int).cast(), 4);
+        [libc::kqueue(), libc::kqueue()]
+    };
+    let watch = |kq: c_int, flags: u16| {
+        // SAFETY: a zeroed kevent, filled.
+        let mut ev: libc::kevent = unsafe { core::mem::zeroed() };
+        ev.ident = kernel as usize;
+        ev.filter = libc::EVFILT_WRITE;
+        ev.flags = libc::EV_ADD | flags;
+        // SAFETY: one change, no events asked.
+        kq >= 0 && unsafe { libc::kevent(kq, &ev, 1, ptr::null_mut(), 0, ptr::null()) } == 0
+    };
+    let send_buffer = (watch(kqs[0], 0) && watch(kqs[1], libc::EV_CLEAR))
+        .then(|| send_space(kqs[0]))
+        .flatten()
+        .filter(|&space| space > 0);
+    let Some(send_buffer) = send_buffer else {
+        let e = io::Error::last_os_error();
+        // SAFETY: closes the descriptors created above.
+        unsafe {
+            for fd in kqs.into_iter().chain([kernel, user]).filter(|&fd| fd >= 0) {
+                libc::close(fd);
+            }
+        }
+        drop_mirror(mirror, mirror_fd);
+        return Err(e);
+    };
     let _guard = lock();
     let Some(index) = CTXS.iter().position(|c| {
         c.fd.compare_exchange(-1, kernel, Ordering::AcqRel, Ordering::Acquire)
@@ -1682,15 +1849,24 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
     }) else {
         // SAFETY: closes the descriptors created above.
         unsafe {
-            libc::close(kernel);
-            libc::close(user);
+            for fd in kqs.into_iter().chain([kernel, user]) {
+                libc::close(fd);
+            }
         }
         drop_mirror(mirror, mirror_fd);
         return Err(errno_err(libc::EMFILE));
     };
-    CTXS[index].mirror_fd.store(mirror_fd, Ordering::SeqCst);
-    CTXS[index].mirror.store(mirror, Ordering::SeqCst);
-    CTXS[index].features.store(features, Ordering::Release);
+    let c = &CTXS[index];
+    c.generation.fetch_add(1, Ordering::SeqCst);
+    c.posted.store(0, Ordering::SeqCst);
+    c.written.store(0, Ordering::SeqCst);
+    c.send_buffer.store(send_buffer, Ordering::SeqCst);
+    c.query_kq.store(kqs[0], Ordering::SeqCst);
+    c.wake_kq.store(kqs[1], Ordering::SeqCst);
+    c.changing.store(0, Ordering::SeqCst);
+    c.mirror_fd.store(mirror_fd, Ordering::SeqCst);
+    c.mirror.store(mirror, Ordering::SeqCst);
+    c.features.store(features, Ordering::Release);
     std::thread::Builder::new()
         .name("userfaultfd".into())
         .spawn(move || serve(index, kernel))
@@ -1698,6 +1874,7 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
             let c = &CTXS[index];
             let (m, fd) = (c.mirror.swap(ptr::null_mut(), Ordering::SeqCst), c.mirror_fd.swap(-1, Ordering::SeqCst));
             drop_mirror(m, fd);
+            close_kqueues(c);
             c.fd.store(-1, Ordering::Release);
         })?;
     Ok((index, user))
@@ -2267,6 +2444,11 @@ fn fill(
     zero: bool,
     mut fill: impl FnMut(*mut u8, usize, usize),
 ) -> Result<u64, (c_int, u64)> {
+    // A remove event under way and unread: `EAGAIN` before anything else
+    // ([`changing`]; its count is the caller's to give).
+    if changing(ctx) {
+        return Err((libc::EAGAIN, 0));
+    }
     let _guard = lock();
     let range = range_of(ctx, dst, len).map_err(|e| (e, 0))?;
     // Linux's hugetlb has no zero page to map: `UFFDIO_ZEROPAGE` into a
@@ -2308,7 +2490,8 @@ fn fill(
     }
 }
 
-/// `UFFDIO_COPY`: fills missing pages from `dst` on with `src`.
+/// `UFFDIO_COPY`: fills missing pages from `dst` on with `src`. While a
+/// remove event of `ctx` is unread, [`CHANGING`] ([`changing`]).
 ///
 /// # Safety
 /// `src` must be readable for `len` bytes.
@@ -2323,15 +2506,25 @@ pub unsafe fn copy(
         // SAFETY: `to` is a view of missing pages; `src` per the contract.
         unsafe { ptr::copy_nonoverlapping(src, to, n) }
     })
+    .map_err(changing_count)
 }
 
 /// `UFFDIO_ZEROPAGE`: fills missing pages from `start` on with zeros. A
-/// range of `MAP_HUGETLB` memory is `EINVAL`, as Linux's hugetlb.
+/// range of `MAP_HUGETLB` memory is `EINVAL`, as Linux's hugetlb. While a
+/// remove event of `ctx` is unread, [`CHANGING`] ([`changing`]).
 pub fn zeropage(ctx: usize, start: u64, len: u64, wake_up: bool) -> Result<u64, (c_int, u64)> {
     fill(ctx, start, len, wake_up, true, |to, n, _| {
         // SAFETY: `to` is a view of missing pages.
         unsafe { ptr::write_bytes(to, 0, n) }
     })
+    .map_err(changing_count)
+}
+
+/// A fill's `EAGAIN` with nothing filled is [`changing`]'s: its count is
+/// `-EAGAIN`, as Linux writes it ([`CHANGING`]). A partial fill's `EAGAIN`
+/// keeps its count.
+fn changing_count(e: (c_int, u64)) -> (c_int, u64) {
+    if e == (libc::EAGAIN, 0) { CHANGING } else { e }
 }
 
 /// `UFFDIO_WAKE`.
@@ -2444,7 +2637,20 @@ pub fn discarding_or_refusing(
     if let Some(_unlocked) = unlocked_change(touches) {
         return discard(&mut done, &mut refused);
     }
-    let _guard = lock();
+    let guard = lock();
+    // The userfaultfds that may get a remove event: fills of theirs are
+    // `EAGAIN` from before the discard until their events are read
+    // ([`changing`]). Linux raises `mmap_changing` at the event, before it
+    // zaps the pages (`userfaultfd_remove`, fs/userfaultfd.c, v6.12, :783;
+    // mm/madvise.c `madvise_dontneed_free` :894), so no fill lands between
+    // the two; here the pages go first, so the count is raised before them.
+    let mut raised: Vec<(usize, u64)> = Vec::new();
+    for (ctx, _, _) in vmas(start, end) {
+        if CTXS[ctx].features.load(Ordering::Acquire) & FEATURE_EVENT_REMOVE != 0 && !raised.iter().any(|&(c, _)| c == ctx) {
+            CTXS[ctx].changing.fetch_add(1, Ordering::SeqCst);
+            raised.push((ctx, CTXS[ctx].generation.load(Ordering::SeqCst)));
+        }
+    }
     let mut runs = Vec::new();
     for_each_missing(start, len, |s, l| runs.push((s, l)));
     for &(s, l) in &runs {
@@ -2502,10 +2708,53 @@ pub fn discarding_or_refusing(
         events.extend(refused_event(a, b));
     }
     events.sort_by_key(|&(_, [_, at, _, _])| at);
-    for (ctx, event) in events {
+    // Each event is posted and read before the next, without the lock, as
+    // Linux's walk posts each vma's and waits for it to be read with the
+    // mmap lock dropped (`userfaultfd_remove` :785, then :793
+    // `userfaultfd_event_wait_completion`). A userfaultfd released since,
+    // and its slot taken by another, gets nothing.
+    drop(guard);
+    for (i, &(ctx, event)) in events.iter().enumerate() {
+        // Every event's userfaultfd was raised above: the owners of the pages
+        // the discard reached, read under the same hold of the lock.
+        let Some(&(_, generation)) = raised.iter().find(|&&(c, _)| c == ctx) else {
+            std::eprintln!("wick: userfaultfd: a remove event for {ctx}, whose fills were not held");
+            std::process::abort();
+        };
+        if enter(ctx).is_none() {
+            continue;
+        }
+        if CTXS[ctx].generation.load(Ordering::SeqCst) != generation {
+            leave(ctx);
+            continue;
+        }
         post(ctx, event);
+        let bound = CTXS[ctx].posted.load(Ordering::SeqCst);
+        leave(ctx);
+        wait_read(ctx, generation, bound);
+        // Its last event read: its fills go on.
+        if !events[i + 1..].iter().any(|&(c, _)| c == ctx) {
+            lower(ctx, generation);
+            raised.retain(|&(c, _)| c != ctx);
+        }
+    }
+    // Userfaultfds that got no event (the discard did not reach their pages).
+    for (ctx, generation) in raised {
+        lower(ctx, generation);
     }
     ret
+}
+
+/// Ends one [`changing`] raise of userfaultfd `ctx`, if it is still the one
+/// raised (`generation`); one released since needs none, and the next one
+/// in its slot starts at 0 ([`create`]).
+fn lower(ctx: usize, generation: u64) {
+    if enter(ctx).is_some() {
+        if CTXS[ctx].generation.load(Ordering::SeqCst) == generation {
+            CTXS[ctx].changing.fetch_sub(1, Ordering::SeqCst);
+        }
+        leave(ctx);
+    }
 }
 
 /// The remove event of a refused piece `[a, b)` (see
@@ -2702,10 +2951,22 @@ fn destroy(ctx: usize) {
     if !mirror.is_null() {
         drop_mirror(mirror, c.mirror_fd.swap(-1, Ordering::SeqCst));
     }
+    close_kqueues(c);
     let fd = c.fd.swap(-1, Ordering::AcqRel);
     if fd >= 0 {
         // SAFETY: the kernel end owned by the serving thread.
         unsafe { libc::close(fd) };
+    }
+}
+
+/// Closes the kqueues of a userfaultfd's slot ([`Ctx`]), once no thread
+/// holds it ([`enter`]).
+fn close_kqueues(c: &Ctx) {
+    for kq in [c.query_kq.swap(-1, Ordering::SeqCst), c.wake_kq.swap(-1, Ordering::SeqCst)] {
+        if kq >= 0 {
+            // SAFETY: a kqueue [`create`] made for this slot.
+            unsafe { libc::close(kq) };
+        }
     }
 }
 
@@ -2833,6 +3094,8 @@ fn recv_hello(fd: c_int) -> Option<Option<c_int>> {
 /// with the count copied.
 fn serve_copy(ctx: usize, fd: c_int, dst: u64, len: u64, mode: u64) -> Option<Result<u64, (c_int, u64)>> {
     let wake_up = mode & proto::MODE_DONTWAKE == 0;
+    // A remove event under way and unread comes first ([`changing`]).
+    let first = if changing(ctx) { Err(CHANGING) } else { Ok(()) };
     let range = validate_range(dst, len)
         .and_then(|_| match mode & !(proto::MODE_DONTWAKE | proto::MODE_WP) {
             0 => range_of(ctx, dst, len),
@@ -2842,7 +3105,7 @@ fn serve_copy(ctx: usize, fd: c_int, dst: u64, len: u64, mode: u64) -> Option<Re
     // Pieces of a mebibyte, or of the range's page when it is larger (a
     // huge page is filled whole).
     let piece = range.map_or(1 << 20, |r| r.page_size().max(1 << 20));
-    let mut result = range.map(|_| 0).map_err(|e| (e, 0));
+    let mut result = first.and_then(|()| range.map(|_| 0).map_err(|e| (e, 0)));
     let mut buf = Vec::new();
     let mut done = 0;
     while done < len {
@@ -2856,6 +3119,11 @@ fn serve_copy(ctx: usize, fd: c_int, dst: u64, len: u64, mode: u64) -> Option<Re
             // SAFETY: `buf` holds `n` bytes.
             result = match unsafe { copy(ctx, buf.as_ptr(), dst + done, n, wake_up) } {
                 Ok(m) => Ok(copied + m),
+                // A remove event began after a first piece: what was
+                // copied, as Linux's `mfill_atomic` stops at its second look
+                // at `mmap_changing` (mm/userfaultfd.c, v6.12, :746).
+                Err(CHANGING) if copied > 0 => Err((libc::EAGAIN, copied)),
+                Err(CHANGING) => Err(CHANGING),
                 Err((_, m)) if copied + m > 0 => Err((libc::EAGAIN, copied + m)),
                 Err(e) => Err(e),
             };
@@ -2885,6 +3153,7 @@ fn serve_request(ctx: usize, fd: c_int) -> bool {
         // than DONTWAKE, both `EINVAL` (fs/userfaultfd.c, v6.12, :1654 to
         // :1660), then the fill's own checks.
         proto::OP_ZEROPAGE => to_reply(match validate_range(a, b) {
+            _ if changing(ctx) => Err(CHANGING),
             Ok(_) if c & !proto::MODE_DONTWAKE != 0 => Err((libc::EINVAL, 0)),
             _ => zeropage(ctx, a, b, c & proto::MODE_DONTWAKE == 0),
         }),
@@ -5099,7 +5368,8 @@ mod tests {
 
     /// A userfaultfd's mirror is made with it and given back at its release:
     /// three times `MAX_CTX` userfaultfds made and released one after another
-    /// leave the process's descriptors and its count of mirrors as they were,
+    /// leave the process's descriptors (the kqueues of [`create`] included)
+    /// and its count of mirrors as they were,
     /// and each mirror's mapping is gone (`msync`: `ENOMEM`) once its
     /// release is done. In a process of its own, so that no other test's
     /// descriptors or mappings come and go meanwhile.
@@ -5116,7 +5386,11 @@ mod tests {
             let (ctx, user) = create(0, false, true).unwrap();
             let m = mirror(ctx).unwrap();
             assert_eq!(MIRRORS.load(Ordering::SeqCst), mirrors + 1, "round {round}");
-            assert_eq!(open(), fds + 3, "round {round}: the kernel end, the user end and the mirror's descriptor");
+            assert_eq!(
+                open(),
+                fds + 5,
+                "round {round}: the kernel end, the user end, the mirror's descriptor and the two kqueues of the kernel end's send space"
+            );
             close(&[user]);
             until("the release", || CTXS[ctx].fd.load(Ordering::SeqCst) < 0);
             // SAFETY: an asynchronous sync of one page, mapped or not:
@@ -5516,15 +5790,15 @@ mod tests {
         assert_eq!(zeropage(b, mem, ps, true), Err((libc::ENOENT, 0)));
         assert_eq!(zeropage(a, mem, ps, true), Ok(ps));
         assert_eq!(zeropage(b, mem + 2 * ps, ps, true), Ok(ps));
-        // SAFETY: the test's mapping.
-        let r = unsafe { crate::linux_items::madvise(mem as *mut _, (4 * ps) as usize, libc::MADV_DONTNEED) };
+        let (r, got) = reading(&[ua, ub], || {
+            // SAFETY: the test's mapping.
+            unsafe { crate::linux_items::madvise(mem as *mut _, (4 * ps) as usize, libc::MADV_DONTNEED) }
+        });
         assert_eq!(r, 0);
-        let mut rec = [0u8; proto::RECORD];
-        assert!(readable(ua) && read_full(ua, &mut rec), "no remove event for the first part");
-        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem, mem + 2 * ps]);
-        assert!(readable(ub) && read_full(ub, &mut rec), "no remove event for the second part");
-        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem + 2 * ps, mem + 4 * ps]);
-        assert!(nothing_to_read(ua) && nothing_to_read(ub), "a second event");
+        assert_eq!(got[0].len(), 1, "the first part's events: {:x?}", got[0]);
+        assert_eq!(got[0][0][..3], [proto::EVENT_REMOVE, mem, mem + 2 * ps]);
+        assert_eq!(got[1].len(), 1, "the second part's events: {:x?}", got[1]);
+        assert_eq!(got[1][0][..3], [proto::EVENT_REMOVE, mem + 2 * ps, mem + 4 * ps]);
         assert!((0..4).all(|page| is_missing(mem + page * ps)));
         close(&[ua]);
         // The release is the serving thread's, once it sees the close.
@@ -6602,12 +6876,13 @@ mod tests {
         mprotect(unplugged, slot_len, RW);
         read_through_the_handler(unplugged + 3 * ps, 0x62);
         // Unplug: discarded, then closed; its pages missing again.
-        // SAFETY: registered memory of the test's.
-        let r = unsafe { crate::linux_items::madvise(unplugged as *mut _, slot_len as usize, libc::MADV_DONTNEED) };
+        let (r, got) = reading(&[user], || {
+            // SAFETY: registered memory of the test's.
+            unsafe { crate::linux_items::madvise(unplugged as *mut _, slot_len as usize, libc::MADV_DONTNEED) }
+        });
         assert_eq!(r, 0);
-        let mut removed = [0u8; proto::RECORD];
-        assert!(read_full(user, &mut removed));
-        assert_eq!(words(&removed)[..3], [proto::EVENT_REMOVE, unplugged, unplugged + slot_len]);
+        assert_eq!(got[0].len(), 1, "{:x?}", got[0]);
+        assert_eq!(got[0][0][..3], [proto::EVENT_REMOVE, unplugged, unplugged + slot_len]);
         mprotect(unplugged, slot_len, libc::PROT_NONE);
         assert!(is_missing(unplugged + 3 * ps));
         // Plugged again: a fault to the handler again.
@@ -6683,9 +6958,12 @@ mod tests {
         // SAFETY: `data` holds a page.
         assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
         mprotect(mem, 2 * ps, libc::PROT_NONE);
-        // SAFETY: the test's mapping.
-        let r = unsafe { crate::linux_items::madvise(mem as *mut _, (2 * ps) as usize, libc::MADV_DONTNEED) };
+        let (r, got) = reading(&[ua], || {
+            // SAFETY: the test's mapping.
+            unsafe { crate::linux_items::madvise(mem as *mut _, (2 * ps) as usize, libc::MADV_DONTNEED) }
+        });
         assert_eq!(r, 0);
+        assert_eq!(got[0].len(), 1, "{:x?}", got[0]);
         assert!(is_missing(mem) && is_missing(mem + ps));
         mprotect(mem, 2 * ps, RW);
         // SAFETY: `data` holds a page.
@@ -6861,14 +7139,15 @@ mod tests {
         let data = std::vec![0x5au8; 2 * ps as usize];
         // SAFETY: `data` holds two pages.
         assert_eq!(unsafe { copy(a, data.as_ptr(), mem, 2 * ps, true) }, Ok(2 * ps));
-        // SAFETY: the test's mapping.
-        let r = unsafe { crate::linux_items::madvise(mem as *mut _, (3 * ps) as usize, libc::MADV_FREE) };
-        assert_eq!((r, io::Error::last_os_error().raw_os_error()), (-1, Some(libc::EINVAL)));
-        let mut rec = [0u8; proto::RECORD];
-        assert!(readable(ua) && read_full(ua, &mut rec), "no event");
-        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem, mem + ps], "the private page's event");
-        assert!(readable(ua) && read_full(ua, &mut rec), "no event for the refused shared pages");
-        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem + ps, mem + 3 * ps], "the shared pages' event");
+        let (r, got) = reading(&[ua], || {
+            // SAFETY: the test's mapping.
+            let r = unsafe { crate::linux_items::madvise(mem as *mut _, (3 * ps) as usize, libc::MADV_FREE) };
+            (r, io::Error::last_os_error().raw_os_error())
+        });
+        assert_eq!(r, (-1, Some(libc::EINVAL)));
+        assert_eq!(got[0].len(), 2, "{:x?}", got[0]);
+        assert_eq!(got[0][0][..3], [proto::EVENT_REMOVE, mem, mem + ps], "the private page's event");
+        assert_eq!(got[0][1][..3], [proto::EVENT_REMOVE, mem + ps, mem + 3 * ps], "the shared pages' event");
         assert!(is_missing(mem), "the private page was not freed");
         assert!(!is_missing(mem + ps), "the refused shared page was discarded");
         // SAFETY: present, as before the call.
@@ -6900,6 +7179,175 @@ mod tests {
         unsafe { libc::poll(&mut p, 1, 200) == 0 }
     }
 
+    /// Runs `f`, a discard of registered memory, while a thread for each of
+    /// `users` reads its records: a discard waits until each remove event
+    /// it posts is read, as Linux's (`wait_read`), so a test that discards
+    /// and then reads on one thread would wait for ever, as it would on
+    /// Linux. Returns `f`'s result and the records each read, in order.
+    fn reading<R>(users: &[c_int], f: impl FnOnce() -> R) -> (R, Vec<Vec<[u64; 4]>>) {
+        let stop = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = users
+            .iter()
+            .map(|&fd| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut got = Vec::new();
+                    loop {
+                        let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                        // SAFETY: one pollfd.
+                        let n = unsafe { libc::poll(&mut p, 1, 20) };
+                        if n == 1 {
+                            let mut rec = [0u8; proto::RECORD];
+                            if !read_full(fd, &mut rec) {
+                                break;
+                            }
+                            got.push(words(&rec));
+                        } else if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                    got
+                })
+            })
+            .collect();
+        let r = f();
+        stop.store(true, Ordering::SeqCst);
+        (r, readers.into_iter().map(|h| h.join().unwrap()).collect())
+    }
+
+    /// The bytes posted to a userfaultfd that its reader has not read: the
+    /// kernel end's send space, as its level `EVFILT_WRITE` reports it,
+    /// falls by each record written and rises by each byte read, up to more
+    /// than 1 MiB unread less a record; with the reader's end closed, none.
+    #[test]
+    fn test_unread_counts_what_the_reader_has_not_read() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        assert_eq!(unread(ctx), Some(0));
+        let rec = [proto::EVENT_REMOVE, 1, 2, 0];
+        post(ctx, rec);
+        assert_eq!(unread(ctx), Some(32));
+        post(ctx, rec);
+        post(ctx, rec);
+        assert_eq!(unread(ctx), Some(96));
+        let mut buf = [0u8; 50];
+        assert!(read_full(user, &mut buf));
+        assert_eq!(unread(ctx), Some(46));
+        let mut rest = [0u8; 46];
+        assert!(read_full(user, &mut rest));
+        assert_eq!(unread(ctx), Some(0));
+        assert_eq!(CTXS[ctx].written.load(Ordering::SeqCst), 96);
+        // Many records, as faults would post them: counted to the byte.
+        let n = (1 << 20) / proto::RECORD as u64 - 1;
+        for _ in 0..n {
+            post(ctx, rec);
+        }
+        assert_eq!(unread(ctx), Some(n * proto::RECORD as u64));
+        let mut drain = std::vec![0u8; (n * proto::RECORD as u64) as usize];
+        assert!(read_full(user, &mut drain));
+        assert_eq!(unread(ctx), Some(0));
+        // SAFETY: the user end's own copy, closed below; the slot stays held
+        // until the serving thread sees the close.
+        let user_copy = unsafe { libc::dup(user) };
+        assert!(enter(ctx).is_some());
+        close(&[user, user_copy]);
+        assert_eq!(unread(ctx), None, "the reader's end closed");
+        leave(ctx);
+    }
+
+    /// A discard waits until its remove event is read, and while it is unread
+    /// a fill of that userfaultfd is `EAGAIN` with `-EAGAIN` as its count,
+    /// before any other check, as Linux's `mmap_changing` makes it
+    /// (fs/userfaultfd.c, v6.12: `userfaultfd_remove` :783,
+    /// `userfaultfd_event_wait_completion` :543 to :608, `userfaultfd_copy`
+    /// :1588 to :1590, `userfaultfd_zeropage` :1644 to :1646); a wake is not
+    /// held. A refused copy's data is read all the same. Once the event is
+    /// read the discard returns and fills go on. A userfaultfd that did not
+    /// ask for remove events gets none and its discards do not wait.
+    #[test]
+    fn test_a_discard_waits_until_its_remove_event_is_read() {
+        let (ctx, user) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(2);
+        register(ctx, mem, 2 * ps).unwrap();
+        let page = std::vec![9u8; ps as usize];
+        // SAFETY: `page` holds a page.
+        assert_eq!(unsafe { copy(ctx, page.as_ptr(), mem, ps, true) }, Ok(ps));
+        let chan = channel(user);
+        // SAFETY: registered memory of the test's.
+        let discard = std::thread::spawn(move || unsafe { crate::linux_items::madvise(mem as *mut _, ps as usize, libc::MADV_DONTNEED) });
+        assert!(readable(user), "no remove event");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!discard.is_finished(), "the discard returned before its event was read");
+        assert!(is_missing(mem), "the discarded page is not missing");
+        let again = (err(libc::EAGAIN), (-(libc::EAGAIN as i64)) as u64);
+        for head in [
+            [proto::OP_COPY, mem, ps, 0],
+            [proto::OP_COPY, mem + 8, ps, 0],
+            [proto::OP_COPY, mem + ps, ps, 1 << 9],
+        ] {
+            assert_eq!(request(chan, head, &page), again, "{head:x?}");
+        }
+        for head in [[proto::OP_ZEROPAGE, mem, ps, 0], [proto::OP_ZEROPAGE, 0, 0, 1 << 9]] {
+            assert_eq!(request(chan, head, &[]), again, "{head:x?}");
+        }
+        // SAFETY: `page` holds a page.
+        assert_eq!(unsafe { copy(ctx, page.as_ptr(), mem + ps, ps, true) }, Err(CHANGING));
+        assert_eq!(zeropage(ctx, mem + ps, ps, true), Err(CHANGING));
+        assert_eq!(request(chan, [proto::OP_WAKE, mem, ps, 0], &[]), (0, 0), "a wake is not held");
+        assert!(is_missing(mem + ps), "a held fill filled a page");
+        let mut rec = [0u8; proto::RECORD];
+        assert!(read_full(user, &mut rec));
+        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem, mem + ps]);
+        let until = Instant::now() + Duration::from_secs(5);
+        while !discard.is_finished() {
+            assert!(Instant::now() < until, "the discard did not return in 5 s after its event was read");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(discard.join().unwrap(), 0);
+        assert_eq!(request(chan, [proto::OP_COPY, mem, ps, 0], &page), (ps as i64, ps));
+        assert_eq!(zeropage(ctx, mem + ps, ps, true), Ok(ps));
+        // No remove events asked: no event, no wait, on this one thread.
+        let (b, ub) = create(0, false, true).unwrap();
+        let other = map(1);
+        register(b, other, ps).unwrap();
+        // SAFETY: registered memory of the test's.
+        assert_eq!(unsafe { crate::linux_items::madvise(other as *mut _, ps as usize, libc::MADV_DONTNEED) }, 0);
+        assert!(nothing_to_read(ub));
+        assert_eq!(zeropage(b, other, ps, true), Ok(ps));
+        assert_eq!(unregister(ctx, mem, 2 * ps), Ok(()));
+        assert_eq!(unregister(b, other, ps), Ok(()));
+        close(&[chan, user, ub]);
+    }
+
+    /// A discard whose remove event is never read waits while any descriptor
+    /// of the userfaultfd is open, its reader's closed or not, and returns
+    /// at the release, as Linux's wait ends only at the read, the context's
+    /// release or a fatal signal (fs/userfaultfd.c, v6.12, :565 to :566).
+    /// Its fills, of a userfaultfd released, are nobody's.
+    #[test]
+    fn test_a_discard_waiting_for_its_event_ends_at_the_release() {
+        let (ctx, user) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(1);
+        register(ctx, mem, ps).unwrap();
+        // SAFETY: a descriptor of this test's.
+        let second = unsafe { libc::dup(user) };
+        // SAFETY: registered memory of the test's.
+        let discard = std::thread::spawn(move || unsafe { crate::linux_items::madvise(mem as *mut _, ps as usize, libc::MADV_DONTNEED) });
+        assert!(readable(user), "no remove event");
+        close(&[user]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!discard.is_finished(), "the discard returned with a descriptor of the userfaultfd open");
+        close(&[second]);
+        let until = Instant::now() + Duration::from_secs(10);
+        while !discard.is_finished() {
+            assert!(Instant::now() < until, "the discard did not return in 10 s after the release");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(discard.join().unwrap(), 0);
+        assert!(!is_missing(mem), "released memory is ordinary memory");
+    }
+
     /// `MADV_FREE` of shared memory whose two halves two userfaultfds have
     /// registered: `EINVAL`, and a remove event for the first half only, to
     /// its userfaultfd. Linux's walk of the vmas stops at the first error
@@ -6916,14 +7364,15 @@ mod tests {
         let mem = map_shared(4);
         register(a, mem, 2 * ps).unwrap();
         register(b, mem + 2 * ps, 2 * ps).unwrap();
-        // SAFETY: the test's mapping.
-        let r = unsafe { crate::linux_items::madvise(mem as *mut _, (4 * ps) as usize, libc::MADV_FREE) };
-        assert_eq!((r, io::Error::last_os_error().raw_os_error()), (-1, Some(libc::EINVAL)));
-        let mut rec = [0u8; proto::RECORD];
-        assert!(readable(ua) && read_full(ua, &mut rec), "no event for the first half");
-        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem, mem + 2 * ps]);
-        assert!(nothing_to_read(ua), "a second event for the first userfaultfd");
-        assert!(nothing_to_read(ub), "an event for the second half, which Linux's walk does not reach");
+        let (r, got) = reading(&[ua, ub], || {
+            // SAFETY: the test's mapping.
+            let r = unsafe { crate::linux_items::madvise(mem as *mut _, (4 * ps) as usize, libc::MADV_FREE) };
+            (r, io::Error::last_os_error().raw_os_error())
+        });
+        assert_eq!(r, (-1, Some(libc::EINVAL)));
+        assert_eq!(got[0].len(), 1, "the first userfaultfd's events: {:x?}", got[0]);
+        assert_eq!(got[0][0][..3], [proto::EVENT_REMOVE, mem, mem + 2 * ps]);
+        assert!(got[1].is_empty(), "an event for the second half, which Linux's walk does not reach: {:x?}", got[1]);
         assert_eq!(unregister(a, mem, 2 * ps), Ok(()));
         assert_eq!(unregister(b, mem + 2 * ps, 2 * ps), Ok(()));
         close(&[ua, ub]);
@@ -7013,14 +7462,14 @@ mod tests {
         let mem = map(3);
         register(a, mem + 2 * ps, ps).unwrap();
         register(a, mem, ps).unwrap();
-        // SAFETY: the test's mapping.
-        let r = unsafe { crate::linux_items::madvise(mem as *mut _, (3 * ps) as usize, libc::MADV_DONTNEED) };
+        let (r, got) = reading(&[ua], || {
+            // SAFETY: the test's mapping.
+            unsafe { crate::linux_items::madvise(mem as *mut _, (3 * ps) as usize, libc::MADV_DONTNEED) }
+        });
         assert_eq!(r, 0);
-        let mut rec = [0u8; proto::RECORD];
-        assert!(readable(ua) && read_full(ua, &mut rec), "no event");
-        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem, mem + ps]);
-        assert!(readable(ua) && read_full(ua, &mut rec), "no second event");
-        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem + 2 * ps, mem + 3 * ps]);
+        assert_eq!(got[0].len(), 2, "{:x?}", got[0]);
+        assert_eq!(got[0][0][..3], [proto::EVENT_REMOVE, mem, mem + ps]);
+        assert_eq!(got[0][1][..3], [proto::EVENT_REMOVE, mem + 2 * ps, mem + 3 * ps]);
         assert_eq!(unregister(a, mem, 3 * ps), Ok(()));
         close(&[ua]);
     }
@@ -7040,18 +7489,18 @@ mod tests {
         let (a, ua) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
         let ps = test_page_size();
         let events = |mem: u64, len: u64| {
-            // SAFETY: the test's mapping.
-            let r = unsafe { crate::linux_items::madvise(mem as *mut _, len as usize, libc::MADV_DONTNEED) };
+            let (r, got) = reading(&[ua], || {
+                // SAFETY: the test's mapping.
+                unsafe { crate::linux_items::madvise(mem as *mut _, len as usize, libc::MADV_DONTNEED) }
+            });
             assert_eq!(r, 0);
-            let mut got = Vec::new();
-            let mut rec = [0u8; proto::RECORD];
-            while !nothing_to_read(ua) {
-                assert!(read_full(ua, &mut rec));
-                let w = words(&rec);
-                assert_eq!(w[0], proto::EVENT_REMOVE);
-                got.push((w[1] - mem, w[2] - mem));
-            }
-            got
+            got[0]
+                .iter()
+                .map(|w| {
+                    assert_eq!(w[0], proto::EVENT_REMOVE);
+                    (w[1] - mem, w[2] - mem)
+                })
+                .collect::<Vec<_>>()
         };
         // A page unregistered from the middle: two vmas registered, one not.
         let mem = map(4);

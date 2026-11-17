@@ -92,7 +92,7 @@
 #   snapshot-editor 6, utils 16, wick-ext 1, wick-version 2, compat-libc 30,
 #   compat-memfd 3, compat-std 1, compat-userfaultfd 5, compat-vmm-sys-util 26;
 #   counted again on 2026-11-18 by check-unit-tests.py for two of them:
-#   compat-libc 114 (1 ignored, the timed timed_a_copy_into_owned_memory),
+#   compat-libc 117 (1 ignored, the timed timed_a_copy_into_owned_memory),
 #   compat-userfaultfd 17 (1 ignored).
 #   No tests: log-instrument, log-instrument-macros, seccompiler,
 #   compat-event-manager, compat-kvm-bindings, compat-micro-http, compat-os,

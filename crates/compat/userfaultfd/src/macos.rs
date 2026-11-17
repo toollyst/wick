@@ -893,6 +893,7 @@ impl UffdBuilder {
 mod tests {
     use std::ptr;
     use std::thread;
+    use std::time::Duration;
 
     use super::*;
 
@@ -1005,18 +1006,26 @@ mod tests {
         unsafe { uffd.copy(src.as_ptr().cast(), mem.cast(), 4 * ps, true) }.unwrap();
         // SAFETY: present.
         assert_eq!(unsafe { ptr::read_volatile(mem.add(ps)) }, 1);
+        // The discard waits until its remove event is read, as Linux's
+        // (`userfaultfd_event_wait_completion`): on a thread of its own.
+        let at = mem as usize + ps;
         // SAFETY: pages of the mapping above.
-        assert_eq!(
-            unsafe { libc::madvise(mem.add(ps).cast(), 2 * ps, libc::MADV_DONTNEED) },
-            0
-        );
-        match uffd.read_event().unwrap() {
-            Some(Event::Remove { start, end }) => {
+        let discard = thread::spawn(move || unsafe { libc::madvise(at as *mut _, 2 * ps, libc::MADV_DONTNEED) });
+        let event = loop {
+            if let Some(event) = uffd.read_event().unwrap() {
+                break event;
+            }
+            assert!(!discard.is_finished(), "the discard returned before its event was read");
+            thread::sleep(Duration::from_millis(1));
+        };
+        match event {
+            Event::Remove { start, end } => {
                 assert_eq!(start as usize, mem as usize + ps);
                 assert_eq!(end as usize, mem as usize + 3 * ps);
             }
             other => panic!("{other:?}"),
         }
+        assert_eq!(discard.join().unwrap(), 0);
         // Missing again: refilled with new contents, the old ones are gone.
         let two = vec![2u8; 2 * ps];
         // SAFETY: two registered pages.
@@ -1046,18 +1055,26 @@ mod tests {
         let src = vec![1u8; 4 * ps];
         // SAFETY: four registered pages.
         unsafe { uffd.copy(src.as_ptr().cast(), mem.cast(), 4 * ps, true) }.unwrap();
+        // The discard waits until its remove event is read, as Linux's
+        // (`userfaultfd_event_wait_completion`): on a thread of its own.
+        let at = mem as usize + ps;
         // SAFETY: pages of the mapping above.
-        assert_eq!(
-            unsafe { libc::madvise(mem.add(ps).cast(), 2 * ps, libc::MADV_FREE) },
-            0
-        );
-        match uffd.read_event().unwrap() {
-            Some(Event::Remove { start, end }) => {
+        let discard = thread::spawn(move || unsafe { libc::madvise(at as *mut _, 2 * ps, libc::MADV_FREE) });
+        let event = loop {
+            if let Some(event) = uffd.read_event().unwrap() {
+                break event;
+            }
+            assert!(!discard.is_finished(), "the discard returned before its event was read");
+            thread::sleep(Duration::from_millis(1));
+        };
+        match event {
+            Event::Remove { start, end } => {
                 assert_eq!(start as usize, mem as usize + ps);
                 assert_eq!(end as usize, mem as usize + 3 * ps);
             }
             other => panic!("{other:?}"),
         }
+        assert_eq!(discard.join().unwrap(), 0);
         // Missing again: a copy fills them (it fails with EEXIST on a
         // present page).
         let two = vec![2u8; 2 * ps];

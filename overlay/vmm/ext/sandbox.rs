@@ -4120,6 +4120,19 @@ mod macos {
             let registered = map(libc::MAP_PRIVATE | libc::MAP_ANON, -1) as u64;
             let (ctx, user) = wick_uffd::create(wick_uffd::FEATURE_EVENT_REMOVE, false, true).unwrap();
             wick_uffd::register(ctx, registered, LEN as u64).unwrap();
+            // The handler: a thread started before the sandbox, as upstream's
+            // handler process is started apart from Firecracker, reading the
+            // remove events. A discard waits until its event is read, as
+            // Linux's, its wait under the run-phase profile (kevent).
+            let (events, received) = std::sync::mpsc::channel();
+            std::thread::spawn(move || loop {
+                let mut record = [0u8; proto::RECORD];
+                // SAFETY: reads one record into a local buffer.
+                let n = unsafe { libc::read(user, record.as_mut_ptr().cast(), proto::RECORD) };
+                if usize::try_from(n).ok() != Some(proto::RECORD) || events.send(record).is_err() {
+                    break;
+                }
+            });
             select(Policy::Default);
             apply().unwrap();
             narrow().unwrap();
@@ -4146,18 +4159,11 @@ mod macos {
                 // SAFETY: registered memory, filled.
                 let r = unsafe { libc::madvise(registered as *mut _, LEN, advice) };
                 assert_eq!(r, 0, "registered, advice {advice}: {:?}", errno());
-                // The remove event is written before madvise returns, so it
-                // is waited for at most 5 s: without it the child fails
-                // here, where a blocking read would hang it to CHILD_LIMIT.
-                let mut ready = libc::pollfd { fd: user, events: libc::POLLIN, revents: 0 };
-                // SAFETY: one pollfd, ours.
-                let polled = unsafe { libc::poll(&mut ready, 1, 5000) };
-                let why = if polled < 0 { format!(", errno {:?}", errno()) } else { String::new() };
-                assert_eq!(polled, 1, "registered, advice {advice}: no event in 5 s (poll returned {polled}{why})");
-                let mut record = [0u8; proto::RECORD];
-                // SAFETY: reads one record into a local buffer.
-                let n = unsafe { libc::read(user, record.as_mut_ptr().cast(), proto::RECORD) };
-                assert_eq!(usize::try_from(n).ok(), Some(proto::RECORD), "registered, advice {advice}: no event");
+                // The discard returned, so its event was read: the handler
+                // thread passes it on at once.
+                let record = received
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap_or_else(|e| panic!("registered, advice {advice}: no event: {e}"));
                 let word = |i: usize| u64::from_le_bytes(record[i * 8..i * 8 + 8].try_into().unwrap());
                 assert_eq!([word(0), word(1), word(2)], [proto::EVENT_REMOVE, registered, registered + LEN as u64]);
                 assert!(wick_uffd::is_missing(registered), "registered, advice {advice}");
