@@ -376,9 +376,12 @@ has the per-control details and results.
   - the VMM (firecracker.exe in the jailer's job): its pool threads run polling's wait callbacks
     (`RegisterWaitForSingleObject`, crates/compat/polling). Before the fix its stack filter passed an overflow on to
     vmm-sys-util's filter, which runs the SIGSEGV handler Firecracker registers, on the overflowed stack; whether a
-    jailed VMM kept running is not measured. The binary-level measurement is not run: needs WHP's DLLs (the PC);
-    the libc and vmm-sys-util code it runs is the tests' above.
-  - the API process: the same polling callbacks on pool threads. Not run: needs WHP's DLLs (the PC).
+    jailed VMM kept running is not measured. The binary-level measurement is not run: firecracker.exe did not start
+    on a host without the Windows Hypervisor Platform, such as the test VM it was tried on (`STATUS_DLL_NOT_FOUND`
+    before `main`: since 527070ed it imported `WHvAdviseGpaRange` at load time, which 03bc63bc loads at first use,
+    `test_no_whp_dll_is_imported_at_load_time`); it can run there now, and has not yet. The libc and vmm-sys-util
+    code it runs is the tests' above.
+  - the API process: the same polling callbacks on pool threads. Not run, for the same reason, and not yet since.
 
 - **Windows: a thread pool could keep an unjailed process running after one of its threads used up its stack**
   (since 50021416, which left the end out of a jail to Windows Error Reporting; fixed by the commit that adds this
@@ -685,6 +688,22 @@ has the per-control details and results.
   close; 15 of its checks failed on the code before, and the register again failed with the slot freed). A reopening
   that fails too ends the process with a line (`test_a_register_whose_reopening_fails_ends_the_process`). Linux's
   register changes no page's protection and has no such failure. Windows Server 2022 20348 and 2025 26100.
+- **Windows: a register that could not give a page holding memory its protection returned with the page more open
+  than `mprotect` made it** (from b0dfb35b, the Windows userfaultfd's start; found by reading, review of the fix
+  above, not observed). The section's view is mapped read-write and each run of pages that holds memory gets its
+  protection back before the range is published; a refusal (`VirtualProtect` on the process's own committed view,
+  which a guest does not reach: the VMM registers its memory at a restore, from its own code) gave the range back and
+  returned the error, leaving that run and the ones after it read-write where `mprotect` made them read-only or
+  inaccessible, and the memory one a later register refused with `EINVAL`; on a reserved section a missing page's
+  next access ended the process with an unhandled 0xC0000005 (the code before, 20348 and 26100). Now the process ends at the
+  refusal with a line naming the run, the protection it should have, the one it has and the error
+  (`test_a_register_that_cannot_protect_a_resident_page_ends_the_process`, through a hook that fails the run's
+  protection, both kinds of section; on the code before it returned the error with pages 2 and 3 at
+  `PAGE_READWRITE` for `PROT_READ`). Linux's register changes no page's protection and cannot fail so. Mapping the
+  view closed and opening each run after the copy would leave a refused run narrower, but it would put a
+  `VirtualProtect` on every run, read-write ones too, end the process later at an access with no line when one is
+  refused, and keep the resident pages closed and unregistered until the last opening, so it is not taken (the
+  register's doc). Windows Server 2022 20348 and 2025 26100.
 - **Windows: a guest access to guest RAM that the host refuses ended the VMM with an access violation, and a store to
   a read-only memory slot waited a million runs again or for ever** (found by reading, review of the WHP run loop's
   memory access exit; failing first in the decision's own shape: `test_a_ram_access_is_decided_in_kvms_order`, 11

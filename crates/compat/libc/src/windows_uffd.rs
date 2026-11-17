@@ -971,6 +971,19 @@ fn protect(addr: u64, len: u64, accessible: bool) -> io::Result<()> {
     protect_as(addr, len, if accessible { PAGE_READWRITE } else { PAGE_NOACCESS })
 }
 
+/// The protection of the page at `addr` now (`VirtualQuery`), 0 if it
+/// cannot be read.
+fn protection_at(addr: u64) -> PAGE_PROTECTION_FLAGS {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { VirtualQuery(addr as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+        return 0;
+    }
+    mbi.Protect
+}
+
 /// [`protect`] with the protection `prot`.
 fn protect_as(addr: u64, len: u64, prot: PAGE_PROTECTION_FLAGS) -> io::Result<()> {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
@@ -1239,6 +1252,26 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
 /// was unmapped or mapped over, is `EBUSY` too, where Linux registers the
 /// new vma (a stated difference: docs/COMPATIBILITY.md's uffd row).
 ///
+/// The section's view is mapped read-write (`windows_mm::uffd_alias`), and
+/// each run of pages that holds memory gets the protection `mprotect` gave
+/// it back before the range is published. A run that cannot get it (a
+/// `VirtualProtect` refusal on the process's own committed view; a guest
+/// does not reach it: the VMM registers its memory at a restore, from its
+/// own code) ends the process with a line naming the run, the protection it
+/// should have and the one it has, and the error
+/// (`test_a_register_that_cannot_protect_a_resident_page_ends_the_process`):
+/// returned from, the register would leave the run more open than
+/// `mprotect` made it, which no later call undoes. Linux's register changes
+/// no page's protection and cannot fail so. The order is not turned (the
+/// view mapped closed, each run opened to its protection after the copy,
+/// so that a refusal leaves a run narrower): every run that holds memory
+/// would need a `VirtualProtect`, read-write ones too, which need none now;
+/// a refused one would leave pages that hold memory closed and not missing,
+/// whose next access nothing resolves, so the process would end there,
+/// later and with no line; and the range's resident pages would be closed,
+/// unregistered, from the map to the last opening, where now they are open
+/// once mapped.
+///
 /// On a range not on a reserved section, the missing pages are closed once
 /// the range is published; a close that fails (`VirtualProtect` refused)
 /// returns its error with the range unregistered whole, as [`unregister`]
@@ -1382,18 +1415,22 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         match (holds, held) {
             (true, None) => held = Some(page),
             (false, Some(h)) => {
-                let mut failed = None;
                 range.by_prot(start, start + h * PAGE, (page - h) * PAGE, |a, n, prot| {
-                    if prot != PAGE_READWRITE && failed.is_none() {
-                        failed = protect_as(a, n, prot).err();
+                    if prot == PAGE_READWRITE {
+                        return;
+                    }
+                    #[cfg(test)]
+                    let given = if tests::PROTECTION_FAILS.load(Ordering::SeqCst) { Err(tests::refused()) } else { protect_as(a, n, prot) };
+                    #[cfg(not(test))]
+                    let given = protect_as(a, n, prot);
+                    if let Err(e) = given {
+                        std::eprintln!(
+                            "wick: userfaultfd: a register could not give its pages {a:#x}+{n:#x} the protection {prot:#x} mprotect gave them, which have {:#x} ({e}): they would stay more open than mprotect made them, so the process ends",
+                            protection_at(a)
+                        );
+                        std::process::abort();
                     }
                 });
-                if let Some(e) = failed {
-                    // Not yet published: the range is given back whole, as
-                    // the release gives it back.
-                    give_back(range, start, end);
-                    return Err(e);
-                }
                 held = None;
             }
             _ => {}
@@ -10811,6 +10848,67 @@ mod tests {
     /// section: the run of this number (from 1) fails, as if `VirtualProtect`
     /// had refused it; 0 for none.
     pub(super) static CLOSE_FAILS_AT: AtomicUsize = AtomicUsize::new(0);
+
+    /// [`register`]'s giving of a resident run its protection, before the
+    /// range is published, fails, as if `VirtualProtect` had refused it.
+    pub(super) static PROTECTION_FAILS: AtomicBool = AtomicBool::new(false);
+
+    /// A register that cannot give a page that holds memory the protection
+    /// `mprotect` gave it (the section's view is mapped read-write, and the
+    /// register gives each resident run its protection back before it
+    /// publishes the range) ends the process with a line: else the page
+    /// would stay readable and writable where `mprotect` made it read-only,
+    /// in memory the register said it did not take. Both kinds of section:
+    /// a reserved one (the exception handler's) and one that is not.
+    #[test]
+    fn test_a_register_that_cannot_protect_a_resident_page_ends_the_process() {
+        let mut failed = std::vec::Vec::new();
+        for kind in ["reserved", "unreserved"] {
+            let (code, text, _) = run_child_in_jobs("protection_fails_child", &[("WICK_UFFD_ALIAS", kind)], &[]);
+            for l in text.lines().filter(|l| l.starts_with("PROTFAIL") || l.starts_with("wick:") || l.starts_with("WATCHDOG")) {
+                std::eprintln!("{kind}: {l}");
+            }
+            let line = text.contains("wick: userfaultfd: a register could not give");
+            if !line || code == Some(0) || code == Some(3) {
+                failed.push(std::format!("{kind}: exit {code:x?}, the line {line}"));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_register_that_cannot_protect_a_resident_page_ends_the_process in processes of its own"]
+    fn protection_fails_child() {
+        const PAGES: u64 = 8;
+        watchdog(60);
+        if std::env::var("WICK_UFFD_ALIAS").as_deref() == Ok("unreserved") {
+            crate::windows_mm::UFFD_UNRESERVED.store(true, Ordering::SeqCst);
+        }
+        let (a, _ua) = create(0, false, true).unwrap();
+        let mem = map((PAGES * PAGE) as usize);
+        // Pages 0 to 3 hold memory, 2 and 3 read-only; 4 to 7 are missing.
+        for page in 0..4 {
+            // SAFETY: a page of the test's own mapping.
+            unsafe { ptr::write_volatile((mem + page * PAGE) as *mut u8, 0x40 + page as u8) };
+        }
+        mprotect_of(mem + 2 * PAGE, 2 * PAGE, crate::PROT_READ).unwrap();
+        PROTECTION_FAILS.store(true, Ordering::SeqCst);
+        let r = register(a, mem, PAGES * PAGE);
+        PROTECTION_FAILS.store(false, Ordering::SeqCst);
+        std::println!("PROTFAIL the register returned: {r:?}");
+        let states = states(mem, PAGES * PAGE);
+        for page in 0..PAGES {
+            let at = mem + page * PAGE;
+            let owner = find(at).and_then(|(r, p)| r.owner(p));
+            std::println!("PROTFAIL page {page}: missing {}, owner {owner:?}, state {:#x}, protection {:#x}", is_missing(at), states[page as usize].0, states[page as usize].1);
+        }
+        let again = register(a, mem, PAGES * PAGE);
+        std::println!("PROTFAIL the same memory registered again: {again:?}");
+        // Last: a read of a missing page, which may end the process.
+        // SAFETY: a page of the test's own mapping.
+        let b = unsafe { ptr::read_volatile((mem + 5 * PAGE) as *const u8) };
+        std::println!("PROTFAIL a missing page read: {b:#x}");
+    }
 
     /// [`register`], after a close failed: its reopening fails too.
     pub(super) static REOPEN_FAILS: AtomicBool = AtomicBool::new(false);

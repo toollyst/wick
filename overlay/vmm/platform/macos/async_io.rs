@@ -110,7 +110,9 @@ struct Job {
 #[derive(Debug, Default)]
 struct State {
     completions: VecDeque<(i32, usize)>,
-    /// Submitted operations whose completion is not on `completions` yet.
+    /// Submitted operations whose completion is not on `completions` yet,
+    /// and those whose completion is there but whose event a worker has not
+    /// written yet (it counts them until then: `worker`).
     running: u32,
 }
 
@@ -237,10 +239,14 @@ fn worker() {
         // finds it, then the event, then the waiters (Linux v6.1
         // io_uring/io_uring.c: `__io_cq_unlock_post` :590 to :596 commits the
         // entry, then `io_cqring_ev_posted` :584 to :588 signals the eventfd,
-        // `io_commit_cqring_flush`, before `io_cqring_wake`). `running`,
-        // which `submit_and_wait_all` waits on, drops after the event, so
-        // the event is readable once it returns; before, a waiter could
-        // return and find it unread (`EAGAIN`).
+        // `io_commit_cqring_flush`, before `io_cqring_wake`). io_uring's
+        // waiter returns without sleeping if the entries are there already
+        // (`io_cqring_wait` :2388, its check at :2408 to :2409), so on Linux a waiter
+        // on another thread can return between the commit and the eventfd's
+        // signal; this queue orders them strictly. `running`, which
+        // `submit_and_wait_all` waits on, drops after the event, so the
+        // event is readable once it returns; before, a waiter could return
+        // and find it unread (`EAGAIN`).
         shared.lock().completions.push_back((res, job.key));
         shared.notify_completion();
         shared.lock().running -= 1;
