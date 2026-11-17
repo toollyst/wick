@@ -140,7 +140,7 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, DETACHED_PROCESS,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
     LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -763,7 +763,7 @@ static READ_KEEPER_ENV: extern "C" fn() = read_keeper_env;
 /// signals no other process; every Windows jail already holds that (module
 /// documentation; `tools/windows/jailer-test.ps1` `pidns`): its token opens
 /// no other process or thread, a process snapshot shows it none, and it has
-/// a console of its own (`console`). What the flag changes is the jailer:
+/// no console (`console`). What the flag changes is the jailer:
 /// upstream clones Firecracker into the namespace, writes its pid to the
 /// pid file and exits 0 at once, while Firecracker runs on. Windows has no
 /// fork, so the jailer relaunches itself, the keeper, with the same
@@ -981,8 +981,6 @@ fn open_nul() -> io::Result<OwnedHandle> {
 /// Starts this jailer again with the same arguments but `--daemonize`,
 /// detached: no console, `NUL` for the standard handles, only those inherited.
 fn relaunch_detached() -> io::Result<std::convert::Infallible> {
-    use windows_sys::Win32::System::Threading::DETACHED_PROCESS;
-
     // The same command line without --daemonize: the relaunched jailer runs
     // the foreground path.
     let mut argv = vec![std::env::current_exe()?.to_string_lossy().into_owned()];
@@ -2192,13 +2190,20 @@ fn spawn_jailed(
     // SAFETY: plain data.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let no_sa: *const SECURITY_ATTRIBUTES = std::ptr::null();
-    // Firecracker has a console of its own, hidden: it is never attached to
-    // the jailer's (`console`), and its console setup does not fail when the
-    // jailer has none (daemonized).
+    // The jail's processes have no console at all (`DETACHED_PROCESS`): they
+    // are never attached to the jailer's (`console`), and a console of their
+    // own (`CREATE_NO_WINDOW`, before) made Windows start a console host,
+    // conhost.exe, on the jail's token, which held two read-write handles to
+    // `\Device\ConDrv` in each process and, under a token restricted to the
+    // jail's SID alone, failed the process's start with 0xC0000142 (it reads
+    // HKLM keys the jail is not granted; fix (i) step 1 on Windows Server
+    // 2022, docs/windows-jail-reach.md). Firecracker needs no console: its
+    // standard handles are the jailer's relay pipes or what the operator
+    // gave, and its terminal requests go to the jailer (`console`).
     let create_flags = CREATE_SUSPENDED
         | CREATE_UNICODE_ENVIRONMENT
         | EXTENDED_STARTUPINFO_PRESENT
-        | CREATE_NO_WINDOW;
+        | DETACHED_PROCESS;
     // SAFETY: NUL-terminated application path, command line, environment and
     // directory; the attribute list and tokens outlive the call.
     let created = unsafe {
@@ -3096,7 +3101,7 @@ mod tests {
     }
 
     pub(super) fn held_process() -> Held {
-        use windows_sys::Win32::System::Threading::{CreateProcessW, STARTUPINFOW};
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CreateProcessW, STARTUPINFOW};
         let exe = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("cmd.exe");
         let mut cmd = wide("cmd.exe");
         // SAFETY: plain data.

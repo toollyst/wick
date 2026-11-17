@@ -550,8 +550,9 @@ function Stage-Daemonize {
         Check (Test-Path $pidFile) 'no pid file'
         $written = [int](Get-Content $pidFile)
         Check ($written -eq $fcp.Id) "the pid file holds $written, Firecracker is $($fcp.Id)"
-        # It has no console window of its own.
+        # It has no console window, and no console at all.
         Check ($fcp.MainWindowHandle -eq 0) 'the detached Firecracker has a window'
+        $looked = Assert-NoConsole $root
         $answer = Invoke-Api $sock 'GET' '/'
         Check ($answer -match ' 200$') "the detached Firecracker's API: $answer"
         # Ending Firecracker lets its detached jailer exit cleanly and remove
@@ -559,8 +560,24 @@ function Stage-Daemonize {
         Stop-Alive $fcp
         $t = [DateTime]::Now.AddSeconds(5)
         while ((Get-Process jailer -ErrorAction SilentlyContinue) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
-        "the launcher returned 0 in $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s; a detached Firecracker (pid $written, in the pid file) ran with no console and answered its API"
+        "the launcher returned 0 in $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s; a detached Firecracker (pid $written, in the pid file) ran with no console (no console host for its $looked processes) and answered its API"
     } finally { Stop-Jailed }
+}
+
+# The jail's processes at `root` (Firecracker and its API process, `api`)
+# have no console: the jailer starts them with DETACHED_PROCESS, so no
+# console host (conhost.exe, which Windows starts as a child of the process
+# it serves) runs for them on the jail's token. Before, each had a hidden
+# console of its own (CREATE_NO_WINDOW) and a console host; under the jail's
+# SID alone that host failed the process's start with 0xC0000142. Returns
+# how many processes of the binary it looked at.
+function Assert-NoConsole([string]$root) {
+    $procs = @(Get-Process firecracker -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$root*" })
+    Check ($procs.Count -ge 1) "no process of the jail's binary under $root to look at for a console"
+    $ids = @($procs | ForEach-Object { $_.Id })
+    $hosts = @(Get-CimInstance Win32_Process -Filter "Name = 'conhost.exe'" | Where-Object { $ids -contains [int]$_.ParentProcessId })
+    Check ($hosts.Count -eq 0) "a console host runs for the jail's processes: $(@($hosts | ForEach-Object { "conhost.exe $($_.ProcessId) of $($_.ParentProcessId)" }) -join ', ')"
+    $procs.Count
 }
 
 # tools\windows\jail-probe.rs, built once (or -Probe).
@@ -1252,6 +1269,8 @@ function Stage-Pidns {
         $t = [DateTime]::Now.AddSeconds(10); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
         $answer = Invoke-Api $sock 'GET' '/'
         Check ($answer -match ' 200$') "--new-pid-ns: Firecracker's API: $answer"
+        # The keeper's Firecracker, on the operator's console, has none.
+        $looked = Assert-NoConsole $root
         # The same isolation with the flag.
         $r = Invoke-Jailer @('--id', 'nsprobe', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--new-pid-ns', '--', 'procs:0', 'signal:parent', "signal:$PID", 'wait:2') 20000
         Check ($r[0] -eq 0) "--new-pid-ns, the probe: the jailer exited $($r[0])"
@@ -1274,7 +1293,7 @@ function Stage-Pidns {
         Stop-Alive $fcp
         $t = [DateTime]::Now.AddSeconds(5)
         while ((Get-Process jailer -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $other.Jailer.Id }) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
-        "the control reaches every process ($($ctl.Count) checks); jailed, nothing ($($checks.Count) checks and a console control event: the user's process survives); the console's mode stays with API-only jails and is raw only once the jailed process asks, typed keys reach it through the relay as bytes, none reach an API-only jail, and the mode is back after ($($timeline -join '; ')); --new-pid-ns: the jailer returned 0 in $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s with Firecracker running (pid file), refused a jail it could not build; a pid's existence still shows ($oracle)"
+        "the control reaches every process ($($ctl.Count) checks); jailed, nothing ($($checks.Count) checks and a console control event: the user's process survives); the console's mode stays with API-only jails and is raw only once the jailed process asks, typed keys reach it through the relay as bytes, none reach an API-only jail, and the mode is back after ($($timeline -join '; ')); --new-pid-ns: the jailer returned 0 in $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s with Firecracker running (pid file) and no console host for its $looked processes, refused a jail it could not build; a pid's existence still shows ($oracle)"
     } finally {
         $victims | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
         [WickJailerTest.Term]::Flush()
@@ -1621,10 +1640,13 @@ function Stage-Boot {
         Check ($out -eq '42 2') "guest: '$out'"
         $fcp = Get-Process firecracker | Where-Object { $_.Path -like "$base*" } | Select-Object -First 1
         Check ($null -ne $fcp) 'no jailed Firecracker'
+        # A guest's serial console runs through the jailer's relay pipes;
+        # Firecracker itself has no console.
+        $looked = Assert-NoConsole $base
         $vm.Send('reboot -ff')
         Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after the guest rebooted'
         Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
-        "a 2 vCPU microVM boots in the jail (WHP under the restricted token) and the jailer exits 0 with it"
+        "a 2 vCPU microVM boots in the jail (WHP under the restricted token), its $looked processes with no console host, and the jailer exits 0 with it"
     } finally { Stop-Jailed }
 }
 

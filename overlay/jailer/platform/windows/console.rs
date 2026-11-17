@@ -11,7 +11,8 @@
 //! (measured: a jailed process ended a process of the user that way), and
 //! `WriteConsoleInput` on its input handle types into the console. So
 //! Firecracker is never attached to the jailer's console: it is started with
-//! a console of its own, hidden (`CREATE_NO_WINDOW`), and each of the
+//! no console at all (`DETACHED_PROCESS`; a console of its own would run a
+//! console host on the jail's token, `spawn_jailed`), and each of the
 //! jailer's standard handles that is a console is given to it as a pipe
 //! that the jailer relays: console input to Firecracker's standard input,
 //! its standard output and error (one pipe when both are the console, so
