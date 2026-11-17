@@ -81,6 +81,43 @@ fn unavailable(dll: Dll) -> HRESULT {
     hr
 }
 
+/// `WHvAdviseGpaRange` from `winhvplatform.dll`, loaded at first use.
+///
+/// # Safety
+/// As the Windows function.
+pub(crate) unsafe fn WHvAdviseGpaRange(
+    partition: WHV_PARTITION_HANDLE,
+    gparanges: *const WHV_MEMORY_RANGE_ENTRY,
+    gparangescount: u32,
+    advice: WHV_ADVISE_GPA_RANGE_CODE,
+    advicebuffer: *const core::ffi::c_void,
+    advicebuffersizeinbytes: u32,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(
+        WHV_PARTITION_HANDLE,
+        *const WHV_MEMORY_RANGE_ENTRY,
+        u32,
+        WHV_ADVISE_GPA_RANGE_CODE,
+        *const core::ffi::c_void,
+        u32,
+    ) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvAdviseGpaRange")) {
+        // SAFETY: the address of `WHvAdviseGpaRange`, whose signature `F` is.
+        Some(p) => unsafe {
+            std::mem::transmute::<usize, F>(p)(
+                partition,
+                gparanges,
+                gparangescount,
+                advice,
+                advicebuffer,
+                advicebuffersizeinbytes,
+            )
+        },
+        None => unavailable(Dll::Platform),
+    }
+}
+
 /// `WHvCancelRunVirtualProcessor` from `winhvplatform.dll`, loaded at first use.
 ///
 /// # Safety
@@ -845,5 +882,57 @@ pub(crate) unsafe fn WHvUpdateTriggerParameters(
         // SAFETY: the address of `WHvUpdateTriggerParameters`, whose signature `F` is.
         Some(p) => unsafe { std::mem::transmute::<usize, F>(p)(partition, parameters, triggerhandle) },
         None => unavailable(Dll::Platform),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The DLLs the PE image at `path` imports at load time, lower case.
+    fn imports(path: &std::path::Path) -> Vec<String> {
+        let b = std::fs::read(path).unwrap();
+        let u16_at = |o: usize| u16::from_le_bytes(b[o..o + 2].try_into().unwrap()) as usize;
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize;
+        let pe = u32_at(0x3c);
+        assert_eq!(&b[pe..pe + 4], b"PE\0\0");
+        let (sections, opt_len) = (u16_at(pe + 6), u16_at(pe + 20));
+        let opt = pe + 24;
+        assert_eq!(u16_at(opt), 0x20b, "a PE32+ image");
+        // The import directory: the second data directory of PE32+'s.
+        let import_rva = u32_at(opt + 120);
+        let table = opt + opt_len;
+        let offset_of = |rva: usize| {
+            (0..sections)
+                .map(|i| table + 40 * i)
+                .find_map(|h| {
+                    let (va, size, raw) = (u32_at(h + 12), u32_at(h + 8).max(u32_at(h + 16)), u32_at(h + 20));
+                    (rva >= va && rva < va + size).then(|| rva - va + raw)
+                })
+                .unwrap()
+        };
+        let mut out = Vec::new();
+        let mut d = offset_of(import_rva);
+        while u32_at(d + 12) != 0 {
+            let name = offset_of(u32_at(d + 12));
+            let end = b[name..].iter().position(|&c| c == 0).unwrap();
+            out.push(String::from_utf8_lossy(&b[name..name + end]).to_lowercase());
+            d += 20;
+        }
+        out
+    }
+
+    /// No WHP DLL is imported at load time: every function of them this
+    /// crate calls is loaded at its first use (this module), so a binary
+    /// that links the crate starts on a host without the Windows Hypervisor
+    /// Platform. A function called through the `windows-sys` declaration
+    /// this module re-exports links its DLL at load time, and the binary
+    /// ends with `STATUS_DLL_NOT_FOUND` before `main` there (the test binary
+    /// too, which then fails to start: the same failure).
+    #[test]
+    fn test_no_whp_dll_is_imported_at_load_time() {
+        let all = imports(&std::env::current_exe().unwrap());
+        println!("WHVIMPORTS {all:?}");
+        assert!(all.iter().any(|d| d == "kernel32.dll"), "{all:?}");
+        let whp: Vec<_> = all.iter().filter(|d| d.starts_with("winhv")).collect();
+        assert!(whp.is_empty(), "imported at load time: {whp:?}");
     }
 }
