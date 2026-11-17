@@ -12,7 +12,26 @@
 //!                         C:\w4\fsprobe-<pid>) must not exist and must be
 //!                         outside the user's profile
 //! fs-probe ea <dir>       EA and stream limits of the volume of <dir>
+//! fs-probe reach [<base>] what (b), the restricted token, reaches on the
+//!                         whole host, and opens by file id; as run, an
+//!                         elevated administrator, <base> (default
+//!                         C:\w4\fsreach-<pid>) new and outside the profile
+//! fs-probe devices [<base>] each device object, opened by its name and by
+//!                         a name beneath it, and TCP, under (b), LPAC and a
+//!                         plain AppContainer; as `reach`
 //! ```
+//!
+//! `reach` lists every named kernel object, named pipe, file and directory of
+//! the fixed volumes and registry key (HKLM and HKU) as the administrator,
+//! then a child under (b) (its initial token reverted, wick's mitigations, a
+//! Job) opens each with `MAXIMUM_ALLOWED` and writes what it reached; the run
+//! prints each with its security descriptor. Before that sweep the child
+//! opens files by id beneath the share's root handle and beneath the
+//! volume's, files the host moved out of the share among them, and walks
+//! each hard link's parents up to the share's root; the run renames the
+//! share's parent while the child holds the share's root (opened by path),
+//! the volume's root alone, a file of the share opened by id, the share's
+//! root opened by id, and a file opened by name beneath that.
 //!
 //! The run builds one share and one outside directory under `<base>`. It
 //! then starts this program again as a child under each confinement, one
@@ -116,7 +135,9 @@ struct SECURITY_ATTRIBUTES {
 }
 #[repr(C)]
 struct LUID_AND_ATTRIBUTES {
-    luid: u64,
+    // LUID is two DWORDs (4-byte aligned); a u64 here would put the entry
+    // at offset 8 of TOKEN_PRIVILEGES, where Windows reads it at 4.
+    luid: [u32; 2],
     attributes: u32,
 }
 #[repr(C)]
@@ -1239,6 +1260,8 @@ enum Who {
     Low,
     AppContainer { sid: PSID, caps: Vec<PSID>, lpac: bool },
     Restricted { primary: HANDLE, initial: HANDLE },
+    /// An LPAC made from the restricted token: both confinements at once.
+    RestrictedLpac { primary: HANDLE, initial: HANDLE, sid: PSID, caps: Vec<PSID> },
 }
 
 struct Started {
@@ -1255,7 +1278,12 @@ fn start(cmd: &str, cwd: &str, who: &Who, lua: HANDLE, low: HANDLE, inherit: &[H
     let mut sc = SECURITY_CAPABILITIES { sid: null_mut(), caps: null_mut(), count: 0, reserved: 0 };
     let opt_out: u32 = 1;
     let mut count = 1;
-    if let Who::AppContainer { sid, caps, lpac } = who {
+    let ac = match who {
+        Who::AppContainer { sid, caps, lpac } => Some((sid, caps, lpac)),
+        Who::RestrictedLpac { sid, caps, .. } => Some((sid, caps, &true)),
+        _ => None,
+    };
+    if let Some((sid, caps, lpac)) = ac {
         caps_sa = caps.iter().map(|&c| SID_AND_ATTRIBUTES { sid: c, attributes: 4 }).collect();
         sc = SECURITY_CAPABILITIES { sid: *sid, caps: caps_sa.as_mut_ptr(), count: caps_sa.len() as u32, reserved: 0 };
         count += 1 + u32::from(*lpac);
@@ -1269,7 +1297,7 @@ fn start(cmd: &str, cwd: &str, who: &Who, lua: HANDLE, low: HANDLE, inherit: &[H
     unsafe {
         assert!(InitializeProcThreadAttributeList(l, count, 0, &mut size) != 0);
         assert!(UpdateProcThreadAttribute(l, 0, 0x20002, inherit.as_ptr().cast(), inherit.len() * 8, null_mut(), null()) != 0);
-        if let Who::AppContainer { lpac, .. } = who {
+        if let Some((_, _, lpac)) = ac {
             assert!(UpdateProcThreadAttribute(l, 0, 0x20009, (&raw const sc).cast(), std::mem::size_of::<SECURITY_CAPABILITIES>(), null_mut(), null()) != 0);
             if *lpac {
                 assert!(UpdateProcThreadAttribute(l, 0, 0x2000F, (&raw const opt_out).cast(), 4, null_mut(), null()) != 0);
@@ -1292,7 +1320,7 @@ fn start(cmd: &str, cwd: &str, who: &Who, lua: HANDLE, low: HANDLE, inherit: &[H
     let token = match who {
         Who::Lua | Who::AppContainer { .. } => lua,
         Who::Low => low,
-        Who::Restricted { primary, .. } => *primary,
+        Who::Restricted { primary, .. } | Who::RestrictedLpac { primary, .. } => *primary,
     };
     // SAFETY: valid strings, structures and attribute list.
     let ok = unsafe { CreateProcessAsUserW(token, null(), c.as_mut_ptr(), null(), null(), 1, flags, null(), wide(cwd).as_ptr(), &si.si, &mut pi) };
@@ -1323,7 +1351,7 @@ fn start(cmd: &str, cwd: &str, who: &Who, lua: HANDLE, low: HANDLE, inherit: &[H
     } else {
         None
     };
-    if let Who::Restricted { initial, .. } = who {
+    if let Who::Restricted { initial, .. } | Who::RestrictedLpac { initial, .. } = who {
         // SAFETY: the suspended child's main thread and an impersonation token.
         if unsafe { SetThreadToken(&mut thread.0, *initial) } == 0 {
             let e = last();
@@ -1397,7 +1425,7 @@ fn enable_privilege(name: &str) -> bool {
         if LookupPrivilegeValueW(null(), wide(name).as_ptr(), &mut luid) == 0 {
             return false;
         }
-        let tp = TOKEN_PRIVILEGES1 { count: 1, privilege: LUID_AND_ATTRIBUTES { luid, attributes: 2 } };
+        let tp = TOKEN_PRIVILEGES1 { count: 1, privilege: LUID_AND_ATTRIBUTES { luid: [luid as u32, (luid >> 32) as u32], attributes: 2 } };
         AdjustTokenPrivileges(t.0, 0, &tp, std::mem::size_of::<TOKEN_PRIVILEGES1>() as u32, null_mut(), null_mut()) != 0 && GetLastError() == 0
     }
 }
@@ -1936,6 +1964,1070 @@ fn run(base: &str) {
     println!("cleanup {parent_dir} security {}", if parent_after == parent_before { "unchanged".to_string() } else { format!("CHANGED {parent_before} -> {parent_after}") });
 }
 
+// ----------------------------------------------------------------------------
+// `fs-probe reach`: what the chosen confinement, (b), reaches on the whole
+// host, and whether a server that holds no handle per node (a node is its
+// file id, reopened beneath one handle) stays confined and leaves the host's
+// renames alone (fs-q8-answers.md §M.6, "Handles the server holds").
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtOpenDirectoryObject(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES) -> i32;
+    fn NtQueryDirectoryObject(h: HANDLE, buf: *mut c_void, len: u32, single: u8, restart: u8, ctx: *mut u32, ret: *mut u32) -> i32;
+    fn NtOpenSymbolicLinkObject(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES) -> i32;
+    fn NtOpenEvent(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES) -> i32;
+    fn NtOpenMutant(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES) -> i32;
+    fn NtOpenSemaphore(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES) -> i32;
+    fn NtOpenSection(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES) -> i32;
+    fn NtOpenTimer(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES) -> i32;
+    fn NtOpenJobObject(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES) -> i32;
+    fn NtOpenKeyedEvent(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES) -> i32;
+    fn NtOpenKey(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES) -> i32;
+    fn NtOpenSession(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES) -> i32;
+    fn NtOpenPartition(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES) -> i32;
+    fn NtAlpcConnectPort(
+        h: *mut HANDLE,
+        name: *const UNICODE_STRING,
+        oa: *const OBJECT_ATTRIBUTES,
+        attrs: *const c_void,
+        flags: u32,
+        server_sid: PSID,
+        msg: *mut c_void,
+        len: *mut usize,
+        out_attrs: *mut c_void,
+        in_attrs: *mut c_void,
+        timeout: *const i64,
+    ) -> i32;
+    fn NtQueryObject(h: HANDLE, class: u32, buf: *mut c_void, len: u32, ret: *mut u32) -> i32;
+    fn NtQuerySecurityObject(h: HANDLE, info: u32, sd: *mut c_void, len: u32, needed: *mut u32) -> i32;
+    fn NtClose(h: HANDLE) -> i32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn SetEvent(h: HANDLE) -> i32;
+    fn CreateHardLinkW(link: *const u16, existing: *const u16, sa: *const c_void) -> i32;
+    fn GetLogicalDriveStringsW(len: u32, buf: *mut u16) -> u32;
+    fn GetDriveTypeW(root: *const u16) -> u32;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegEnumKeyExW(key: usize, i: u32, name: *mut u16, len: *mut u32, r: *mut u32, class: *mut u16, cl: *mut u32, t: *mut u64) -> i32;
+}
+
+const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+const READ_CONTROL: u32 = 0x2_0000;
+const WRITE_DAC: u32 = 0x4_0000;
+const FILE_LINKS_INFORMATION: u32 = 46;
+const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
+
+/// An NT name as a UNICODE_STRING for the call's duration.
+fn with_oa<T>(root: HANDLE, name: &str, attrs: u32, f: impl FnOnce(&OBJECT_ATTRIBUTES, &UNICODE_STRING) -> T) -> T {
+    let n: Vec<u16> = name.encode_utf16().collect();
+    let bytes = u16::try_from(n.len() * 2).unwrap_or(u16::MAX & !1);
+    let us = UNICODE_STRING { len: bytes, max: bytes, buf: n.as_ptr() };
+    let oa = OBJECT_ATTRIBUTES { len: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32, root, name: &us, attrs, sd: null_mut(), qos: null_mut() };
+    f(&oa, &us)
+}
+
+/// Opens the named kernel object `path` of type `ty` with `access`: Ok(handle),
+/// Err(status), or Err(1) for a type this probe does not open by name.
+fn open_object(ty: &str, path: &str, access: u32) -> Result<H, i32> {
+    type Open = unsafe extern "system" fn(*mut HANDLE, u32, *const OBJECT_ATTRIBUTES) -> i32;
+    let f: Open = match ty {
+        "Directory" => NtOpenDirectoryObject,
+        "SymbolicLink" => NtOpenSymbolicLinkObject,
+        "Event" => NtOpenEvent,
+        "Mutant" => NtOpenMutant,
+        "Semaphore" => NtOpenSemaphore,
+        "Section" => NtOpenSection,
+        "Timer" => NtOpenTimer,
+        "Job" => NtOpenJobObject,
+        "KeyedEvent" => NtOpenKeyedEvent,
+        "Key" => NtOpenKey,
+        "Session" => NtOpenSession,
+        "Partition" => NtOpenPartition,
+        "Device" | "File" => {
+            let n: Vec<u16> = path.encode_utf16().collect();
+            return nt_open_raw(null_mut(), &n, access, FILE_OPEN, 0, OBJ_CASE_INSENSITIVE);
+        }
+        _ => return Err(1),
+    };
+    with_oa(null_mut(), path, OBJ_CASE_INSENSITIVE, |oa, _| {
+        let mut h = null_mut();
+        // SAFETY: valid structures for the call's duration.
+        let st = unsafe { f(&mut h, access, oa) };
+        if st < 0 { Err(st) } else { Ok(H(h)) }
+    })
+}
+
+/// The access a handle was granted (ObjectBasicInformation).
+fn granted(h: HANDLE) -> u32 {
+    let mut b = [0u32; 14];
+    // SAFETY: a buffer of 56 bytes.
+    let st = unsafe { NtQueryObject(h, 0, b.as_mut_ptr().cast(), 56, null_mut()) };
+    if st < 0 { 0 } else { b[1] }
+}
+
+/// The DACL, owner and label of a handle opened with READ_CONTROL, as SDDL.
+fn handle_sddl(h: HANDLE) -> String {
+    let mut buf = vec![0u64; 1024];
+    let mut need = 0;
+    // SAFETY: a buffer of its length; OWNER | DACL | LABEL.
+    let st = unsafe { NtQuerySecurityObject(h, 0x1 | DACL_INFO | LABEL_INFO, buf.as_mut_ptr().cast(), 8192, &mut need) };
+    if st < 0 {
+        return format!("sd {:#010x}", st as u32);
+    }
+    sddl_of(buf.as_mut_ptr().cast(), 0x1 | DACL_INFO | LABEL_INFO)
+}
+
+/// Every object of the object manager's namespace beneath `dir`: (type, path).
+fn walk_objects(dir: &str, out: &mut Vec<(String, String)>) {
+    let Ok(h) = open_object("Directory", dir, 0x3) else {
+        out.push(("Directory-unlisted".into(), dir.into()));
+        return;
+    };
+    let mut ctx = 0u32;
+    let mut buf = vec![0u64; 8192];
+    let mut restart = 1;
+    loop {
+        let mut ret = 0;
+        // SAFETY: a buffer of its length; OBJECT_DIRECTORY_INFORMATION entries.
+        let st = unsafe { NtQueryDirectoryObject(h.0, buf.as_mut_ptr().cast(), 65536, 0, restart, &mut ctx, &mut ret) };
+        restart = 0;
+        if st < 0 || st == 0x8000_001A_u32 as i32 {
+            break;
+        }
+        let mut i = 0;
+        loop {
+            // SAFETY: entries of two UNICODE_STRINGs (32 bytes) until an empty one.
+            let (name, ty) = unsafe {
+                let e = buf.as_ptr().cast::<u8>().add(i * 32).cast::<UNICODE_STRING>();
+                let (n, t) = (&*e, &*e.add(1));
+                if n.buf.is_null() {
+                    break;
+                }
+                (
+                    String::from_utf16_lossy(std::slice::from_raw_parts(n.buf, n.len as usize / 2)),
+                    String::from_utf16_lossy(std::slice::from_raw_parts(t.buf, t.len as usize / 2)),
+                )
+            };
+            let path = if dir == "\\" { format!("\\{name}") } else { format!("{dir}\\{name}") };
+            if ty == "Directory" {
+                walk_objects(&path, out);
+            }
+            out.push((ty, path));
+            i += 1;
+        }
+        if st == 0 {
+            continue;
+        }
+    }
+}
+
+/// Every key beneath `root` (an open key named `nt` in NT form).
+fn walk_keys(root: usize, nt: &str, out: &mut Vec<String>, unlisted: &mut usize) {
+    out.push(nt.to_string());
+    let mut i = 0;
+    let mut name = [0u16; 512];
+    loop {
+        let mut len = 512;
+        // SAFETY: a buffer of 512 characters.
+        let e = unsafe { RegEnumKeyExW(root, i, name.as_mut_ptr(), &mut len, null_mut(), null_mut(), null_mut(), null_mut()) };
+        if e != 0 {
+            break;
+        }
+        i += 1;
+        let sub = String::from_utf16_lossy(&name[..len as usize]);
+        let mut k = 0;
+        // SAFETY: an out-pointer; REG_OPTION_BACKUP_RESTORE (SeBackupPrivilege).
+        let e = unsafe { RegOpenKeyExW(root, wide(&sub).as_ptr(), 0x4, 0x8 | 0x100, &mut k) };
+        if e != 0 {
+            *unlisted += 1;
+            out.push(format!("{nt}\\{sub}"));
+            continue;
+        }
+        walk_keys(k, &format!("{nt}\\{sub}"), out, unlisted);
+        // SAFETY: the key just opened.
+        unsafe { RegCloseKey(k) };
+    }
+}
+
+/// Every path on the fixed volumes, `skip` (the probe's own base) left out.
+fn walk_volumes(skip: &str, out: &mut Vec<String>, unlisted: &mut usize) {
+    let mut buf = [0u16; 512];
+    // SAFETY: a buffer of 512 characters.
+    let n = unsafe { GetLogicalDriveStringsW(512, buf.as_mut_ptr()) } as usize;
+    for root in String::from_utf16_lossy(&buf[..n]).split('\0').filter(|s| !s.is_empty()) {
+        // SAFETY: NUL-terminated root; DRIVE_FIXED is 3.
+        if unsafe { GetDriveTypeW(wide(root).as_ptr()) } != 3 {
+            continue;
+        }
+        let mut stack = vec![root.trim_end_matches('\\').to_string() + "\\"];
+        while let Some(d) = stack.pop() {
+            out.push(d.clone());
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                *unlisted += 1;
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path().to_string_lossy().into_owned();
+                if p.to_lowercase().starts_with(&skip.to_lowercase()) {
+                    continue;
+                }
+                match e.file_type() {
+                    Ok(t) if t.is_dir() && !t.is_symlink() => {
+                        // Junctions are not followed either.
+                        let attrs = e.metadata().map(|m| std::os::windows::fs::MetadataExt::file_attributes(&m)).unwrap_or(0);
+                        if attrs & 0x400 == 0 { stack.push(p) } else { out.push(p) }
+                    }
+                    _ => out.push(p),
+                }
+            }
+        }
+    }
+}
+
+fn write_list(path: &str, lines: impl Iterator<Item = String>) -> usize {
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    let mut n = 0;
+    for l in lines {
+        writeln!(f, "{l}").unwrap();
+        n += 1;
+    }
+    n
+}
+
+/// The id as the 8 bytes `FILE_OPEN_BY_FILE_ID` takes.
+fn by_id(rel: HANDLE, id: u64, access: u32, opts: u32) -> Result<H, i32> {
+    let units: Vec<u16> = id.to_le_bytes().chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    nt_open_raw(rel, &units, access, FILE_OPEN, FILE_OPEN_BY_FILE_ID | opts, 0)
+}
+
+/// Whether `h` lies beneath the share whose root has id `root_id`: each
+/// hard link's parent is opened by id beneath `rel`, up to the root. The
+/// confined server can open no directory outside the share, so a parent it
+/// cannot open ends that link's walk.
+fn beneath(rel: HANDLE, h: HANDLE, root_id: u64) -> String {
+    let mut tried = Vec::new();
+    let mut b = [0u64; 512];
+    if let Err(st) = query(h, FILE_LINKS_INFORMATION, &mut b) {
+        return format!("links {:#010x}", st as u32);
+    }
+    // FILE_LINKS_INFORMATION: BytesNeeded, EntriesReturned, then entries of
+    // NextEntryOffset (4), ParentFileId (8), FileNameLength (4), FileName.
+    let bytes = b.as_ptr().cast::<u8>();
+    // SAFETY: within the buffer the call filled.
+    let count = unsafe { std::ptr::read_unaligned(bytes.add(4).cast::<u32>()) };
+    let mut off = 8usize;
+    for _ in 0..count {
+        // SAFETY: as above.
+        let (next, mut parent) = unsafe { (std::ptr::read_unaligned(bytes.add(off).cast::<u32>()), std::ptr::read_unaligned(bytes.add(off + 8).cast::<u64>())) };
+        let mut depth = 0;
+        let verdict = loop {
+            if parent & 0x0000_FFFF_FFFF_FFFF == root_id & 0x0000_FFFF_FFFF_FFFF {
+                break "root".to_string();
+            }
+            depth += 1;
+            if depth > 64 {
+                break "too deep".to_string();
+            }
+            match by_id(rel, parent, FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE) {
+                Ok(p) => {
+                    let mut lb = [0u64; 512];
+                    if query(p.0, FILE_LINKS_INFORMATION, &mut lb).is_err() {
+                        break "parent links unreadable".to_string();
+                    }
+                    // SAFETY: the first entry's parent id of the buffer filled.
+                    let up = unsafe { std::ptr::read_unaligned(lb.as_ptr().cast::<u8>().add(16).cast::<u64>()) };
+                    if up == parent {
+                        break "volume root".to_string();
+                    }
+                    parent = up;
+                }
+                Err(st) => break format!("ancestor {parent:#x} {}", status(st)),
+            }
+        };
+        tried.push(verdict);
+        if next == 0 {
+            break;
+        }
+        off += next as usize;
+    }
+    if tried.iter().any(|v| v == "root") {
+        format!("beneath the share ({})", tried.join("; "))
+    } else {
+        format!("NOT beneath the share ({})", tried.join("; "))
+    }
+}
+
+struct ReachArgs {
+    base: String,
+    share: String,
+    root: HANDLE,
+    vol: HANDLE,
+    ids: Vec<(String, u64)>,
+    root_id: u64,
+    ready: [HANDLE; 6],
+    go: [HANDLE; 6],
+}
+
+fn reach_child(args: &[String]) {
+    let a = |i: usize| args[i].clone();
+    let n = |i: usize| args[i].parse::<u64>().unwrap();
+    let hd = |i: usize| n(i) as usize as HANDLE;
+    let ids_arg = a(18);
+    let ids = ids_arg.split(',').map(|kv| {
+        let (k, v) = kv.split_once('=').unwrap();
+        (k.to_string(), v.parse::<u64>().unwrap())
+    });
+    let r = ReachArgs {
+        base: a(0),
+        share: a(1),
+        root: hd(2),
+        vol: hd(3),
+        root_id: n(4),
+        ready: [hd(5), hd(6), hd(7), hd(8), hd(9), hd(10)],
+        go: [hd(11), hd(12), hd(13), hd(14), hd(15), hd(16)],
+        ids: ids.collect(),
+    };
+    let c = Child { scn: "reach".into(), base: r.base.clone(), root: r.root, secret_id: 0, share_id: 0, parent: 0, dummy: 0, tcp_port: 0, pid_tag: String::new() };
+    // SAFETY: plain call (the initial token goes; nothing is loaded after).
+    let ok = unsafe { RevertToSelf() };
+    c.out("revert-to-lockdown-token", if ok != 0 { "allowed".into() } else { last() });
+    c.token();
+    c.mitigate();
+    let sync = |i: usize| {
+        // SAFETY: inherited event handles.
+        unsafe {
+            SetEvent(r.ready[i]);
+            WaitForSingleObject(r.go[i], 600_000);
+        }
+    };
+    // 1. Open by id: beneath the share's root handle and beneath a handle on
+    //    the volume's root, each file the run made or moved.
+    for (name, id) in &r.ids {
+        for (rel_name, rel) in [("share-root", r.root), ("volume-root", r.vol)] {
+            let check = format!("by-id-{name}-beneath-{rel_name}");
+            match by_id(rel, *id, FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL, 0) {
+                Ok(h) => {
+                    let path = name_of(h.0, FILE_NORMALIZED_NAME_INFORMATION).unwrap_or_else(|s| format!("? {s:#x}"));
+                    c.out(&check, format!("allowed granted {:#x} as {path}; {}", granted(h.0), beneath(rel, h.0, r.root_id)));
+                }
+                Err(st) => c.out(&check, status(st)),
+            }
+        }
+    }
+    // The owner's implicit rights: a file of the user's, the user its owner,
+    // its DACL the user's alone.
+    let owned = format!("{}\\outside\\owned-by-user.txt", r.base);
+    for (check, access) in [("owner-read-control", READ_CONTROL), ("owner-write-dac", WRITE_DAC), ("owner-maximum-allowed", MAXIMUM_ALLOWED)] {
+        let n: Vec<u16> = format!("\\??\\{owned}").encode_utf16().collect();
+        match nt_open_raw(null_mut(), &n, access, FILE_OPEN, 0, 0) {
+            Ok(h) => c.out(check, format!("allowed granted {:#x}", granted(h.0))),
+            Err(st) => c.out(check, status(st)),
+        }
+    }
+    // 2. The host renames, while this server holds the share's root handle
+    //    and the volume's, then the volume's alone, then a file of the share.
+    sync(0);
+    // SAFETY: the inherited share root handle.
+    unsafe { CloseHandle(r.root) };
+    sync(1);
+    let f_id = r.ids.iter().find(|(k, _)| k == "f").map(|(_, v)| *v).unwrap();
+    match by_id(r.vol, f_id, FILE_READ_DATA, 0) {
+        Ok(h) => c.out("by-id-after-the-host-renamed-the-shares-parent", format!("allowed as {}; {}", name_of(h.0, FILE_NORMALIZED_NAME_INFORMATION).unwrap_or_default(), beneath(r.vol, h.0, r.root_id))),
+        Err(st) => c.out("by-id-after-the-host-renamed-the-shares-parent", status(st)),
+    }
+    let g_id = r.ids.iter().find(|(k, _)| k == "g").map(|(_, v)| *v).unwrap();
+    let held = by_id(r.vol, g_id, FILE_READ_DATA, 0);
+    c.out("hold-a-file-in-sub-opened-by-id", match &held {
+        Ok(_) => "allowed".into(),
+        Err(st) => status(*st),
+    });
+    sync(2);
+    drop(held);
+    // The share's root opened by id beneath the volume's handle: held alone,
+    // then with a file of the share opened by name beneath it.
+    let root_by_id = by_id(r.vol, r.root_id, FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_DIRECTORY_FILE);
+    c.out("hold-the-share-root-opened-by-id", match &root_by_id {
+        Ok(h) => format!("allowed as {}", name_of(h.0, FILE_NORMALIZED_NAME_INFORMATION).unwrap_or_default()),
+        Err(st) => status(*st),
+    });
+    sync(3);
+    let by_name = match &root_by_id {
+        Ok(rb) => {
+            let n: Vec<u16> = "sub\\g.txt".encode_utf16().collect();
+            nt_open_raw(rb.0, &n, FILE_READ_DATA | SYNCHRONIZE, FILE_OPEN, FILE_NON_DIRECTORY_FILE, OBJ_DONT_REPARSE)
+        }
+        Err(st) => Err(*st),
+    };
+    c.out("hold-a-file-in-sub-opened-by-name-beneath-the-root-opened-by-id", match &by_name {
+        Ok(h) => format!("allowed as {}", name_of(h.0, FILE_NORMALIZED_NAME_INFORMATION).unwrap_or_default()),
+        Err(st) => status(*st),
+    });
+    sync(4);
+    drop((by_name, root_by_id));
+    // The run puts the share back where it was before the sweep.
+    sync(5);
+    // 3. The sweep of the host's names, from the lists the run wrote.
+    let lists = format!("{}\\lists", r.share);
+    let out_path = format!("{}\\reach.txt", r.share);
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&out_path).unwrap());
+    let lines = |f: &str| std::io::BufReader::new(std::fs::File::open(format!("{lists}\\{f}")).unwrap()).lines().map_while(Result::ok);
+    let mut summary = Vec::new();
+    // Kernel objects.
+    let (mut tried, mut reached, mut skipped) = (0, 0, std::collections::BTreeMap::<String, usize>::new());
+    for l in lines("objects.txt") {
+        let Some((ty, path)) = l.split_once('\t') else { continue };
+        tried += 1;
+        if ty == "ALPC Port" {
+            // A connection: the port's own access check first.
+            let r2 = with_oa(null_mut(), path, 0, |_, us| {
+                let mut h = null_mut();
+                let timeout: i64 = -10_000_000;
+                // SAFETY: a port name; no message; one second.
+                let st = unsafe { NtAlpcConnectPort(&mut h, us, null(), null(), 0, null_mut(), null_mut(), null_mut(), null_mut(), null_mut(), &timeout) };
+                if st >= 0 {
+                    // SAFETY: the port handle.
+                    unsafe { NtClose(h) };
+                }
+                st
+            });
+            // Connected, or refused by the server after the access check
+            // (STATUS_PORT_CONNECTION_REFUSED), is reached.
+            if r2 >= 0 || r2 as u32 == 0xC000_0041 {
+                reached += 1;
+                writeln!(out, "object\t{ty}\t{path}\tconnect {:#010x}", r2 as u32).unwrap();
+            } else if r2 != STATUS_ACCESS_DENIED {
+                writeln!(out, "object-other\t{ty}\t{path}\tconnect {:#010x}", r2 as u32).unwrap();
+            }
+            continue;
+        }
+        let opened = open_object(ty, path, MAXIMUM_ALLOWED);
+        if ty == "Device" && matches!(opened, Err(st) if st == STATUS_ACCESS_DENIED) {
+            // A name beneath a device opened without FILE_DEVICE_SECURE_OPEN
+            // is not checked against the device's security.
+            let n: Vec<u16> = format!("{path}\\wick-probe").encode_utf16().collect();
+            if let Ok(h) = nt_open_raw(null_mut(), &n, MAXIMUM_ALLOWED, FILE_OPEN, 0, OBJ_CASE_INSENSITIVE) {
+                reached += 1;
+                writeln!(out, "device-subname\t{ty}\t{path}\tgranted {:#x}", granted(h.0)).unwrap();
+            }
+        }
+        match opened {
+            Ok(h) => {
+                reached += 1;
+                writeln!(out, "object\t{ty}\t{path}\tgranted {:#x}", granted(h.0)).unwrap();
+            }
+            Err(1) => *skipped.entry(ty.to_string()).or_default() += 1,
+            Err(st) if st == STATUS_ACCESS_DENIED => {}
+            Err(st) => {
+                if !matches!(st as u32, 0xC000_0034 | 0xC000_003A | 0xC000_0024 | 0xC000_0033 | 0xC000_0010 | 0xC000_000D) {
+                    writeln!(out, "object-other\t{ty}\t{path}\t{:#010x}", st as u32).unwrap();
+                }
+            }
+        }
+        if tried % 2000 == 0 {
+            c.out("sweep-objects-progress", format!("{tried}"));
+        }
+    }
+    summary.push(format!("objects tried {tried} reached {reached} not-opened-by-type {skipped:?}"));
+    // Named pipes: a connection is an open of the pipe's name.
+    let (mut tried, mut reached, mut busy) = (0, 0, 0);
+    for name in lines("pipes.txt") {
+        tried += 1;
+        let n: Vec<u16> = format!("\\Device\\NamedPipe\\{name}").encode_utf16().collect();
+        match nt_open_raw(null_mut(), &n, MAXIMUM_ALLOWED, FILE_OPEN, FILE_NON_DIRECTORY_FILE, 0) {
+            Ok(h) => {
+                reached += 1;
+                writeln!(out, "pipe\t{name}\tgranted {:#x}", granted(h.0)).unwrap();
+            }
+            Err(st) if st == STATUS_ACCESS_DENIED => {}
+            Err(st) => {
+                busy += 1;
+                writeln!(out, "pipe-other\t{name}\t{:#010x}", st as u32).unwrap();
+            }
+        }
+    }
+    summary.push(format!("pipes tried {tried} reached {reached} other-status {busy}"));
+    // Files and directories.
+    let (mut tried, mut reached) = (0, 0);
+    for p in lines("files.txt") {
+        tried += 1;
+        let n: Vec<u16> = format!("\\??\\{p}").encode_utf16().collect();
+        if let Ok(h) = nt_open_raw(null_mut(), &n, MAXIMUM_ALLOWED, FILE_OPEN, FILE_OPEN_REPARSE_POINT, 0) {
+            reached += 1;
+            writeln!(out, "file\t{p}\tgranted {:#x}", granted(h.0)).unwrap();
+        }
+        if tried % 50_000 == 0 {
+            c.out("sweep-files-progress", format!("{tried}"));
+        }
+    }
+    summary.push(format!("files tried {tried} reached {reached}"));
+    // Registry keys.
+    let (mut tried, mut reached) = (0, 0);
+    for k in lines("keys.txt") {
+        tried += 1;
+        if let Ok(h) = open_object("Key", &k, MAXIMUM_ALLOWED) {
+            reached += 1;
+            writeln!(out, "key\t{k}\tgranted {:#x}", granted(h.0)).unwrap();
+        }
+        if tried % 50_000 == 0 {
+            c.out("sweep-keys-progress", format!("{tried}"));
+        }
+    }
+    summary.push(format!("keys tried {tried} reached {reached}"));
+    drop(out);
+    for s in summary {
+        c.out("sweep", s);
+    }
+    c.out("done", "");
+}
+
+fn reach(base: &str) {
+    let tag = format!("{}", std::process::id());
+    let profile = std::env::var("USERPROFILE").unwrap_or_default().to_lowercase();
+    assert!(!profile.is_empty() && !base.to_lowercase().starts_with(&profile), "{base} is inside the user's profile");
+    assert!(std::fs::metadata(base).is_err(), "{base} exists");
+    let parent_dir = std::path::Path::new(base).parent().unwrap().to_string_lossy().into_owned();
+    let parent_before = file_sddl(&parent_dir);
+    std::fs::create_dir(base).unwrap();
+    println!("host privileges backup {} restore {}", enable_privilege("SeBackupPrivilege"), enable_privilege("SeRestorePrivilege"));
+    let own = own_token();
+    let user = token_sid(own, 1);
+    let r = std::collections::hash_map::RandomState::new();
+    let rnd = |i: u64| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = r.build_hasher();
+        h.write_u64(i);
+        h.finish() as u32
+    };
+    let share_sid = format!("S-1-9-{}-{}-{}-{}", rnd(1), rnd(2), rnd(3), rnd(4));
+    println!("host user {user} share-sid {share_sid}");
+    // <base>\up\share is the share; <base>\up is its parent, which the host
+    // renames; <base>\bin holds the child's image, outside what is renamed.
+    let up = format!("{base}\\up");
+    let share = format!("{up}\\share");
+    let outside = format!("{base}\\outside");
+    let bin = format!("{base}\\bin");
+    for d in [&up, &share, &outside, &bin, &format!("{share}\\sub"), &format!("{share}\\lists"), &format!("{share}\\moveddir")] {
+        std::fs::create_dir(d).unwrap();
+    }
+    let share_dacl = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})");
+    assert_eq!(set_dacl(&share, &share_dacl), 0);
+    assert_eq!(set_dacl(&outside, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})")), 0);
+    let exe = format!("{bin}\\fs-probe.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    assert_eq!(set_dacl(&bin, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;0x1200a9;;;{share_sid})")), 0);
+    let e = set_dacl(&share, &format!("{share_dacl}(A;OICI;{MODIFY:#x};;;{share_sid})"));
+    println!("grant reach ace {share_sid} {}", if e == 0 { "set" } else { "failed" });
+    // The files of the by-id checks.
+    create_file(&format!("{share}\\f.txt"), b"f");
+    create_file(&format!("{share}\\sub\\g.txt"), b"g");
+    create_file(&format!("{share}\\moved.txt"), b"m");
+    create_file(&format!("{share}\\moveddir\\c.txt"), b"c");
+    create_file(&format!("{share}\\linked.txt"), b"l");
+    create_file(&format!("{outside}\\never.txt"), b"n");
+    create_file(&format!("{outside}\\nulldacl.txt"), b"z");
+    create_file(&format!("{outside}\\owned-by-user.txt"), b"o");
+    // SAFETY: NUL-terminated paths; a NULL DACL; then the user as owner and a DACL of the user's alone.
+    unsafe {
+        SetNamedSecurityInfoW(wide(&format!("{outside}\\nulldacl.txt")).as_ptr(), SE_FILE_OBJECT, DACL_INFO | PROTECTED_DACL, null_mut(), null_mut(), null(), null());
+        let u = sid(&user);
+        let e = SetNamedSecurityInfoW(wide(&format!("{outside}\\owned-by-user.txt")).as_ptr(), SE_FILE_OBJECT, 0x1, u, null_mut(), null(), null());
+        println!("host owned-by-user owner set {e}");
+    }
+    assert_eq!(set_dacl(&format!("{outside}\\owned-by-user.txt"), &format!("D:P(A;;FA;;;{user})")), 0);
+    println!("host owned-by-user {}", file_sddl(&format!("{outside}\\owned-by-user.txt")));
+    // SAFETY: NUL-terminated paths.
+    let hl = unsafe { CreateHardLinkW(wide(&format!("{outside}\\linked-outside.txt")).as_ptr(), wide(&format!("{share}\\linked.txt")).as_ptr(), null()) };
+    println!("host hard-link-outside {}", if hl != 0 { "made".into() } else { last() });
+    let id = |p: &str| file_id_of_path(p).1 as u64;
+    let mut ids = vec![
+        ("f".to_string(), id(&format!("{share}\\f.txt"))),
+        ("g".to_string(), id(&format!("{share}\\sub\\g.txt"))),
+        ("moved".to_string(), id(&format!("{share}\\moved.txt"))),
+        ("moveddir-c".to_string(), id(&format!("{share}\\moveddir\\c.txt"))),
+        ("linked".to_string(), id(&format!("{share}\\linked.txt"))),
+        ("never".to_string(), id(&format!("{outside}\\never.txt"))),
+        ("nulldacl".to_string(), id(&format!("{outside}\\nulldacl.txt"))),
+    ];
+    // The host moves a file and a directory out of the share, on the volume.
+    for (from, to) in [(format!("{share}\\moved.txt"), format!("{outside}\\moved.txt")), (format!("{share}\\moveddir"), format!("{outside}\\moveddir"))] {
+        // SAFETY: NUL-terminated paths.
+        let ok = unsafe { MoveFileExW(wide(&from).as_ptr(), wide(&to).as_ptr(), 0) };
+        println!("host move-out {to} {} sddl-after {}", if ok != 0 { "moved".into() } else { last() }, file_sddl(&to));
+    }
+    ids.push(("moveddir".to_string(), id(&format!("{outside}\\moveddir"))));
+    let root_id = id(&share);
+    // The lists the child sweeps, written into the share (the child reads them).
+    let t = std::time::Instant::now();
+    let mut objects = Vec::new();
+    walk_objects("\\", &mut objects);
+    let mut types = std::collections::BTreeMap::<String, usize>::new();
+    for (ty, _) in &objects {
+        *types.entry(ty.clone()).or_default() += 1;
+    }
+    let n_obj = write_list(&format!("{share}\\lists\\objects.txt"), objects.iter().map(|(t, p)| format!("{t}\t{p}")));
+    println!("host list objects {n_obj} by type {types:?}");
+    let pipes: Vec<String> = std::fs::read_dir(r"\\.\pipe\").map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    println!("host list pipes {}", write_list(&format!("{share}\\lists\\pipes.txt"), pipes.into_iter()));
+    let (mut files, mut f_unlisted) = (Vec::new(), 0);
+    walk_volumes(base, &mut files, &mut f_unlisted);
+    println!("host list files {} directories-not-listed {f_unlisted}", write_list(&format!("{share}\\lists\\files.txt"), files.into_iter()));
+    let (mut keys, mut k_unlisted) = (Vec::new(), 0);
+    for (hk, nt) in [(HKLM, "\\REGISTRY\\MACHINE"), (0x8000_0003usize, "\\REGISTRY\\USER")] {
+        walk_keys(hk, nt, &mut keys, &mut k_unlisted);
+    }
+    println!("host list keys {} keys-not-opened {k_unlisted} ({} s for all lists)", write_list(&format!("{share}\\lists\\keys.txt"), keys.into_iter()), t.elapsed().as_secs());
+    // The handles the child holds: the share's root, the volume's root.
+    let open_dir = |p: &str| {
+        // SAFETY: NUL-terminated path.
+        H(unsafe { CreateFileW(wide(p).as_ptr(), FILE_READ_ATTRIBUTES | SYNCHRONIZE, SHARE_ALL, null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, null_mut()) })
+    };
+    let root = open_dir(&share);
+    let vol = open_dir(&format!("{}\\", &base[..2]));
+    let (root_i, vol_i) = (inheritable(root.0), inheritable(vol.0));
+    drop((root, vol));
+    let sa = SECURITY_ATTRIBUTES { len: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, sd: null_mut(), inherit: 1 };
+    // SAFETY: unnamed auto-reset events.
+    let ev: Vec<HANDLE> = (0..12).map(|_| unsafe { CreateEventW((&raw const sa).cast(), 0, 0, null()) }).collect();
+    let primary = restricted_token(own, &user, &[&share_sid], &[&user, &share_sid]);
+    let logon = logon_sid(own);
+    let initial = impersonation(restricted_token(own, &user, &[&share_sid, "S-1-1-0", "S-1-5-32-545", "S-1-5-11", "S-1-5-4", &logon, &user], &[&user, &share_sid]));
+    let ids_arg: Vec<String> = ids.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let cmd = format!(
+        "\"{exe}\" reach-child {base} {share} {} {} {root_id} {} {tag} {}",
+        root_i as usize,
+        vol_i as usize,
+        ev.iter().map(|h| (*h as usize).to_string()).collect::<Vec<_>>().join(" "),
+        ids_arg.join(",")
+    );
+    // SAFETY: NUL-terminated name.
+    let null_in = inheritable(H(unsafe { CreateFileW(wide("NUL").as_ptr(), GENERIC_READ, SHARE_ALL, null(), OPEN_EXISTING, 0, null_mut()) }).0);
+    let out = inheritable(GetStd(-11));
+    let mut inherit = vec![root_i, vol_i, null_in, out];
+    inherit.extend_from_slice(&ev);
+    let who = Who::Restricted { primary, initial };
+    let child = match start(&cmd, &bin, &who, null_mut(), null_mut(), &inherit, [null_in, out, out], true) {
+        Ok(c) => c,
+        Err(e) => panic!("start: {e}"),
+    };
+    // SAFETY: the suspended child; then our copies of the handles it holds.
+    unsafe {
+        ResumeThread(child.thread.0);
+        CloseHandle(root_i);
+        CloseHandle(vol_i);
+    }
+    let up2 = format!("{base}\\up2");
+    let up3 = format!("{base}\\up3");
+    let up4 = format!("{base}\\up4");
+    let up5 = format!("{base}\\up5");
+    // Where the share's parent is now.
+    let ups = [up.clone(), up2.clone(), up3.clone(), up4.clone(), up5.clone()];
+    let now_up = || ups.iter().find(|u| std::fs::metadata(u).is_ok()).unwrap().clone();
+    let mv = |from: &str, to: &str| {
+        // SAFETY: NUL-terminated paths.
+        let ok = unsafe { MoveFileExW(wide(from).as_ptr(), wide(to).as_ptr(), 0) };
+        if ok != 0 { "allowed".to_string() } else { last() }
+    };
+    let wait = |i: usize| {
+        // SAFETY: our event.
+        let w = unsafe { WaitForSingleObject(ev[i], 600_000) };
+        assert_eq!(w, 0, "the child's step {i} did not come");
+    };
+    let go = |i: usize| {
+        // SAFETY: our event.
+        unsafe { SetEvent(ev[6 + i]) };
+    };
+    wait(0);
+    let r1 = mv(&up, &up2);
+    println!("host rename-the-shares-parent-while-the-server-holds-the-share-root-and-the-volume-root {r1}");
+    if r1 == "allowed" {
+        mv(&up2, &up);
+    }
+    let r2 = mv(&format!("{share}\\sub"), &format!("{share}\\sub-renamed"));
+    println!("host rename-a-directory-of-the-share-while-the-server-holds-the-share-root {r2}");
+    if r2 == "allowed" {
+        mv(&format!("{share}\\sub-renamed"), &format!("{share}\\sub"));
+    }
+    go(0);
+    wait(1);
+    println!("host rename-the-shares-parent-while-the-server-holds-the-volume-root-only {}", mv(&up, &up2));
+    go(1);
+    wait(2);
+    // The share is at up2 now. The renames inside it first, each undone,
+    // then the parent's, so no rename names a path an earlier one moved.
+    let share2 = format!("{up2}\\share");
+    let r3 = mv(&format!("{share2}\\sub"), &format!("{share2}\\sub-renamed"));
+    println!("host rename-the-held-files-directory {r3}");
+    if r3 == "allowed" {
+        mv(&format!("{share2}\\sub-renamed"), &format!("{share2}\\sub"));
+    }
+    let r4 = mv(&format!("{share2}\\lists"), &format!("{share2}\\lists-renamed"));
+    println!("host rename-a-sibling-directory-of-the-held-file {r4}");
+    if r4 == "allowed" {
+        mv(&format!("{share2}\\lists-renamed"), &format!("{share2}\\lists"));
+    }
+    println!("host rename-the-shares-parent-while-the-server-holds-a-file-of-the-share {}", mv(&up2, &up3));
+    go(2);
+    wait(3);
+    // The server holds the share's root, opened by id.
+    let cur = now_up();
+    let next = if cur == up3 { &up4 } else { &up3 };
+    println!("host rename-the-shares-parent-while-the-server-holds-the-share-root-opened-by-id {}", mv(&cur, next));
+    let cur = now_up();
+    let r5 = mv(&format!("{cur}\\share"), &format!("{cur}\\share-renamed"));
+    println!("host rename-the-share-itself-while-the-server-holds-its-root-opened-by-id {r5}");
+    if r5 == "allowed" {
+        mv(&format!("{cur}\\share-renamed"), &format!("{cur}\\share"));
+    }
+    go(3);
+    wait(4);
+    // The server holds the root opened by id and a file opened by name
+    // beneath it.
+    let cur = now_up();
+    let s4 = format!("{cur}\\share");
+    let r6 = mv(&format!("{s4}\\sub"), &format!("{s4}\\sub-renamed"));
+    println!("host rename-the-held-files-directory-while-it-is-held-by-name {r6}");
+    if r6 == "allowed" {
+        mv(&format!("{s4}\\sub-renamed"), &format!("{s4}\\sub"));
+    }
+    let r7 = mv(&format!("{s4}\\lists"), &format!("{s4}\\lists-renamed"));
+    println!("host rename-a-sibling-directory-of-the-file-held-by-name {r7}");
+    if r7 == "allowed" {
+        mv(&format!("{s4}\\lists-renamed"), &format!("{s4}\\lists"));
+    }
+    println!("host rename-the-shares-parent-while-the-server-holds-a-file-by-name-beneath-the-root-opened-by-id {}", mv(&cur, &up5));
+    go(4);
+    wait(5);
+    // The share back at <base>\up for the sweep.
+    let cur = now_up();
+    if cur != up {
+        println!("host rename-back {cur} {}", mv(&cur, &up));
+    }
+    go(5);
+    // SAFETY: the child.
+    unsafe {
+        let w = WaitForSingleObject(child.process.0, 3_600_000);
+        let mut code = 0;
+        GetExitCodeProcess(child.process.0, &mut code);
+        if w != 0 {
+            TerminateProcess(child.process.0, 1);
+        }
+        println!("host reach child-exit {code:#x}{}", if w != 0 { " (timed out)" } else { "" });
+    }
+    // Wherever the share is now: up, up2 or up3.
+    let now = ups.iter().map(|u| format!("{u}\\share")).find(|s| std::fs::metadata(s).is_ok()).unwrap();
+    // What the child reached, explained by the security of each object.
+    let reached = std::fs::read_to_string(format!("{now}\\reach.txt")).unwrap_or_default();
+    for l in reached.lines() {
+        let f: Vec<&str> = l.split('\t').collect();
+        let sd = match f[0] {
+            "object" => open_object(f[1], f[2], READ_CONTROL).map(|h| handle_sddl(h.0)).unwrap_or_else(|s| format!("sd-open {:#010x}", s as u32)),
+            "file" => file_sddl(f[1]),
+            "pipe" => file_sddl(&format!(r"\\.\pipe\{}", f[1])),
+            "key" => open_object("Key", f[1], READ_CONTROL).map(|h| handle_sddl(h.0)).unwrap_or_else(|s| format!("sd-open {:#010x}", s as u32)),
+            _ => String::new(),
+        };
+        let kind = if sd.contains("D:NO_ACCESS_CONTROL") {
+            "NULL-DACL"
+        } else if sd.contains(&share_sid) {
+            "share-SID-ACE"
+        } else if !sd.contains("D:") && !sd.is_empty() {
+            "no-DACL-read"
+        } else {
+            "other"
+        };
+        println!("reached {kind} {l} | {sd}");
+    }
+    // Clean-up: the ACE off, then everything checked and removed.
+    let e = set_dacl(&now, &share_dacl);
+    println!("revert reach ace {}", if e == 0 { "removed" } else { "failed" });
+    verify_clean("reach", &now, &[share_sid.clone()]);
+    verify_clean("reach-outside", &outside, &[share_sid.clone()]);
+    for h in ev {
+        // SAFETY: our events.
+        unsafe { CloseHandle(h) };
+    }
+    let mut all = Vec::new();
+    walk(base, &mut all);
+    for p in &all {
+        // SAFETY: NUL-terminated path; FILE_ATTRIBUTE_NORMAL.
+        unsafe { SetFileAttributesW(wide(p).as_ptr(), 0x80) };
+    }
+    let removed = std::fs::remove_dir_all(base);
+    println!("cleanup base removed {:?} exists-after {}", removed.map_err(|e| e.to_string()), std::fs::metadata(base).is_ok());
+    let parent_after = file_sddl(&parent_dir);
+    println!("cleanup {parent_dir} security {}", if parent_after == parent_before { "unchanged".to_string() } else { format!("CHANGED {parent_before} -> {parent_after}") });
+}
+
+// ----------------------------------------------------------------------------
+// `fs-probe devices`: the device objects `reach` found open beneath their
+// names (no FILE_DEVICE_SECURE_OPEN), and TCP, under (b), LPAC and a plain
+// AppContainer side by side: whether an AppContainer token closes what (b)
+// leaves open.
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtReadFile(h: HANDLE, event: HANDLE, apc: *const c_void, ctx: *const c_void, io: *mut IO_STATUS_BLOCK, buf: *mut c_void, len: u32, offset: *const i64, key: *const u32) -> i32;
+}
+#[link(name = "kernel32")]
+extern "system" {
+    fn CancelIoEx(h: HANDLE, ov: *const c_void) -> i32;
+}
+#[link(name = "fltlib")]
+extern "system" {
+    fn FilterConnectCommunicationPort(name: *const u16, options: u32, ctx: *const c_void, size: u16, sa: *const c_void, port: *mut HANDLE) -> i32;
+}
+
+/// A read of the input class device `path`, opened by a name beneath it:
+/// whether the driver queues it (and so would complete it with input).
+fn input_read(path: &str, access: u32) -> String {
+    let n: Vec<u16> = format!("{path}\\wick-probe").encode_utf16().collect();
+    // An asynchronous handle.
+    let h = match nt_open_raw(null_mut(), &n, access, FILE_OPEN, 0, OBJ_CASE_INSENSITIVE) {
+        Ok(h) => h,
+        Err(st) => return format!("open for read {:#010x}", st as u32),
+    };
+    // SAFETY: an unnamed manual-reset event; a buffer of 10 input records
+    // (12 bytes each for KEYBOARD_INPUT_DATA, 24 for MOUSE_INPUT_DATA).
+    unsafe {
+        let ev = H(CreateEventW(null(), 1, 0, null()));
+        let mut io = IO_STATUS_BLOCK { status: 0, info: 0 };
+        let mut buf = [0u8; 240];
+        let st = NtReadFile(h.0, ev.0, null(), null(), &mut io, buf.as_mut_ptr().cast(), 240, null(), null());
+        if st == 0x103 {
+            let w = WaitForSingleObject(ev.0, 2000);
+            if w == 0 {
+                return format!("granted {:#x}, read pending, then completed {:#010x} with {} bytes", granted(h.0), io.status as u32, io.info);
+            }
+            CancelIoEx(h.0, null());
+            WaitForSingleObject(ev.0, 5000);
+            format!("granted {:#x}, read pending (queued; no input came in 2 s), cancelled {:#010x}", granted(h.0), io.status as u32)
+        } else {
+            format!("granted {:#x}, read {:#010x}", granted(h.0), st as u32)
+        }
+    }
+}
+
+/// A TCP connect to `ip:port`: "allowed", or the error of socket or connect.
+fn tcp_connect(ip: [u8; 4], port: u16) -> String {
+    // SAFETY: plain Winsock calls on a socket made here.
+    unsafe {
+        let s = socket(2, 1, 6);
+        if s == usize::MAX {
+            return format!("socket denied wsa {}", WSAGetLastError());
+        }
+        let mut a = [0u8; 16];
+        a[0] = 2;
+        a[2..4].copy_from_slice(&port.to_be_bytes());
+        a[4..8].copy_from_slice(&ip);
+        let r = if connect(s, a.as_ptr(), 16) == 0 { "allowed".to_string() } else { format!("connect denied wsa {}", WSAGetLastError()) };
+        closesocket(s);
+        r
+    }
+}
+
+fn devices_child(args: &[String]) {
+    let c = Child { scn: args[0].clone(), base: String::new(), root: null_mut(), secret_id: 0, share_id: 0, parent: 0, dummy: 0, tcp_port: 0, pid_tag: String::new() };
+    let revert = args[1] == "1";
+    let port = args[2].parse::<u16>().unwrap();
+    // Winsock is loaded while the initial token (if any) is on the thread.
+    wsa();
+    // SAFETY: plain Winsock calls.
+    unsafe {
+        let s = socket(2, 1, 6);
+        c.out("preload-tcp-socket", if s != usize::MAX { "allowed".into() } else { format!("denied wsa {}", WSAGetLastError()) });
+        if s != usize::MAX {
+            closesocket(s);
+        }
+    }
+    if revert {
+        // SAFETY: plain call.
+        let ok = unsafe { RevertToSelf() };
+        c.out("revert-to-lockdown-token", if ok != 0 { "allowed".into() } else { last() });
+    }
+    c.token();
+    c.mitigate();
+    c.out("tcp-loopback", tcp_connect([127, 0, 0, 1], port));
+    // The cloud metadata server of the test VM: a connect only, nothing sent.
+    c.out("tcp-link-local-metadata", tcp_connect([169, 254, 169, 254], 80));
+    let (mut tried, mut plain, mut sub) = (0, 0, 0);
+    let (mut ports, mut ports_reached) = (0, 0);
+    for l in std::io::stdin().lock().lines().map_while(Result::ok) {
+        let Some((ty, path)) = l.trim().split_once('\t') else { continue };
+        if ty == "FilterConnectionPort" {
+            ports += 1;
+            let mut h = null_mut();
+            // SAFETY: a NUL-terminated port name, no context, an out-pointer.
+            let hr = unsafe { FilterConnectCommunicationPort(wide(path).as_ptr(), 0, null(), 0, null(), &mut h) };
+            if hr >= 0 {
+                ports_reached += 1;
+                // SAFETY: the port handle.
+                unsafe { CloseHandle(h) };
+                c.out("filter-port", format!("{path} connected"));
+            } else if hr as u32 != 0x8007_0005 {
+                c.out("filter-port-other", format!("{path} {:#010x}", hr as u32));
+            }
+            continue;
+        }
+        tried += 1;
+        match open_object("Device", path, MAXIMUM_ALLOWED) {
+            Ok(h) => {
+                plain += 1;
+                c.out("device-plain", format!("{path} granted {:#x}", granted(h.0)));
+            }
+            Err(st) if st == STATUS_ACCESS_DENIED => {
+                let n: Vec<u16> = format!("{path}\\wick-probe").encode_utf16().collect();
+                match nt_open_raw(null_mut(), &n, MAXIMUM_ALLOWED, FILE_OPEN, 0, OBJ_CASE_INSENSITIVE) {
+                    Ok(h) => {
+                        sub += 1;
+                        c.out("device-subname", format!("{path} granted {:#x}", granted(h.0)));
+                    }
+                    Err(st) if st == STATUS_ACCESS_DENIED => {}
+                    Err(st) => c.out("device-subname-other", format!("{path} {:#010x}", st as u32)),
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    c.out("devices", format!("tried {tried} plain {plain} subname {sub}"));
+    c.out("filter-ports", format!("tried {ports} connected {ports_reached}"));
+    for d in [r"\Device\KeyboardClass0", r"\Device\PointerClass0"] {
+        c.out("input-read-asking-read-data", format!("{d} {}", input_read(d, 0x1 | SYNCHRONIZE)));
+        c.out("input-read-asking-maximum-allowed", format!("{d} {}", input_read(d, MAXIMUM_ALLOWED)));
+    }
+}
+
+fn devices(base: &str) {
+    let tag = format!("{}", std::process::id());
+    assert!(std::fs::metadata(base).is_err(), "{base} exists");
+    let parent_dir = std::path::Path::new(base).parent().unwrap().to_string_lossy().into_owned();
+    let parent_before = file_sddl(&parent_dir);
+    std::fs::create_dir(base).unwrap();
+    wsa();
+    let own = own_token();
+    let user = token_sid(own, 1);
+    let lua = lua_token(own, &user);
+    let r = std::collections::hash_map::RandomState::new();
+    let rnd = |i: u64| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = r.build_hasher();
+        h.write_u64(i);
+        h.finish() as u32
+    };
+    let share_sid = format!("S-1-9-{}-{}-{}-{}", rnd(1), rnd(2), rnd(3), rnd(4));
+    let bin = format!("{base}\\bin");
+    std::fs::create_dir(&bin).unwrap();
+    let exe = format!("{bin}\\fs-probe.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    assert_eq!(set_dacl(&bin, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;0x1200a9;;;AC)(A;OICI;0x1200a9;;;S-1-15-2-2)(A;OICI;0x1200a9;;;{share_sid})")), 0);
+    let mut objs = Vec::new();
+    walk_objects("\\", &mut objs);
+    let list = format!("{base}\\devices.txt");
+    for (_, p) in objs.iter().filter(|(t, _)| t == "Directory-unlisted") {
+        println!("host directory-unlisted {p}");
+    }
+    let n = write_list(&list, objs.iter().filter(|(t, _)| t == "Device" || t == "FilterConnectionPort").map(|(t, p)| format!("{t}\t{p}")));
+    println!("host devices and filter ports {n}");
+    // A loopback listener.
+    // SAFETY: plain Winsock calls.
+    let port = unsafe {
+        let t = socket(2, 1, 6);
+        let mut a = [0u8; 16];
+        a[0] = 2;
+        a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        assert_eq!(bind(t, a.as_ptr(), 16), 0);
+        listen(t, 8);
+        let mut len = 16;
+        getsockname(t, a.as_mut_ptr(), &mut len);
+        sink(t);
+        u16::from_be_bytes([a[2], a[3]])
+    };
+    println!("host control tcp-link-local-metadata {}", tcp_connect([169, 254, 169, 254], 80));
+    for d in [r"\Device\KeyboardClass0", r"\Device\PointerClass0"] {
+        println!("host control input-read-asking-read-data {d} {}", input_read(d, 0x1 | SYNCHRONIZE));
+        println!("host control input-read-asking-maximum-allowed {d} {}", input_read(d, MAXIMUM_ALLOWED));
+    }
+    let lpac_name = format!("wick.fsprobe.dev.{tag}");
+    let ac_name = format!("wick.fsprobe.devac.{tag}");
+    let mut profiles = Vec::new();
+    let caps = vec![capability_sid("registryRead"), capability_sid("lpacCom")];
+    let logon = logon_sid(own);
+    // The jail's: its own SID and four session groups restricting, at the
+    // jail's integrity level (overlay/jailer/platform/windows/mod.rs).
+    let jail_groups = [share_sid.as_str(), "S-1-1-0", "S-1-5-32-545", "S-1-5-11", "S-1-5-4"];
+    let both_name = format!("wick.fsprobe.devboth.{tag}");
+    for scn in ["restricted", "jail", "restricted-lpac", "lpac", "appcontainer"] {
+        let who = match scn {
+            "restricted" => Who::Restricted {
+                primary: restricted_token(own, &user, &[&share_sid], &[&user, &share_sid]),
+                initial: impersonation(restricted_token(own, &user, &[&share_sid, "S-1-1-0", "S-1-5-32-545", "S-1-5-11", "S-1-5-4", &logon, &user], &[&user, &share_sid])),
+            },
+            "jail" => {
+                let primary = restricted_token(own, &user, &jail_groups, &[&user, &share_sid]);
+                set_integrity(primary, "S-1-16-6144");
+                let mut all = jail_groups.to_vec();
+                all.extend([logon.as_str(), user.as_str()]);
+                let initial = restricted_token(own, &user, &all, &[&user, &share_sid]);
+                set_integrity(initial, "S-1-16-6144");
+                Who::Restricted { primary, initial: impersonation(initial) }
+            }
+            "restricted-lpac" => Who::RestrictedLpac {
+                primary: restricted_token(own, &user, &[&share_sid], &[&user, &share_sid]),
+                initial: impersonation(restricted_token(own, &user, &[&share_sid, "S-1-1-0", "S-1-5-32-545", "S-1-5-11", "S-1-5-4", &logon, &user], &[&user, &share_sid])),
+                sid: appcontainer_sid(&both_name),
+                caps: caps.clone(),
+            },
+            "lpac" => Who::AppContainer { sid: appcontainer_sid(&lpac_name), caps: caps.clone(), lpac: true },
+            _ => Who::AppContainer { sid: appcontainer_sid(&ac_name), caps: Vec::new(), lpac: false },
+        };
+        // SAFETY: NUL-terminated path; a fresh read handle at offset 0 for each child.
+        let input = inheritable(H(unsafe { CreateFileW(wide(&list).as_ptr(), GENERIC_READ, SHARE_ALL, null(), OPEN_EXISTING, 0, null_mut()) }).0);
+        let out = inheritable(GetStd(-11));
+        let cmd = format!("\"{exe}\" devices-child {scn} {} {port}", u8::from(matches!(scn, "restricted" | "jail" | "restricted-lpac")));
+        let mut started = start(&cmd, &bin, &who, lua, lua, &[input, out], [input, out, out], true);
+        if let (Err(e), false) = (&started, matches!(scn, "restricted" | "jail")) {
+            println!("host {scn} start-without-profile {e}");
+            let name = match scn {
+                "lpac" => &lpac_name,
+                "restricted-lpac" => &both_name,
+                _ => &ac_name,
+            };
+            let (_, made) = appcontainer_profile(name);
+            if made {
+                profiles.push(name.clone());
+            }
+            started = start(&cmd, &bin, &who, lua, lua, &[input, out], [input, out, out], true);
+        }
+        match started {
+            // SAFETY: the suspended child.
+            Ok(child) => unsafe {
+                ResumeThread(child.thread.0);
+                let w = WaitForSingleObject(child.process.0, 600_000);
+                let mut code = 0;
+                GetExitCodeProcess(child.process.0, &mut code);
+                if w != 0 {
+                    TerminateProcess(child.process.0, 1);
+                }
+                println!("host {scn} child-exit {code:#x}{}", if w != 0 { " (timed out)" } else { "" });
+            },
+            Err(e) => println!("host {scn} start {e}"),
+        }
+        // SAFETY: our copy of the list handle.
+        unsafe { CloseHandle(input) };
+    }
+    for p in &profiles {
+        delete_appcontainer_profile(p);
+    }
+    let removed = std::fs::remove_dir_all(base);
+    println!("cleanup base removed {:?} exists-after {}", removed.map_err(|e| e.to_string()), std::fs::metadata(base).is_ok());
+    let parent_after = file_sddl(&parent_dir);
+    println!("cleanup {parent_dir} security {}", if parent_after == parent_before { "unchanged".to_string() } else { format!("CHANGED {parent_before} -> {parent_after}") });
+}
+
 #[allow(non_snake_case)]
 fn GetStd(which: i32) -> HANDLE {
     // SAFETY: plain call.
@@ -1981,12 +3073,22 @@ fn main() {
         Some("child") => child(&args[1..]),
         Some("dummy") => dummy(&args[1]),
         Some("ea") => ea_limits(&args[1]),
+        Some("reach-child") => reach_child(&args[1..]),
+        Some("devices-child") => devices_child(&args[1..]),
+        Some("devices") => {
+            let base = args.get(1).cloned().unwrap_or_else(|| format!(r"C:\w4\fsdev-{}", std::process::id()));
+            devices(&base);
+        }
+        Some("reach") => {
+            let base = args.get(1).cloned().unwrap_or_else(|| format!(r"C:\w4\fsreach-{}", std::process::id()));
+            reach(&base);
+        }
         Some("run") => {
             let base = args.get(1).cloned().unwrap_or_else(|| format!(r"C:\w4\fsprobe-{}", std::process::id()));
             run(&base);
         }
         _ => {
-            eprintln!("usage: fs-probe run [<base>] | fs-probe ea <dir>");
+            eprintln!("usage: fs-probe run [<base>] | fs-probe reach [<base>] | fs-probe devices [<base>] | fs-probe ea <dir>");
             std::process::exit(2);
         }
     }
