@@ -128,12 +128,21 @@ pub(crate) fn fallible<T>(f: impl FnOnce() -> T) -> T {
 /// Whether the process's heap allocator is [`Allocator`]: an allocation no
 /// heap can make (`isize::MAX` bytes less 7) is asked for with this thread
 /// marked, and only [`Allocator`]'s refusal sees the mark. The system's
-/// returns null. Allocates nothing.
+/// returns null. Allocates nothing — the request is always refused — but the
+/// call must still reach the allocator, so the layout and the returned pointer
+/// are passed through [`core::hint::black_box`]. Without them a release build's
+/// dead-allocation-elimination removes the alloc/dealloc pair: its only effect,
+/// the `ASKED` mark set inside [`Allocator`]'s `refused`, is invisible to the
+/// optimizer, so the allocator never runs and this returns a false negative
+/// (proven: the probe passed in a debug build and failed in a release one with
+/// the same source). Do not remove the `black_box`es.
 pub fn installed() -> bool {
     ASKED.with(|a| a.set(1));
     let layout = Layout::from_size_align(isize::MAX.unsigned_abs() - 7, 8).expect("a valid layout");
     // SAFETY: a layout of non-zero size; the block, were it made, is freed.
-    let p = unsafe { std::alloc::alloc(layout) };
+    // black_box (see the doc comment) keeps release's dead-allocation-elimination
+    // from eliding the call: the allocator must run to set the mark.
+    let p = core::hint::black_box(unsafe { std::alloc::alloc(core::hint::black_box(layout)) });
     if !p.is_null() {
         // SAFETY: just allocated with this layout.
         unsafe { std::alloc::dealloc(p, layout) };
