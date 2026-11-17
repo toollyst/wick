@@ -63,6 +63,11 @@ fn module(dll: Dll) -> Loaded {
     })
 }
 
+/// The Win32 error loading `dll` gave, if it did not load.
+pub(crate) fn load_error(dll: Dll) -> Option<u32> {
+    module(dll).err()
+}
+
 /// The address of `name` in `dll`, if both load.
 fn proc_address(dll: Dll, name: &CStr) -> Option<usize> {
     let h = module(dll).ok()?;

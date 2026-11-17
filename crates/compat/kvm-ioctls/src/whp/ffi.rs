@@ -122,24 +122,82 @@ pub(crate) fn from_hresult(hres: i32) -> Error {
     })
 }
 
-/// Whether WHP is present on this host (the hypervisor platform feature is
-/// installed and enabled). Cached.
-pub(crate) fn whp_present() -> bool {
-    static PRESENT: OnceLock<bool> = OnceLock::new();
-    *PRESENT.get_or_init(|| {
-        let mut cap: whv::WHV_CAPABILITY = unsafe { std::mem::zeroed() };
-        let mut written = 0u32;
-        // SAFETY: valid output buffer of the given size.
-        let hres = unsafe {
-            whv::WHvGetCapability(
-                whv::WHvCapabilityCodeHypervisorPresent,
-                (&raw mut cap).cast(),
-                u32::try_from(std::mem::size_of_val(&cap)).unwrap(),
-                &mut written,
-            )
-        };
-        hres == S_OK && written >= 1 && unsafe { cap.HypervisorPresent } != 0
-    })
+/// Why WHP cannot make VMs on this host, or `None` when it can: the
+/// hypervisor platform's DLL loads and `WHvGetCapability`'s
+/// `WHvCapabilityCodeHypervisorPresent` is true, which Microsoft's
+/// documentation gives as the way to "determine whether the Windows
+/// Hypervisor is running on a host and the functions of the platform APIs
+/// can be used to create VM partitions" (learn.microsoft.com,
+/// virtualization/api/hypervisor-platform/funcs/whvgetcapability). Cached.
+pub(crate) fn whp_absent() -> Option<&'static str> {
+    static ABSENT: OnceLock<Option<String>> = OnceLock::new();
+    ABSENT
+        .get_or_init(|| {
+            let mut cap: whv::WHV_CAPABILITY = unsafe { std::mem::zeroed() };
+            let mut written = 0u32;
+            // SAFETY: valid output buffer of the given size.
+            let hres = unsafe {
+                whv::WHvGetCapability(
+                    whv::WHvCapabilityCodeHypervisorPresent,
+                    (&raw mut cap).cast(),
+                    u32::try_from(std::mem::size_of_val(&cap)).unwrap(),
+                    &mut written,
+                )
+            };
+            // SAFETY: the union's BOOL member, written or still zero.
+            let present = unsafe { cap.HypervisorPresent } != 0;
+            absent_cause(whv::load_error(whv::Dll::Platform), hres, written, present)
+        })
+        .as_deref()
+}
+
+/// [`whp_absent`]'s answer from what it read: the error loading
+/// `WinHvPlatform.dll` (`load_error`), else `WHvGetCapability`'s result.
+fn absent_cause(load_error: Option<u32>, hres: i32, written: u32, present: bool) -> Option<String> {
+    if let Some(code) = load_error {
+        return Some(format!(
+            "WinHvPlatform.dll did not load from System32: {} (Win32 error {code})",
+            std::io::Error::from_raw_os_error(code.cast_signed())
+        ));
+    }
+    if hres != S_OK {
+        return Some(format!(
+            "WHvGetCapability(WHvCapabilityCodeHypervisorPresent) failed: HRESULT {:#010x}",
+            hres.cast_unsigned()
+        ));
+    }
+    if written < 1 || !present {
+        return Some(
+            "WHvGetCapability says the Windows hypervisor is not running (WHvCapabilityCodeHypervisorPresent is false)"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// The line [`super::Kvm::new`] reports when WHP cannot make VMs, `cause`
+/// being [`whp_absent`]'s answer: what is missing and how to turn it on.
+/// On client Windows the feature is turned on in the Windows Features
+/// dialog, as "Windows Hypervisor Platform", and a reboot follows, the
+/// processor's virtualization on in the BIOS; inside a VM its host's nested
+/// virtualization must be on (learn.microsoft.com, Microsoft's ".NET MAUI"
+/// "Enable hardware acceleration for the Android emulator": "enable both
+/// Hyper-V and Windows Hypervisor Platform ... After making these changes,
+/// reboot your computer"; "nested virtualization must be enabled in the
+/// host hypervisor"). Its id for `Enable-WindowsOptionalFeature` and DISM
+/// is `HypervisorPlatform`, the same on Windows Server as on client
+/// Windows: read on Windows Server 2022 20348 and 2025 26100
+/// (`Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`
+/// gives `DisplayName` "Windows Hypervisor Platform", `RestartRequired`
+/// `Possible`), an optional feature there, not a server feature of
+/// `Install-WindowsFeature`.
+pub(crate) fn absent_line(cause: &str) -> String {
+    format!(
+        "wick: the Windows Hypervisor Platform is not available, so no VM can be made: {cause}. Turn on the \
+         Windows feature \"Windows Hypervisor Platform\" (as administrator: Enable-WindowsOptionalFeature -Online \
+         -FeatureName HypervisorPlatform) and restart; virtualization must be on in the firmware (inside a VM, \
+         its host must offer nested virtualization)"
+    )
 }
 
 /// Creates a partition handle.
@@ -1247,6 +1305,63 @@ mod tests {
     // failure (in the compat libc's values): the Win32 ones through the one
     // table, so E_INVALIDARG is EINVAL and E_OUTOFMEMORY (ERROR_OUTOFMEMORY,
     // 14) ENOMEM, not its raw code.
+    // Each way the platform can be missing gives its own cause, and the
+    // line names it, the feature, the command and the restart.
+    #[test]
+    fn test_an_absent_platform_is_said_with_its_cause_and_its_fix() {
+        let e_notimpl = 0x8000_4001u32.cast_signed();
+        // (DLL load error, WHvGetCapability HRESULT, bytes written, present, the cause the line must contain).
+        type Row = (Option<u32>, i32, u32, bool, Option<&'static str>);
+        let rows: [Row; 5] = [
+            (Some(126), S_OK, 4, true, Some("WinHvPlatform.dll did not load from System32: ")),
+            (None, e_notimpl, 0, false, Some("failed: HRESULT 0x80004001")),
+            (None, S_OK, 4, false, Some("the Windows hypervisor is not running")),
+            (None, S_OK, 0, true, Some("the Windows hypervisor is not running")),
+            (None, S_OK, 4, true, None),
+        ];
+        for (load, hres, written, present, want) in rows {
+            let got = absent_cause(load, hres, written, present);
+            match (want, &got) {
+                (Some(w), Some(g)) => assert!(g.contains(w), "{load:?} {hres:#x} {written} {present}: {g}"),
+                (None, None) => {}
+                _ => panic!("{load:?} {hres:#x} {written} {present}: {got:?}, wanted {want:?}"),
+            }
+        }
+        assert!(absent_cause(Some(126), S_OK, 4, true).unwrap().ends_with("(Win32 error 126)"));
+        let line = absent_line("CAUSE");
+        for part in [
+            "the Windows Hypervisor Platform is not available",
+            ": CAUSE.",
+            "\"Windows Hypervisor Platform\"",
+            "Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform",
+            "restart",
+            "firmware",
+            "nested virtualization",
+        ] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+        assert!(!line.contains('\n'), "one line: {line}");
+    }
+
+    // On this host: Kvm::new fails with ENODEV exactly when the platform is
+    // absent, and the cause is said. The cause differs by host: fc-win
+    // (Windows Server 2022 20348) has no WinHvPlatform.dll, so the load
+    // error (os error 126); fc-win25 (Server 2025 26100) has the DLL but
+    // the feature off, so WHvGetCapability's HypervisorPresent is false; on
+    // CI's runners and a PC with the feature on, no cause (WHPABSENT line).
+    #[test]
+    fn test_kvm_new_fails_with_enodev_where_the_platform_is_absent() {
+        let absent = whp_absent();
+        match crate::Kvm::new() {
+            Ok(_) => assert_eq!(absent, None),
+            Err(e) => {
+                assert_eq!(e.errno(), libc::ENODEV);
+                assert!(absent.is_some());
+            }
+        }
+        eprintln!("WHPABSENT on this host: {absent:?}");
+    }
+
     #[test]
     fn test_hresults_are_kvms_errnos() {
         let errno = |h: u32| from_hresult(h as i32).errno();

@@ -109,9 +109,14 @@ pub struct Kvm {
 
 impl Kvm {
     /// Opens the hypervisor. Fails with `ENODEV` if WHP is not available
-    /// (the Windows Hypervisor Platform feature is not installed or enabled).
+    /// (the Windows Hypervisor Platform feature is not turned on, or no
+    /// hypervisor runs), as KVM's open of `/dev/kvm` does without the
+    /// device, after an Error line saying which and how to turn it on
+    /// ([`ffi::absent_line`]): ENODEV's own text, which Firecracker
+    /// prints, names a device and `/dev/kvm`'s ACL.
     pub fn new() -> Result<Self> {
-        if !ffi::whp_present() {
+        if let Some(cause) = ffi::whp_absent() {
+            ffi::report(log::Level::Error, &ffi::absent_line(cause));
             return Err(Error::new(libc::ENODEV));
         }
         Ok(Kvm { fd: Handle::new()? })
