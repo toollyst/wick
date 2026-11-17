@@ -889,6 +889,21 @@ unsafe fn write_from_copy(buf: *const c_void, count: usize, copy: &mut [u8], mut
 /// `buf` must be valid for `count` bytes of writes.
 pub unsafe fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
     let mapped = crate::windows_mm::mapped(buf as usize, count);
+    // The gate: a read that may block goes through a copy unless bytes are
+    // waiting ([`has_data`]); then it is counted in flight on the caller's
+    // buffer, so a discard, a reclaim's move or a userfaultfd register of
+    // that memory waits for it, and the wait ends when this read returns.
+    // That holds while this thread is the descriptor's only reader: a
+    // second reader that takes the bytes between `has_data` and the read
+    // leaves this read blocked, and the waiter with it, until more bytes
+    // come. Firecracker on Windows has no such descriptor: its reads into
+    // guest memory are of regular files (block Sync and Async engines, the
+    // initrd: never `may_block`) or of non-blocking sockets (vsock), each
+    // read by one thread, and net, serial, entropy and the userfaultfd's
+    // socket go through heap buffers. A program with two readers of one
+    // blocking pipe or socket into mapped memory can wait that way; the
+    // bound if one is needed: a non-blocking read inside the count, and on
+    // `EAGAIN` the count left and the read made through a copy.
     if mapped && may_block(fd) && !has_data(fd) {
         // SAFETY: `read_now` gets the copy, valid for its length.
         let call = |b, n| unsafe { read_now(fd, b, n) };
@@ -1094,6 +1109,7 @@ fn keeping_position(h: HANDLE, f: impl FnOnce() -> ssize_t) -> ssize_t {
 /// `buf` must be valid for `count` bytes of writes.
 pub unsafe fn pread(fd: c_int, buf: *mut c_void, count: size_t, offset: off_t) -> ssize_t {
     let mapped = crate::windows_mm::mapped(buf as usize, count);
+    // The gate and its one-reader condition: [`read`]'s.
     if mapped && may_block(fd) && !has_data(fd) {
         // SAFETY: `pread_now` gets the copy, valid for its length.
         let call = |b, n| unsafe { pread_now(fd, b, n, offset) };
