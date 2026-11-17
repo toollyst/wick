@@ -9325,7 +9325,10 @@ mod tests {
     /// pages': a chunk whose first half was never filled (missing, no commit
     /// and no charge) and whose last page is dead, with no room left in the
     /// job ([`no_room_left`]), is moved by a fill's reclaim, the fill made
-    /// with what it gave back; the pages read back as they were.
+    /// with what it gave back; the pages read back as they were, and a
+    /// never-filled one, touched after the move, faults to a handler thread
+    /// and reads its fill (under a timeout: macOS's twin of the move read
+    /// such pages under the lock their fill needs, and deadlocked).
     #[test]
     fn test_a_chunk_whose_dead_pages_lie_above_unfilled_ones_moves() {
         let (code, text) = run_child("dead_above_unfilled_child", Some(96 << 20));
@@ -9336,6 +9339,7 @@ mod tests {
             std::eprintln!("{l}");
         }
         assert!(text.contains("dead above unfilled: the fill made, 1 moves made, 0 not made"), "{text}");
+        assert!(text.contains("a never-filled page read after the move faulted to the handler and read its fill"), "{text}");
         assert_eq!(code, Some(0), "{text}");
     }
 
@@ -9399,6 +9403,24 @@ mod tests {
                 assert_eq!(unsafe { *((mem + p + 9) as *const u8) }, 0x5a, "{p:#x}");
             }
         }
+        // A never-filled page of the moved chunk still faults to the handler,
+        // which fills it: the move neither read it (under the lock the fill
+        // needs, which would hang) nor opened it (which would read a zero
+        // here, with no event). Under a timeout, as the macOS twin of this
+        // defect was a deadlock.
+        let unfilled = mem + PAGE;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            // SAFETY: registered memory; the read waits for the fill.
+            let _ = tx.send(unsafe { core::ptr::read_volatile((unfilled + 9) as *const u8) });
+        });
+        let handler = std::thread::spawn(move || serve_one(user, ctx, 0x6d));
+        let read = rx.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(read, Ok(0x6d), "a never-filled page read after the move: not filled through the handler within 10 s");
+        let event = handler.join().unwrap();
+        assert_eq!((event[0], event[1]), (proto::EVENT_PAGEFAULT2, unfilled + 9));
+        reader.join().unwrap();
+        std::println!("dead above unfilled: a never-filled page read after the move faulted to the handler and read its fill");
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
