@@ -3828,6 +3828,180 @@ mod tests {
         }
     }
 
+    /// MIRRORHANDLES: attributes the process handle growth seen while
+    /// userfaultfds are made and released back to back (a mirror wired at each
+    /// `create`, the serving thread detached, `destroy` run when the user end
+    /// closes). Two blocks of `N` cycles, each followed by a settle in which the
+    /// process handle count is sampled over time, and the per-type handle
+    /// histogram (`NtQuerySystemInformation`, `SystemExtendedHandleInformation`,
+    /// this process's handles only, named with `NtQueryObject`) taken at the
+    /// baseline, at the peak right after the cycles, and at the end of the
+    /// settle. Tells (i) threads winding down — the growth is `Thread` handles
+    /// that drain to the baseline given enough settle — from (ii) a real
+    /// per-release leak — a handle type whose count stays up block over block.
+    /// Measured (Windows Server 2022, release, `N` = 48): it is neither. The
+    /// growth is the fixed 256-entry waiter-semaphore pool (`WAITERS[].sem`,
+    /// made once in `init`'s `call_once` and kept for the process's life):
+    /// `Semaphore` handles go 4 to 260 on the first block and stay 260 on the
+    /// second (not 516), and the process's total holds near 370 across both
+    /// blocks rather than climbing. The per-release delta is zero; `Thread`
+    /// stays within 2–3 of the baseline, so the serving threads wind down
+    /// promptly. No leak: the earlier "~5.8 handles a cycle" was this one-time
+    /// pool filling over the first cycles, not a per-release cost.
+    /// A record: nothing asserted but that the cycles ran. Run with
+    /// `--release --ignored --nocapture`.
+    #[test]
+    #[ignore = "a probe: run alone, with --release --ignored --nocapture"]
+    fn test_the_release_handle_growth_is_a_bounded_pool_not_a_leak() {
+        use core::ffi::c_void;
+        use std::collections::BTreeMap;
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQuerySystemInformation(class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+            fn NtQueryObject(handle: HANDLE, class: u32, info: *mut c_void, len: u32, returned: *mut u32) -> i32;
+        }
+        const SYSTEM_EXTENDED_HANDLE_INFORMATION: u32 = 64;
+        const OBJECT_TYPE_INFORMATION: u32 = 2;
+        const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
+        const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
+        const N: usize = 48;
+
+        // The layout of SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX; only three fields are
+        // read, the rest give the stride.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        #[allow(dead_code)]
+        struct Entry {
+            object: *mut c_void,
+            unique_process_id: usize,
+            handle_value: usize,
+            granted_access: u32,
+            creator_back_trace_index: u16,
+            object_type_index: u16,
+            handle_attributes: u32,
+            reserved: u32,
+        }
+
+        let hcount = || {
+            let mut n = 0u32;
+            // SAFETY: a process pseudo-handle and a u32 out-buffer.
+            assert_ne!(unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) }, 0);
+            n
+        };
+        // The name of the object a handle names, through `NtQueryObject`'s
+        // `ObjectTypeInformation` (safe on any handle; unlike the name class it
+        // does not block). The type name is a `UNICODE_STRING` at the front.
+        let type_name = |handle: usize| -> std::string::String {
+            let mut buf = [0u8; 2048];
+            let mut got = 0u32;
+            // SAFETY: a handle this process owns and an output buffer.
+            let st = unsafe {
+                NtQueryObject(handle as HANDLE, OBJECT_TYPE_INFORMATION, buf.as_mut_ptr().cast(), buf.len() as u32, &mut got)
+            };
+            if st < 0 {
+                return std::format!("?{st:#x}");
+            }
+            let length = u16::from_ne_bytes([buf[0], buf[1]]) as usize;
+            let ptr = usize::from_ne_bytes(buf[8..16].try_into().unwrap()) as *const u16;
+            if ptr.is_null() || length == 0 {
+                return std::string::String::from("<none>");
+            }
+            // SAFETY: the type name buffer the call filled in, `length` bytes.
+            let wide = unsafe { core::slice::from_raw_parts(ptr, length / 2) };
+            std::string::String::from_utf16_lossy(wide)
+        };
+        // This process's handles, counted per object-type index, with one
+        // sample handle of each type (to name it).
+        let enumerate = || -> BTreeMap<u16, (u32, usize)> {
+            let pid = std::process::id() as usize;
+            let mut cap = 4usize << 20;
+            loop {
+                let mut buf = std::vec![0u8; cap];
+                let mut ret = 0u32;
+                // SAFETY: a byte buffer of `cap` bytes.
+                let st = unsafe {
+                    NtQuerySystemInformation(SYSTEM_EXTENDED_HANDLE_INFORMATION, buf.as_mut_ptr().cast(), cap as u32, &mut ret)
+                };
+                if (st == STATUS_INFO_LENGTH_MISMATCH || st == STATUS_BUFFER_TOO_SMALL) && cap < (512 << 20) {
+                    cap *= 2;
+                    continue;
+                }
+                assert!(st >= 0, "NtQuerySystemInformation: {st:#x}");
+                // SYSTEM_HANDLE_INFORMATION_EX: NumberOfHandles (usize), Reserved
+                // (usize), then the entries.
+                let n = usize::from_ne_bytes(buf[0..8].try_into().unwrap());
+                // SAFETY: the header says `n` entries follow at offset 16.
+                let entries = unsafe { core::slice::from_raw_parts(buf.as_ptr().add(16).cast::<Entry>(), n) };
+                let mut hist: BTreeMap<u16, (u32, usize)> = BTreeMap::new();
+                for e in entries {
+                    if e.unique_process_id == pid {
+                        let slot = hist.entry(e.object_type_index).or_insert((0, e.handle_value));
+                        slot.0 += 1;
+                    }
+                }
+                return hist;
+            }
+        };
+        let cycle = || {
+            let (ctx, user) = create(0, false, true).unwrap();
+            // SAFETY: the user descriptor this test owns.
+            assert_eq!(unsafe { crate::close(user) }, 0);
+            let t = Instant::now();
+            while CTXS[ctx].fd.load(Ordering::SeqCst) >= 0 {
+                assert!(t.elapsed() < Duration::from_secs(60), "the userfaultfd was not released");
+                std::thread::yield_now();
+            }
+        };
+        let settle_samples = |label: &str| -> u32 {
+            let mut last = 0u32;
+            let mut waited = 0u64;
+            for at in [0u64, 5, 15, 30, 60, 120] {
+                if at > waited {
+                    std::thread::sleep(Duration::from_secs(at - waited));
+                    waited = at;
+                }
+                last = hcount();
+                std::println!("MIRRORHANDLES {label}: +{at:>3}s -> {last} handles");
+            }
+            last
+        };
+        let diff = |base: &BTreeMap<u16, (u32, usize)>, now: &BTreeMap<u16, (u32, usize)>, label: &str| {
+            let mut keys: std::vec::Vec<u16> = base.keys().chain(now.keys()).copied().collect();
+            keys.sort_unstable();
+            keys.dedup();
+            for k in keys {
+                let b = base.get(&k).map_or(0, |v| v.0);
+                let n = now.get(&k).map_or(0, |v| v.0);
+                if b != n {
+                    let sample = now.get(&k).or_else(|| base.get(&k)).map_or(0, |v| v.1);
+                    std::println!("MIRRORHANDLES {label}: type {k} ({}) {b} -> {n} ({})", type_name(sample), i64::from(n) - i64::from(b));
+                }
+            }
+        };
+
+        // Let any threads of earlier tests in this binary drain first.
+        std::thread::sleep(Duration::from_secs(3));
+        let base = hcount();
+        let base_hist = enumerate();
+        std::println!("MIRRORHANDLES baseline: {base} handles, {} types", base_hist.len());
+
+        for block in 1..=2 {
+            for _ in 0..N {
+                cycle();
+            }
+            let peak = hcount();
+            let peak_hist = enumerate();
+            std::println!("MIRRORHANDLES block {block}: {N} cycles, peak {peak} handles (+{} over baseline)", i64::from(peak) - i64::from(base));
+            diff(&base_hist, &peak_hist, &std::format!("block {block} peak vs base"));
+            let settled = settle_samples(&std::format!("block {block} settle"));
+            let settled_hist = enumerate();
+            std::println!("MIRRORHANDLES block {block}: settled {settled} handles ({:+} vs baseline, {:+} vs peak)", i64::from(settled) - i64::from(base), i64::from(settled) - i64::from(peak));
+            diff(&base_hist, &settled_hist, &std::format!("block {block} settled vs base"));
+        }
+    }
+
     /// PROBECOST: the fill path's time per page with the stack probe of its
     /// locks as the stack reclaim's step 3 will have it (`windows_stacklock::probe`,
     /// which writes nothing; in tests only until then) and with the probe
