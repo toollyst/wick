@@ -30,7 +30,8 @@ In short:
   Job Object, jail drive and directory as Firecracker's. It reverts to the jail's lockdown token first, as Firecracker
   does, and applies wick's mitigation profile.
 - **The lists.** `fs-probe list-objects <file>` (elevated) lists every named kernel object (1,680: all object
-  directories) and named pipe (60) into a file every jail may read.
+  directories) and named pipe (61) into a file every jail may read. Pipe names come and go, so the list is taken just
+  before the run; `devjail` tried all 61, and the pipe it makes itself comes after the list and is not in it.
 - **The jailed run:** `jailer --id dj1 --exec-file fs-probe.exe --uid 0 --gid 0 --chroot-base-dir <dir> -- devjail
   <file> 22 8.8.8.8 53`. It ran again with `--netns <dir>`; both gave the same counts but for IP.
 - **What `devjail` does with each name:**
@@ -63,7 +64,7 @@ All counts are `devjail` under the jailer, unless marked otherwise.
 | --- | --- | --- | --- |
 | Device objects | 174 | 87, by name | each driver's create, close and I/O-control code; the groups below |
 | ALPC ports | 167 | 147, connected | among them the RPC endpoints of LSA (`lsasspirpc`, `lsapolicylookup`, `lsacap`), SAM (`samss lpc`), the service control manager (`ntsvcs`), the event log, the endpoint mapper, `keysvc`, `protected_storage`, `audit`, `WindowsShutdown`, Terminal Services, DCOM's `OLE…` ports, 43 `LRPC-…` endpoints, csrss's `\Windows\ApiPort` and the desktop window manager's |
-| Named pipes | 60 | 17, opened | `lsass`, `spoolss` (granted `0x1201bb`, which includes write), `srvsvc`, `wkssvc`, `atsvc`, `ntsvcs`, `eventlog`, `epmapper`, `InitShutdown`, `scerpc`, `LSM_API_service`, `TermSrv_API_service`, `Ctx_WinStation_API_service`, `SessEnvPublicRpc`, `trkwks`, `W32TIME_ALT`, `openssh-ssh-agent` |
+| Named pipes | 61 | 17, opened | `lsass`, `spoolss` (granted `0x1201bb`, which includes write), `srvsvc`, `wkssvc`, `atsvc`, `ntsvcs`, `eventlog`, `epmapper`, `InitShutdown`, `scerpc`, `LSM_API_service`, `TermSrv_API_service`, `Ctx_WinStation_API_service`, `SessEnvPublicRpc`, `trkwks`, `W32TIME_ALT`, `openssh-ssh-agent` |
 | Sections (shared memory) | 197 | 97 | to read: KnownDlls, code-page tables, the COM catalogue caches, Microsoft Defender's `MpSvcMemory-…`, the MSDTC and WMI counters, `\Windows\SharedSection`. To write: `windows_shell_global_counters` |
 | Events | 115 | 30 | to wait on only (no `EVENT_MODIFY_STATE`) |
 | Mutexes | 214 | 5 | with `SYNCHRONIZE`, so it can hold them: `DBWinMutex` (global and the session's), `RasPbFile` |
