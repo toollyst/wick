@@ -67,7 +67,8 @@
 #   vmm --lib: 1038 tests; 850 pass, 138 fail, 50 ignored (the ext:: helpers
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
-#   cpu-template-helper: 30 tests; 25 pass, 5 fail (no-hvf).
+#   cpu-template-helper: 30 tests; 25 pass, 5 fail (no-hvf); 31 and 26
+#   since 2026-11-18 (test_ioreg_listing_with_a_non_utf8_byte_ahead_of_the_firmware_line).
 #   compat-kvm-ioctls: 122 tests; 34 pass, 86 fail, 2 ignored (counted again
 #   on 2026-11-17, after the four *_charged_once tests, the seven
 #   test_owned_* guest-memory tests (the allocation, two charged-once twins,

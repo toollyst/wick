@@ -54,3 +54,4 @@
 0052-macos-Firecracker-starts-with-libmalloc-s-configurat.patch
 0053-tests-a-slot-plugged-after-a-userfaultfd-restore-sti.patch
 0054-vmm-anonymous-guest-RAM-is-committed-through-one-sea.patch
+0055-cpu-template-helper-macOS-the-firmware-test-decodes-.patch

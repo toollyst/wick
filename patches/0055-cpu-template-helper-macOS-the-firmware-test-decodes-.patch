@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Wed, 18 Nov 2026 01:00:49 +0900
+Subject: [PATCH] cpu-template-helper (macOS): the firmware test decodes
+ ioreg(8)'s listing as the product decodes the property, lossily, and a byte
+ that is not UTF-8 ahead of the firmware line leaves the line as it is
+
+wick: test_macos_firmware_is_ioregs decoded the whole ioreg listing of
+IODeviceTree:/chosen with String::from_utf8, and failed on a macOS 26
+runner image (20261102.0473) where another property of /chosen holds a
+byte that is not UTF-8 (FromUtf8Error, valid_up_to 5520). The product
+never reads that listing: iokit::firmware_version reads the one property,
+system-firmware-version, through IOKit (IORegistryEntryCreateCFProperty)
+and decodes it with from_utf8_lossy, so no other property's bytes reach
+it, and ioreg stays the test's independent oracle. The line is now found
+by ioreg_firmware_version, a test helper that decodes lossily, and
+test_ioreg_listing_with_a_non_utf8_byte_ahead_of_the_firmware_line checks
+it on a listing with 0xFF in an earlier property.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/fingerprint/dump.rs                   | 36 +++++++++++++++----
+ 1 file changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/src/cpu-template-helper/src/fingerprint/dump.rs b/src/cpu-template-helper/src/fingerprint/dump.rs
+index ecf60a0a02826095756fc9089393b80ced99d9e8..a39763f9a0c23af0a38b18382cd07cc392538710 100644
+--- a/src/cpu-template-helper/src/fingerprint/dump.rs
++++ b/src/cpu-template-helper/src/fingerprint/dump.rs
+@@ -322,6 +322,21 @@ mod tests {
+         read_sysfs_file(valid_sysfs_path).unwrap();
+     }
+ 
++    // wick: the system-firmware-version line of ioreg(8)'s listing of
++    // IODeviceTree:/chosen, the test's oracle for `iokit::firmware_version`.
++    // The listing is decoded lossily: other properties of /chosen may hold
++    // bytes that are not UTF-8 (a macOS 26 runner image, 20261102.0473, has
++    // one), and the product never reads them, as it reads this one property
++    // through IOKit (`iokit::data`) and decodes it lossily itself.
++    #[cfg(target_os = "macos")]
++    fn ioreg_firmware_version(listing: &[u8]) -> Option<String> {
++        let text = String::from_utf8_lossy(listing);
++        let line = text
++            .lines()
++            .find(|l| l.contains("\"system-firmware-version\" = <\""))?;
++        Some(line.split("<\"").nth(1)?.trim_end_matches("\">").to_string())
++    }
++
+     // wick: the firmware's version and release on macOS are those ioreg(8)
+     // shows, and a version without a major.minor release is refused.
+     #[cfg(target_os = "macos")]
+@@ -331,12 +346,7 @@ mod tests {
+             .args(["-p", "IODeviceTree", "-r", "-n", "chosen", "-d", "1", "-l"])
+             .output()
+             .unwrap();
+-        let text = String::from_utf8(out.stdout).unwrap();
+-        let line = text
+-            .lines()
+-            .find(|l| l.contains("\"system-firmware-version\" = <\""))
+-            .unwrap();
+-        let shown = line.split("<\"").nth(1).unwrap().trim_end_matches("\">");
++        let shown = ioreg_firmware_version(&out.stdout).unwrap();
+         let version = read_sysfs_file("/sys/devices/virtual/dmi/id/bios_version").unwrap();
+         assert_eq!(version, shown);
+         let release = read_sysfs_file("/sys/devices/virtual/dmi/id/bios_release").unwrap();
+@@ -354,6 +364,20 @@ mod tests {
+         iokit::data(c"IODeviceTree:/no-such-node", c"system-firmware-version").unwrap_err();
+     }
+ 
++    // wick: a byte that is not UTF-8 in another property of /chosen, ahead
++    // of the firmware's line, leaves the line as it is (the runner image
++    // above failed `String::from_utf8` of the whole listing).
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn test_ioreg_listing_with_a_non_utf8_byte_ahead_of_the_firmware_line() {
++        let mut listing = b"+-o chosen  <class IOService>\n    {\n      \"other\" = <\"a".to_vec();
++        listing.push(0xff);
++        listing.extend_from_slice(b"b\">\n      \"system-firmware-version\" = <\"mBoot-20457.41.3\">\n    }\n");
++        assert!(String::from_utf8(listing.clone()).is_err());
++        assert_eq!(ioreg_firmware_version(&listing).as_deref(), Some("mBoot-20457.41.3"));
++        assert_eq!(ioreg_firmware_version(b"+-o chosen\n"), None);
++    }
++
+     #[test]
+     fn test_read_invalid_sysfs_file() {
+         let invalid_sysfs_path = "/sys/invalid/path";
