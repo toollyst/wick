@@ -2476,7 +2476,8 @@ jobs:
       # elevated process, then in a child whose lockdown token restricts to
       # the jail's SID with the four session groups (as now), alone (with
       # and without the WHP DLLs loaded before the revert, and with the
-      # partition made before it, and option P's whole VM made so), with each
+      # partition made before it, and option P's whole VM made so, with the
+      # jail's token as now as its control and what the partitions cost), with each
       # group alone, with two of them and with the hypervisorPlatform
       # capability SID; in an AppContainer with and without that capability;
       # and in an LPAC with it. Each child opens WHP's devices itself; the
@@ -2489,8 +2490,11 @@ jobs:
       # What each token the jailer could give Firecracker reaches
       # (docs/windows-jail-reach.md): every named kernel object, named pipe
       # and device, IP, randomness and the jail's socket directory, under
-      # the jail's token as now, its SID alone or with Authenticated Users,
-      # and in an AppContainer and an LPAC with WHP's capability (option Q);
+      # the jail's token as now, its SID alone or with Authenticated Users
+      # (and Everyone, or Users), and in an AppContainer and an LPAC with
+      # WHP's capability (option Q), the LPAC also with the jailer's initial
+      # token and Firecracker's preload, and with win32k's lockdown set at
+      # its creation, and an AppContainer of another profile;
       # then option Q's questions (a file in a jail-labelled directory, Unix
       # sockets each way, the parent opened, sections given, the Job's
       # memory limit) and each child's process security. The external

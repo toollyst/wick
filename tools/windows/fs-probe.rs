@@ -29,11 +29,15 @@
 //!                         Authenticated Users and Users, with the
 //!                         hypervisorPlatform capability SID, and alone or as
 //!                         now with the partition made and set up before the
-//!                         revert; alone with option P's whole VM (the
-//!                         partition made as kvm-ioctls makes one, before the
-//!                         revert; after it, every capability read again,
-//!                         each property set again, two of four vCPUs, each
-//!                         call a running VM makes, a second partition); in
+//!                         revert; alone and as now with option P's whole
+//!                         VM (the partition made as kvm-ioctls makes one,
+//!                         before the revert, with what both partitions cost;
+//!                         after it, every capability read again, each
+//!                         property set again, two of four vCPUs, one run to
+//!                         the guest's OUT under a 5 s watchdog, each call a
+//!                         running VM makes, 64 MiB of guest memory against
+//!                         the Job's count, a second partition, the partition
+//!                         used again); in
 //!                         an AppContainer with and without that capability,
 //!                         and with it on a SID with no profile; and in an
 //!                         LPAC with it, alone and with registryRead and
@@ -85,6 +89,11 @@
 //! LPAC child must load nothing from outside System32.
 
 #![allow(non_snake_case, non_camel_case_types, clippy::upper_case_acronyms)]
+
+/// Firecracker's preload before its revert (vmm::ext::jail), the same code:
+/// the jail-variants children take it before they revert.
+#[path = "../../overlay/vmm/ext/jail_preload.rs"]
+mod preload;
 
 use std::ffi::c_void;
 use std::io::{BufRead, Write};
@@ -728,6 +737,16 @@ impl Child {
     }
 
     fn mitigate(&self) {
+        // The win32k policy as the process has it before this sets it (on
+        // when set at creation), and whether user32 is loaded, after which
+        // the policy cannot be set.
+        let mut flags = 0u32;
+        // SAFETY: a flags word of 4 bytes; ProcessSystemCallDisablePolicy.
+        let got = unsafe { GetProcessMitigationPolicy(GetCurrentProcess(), 4, (&raw mut flags).cast(), 4) };
+        self.out("mitigation-win32k-before", if got != 0 { format!("flags {flags:#x}") } else { last() });
+        // SAFETY: a NUL-terminated name; this loads nothing.
+        let user32 = unsafe { GetModuleHandleW(wide("user32.dll").as_ptr()) };
+        self.out("user32-loaded", if user32.is_null() { "no" } else { "yes" });
         // ProcessDynamicCodePolicy 2, StrictHandleCheck 3, SystemCallDisable
         // (win32k) 4, ExtensionPointDisable 6, Signature 8, ImageLoad 10,
         // ChildProcess 13: wick's profile (overlay/vmm/ext/sandbox.rs).
@@ -1287,6 +1306,11 @@ enum Who {
     Restricted { primary: HANDLE, initial: HANDLE },
     /// An LPAC made from the restricted token: both confinements at once.
     RestrictedLpac { primary: HANDLE, initial: HANDLE, sid: PSID, caps: Vec<PSID> },
+    /// An AppContainer (or LPAC) given, besides, an impersonation token on
+    /// its main thread until it reverts (`initial`), as the jailer gives
+    /// Firecracker its initial token, and process mitigation policies set at
+    /// its creation (`PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`, 0 for none).
+    AppContainerWith { sid: PSID, caps: Vec<PSID>, lpac: bool, initial: Option<HANDLE>, mitigations: u64 },
 }
 
 struct Started {
@@ -1306,8 +1330,13 @@ fn start(cmd: &str, cwd: &str, who: &Who, lua: HANDLE, low: HANDLE, inherit: &[H
     let ac = match who {
         Who::AppContainer { sid, caps, lpac } => Some((sid, caps, lpac)),
         Who::RestrictedLpac { sid, caps, .. } => Some((sid, caps, &true)),
+        Who::AppContainerWith { sid, caps, lpac, .. } => Some((sid, caps, lpac)),
         _ => None,
     };
+    let mitigations: u64 = if let Who::AppContainerWith { mitigations, .. } = who { *mitigations } else { 0 };
+    if mitigations != 0 {
+        count += 1;
+    }
     if let Some((sid, caps, lpac)) = ac {
         caps_sa = caps.iter().map(|&c| SID_AND_ATTRIBUTES { sid: c, attributes: 4 }).collect();
         sc = SECURITY_CAPABILITIES { sid: *sid, caps: caps_sa.as_mut_ptr(), count: caps_sa.len() as u32, reserved: 0 };
@@ -1328,6 +1357,10 @@ fn start(cmd: &str, cwd: &str, who: &Who, lua: HANDLE, low: HANDLE, inherit: &[H
                 assert!(UpdateProcThreadAttribute(l, 0, 0x2000F, (&raw const opt_out).cast(), 4, null_mut(), null()) != 0);
             }
         }
+        if mitigations != 0 {
+            // PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY: a DWORD64.
+            assert!(UpdateProcThreadAttribute(l, 0, 0x20007, (&raw const mitigations).cast(), 8, null_mut(), null()) != 0);
+        }
     }
     // SAFETY: plain data.
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
@@ -1343,7 +1376,7 @@ fn start(cmd: &str, cwd: &str, who: &Who, lua: HANDLE, low: HANDLE, inherit: &[H
     // console, whose device a restricted token may not open.
     let flags = 0x4 | 0x8_0000 | 0x8;
     let token = match who {
-        Who::Lua | Who::AppContainer { .. } => lua,
+        Who::Lua | Who::AppContainer { .. } | Who::AppContainerWith { .. } => lua,
         Who::Low => low,
         Who::Restricted { primary, .. } | Who::RestrictedLpac { primary, .. } => *primary,
     };
@@ -1376,7 +1409,12 @@ fn start(cmd: &str, cwd: &str, who: &Who, lua: HANDLE, low: HANDLE, inherit: &[H
     } else {
         None
     };
-    if let Who::Restricted { initial, .. } | Who::RestrictedLpac { initial, .. } = who {
+    let initial = match who {
+        Who::Restricted { initial, .. } | Who::RestrictedLpac { initial, .. } => Some(initial),
+        Who::AppContainerWith { initial: Some(initial), .. } => Some(initial),
+        _ => None,
+    };
+    if let Some(initial) = initial {
         // SAFETY: the suspended child's main thread and an impersonation token.
         if unsafe { SetThreadToken(&mut thread.0, *initial) } == 0 {
             let e = last();
@@ -3252,6 +3290,20 @@ fn jail_checks(c: &Child, revert: bool, list: &str, port: u16, ext: ([u8; 4], u1
         BCryptGenRandom(null_mut(), b.as_mut_ptr(), 16, 2);
     }
     if revert {
+        // The main thread's initial token, if any: its impersonation level
+        // (TokenImpersonationLevel; 2 is SecurityImpersonation, below it
+        // Windows lets the thread identify but not act), and Firecracker's
+        // preload taken under it (jail_preload.rs, the same code).
+        let mut t = null_mut();
+        // SAFETY: our own thread's token, opened as ourselves.
+        let level = if unsafe { OpenThreadToken(GetCurrentThread(), 0x8, 1, &mut t) } != 0 {
+            let t = H(t);
+            format!("impersonation-level {}", token_info(t.0, 9)[0] as u32)
+        } else {
+            format!("none {}", last())
+        };
+        c.out("initial-token", level);
+        c.out("preload", match preload::preload() { Ok(()) => "allowed".to_string(), Err(e) => e.to_string() });
         // SAFETY: plain call.
         let ok = unsafe { RevertToSelf() };
         c.out("revert-to-lockdown-token", if ok != 0 { "allowed".into() } else { last() });
@@ -3466,6 +3518,8 @@ fn jail_variants(base: &str, ext: &str, only: &[String]) {
         ("jail-sid-au", Some(vec!["S-1-5-11"]), Vec::new(), false),
         // WHP's two devices' groups (`whp-token`'s jail-au-everyone).
         ("jail-sid-au-everyone", Some(vec!["S-1-5-11", "S-1-1-0"]), Vec::new(), false),
+        // `whp-token`'s jail-au-users, which runs WHP: what it reaches.
+        ("jail-sid-au-users", Some(vec!["S-1-5-11", "S-1-5-32-545"]), Vec::new(), false),
         ("jail-sid-hypervisor-platform", Some(vec![cap.as_str()]), Vec::new(), false),
         // Option Q's tokens (docs/windows-jail-reach.md): an AppContainer
         // with WHP's capability, and an LPAC with it, alone and with the two
@@ -3479,7 +3533,10 @@ fn jail_variants(base: &str, ext: &str, only: &[String]) {
     // integrity, which a jail's label (0x1800, no write up) keeps out of
     // `sock`, so `sock-low` is labelled low.
     let profile = format!("wick.jail-variants.{}", std::process::id());
-    let ac = variants.iter().any(|v| v.1.is_none() && (only.is_empty() || only.iter().any(|o| o == v.0)));
+    // Option Q's follow-ups, after the variants (below).
+    let followups = ["lpac-cap-preload", "lpac-cap-win32k-at-create", "appcontainer-other"];
+    let want = |n: &str| only.is_empty() || only.iter().any(|o| o == n);
+    let ac = variants.iter().any(|v| v.1.is_none() && want(v.0)) || followups.iter().any(|n| want(n));
     let (ac_psid, ac_made) = if ac { appcontainer_profile(&profile) } else { (null_mut(), false) };
     let sock_low = format!("{base}\\sock-low");
     if ac {
@@ -3492,6 +3549,12 @@ fn jail_variants(base: &str, ext: &str, only: &[String]) {
         // AppContainer too: whether its label alone keeps it out.
         assert_eq!(set_dacl(&sock, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{jail_sid})(A;OICI;FA;;;{ac_sid})")), 0);
         assert_eq!(set_label(&sock, Some("S:(ML;OICI;NWNRNX;;;S-1-16-6144)")), 0);
+    }
+    // What `jail-labelled-dir-create` asks of each directory.
+    for dir in [sock.as_str(), sock_low.as_str()] {
+        if std::fs::metadata(dir).is_ok() {
+            println!("host labelled-dir {dir} {}", file_sddl(dir));
+        }
     }
     // A Unix socket listening in each socket directory, as the API process
     // listens for Firecracker (`vmm::ext::api_process`): the jailed side
@@ -3561,6 +3624,48 @@ fn jail_variants(base: &str, ext: &str, only: &[String]) {
         let who = Who::Restricted { primary, initial: impersonation(initial) };
         jail_variant_run(name, &exe, &bin, &who, &list, port, ext, &sock, &sock, &plain, large.as_ref());
     }
+    // Option Q's follow-ups (docs/windows-jail-reach.md):
+    // - lpac-cap-preload: the LPAC with the jailer's initial token on its
+    //   main thread (at the AppContainer's low integrity, which it may
+    //   impersonate) and Firecracker's preload taken under it: whether
+    //   Winsock then works after the revert without registryRead and
+    //   lpacCom;
+    // - lpac-cap-win32k-at-create: the LPAC with win32k's lockdown set at
+    //   its creation (PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_
+    //   DISABLE_ALWAYS_ON, bit 28), where setting it later was denied;
+    // - appcontainer-other: an AppContainer of another profile, as a second
+    //   jail or another app of the user, against the first's directory and
+    //   socket (`sock-low`, which grants the first's SID only).
+    if ac {
+        let hv_caps = || vec![capability_sid("hypervisorPlatform")];
+        if want("lpac-cap-preload") {
+            let mut all = vec![jail_sid.as_str()];
+            all.extend(session);
+            all.extend([logon.as_str(), user.as_str()]);
+            let initial = restricted_token(own, &user, &all, &[&user, &jail_sid]);
+            set_integrity(initial, "S-1-16-4096");
+            let who = Who::AppContainerWith { sid: ac_psid, caps: hv_caps(), lpac: true, initial: Some(impersonation(initial)), mitigations: 0 };
+            jail_variant_run("lpac-cap-preload", &exe, &bin, &who, &list, port, ext, &sock_low, &sock, &plain, large.as_ref());
+        }
+        if want("lpac-cap-win32k-at-create") {
+            let who = Who::AppContainerWith { sid: ac_psid, caps: hv_caps(), lpac: true, initial: None, mitigations: 1 << 28 };
+            jail_variant_run("lpac-cap-win32k-at-create", &exe, &bin, &who, &list, port, ext, &sock_low, &sock, &plain, large.as_ref());
+        }
+        if want("appcontainer-other") {
+            let other = format!("{profile}.other");
+            let (other_psid, other_made) = appcontainer_profile(&other);
+            let other_sid = sid_string(other_psid);
+            // It may run the probe, as the first may: nothing else of the
+            // first's is granted to it.
+            let ac_sid = sid_string(ac_psid);
+            assert_eq!(set_dacl(&bin, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;0x1200a9;;;{jail_sid})(A;OICI;0x1200a9;;;{ac_sid})(A;OICI;0x1200a9;;;{other_sid})")), 0);
+            let who = Who::AppContainer { sid: other_psid, caps: Vec::new(), lpac: false };
+            jail_variant_run("appcontainer-other", &exe, &bin, &who, &list, port, ext, &sock_low, &sock_low, &plain, large.as_ref());
+            if other_made {
+                delete_appcontainer_profile(&other);
+            }
+        }
+    }
     if ac_made {
         delete_appcontainer_profile(&profile);
     }
@@ -3576,6 +3681,15 @@ extern "system" {
     fn MapViewOfFile(section: HANDLE, access: u32, high: u32, low: u32, size: usize) -> *mut c_void;
     fn VirtualFree(addr: *mut c_void, size: usize, ty: u32) -> i32;
     fn GetCurrentProcessId() -> u32;
+    fn GetCurrentThread() -> HANDLE;
+    fn GetModuleHandleW(name: *const u16) -> HANDLE;
+    fn GetProcessMitigationPolicy(process: HANDLE, policy: i32, buf: *mut c_void, len: usize) -> i32;
+    fn K32GetProcessMemoryInfo(process: HANDLE, counters: *mut u64, size: u32) -> i32;
+    fn QueryInformationJobObject(job: HANDLE, class: i32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+}
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenThreadToken(thread: HANDLE, access: u32, as_self: i32, token: *mut HANDLE) -> i32;
 }
 #[link(name = "ws2_32")]
 extern "system" {
@@ -4180,6 +4294,10 @@ impl Whp {
     fn p_before(&self, tag: &str) -> Option<(HANDLE, Vec<String>)> {
         let caps = self.caps(tag);
         let mut devices = Vec::new();
+        // What the two partitions cost (time, this process's commit and its
+        // Job's peak), made under the initial token.
+        memory_line(tag, "before-partitions");
+        let t = std::time::Instant::now();
         if let Some((probe, set_up)) = self.make(&format!("{tag} register-probe-partition"), &mut devices) {
             if set_up {
                 // SAFETY: the partition; vCPU 0, no flags.
@@ -4188,6 +4306,9 @@ impl Whp {
             // SAFETY: the partition made above, with its vCPU.
             show_hr(&format!("{tag} register-probe-partition"), "WHvDeletePartition", unsafe { (self.delete)(probe) });
         }
+        println!("{tag} register-probe-partition took {} us (made, set up, a vCPU, deleted)", t.elapsed().as_micros());
+        memory_line(tag, "after-register-probe-partition");
+        let t = std::time::Instant::now();
         let mut part = null_mut();
         // SAFETY: an out-pointer.
         let hr = unsafe { (self.create)(&mut part) };
@@ -4218,6 +4339,8 @@ impl Whp {
         // SAFETY: the partition.
         let hr = unsafe { (self.setup)(part) };
         show_hr(tag, "WHvSetupPartition", hr);
+        println!("{tag} vm-partition took {} us (made, its properties set, set up)", t.elapsed().as_micros());
+        memory_line(tag, "after-vm-partition-setup");
         if hr < 0 {
             // SAFETY: the partition made above.
             unsafe { (self.delete)(part) };
@@ -4281,8 +4404,14 @@ impl Whp {
         assert!(!mem.is_null(), "VirtualAlloc {}", last());
         for (page, gpa, flags) in [(0usize, 0xFFFF_F000u64, 0x7u32), (0x1000, 0xF_F000, 0x7), (0x2000, 0x1000, 0xB)] {
             if flags == 0x7 {
+                // `out 0x80, al; hlt` at the reset vector: an I/O port
+                // exit, which WHP always gives the VMM, where a HLT with
+                // the local APIC emulated halts in the hypervisor and never
+                // returns (crates/compat/kvm-ioctls/src/whp/vcpu.rs,
+                // `WHvRunVpExitReasonX64Halt`; the first P record's run
+                // never returned).
                 // SAFETY: within the pages.
-                unsafe { *mem.cast::<u8>().add(page + 0xFF0) = 0xF4 };
+                unsafe { std::ptr::copy_nonoverlapping([0xE6u8, 0x80, 0xF4].as_ptr(), mem.cast::<u8>().add(page + 0xFF0), 3) };
             }
             // SAFETY: the partition, our page; Read | Write | Execute, or Read | Write | TrackDirtyPages.
             show_hr(tag, &format!("WHvMapGpaRange({gpa:#x},{flags:#x})"), unsafe { (self.map)(part, mem.cast::<u8>().add(page).cast(), gpa, 0x1000, flags) });
@@ -4299,15 +4428,21 @@ impl Whp {
             }
         }
         if made.contains(&0) {
-            let mut ctx = [0u64; WHV_EXIT_CONTEXT_SIZE as usize / 8];
-            // SAFETY: the partition, vCPU 0, an exit context of its size.
-            let hr = unsafe { (self.run)(part, 0, ctx.as_mut_ptr().cast(), WHV_EXIT_CONTEXT_SIZE) };
-            show_hr(tag, "WHvRunVirtualProcessor(0)", hr);
-            if hr >= 0 {
-                let reason = ctx[0] as u32;
-                println!("{tag} exit-reason {reason:#x}{}", if reason == WHV_EXIT_HALT { " (X64Halt: the guest's HLT)" } else { " (not the HLT)" });
-            }
+            self.run_bounded(tag, part);
             self.p_running_calls(tag, part);
+        }
+        // Guest memory as Firecracker's: 64 MiB committed by this process
+        // and mapped, with the Job's count read before and after, as
+        // `memory.max` must count it with the partition made under the
+        // initial token.
+        memory_line(tag, "before-guest-memory");
+        // SAFETY: a fresh committed read-write region of 64 MiB.
+        let guest = unsafe { VirtualAlloc(null_mut(), 64 << 20, 0x3000, 0x04) };
+        memory_line(tag, "after-guest-memory-committed");
+        if !guest.is_null() {
+            // SAFETY: the partition; our region; Read | Write.
+            show_hr(tag, "WHvMapGpaRange(0x10000000, 64 MiB)", unsafe { (self.map)(part, guest, 0x1000_0000, 64 << 20, 0x3) });
+            memory_line(tag, "after-guest-memory-mapped");
         }
         // A partition made now, as a retried InstanceStart or a second
         // `Kvm`'s register probe would: option P has none after the revert.
@@ -4340,20 +4475,50 @@ impl Whp {
             let hr = unsafe { (self.create_vp)(part, 0, 0) };
             show_hr(&again, "WHvCreateVirtualProcessor(0)", hr);
             if hr >= 0 {
-                let mut ctx = [0u64; WHV_EXIT_CONTEXT_SIZE as usize / 8];
-                // SAFETY: the partition, vCPU 0, an exit context of its size.
-                let hr = unsafe { (self.run)(part, 0, ctx.as_mut_ptr().cast(), WHV_EXIT_CONTEXT_SIZE) };
-                show_hr(&again, "WHvRunVirtualProcessor(0)", hr);
-                if hr >= 0 {
-                    let reason = ctx[0] as u32;
-                    println!("{again} exit-reason {reason:#x}{}", if reason == WHV_EXIT_HALT { " (X64Halt: the guest's HLT)" } else { " (not the HLT)" });
-                }
+                self.run_bounded(&again, part);
                 // SAFETY: the vCPU just made.
                 show_hr(&again, "WHvDeleteVirtualProcessor(0)", unsafe { (self.delete_vp)(part, 0) });
             }
         }
         // SAFETY: the partition made before the revert.
         show_hr(tag, "WHvDeletePartition", unsafe { (self.delete)(part) });
+    }
+
+    /// One run of vCPU 0 of `part`, cancelled from another thread after 5 s
+    /// if it has not returned (`WHvCancelRunVirtualProcessor`), so that a
+    /// run that does not return is a line, not a child that times out: the
+    /// HRESULT and the exit reason printed.
+    fn run_bounded(&self, tag: &str, part: HANDLE) -> Option<u32> {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let watchdog = self.more("WHvCancelRunVirtualProcessor").map(|cancel| {
+            let (done, p) = (done.clone(), part as usize);
+            std::thread::spawn(move || {
+                for _ in 0..50 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if done.load(SeqCst) {
+                        return false;
+                    }
+                }
+                // SAFETY: the export, of this type (WinHvPlatform.h).
+                let cancel = unsafe { std::mem::transmute::<usize, unsafe extern "system" fn(HANDLE, u32, u32) -> i32>(cancel) };
+                // SAFETY: the partition, vCPU 0, no flags.
+                unsafe { cancel(p as HANDLE, 0, 0) };
+                true
+            })
+        });
+        let mut ctx = [0u64; WHV_EXIT_CONTEXT_SIZE as usize / 8];
+        // SAFETY: the partition, vCPU 0, an exit context of its size.
+        let hr = unsafe { (self.run)(part, 0, ctx.as_mut_ptr().cast(), WHV_EXIT_CONTEXT_SIZE) };
+        done.store(true, SeqCst);
+        let cancelled = watchdog.is_some_and(|w| w.join().unwrap_or(false));
+        show_hr(tag, "WHvRunVirtualProcessor(0)", hr);
+        if hr < 0 {
+            return None;
+        }
+        let reason = ctx[0] as u32;
+        println!("{tag} exit-reason {reason:#x} ({}){}", exit_name(reason), if cancelled { ", after the watchdog's cancel at 5 s" } else { "" });
+        Some(reason)
     }
 
     /// The calls kvm-ioctls' WHP backend makes on a running VM, each once on
@@ -4408,6 +4573,41 @@ impl Whp {
         });
         call!("WHvUnmapGpaRange", unsafe extern "system" fn(HANDLE, u64, u64) -> i32, |f| unsafe { f(part, 0x1000, 0x1000) });
     }
+}
+
+/// `WHV_RUN_VP_EXIT_REASON`'s name for `reason` (WinHvPlatformDefs.h).
+fn exit_name(reason: u32) -> &'static str {
+    match reason {
+        0x1 => "MemoryAccess",
+        0x2 => "X64IoPortAccess: the guest's OUT",
+        0x4 => "UnrecoverableException",
+        0x5 => "InvalidVpRegisterValue",
+        0x6 => "UnsupportedFeature",
+        0x7 => "X64InterruptWindow",
+        WHV_EXIT_HALT => "X64Halt: the guest's HLT",
+        0x9 => "X64ApicEoi",
+        0x1000 => "X64MsrAccess",
+        0x1001 => "X64Cpuid",
+        0x1002 => "Exception",
+        0x2001 => "Canceled",
+        _ => "another",
+    }
+}
+
+/// This process's commit (`PROCESS_MEMORY_COUNTERS_EX.PrivateUsage`) and
+/// its Job's peak (`JOBOBJECT_EXTENDED_LIMIT_INFORMATION.PeakJobMemoryUsed`,
+/// of the Job the process is in), printed as `<tag> memory <what> ...`.
+fn memory_line(tag: &str, what: &str) {
+    // PROCESS_MEMORY_COUNTERS_EX: 80 bytes, `cb` first, PrivateUsage last.
+    let mut c = [0u64; 10];
+    c[0] = 80;
+    // SAFETY: our process; a structure of the size given.
+    let private = if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), c.as_mut_ptr(), 80) } != 0 { format!("{} KiB", c[9] >> 10) } else { last() };
+    let mut info = [0u64; 18];
+    let mut n = 0u32;
+    // SAFETY: the calling process's Job; JobObjectExtendedLimitInformation, 144 bytes.
+    let job = if unsafe { QueryInformationJobObject(null_mut(), 9, info.as_mut_ptr().cast(), 144, &mut n) } != 0 { format!("{} KiB", info[17] >> 10) } else { last() };
+    println!("{tag} memory {what} private {private} job-peak {job}");
 }
 
 /// One microVM's worth of WHP, step by step, through `m` (WinHvPlatform.dll):
@@ -4545,6 +4745,9 @@ fn whp_token(base: &str) {
         ("jail-own-sid-made-before-revert", Some(Vec::new()), none.clone(), false, true, true, "1"),
         ("jail-as-now-made-before-revert", Some(session.to_vec()), none.clone(), false, true, true, "1"),
         ("jail-own-sid-p", Some(Vec::new()), none.clone(), false, true, true, "p"),
+        // The control: the same configured VM's life under the jail's token
+        // as now.
+        ("jail-as-now-p", Some(session.to_vec()), none.clone(), false, true, true, "p"),
         ("jail-cap", Some(vec![cap.as_str()]), none.clone(), false, true, true, "0"),
         ("appcontainer", None, none.clone(), false, true, true, "0"),
         ("appcontainer-cap", None, hv.clone(), false, true, true, "0"),

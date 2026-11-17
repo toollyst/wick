@@ -1227,10 +1227,13 @@ upstream Firecracker and its jailer.
     It needs every DLL and registry key Firecracker uses to be loaded before `RevertToSelf` (in place: the preload
     step 1's trace found runs before the revert, and a step that fails stops the start, named), and WHP to work
     under it. WHP does not, measured: it reports no hypervisor, as `\Device\VidExo` grants Authenticated Users and the
-    `hypervisorPlatform` capability, not the jail. A restricted token needed both WHP devices in the records (each
-    group that opens one alone failed). Two ways work: a partition made and set up before `RevertToSelf` runs after
+    `hypervisorPlatform` capability, not the jail. Opening WHP's two devices is not what it needs: with Authenticated
+    Users and Everyone both open and WHP still reports no hypervisor; with Authenticated Users and Users
+    `\Device\HvService` is denied and WHP runs. Two ways work: a partition made and set up before `RevertToSelf` runs after
     it under the jail's SID alone (option P), and an AppContainer with the `hypervisorPlatform` capability runs WHP
-    fully (option Q). Which one, and what each leaves reachable, is measured next (`fs-probe whp-token`,
+    fully (option Q), as does an LPAC with it, which reaches four devices (`fs-probe jail-variants`). Option P's
+    record did not settle it: its vCPU's run did not return under the emulated local APIC. Which one, and what each
+    leaves reachable, is measured next (`fs-probe whp-token`,
     `fs-probe jail-variants`; docs/windows-jail-reach.md).
   - **The plan this replaces cannot be done.** ALL APPLICATION PACKAGES in place of the four groups:
     `CreateRestrictedToken` refuses it, ALL RESTRICTED APPLICATION PACKAGES and the `hypervisorPlatform`

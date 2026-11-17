@@ -323,6 +323,8 @@ itself after its revert):
 | With Everyone | denied | granted | 0 | `0xC0351000` |
 | With Users | denied | denied | `E_ACCESSDENIED` | `E_ACCESSDENIED` |
 | With Interactive | denied | denied | 0 | `0xC0351000` |
+| With Authenticated Users and Everyone (third record) | granted | granted | 0 | `0xC0351000` |
+| With Authenticated Users and Users (third record) | granted | denied | 1 | every step, HLT |
 | With the `hypervisorPlatform` capability SID | `CreateRestrictedToken` refuses the SID as a restricting SID (87): not run | | | |
 | Jail's SID alone, partition made and set up before the revert | denied | denied | (1 before) | maps, vCPU, run to HLT after the revert |
 | As now, partition made before the revert | granted | granted | (1 before) | the same |
@@ -332,9 +334,11 @@ itself after its revert):
 What it shows:
 - **A capability SID cannot be a restricting SID.** `CreateRestrictedToken` refuses it with 87, as it refuses ALL
   APPLICATION PACKAGES and ALL RESTRICTED APPLICATION PACKAGES (below). Microsoft's page documents no such limit.
-- **A restricted token needs both devices.** Each group that opens one of them alone leaves WHP reporting no
-  hypervisor: Authenticated Users opens VidExo, Everyone HvService, and neither variant made a partition. Whether the
-  two together suffice is the next record's `jail-au-everyone` (and `jail-au-users`).
+- **Opening the two devices is not what WHP needs.** With Authenticated Users and Everyone both devices open and WHP
+  still reports no hypervisor; with Authenticated Users and Users, `\Device\HvService` is denied and WHP runs the
+  vCPU to its HLT (the third record). What Users grants that WHP needs is not measured; the next record lists what
+  that token reaches (`jail-variants`' `jail-sid-au-users`). It is not a candidate: Users is granted far more than
+  WHP.
 - **An AppContainer with `hypervisorPlatform` runs WHP fully with VidExo alone**: HvService was denied it, and WHP
   still reported a hypervisor and ran the vCPU to its HLT. Without the capability WHP refuses the AppContainer
   (`E_ACCESSDENIED`), which is what "WHP is refused inside an AppContainer" measured before.
@@ -371,6 +375,25 @@ kvm-ioctls' WHP backend (crates/compat/kvm-ioctls/src/whp/vm.rs, `configure`, `V
   cancel, address translation, dirty bitmap, advice, unmap): the next record makes each after the revert.
 - The API process needs none of it: it makes no partition.
 
+**The third record** (`whp-token`'s `jail-own-sid-p`: P's partition made and configured as the backend's before the
+revert, the rest of the VM's life after it, under the jail's SID alone):
+- Every capability code read after the revert returned `S_OK` with the same bytes as before it (17 codes, the clock
+  frequency included).
+- Every property read back. After `WHvSetupPartition`, `ProcessorCount`, `LocalApicEmulationMode`,
+  `ProcessorXsaveFeatures` and `ProcessorFeaturesBanks` are refused (`0x80070057`); `ExtendedVmExits`,
+  `CpuidExitList`, `ExceptionExitBitmap` and `X64MsrExitBitmap` are set. The backend sets the first four before
+  set-up only, from the host.
+- Three memory maps, one with dirty tracking, and two of four vCPUs: `S_OK`.
+- The run of vCPU 0 never returned, and the child was ended at 120 s ("child-exit 0x103 (timed out)"). The probe's
+  guest is a HLT at the reset vector, and with the local APIC emulated (`LocalApicEmulationMode` xAPIC) WHP halts the
+  vCPU in the hypervisor rather than exiting (the backend's own note: crates/compat/kvm-ioctls/src/whp/vcpu.rs,
+  `WHvRunVpExitReasonX64Halt`); the variants that exited at their HLT set no APIC mode. So the calls a running VM
+  makes, the second partition and the partition used again were not reached: **P is not settled by this record.**
+  The next record's guest exits by an `OUT` to port 0x80, a watchdog cancels a run still in WHP after 5 s, and the
+  same life runs under the jail's token as now as its control (`jail-as-now-p`). It also prints what the two
+  partitions cost (time, the process's commit, the Job's peak) and the Job's count of 64 MiB of guest memory mapped
+  into a partition made under the initial token.
+
 **Option Q: the VMM in an AppContainer (or an LPAC) with `hypervisorPlatform`.** WHP works natively, with no change
 to when the partition is made. What it brings, and what the next record (`jail-variants`' `appcontainer-cap`,
 `lpac-cap`, `lpac-cap-registry-com`, and `q_checks` after every variant) measures:
@@ -397,6 +420,35 @@ to when the partition is made. What it brings, and what the next record (`jail-v
   (`load-library-after-revert`). The mitigation profile is applied inside each (`mitigation-*`).
 - A profile per jail or none: `appcontainer-cap-bare-sid` runs WHP on a SID from
   `DeriveAppContainerSidFromAppContainerName` with no profile made.
+
+**Option Q in the third record** (`jail-variants`, Windows Server 2025 build 26100; objects reached by name, as above):
+
+| Token | Devices | ALPC ports | Pipes | Sections | IP (TCP) | AF_UNIX out / in | HKLM | win32k lockdown set after start |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| The jail's token as now | 94 | 262 | 19 | 102 | yes | denied | read | yes |
+| The jail's SID alone | 10 | 0 | 0 | 0 | yes | denied | denied | yes |
+| AppContainer with `hypervisorPlatform` | 7 | 138 | 1 | 97 | denied (10013, 10060) | connect and accept | read | yes |
+| LPAC with `hypervisorPlatform` | 4 | 3 | 0 | 83 | no Winsock (10093) | no Winsock | denied | denied (5) |
+| LPAC with `hypervisorPlatform`, `registryRead`, `lpacCom` | 4 | 48 | 0 | 85 | denied (10013) | connect and accept | read | denied (5) |
+
+- The LPAC's four devices are `\Device\VidExo`, `KsecDD`, `CNG` and `Afd`, and WHP runs in it to the guest's HLT
+  (`whp-token`'s `lpac-cap`). Its three ALPC ports are two of csrss's `ApiPort`s (`\Windows\ApiPort`, the session's)
+  and the RPC endpoint mapper (`\RPC Control\epmapper`). Its 83 sections are the 81 image sections of `\KnownDlls`
+  and `\KnownDlls32` (granted `0x2000f`: query and map) and the two `SharedSection`s of `\Windows` (granted
+  `0x20004`: map for reading). Its other names are the two `KnownDlls` directories and their `KnownDllPath` links,
+  the two sessions' `AppContainerNamedObjects` directories, `\KernelObjects`' memory-condition events and links
+  (read and wait) and one event of the antimalware service (wait).
+- Each AppContainer's memory limit held (a 300 MiB commit refused, 1455), the host opened each (duplicate a handle,
+  query, read memory), and the section the host gave was mapped. No large-page section was given: the runner's
+  account does not hold "Lock pages in memory".
+- In the AppContainers, `jail-labelled-dir-create` answered 1314 (`ERROR_PRIVILEGE_NOT_HELD`), not 5. The jail's
+  token as now and the jail's SID alone answered 5 in the same directory, so the check itself is in question; the
+  next record prints each directory's security first.
+- `appcontainer-cap-bare-sid` (a package SID with no profile): the process did not start (2).
+- Next record: an LPAC given the jailer's initial token and Firecracker's preload before its revert, without
+  `registryRead` and `lpacCom` (`lpac-cap-preload`); an LPAC with win32k's lockdown set at its creation
+  (`lpac-cap-win32k-at-create`), and the policy as each process has it before it is set; an AppContainer of another
+  profile against the first's directory and socket (`appcontainer-other`).
 
 **What does not work.**
 - `CreateRestrictedToken` refuses ALL APPLICATION PACKAGES (`S-1-15-2-1`), ALL RESTRICTED APPLICATION PACKAGES
