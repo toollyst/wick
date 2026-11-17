@@ -53,3 +53,4 @@
 0051-windows-the-compatibility-polling-in-the-lock-file.patch
 0052-macos-Firecracker-starts-with-libmalloc-s-configurat.patch
 0053-tests-a-slot-plugged-after-a-userfaultfd-restore-sti.patch
+0054-vmm-anonymous-guest-RAM-is-committed-through-one-sea.patch

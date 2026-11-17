@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Tue, 17 Nov 2026 15:12:54 +0900
+Subject: [PATCH] vmm: anonymous guest RAM is committed through one seam, owned
+ purgeable 2 MiB chunks on macOS
+
+A compromised VMM can write anonymous memory that no per-process ledger
+counts, so the jail's memory limit does not bound it on macOS
+(docs/macos-memory-limit.md). The fix for the common case (boot and a
+userfaultfd restore, whose guest memory is anonymous) is to make guest
+RAM out of purgeable (owned) objects, which the kernel charges to the
+jail's phys_footprint by the object.
+
+Route the one anonymous guest-RAM commit (`fd == -1`, no huge pages)
+through a single named seam, `owned_guest_commit`, so there is one
+grep-able call site for the owned-memory design. On macOS it makes the
+reserved range owned purgeable 2 MiB chunks (`libc::wick_owned::allocate`);
+on Linux and Windows it is the plain fixed anonymous commit, byte for
+byte as before. A File restore's fd-backed mapping and a huge-page guest
+keep the original path (they stay uncovered for now, stated in SECURITY).
+
+wick: the seam and the macOS owned backing; other hosts unchanged.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/vmm/src/vstate/memory.rs | 68 +++++++++++++++++++++++++++++++-----
+ 1 file changed, 59 insertions(+), 9 deletions(-)
+
+diff --git a/src/vmm/src/vstate/memory.rs b/src/vmm/src/vstate/memory.rs
+index 29d61c839af5ac83079aff14609bba80a4527395..ee35fd26b7d2a32ae5a689d9590e1c36eb01d536 100644
+--- a/src/vmm/src/vstate/memory.rs
++++ b/src/vmm/src/vstate/memory.rs
+@@ -112,6 +112,44 @@ struct RawGuestRegionMmap {
+     mmap_size: usize,
+ }
+ 
++/// wick: the single guest-RAM commit of anonymous memory (the one grep-able
++/// call site of the owned-memory design). On macOS the reserved, 2 MiB-aligned
++/// range `[addr, addr + len)` is made of owned purgeable 2 MiB chunks
++/// (`libc::wick_owned::allocate`), so a compromised VMM's guest writes are
++/// charged to the jail (docs/macos-memory-limit.md). On Linux and Windows it
++/// is the plain fixed anonymous commit, unchanged. Returns `addr`, or
++/// [`libc::MAP_FAILED`] with `errno` set.
++///
++/// # Safety
++/// `[addr, addr + len)` must be the caller's reserved, `2 MiB`-aligned,
++/// page-sized guest-RAM range that nothing else maps and nothing has written.
++#[cfg(target_os = "macos")]
++unsafe fn owned_guest_commit(addr: *mut c_void, len: usize, prot: libc::c_int) -> *mut c_void {
++    // SAFETY: the caller's reserved range.
++    unsafe { libc::wick_owned::allocate(addr, len, prot) }
++}
++
++/// See the macOS version: on every other host guest RAM is the plain fixed
++/// anonymous commit (the owned-purgeable backing is macOS-only, behind the
++/// hypervisor backend's hooks that exist only there).
++///
++/// # Safety
++/// As the macOS version.
++#[cfg(not(target_os = "macos"))]
++unsafe fn owned_guest_commit(addr: *mut c_void, len: usize, prot: libc::c_int) -> *mut c_void {
++    // SAFETY: the caller's reserved range.
++    unsafe {
++        libc::mmap(
++            addr,
++            len,
++            prot,
++            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED,
++            -1,
++            0,
++        )
++    }
++}
++
+ impl RawGuestRegionMmap {
+     /// Allocates a `PROT_NONE` region of memory, aligned to [`GUEST_MEMORY_ALIGNMENT`] (2 MiB).
+     ///
+@@ -270,17 +308,29 @@ impl RawGuestRegionMmap {
+         // This function works by doing a mmap fixed over a GuestMmapRegion allocated with PROT_NONE.
+         let ret = Self::allocate_protected(size, hugetlb_flags)?;
+ 
++        // wick: anonymous guest RAM (boot and a userfaultfd restore: `fd == -1`,
++        // no huge pages) is committed as owned purgeable 2 MiB chunks on macOS,
++        // so the jail's memory limit bounds a compromised VMM
++        // (docs/macos-memory-limit.md); every other case (a File restore's
++        // `fd`-backed mapping, a huge-page guest) is the plain fixed commit.
+         // SAFETY: this mmap is performed over the same memory region we just allocated, so it's
+         // guarantee it's not in use elsewhere.
+-        let addr = unsafe {
+-            libc::mmap(
+-                ret.mmap_address.cast::<c_void>(),
+-                ret.mmap_size,
+-                prot,
+-                flags | libc::MAP_FIXED,
+-                fd,
+-                offset,
+-            )
++        let addr = if fd == -1 && hugetlb_flags == 0 {
++            // SAFETY: the reserved, 2 MiB-aligned guest-RAM range, nothing else maps it.
++            unsafe { owned_guest_commit(ret.mmap_address.cast::<c_void>(), ret.mmap_size, prot) }
++        } else {
++            // SAFETY: this mmap is performed over the same memory region we just allocated, so it's
++            // guarantee it's not in use elsewhere.
++            unsafe {
++                libc::mmap(
++                    ret.mmap_address.cast::<c_void>(),
++                    ret.mmap_size,
++                    prot,
++                    flags | libc::MAP_FIXED,
++                    fd,
++                    offset,
++                )
++            }
+         };
+         if addr == libc::MAP_FAILED {
+             return Err(MemoryError::MmapRegionError(MmapRegionError::Mmap(

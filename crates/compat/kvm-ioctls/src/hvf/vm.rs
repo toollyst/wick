@@ -2846,6 +2846,76 @@ mod tests {
         });
     }
 
+    /// Owned (purgeable) guest memory (`libc::wick_owned::allocate`, the macOS
+    /// fix in docs/macos-memory-limit.md): a range made of purgeable 2 MiB
+    /// chunks is charged to the task when the guest writes it (so the jail's
+    /// memory limit bounds a compromised VMM), the guest reads back what it
+    /// wrote (the chunks are its memory), and the VMM's own read through the
+    /// host mapping adds nothing more (charged once, by the object). This
+    /// revision proves the allocation under a live guest; the whole-chunk
+    /// discard, the partial discard and the dead-page reclaim are later ones.
+    #[test]
+    fn test_owned_guest_memory_is_charged_and_usable() {
+        const CHUNK: u64 = 2 << 20;
+        let page = host_page_size();
+        let (vm, mut vcpu, _code, _clen) = vm_with_memory(1, &FILL);
+        // A 5 MiB range: two whole 2 MiB chunks and a 1 MiB last chunk (the
+        // partial-chunk path of `wick_owned`).
+        let len: u64 = 5 << 20;
+        // Reserve a 2 MiB-aligned range (as the guest-memory allocator does
+        // before its commit), then make it owned purgeable chunks.
+        let reserve = len + CHUNK;
+        // SAFETY: a new anonymous reservation of the test's.
+        let raw = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                reserve as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "reserve");
+        let base = (raw as u64).next_multiple_of(CHUNK);
+        // SAFETY: the reserved, chunk-aligned range; nothing else maps it.
+        let mem = unsafe {
+            libc::wick_owned::allocate(base as *mut core::ffi::c_void, len as usize, libc::PROT_READ | libc::PROT_WRITE)
+        };
+        assert_eq!(mem as u64, base, "owned allocate returns its range");
+
+        let ipa = GUEST_BASE + (1 << 30);
+        let region = kvm_userspace_memory_region {
+            slot: 1,
+            guest_phys_addr: ipa,
+            memory_size: len,
+            userspace_addr: base,
+            flags: 0,
+        };
+        // SAFETY: the mapping stays for the test.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+
+        let idle = phys_footprint();
+        guest_pass(&mut vcpu, ipa, ipa + len); // the guest writes 0x77 to every page
+        let written = phys_footprint();
+        assert_eq!(host_pass(base, len), 0x77 * (len / page), "the guest's writes are the host's data (its memory)");
+        let host_read = phys_footprint();
+
+        let charged = written as i64 - idle as i64;
+        assert!(
+            charged >= len as i64 && charged < (len + CHUNK) as i64,
+            "the guest's writes are charged to the task (want ~+{} MiB, was {:+} MiB): owned memory bounds the VMM",
+            len >> 20,
+            charged >> 20
+        );
+        let second = host_read as i64 - written as i64;
+        assert!(
+            second < (len / 2) as i64,
+            "the VMM's read through the host mapping adds ~0 (charged once by the object), was {:+} MiB",
+            second >> 20
+        );
+    }
+
     /// Guest programs: at [`GUEST_BASE`], writes X3 to X1, then to X4 (MMIO:
     /// the exit); at `GUEST_BASE + 16`, reads X1 into X5 and writes it to X4.
     const STORE_THEN_LOAD: [u32; 7] = [

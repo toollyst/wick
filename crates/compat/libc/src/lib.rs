@@ -39,6 +39,11 @@ pub mod wick_uffd;
 // `libc`): its documentation is the module's own, as `wick_uffd`'s.
 #[cfg(target_os = "macos")]
 pub mod wick_guest;
+// Owned (purgeable) guest memory (a wick API, not part of `libc`): guest RAM
+// made of purgeable 2 MiB chunks so the jail's memory limit bounds a
+// compromised VMM. Its documentation is the module's own, as `wick_uffd`'s.
+#[cfg(target_os = "macos")]
+pub mod wick_owned;
 // CLOCK_MONOTONIC as Linux has it: the explicit re-export takes precedence
 // over the glob re-export of `upstream`.
 #[cfg(target_os = "macos")]
