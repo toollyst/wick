@@ -33,9 +33,30 @@
 //! has not filled (missing, [`crate::wick_uffd`]) is never read and never
 //! charged by any of these: it stays missing, with its protection and the
 //! guest's stage 2 as they were.
+//!
+//! A system call copying to or from guest memory on a thread of its own
+//! (the async block engine's workers' `pread` and `pwrite`) counts the
+//! chunks it touches busy for the length of the call ([`copying`], from
+//! `wick_uffd::syscalls`), and the reclaim leaves a busy chunk for a later
+//! discard: the reclaim replaces the chunk's object, so a copy under it
+//! would read the fresh object's pages or write into the old one, which is
+//! freed. The guest's own vCPUs and the main thread need no count: stage 2
+//! is unmapped for the reclaim's window (`wick_guest::replacing`), and the
+//! main thread is the one that discards.
+//!
+//! Lock order: `wick_uffd`'s lock, then [`OWNED`]'s (a discard under a
+//! userfaultfd holds the first, `wick_uffd::discarding_or_refusing`, and
+//! takes the second, [`discard`]). [`OWNED`]'s is the innermost: a thread
+//! holding it takes no other lock of these two and never waits for a page
+//! fault, and the copy path holds it only to count and uncount, never over
+//! the call itself (where a fault on a missing page waits for a handler
+//! whose fill needs `wick_uffd`'s lock). Debug builds check it
+//! ([`held_here`], asserted where `wick_uffd` takes its lock and waits for
+//! a fault).
 
 use core::ffi::c_void;
-use std::sync::Mutex;
+use core::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::vec::Vec;
 use upstream::{self as libc, c_int};
 
@@ -117,12 +138,207 @@ struct Owned {
     base: u64,
     len: u64,
     dead: Vec<u32>,
+    /// Per chunk, the system calls copying to or from it now ([`copying`]):
+    /// the reclaim leaves a chunk whose count is not 0.
+    busy: Vec<u32>,
+    /// This registration's own number, never reused: a copy that outlives
+    /// the range ([`forget`]) uncounts nothing of a range registered at the
+    /// same address after it.
+    id: u64,
+}
+
+impl Owned {
+    /// The chunks of this range `[a, a + l)` touches, first and last.
+    fn span(&self, a: u64, l: u64) -> Option<(usize, usize)> {
+        let s = a.max(self.base);
+        let e = a.saturating_add(l).min(self.base + self.len);
+        (s < e).then(|| (((s - self.base) / CHUNK) as usize, ((e - 1 - self.base) / CHUNK) as usize))
+    }
 }
 
 /// Every owned guest-memory range of this process. A VMM has a handful (one
 /// per guest memory region), so a `Vec` under a lock is enough; the discard
 /// path (a later revision) looks a host address up here.
 static OWNED: Mutex<Vec<Owned>> = Mutex::new(Vec::new());
+
+/// The lowest start and the highest end of every owned range this process
+/// has registered, read with no lock by [`copying`] to pass over a buffer
+/// that is in none (the VMM's own memory). They only ever widen, and are
+/// widened before a range is registered: a range forgotten leaves them as
+/// they were, so at every instant they hold every registered range (a
+/// buffer that is in one is never passed over), at worst more.
+static LOW: AtomicU64 = AtomicU64::new(u64::MAX);
+static HIGH: AtomicU64 = AtomicU64::new(0);
+/// The next [`Owned::id`].
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The thread that holds [`OWNED`]'s lock (its `pthread_self`), 0 when none
+/// does ([`held_here`]). An atomic, not a thread-local: [`held_here`] is
+/// asserted in `wick_uffd::fault`, which runs in a signal handler, where a
+/// thread's first touch of a thread-local may allocate.
+static HOLDER: AtomicU64 = AtomicU64::new(0);
+
+/// This thread's `pthread_self`.
+fn this_thread() -> u64 {
+    // SAFETY: no preconditions; async-signal-safe.
+    unsafe { libc::pthread_self() as u64 }
+}
+
+/// [`OWNED`] locked, with [`HOLDER`] set for as long.
+struct Registry(MutexGuard<'static, Vec<Owned>>);
+
+impl core::ops::Deref for Registry {
+    type Target = Vec<Owned>;
+    fn deref(&self) -> &Vec<Owned> {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Registry {
+    fn deref_mut(&mut self) -> &mut Vec<Owned> {
+        &mut self.0
+    }
+}
+
+impl Drop for Registry {
+    fn drop(&mut self) {
+        HOLDER.store(0, Ordering::Release);
+    }
+}
+
+/// Locks [`OWNED`].
+fn registry() -> Registry {
+    let guard = OWNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    HOLDER.store(this_thread(), Ordering::Release);
+    Registry(guard)
+}
+
+/// Whether this thread holds the owned ranges' lock, which is the innermost
+/// (the module's lock order): `wick_uffd` asserts it does not where it
+/// takes its own lock and where it waits for a page fault.
+pub(crate) fn held_here() -> bool {
+    HOLDER.load(Ordering::Acquire) == this_thread()
+}
+
+/// The buffers of a system call: calls its argument with each one's start
+/// and length.
+pub(crate) type Buffers<'a> = &'a dyn Fn(&mut dyn FnMut(u64, u64));
+
+/// Runs `call`, a system call that copies to or from `bufs`, with each
+/// owned chunk they touch counted busy until it returns, so that no reclaim
+/// replaces the chunk's object under the copy (the module's doc). A buffer
+/// outside the span of the owned ranges costs two atomic loads ([`LOW`],
+/// [`HIGH`]); one inside it, [`OWNED`]'s lock twice, briefly, never over the
+/// call. A
+/// call that starts while a discard holds the lock waits for it, and then
+/// copies to or from the chunk as the reclaim left it. The count is undone
+/// however the call ends, by its result or by a panic (a guard's drop).
+pub(crate) fn copying<T>(bufs: Buffers<'_>, call: impl FnOnce() -> T) -> T {
+    let (low, high) = (LOW.load(Ordering::Acquire), HIGH.load(Ordering::Acquire));
+    let mut near = false;
+    bufs(&mut |a, l| near |= l != 0 && a < high && a.saturating_add(l) > low);
+    if !near {
+        return call();
+    }
+    let _busy = Busy::count(bufs);
+    #[cfg(test)]
+    test_hook(&IN_FLIGHT);
+    call()
+}
+
+/// The owned ranges a copy counted busy ([`copying`]), by [`Owned::id`].
+struct Busy<'a> {
+    bufs: Buffers<'a>,
+    ids: [u64; 4],
+    more: Vec<u64>,
+}
+
+impl<'a> Busy<'a> {
+    fn count(bufs: Buffers<'a>) -> Self {
+        #[cfg(test)]
+        GATE_WAITERS.fetch_add(1, Ordering::SeqCst);
+        let mut owned = registry();
+        #[cfg(test)]
+        GATE_WAITERS.fetch_sub(1, Ordering::SeqCst);
+        let mut busy = Busy { bufs, ids: [0; 4], more: Vec::new() };
+        bufs(&mut |a, l| {
+            for o in owned.iter_mut() {
+                if let Some((first, last)) = o.span(a, l) {
+                    for c in first..=last {
+                        o.busy[c] += 1;
+                    }
+                    busy.note(o.id);
+                }
+            }
+        });
+        busy
+    }
+
+    fn note(&mut self, id: u64) {
+        if self.has(id) {
+            return;
+        }
+        match self.ids.iter_mut().find(|i| **i == 0) {
+            Some(slot) => *slot = id,
+            None => self.more.push(id),
+        }
+    }
+
+    fn has(&self, id: u64) -> bool {
+        self.ids.contains(&id) || self.more.contains(&id)
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        let mut owned = registry();
+        (self.bufs)(&mut |a, l| {
+            for o in owned.iter_mut() {
+                if !self.has(o.id) {
+                    continue;
+                }
+                if let Some((first, last)) = o.span(a, l) {
+                    for c in first..=last {
+                        o.busy[c] -= 1;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// A test's hook, run where the code names it.
+#[cfg(test)]
+pub(crate) type TestHook = Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>;
+
+/// Run by [`copying`] once the chunks are counted, before the call.
+#[cfg(test)]
+pub(crate) static IN_FLIGHT: TestHook = Mutex::new(None);
+
+/// Run by the reclaim between the replace of the chunk's object and the
+/// copy back of its live pages.
+#[cfg(test)]
+pub(crate) static IN_RECLAIM: TestHook = Mutex::new(None);
+
+/// The copies waiting for [`OWNED`]'s lock to count their chunks.
+#[cfg(test)]
+pub(crate) static GATE_WAITERS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn test_hook(hook: &TestHook) {
+    let f = hook.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    if let Some(f) = f {
+        f();
+    }
+}
+
+/// The copies counted busy in the chunk that holds `start` (0 when it is in
+/// no owned range).
+#[cfg(test)]
+pub(crate) fn busy(start: u64) -> u32 {
+    let owned = registry();
+    owned.iter().find_map(|o| o.span(start, 1).map(|(c, _)| o.busy[c])).unwrap_or(0)
+}
 
 /// The chunks of `[base, base + len)`: `(chunk_base, chunk_size)` for each,
 /// the last shorter when `len` is not a multiple of [`CHUNK`].
@@ -149,7 +365,7 @@ pub unsafe fn allocate(addr: *mut c_void, len: usize, prot: c_int) -> *mut c_voi
     // The range must be freshly reserved: not already an owned range (so the
     // carve preserves nothing, and no earlier guest's chunks are overwritten).
     {
-        let owned = OWNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owned = registry();
         debug_assert!(
             !owned.iter().any(|o| o.base < base + len && base < o.base + o.len),
             "owned guest memory overlaps an existing owned range: {base:#x}+{len:#x}"
@@ -183,10 +399,11 @@ pub unsafe fn allocate(addr: *mut c_void, len: usize, prot: c_int) -> *mut c_voi
     }
 
     let nchunks = len.div_ceil(CHUNK) as usize;
-    OWNED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(Owned { base, len, dead: std::vec![0u32; nchunks] });
+    // The bounds first, so that a copy never passes over a registered range.
+    LOW.fetch_min(base, Ordering::AcqRel);
+    HIGH.fetch_max(base + len, Ordering::AcqRel);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    registry().push(Owned { base, len, dead: std::vec![0u32; nchunks], busy: std::vec![0u32; nchunks], id });
     // Parity with the `mmap` this stands in for: it clears any stale huge-page
     // record of the range (these chunks are not huge pages).
     crate::wick_uffd::note_mapping(base, len, false);
@@ -211,9 +428,7 @@ unsafe fn release(base: u64, len: u64) {
 /// anonymous memory, which the plain anonymous replace handles as before.
 pub(crate) fn is_owned(start: u64, len: u64) -> bool {
     let end = start.saturating_add(len);
-    OWNED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    registry()
         .iter()
         .any(|o| o.base <= start && end <= o.base + o.len)
 }
@@ -227,7 +442,7 @@ pub(crate) fn is_owned(start: u64, len: u64) -> bool {
 /// [`allocate`]'s overlap check trips. Returns whether it forgot any.
 pub(crate) fn forget(start: u64, len: u64) -> bool {
     let end = start.saturating_add(len);
-    let mut owned = OWNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut owned = registry();
     let before = owned.len();
     owned.retain(|o| !(start <= o.base && o.base + o.len <= end));
     owned.len() != before
@@ -243,7 +458,7 @@ fn page_size() -> u64 {
 /// in no owned range). The reclaim (a later revision) triggers on it; a test
 /// reads it to check a partial discard counted the pages it zeroed.
 pub fn dead_pages(start: u64) -> u32 {
-    let owned = OWNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let owned = registry();
     for o in owned.iter() {
         if o.base <= start && start < o.base + o.len {
             return o.dead[((start - o.base) / CHUNK) as usize];
@@ -275,7 +490,7 @@ pub unsafe fn discard(start: u64, len: u64, prot: c_int) -> c_int {
     }
     let end = start + len;
     let page = page_size();
-    let mut owned = OWNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut owned = registry();
     let Some(o) = owned.iter_mut().find(|o| o.base <= start && end <= o.base + o.len) else {
         // The caller checked `is_owned`; a miss here is a straddle or a race.
         crate::linux_items::set_errno(libc::ENOMEM);
@@ -292,6 +507,10 @@ pub unsafe fn discard(start: u64, len: u64, prot: c_int) -> c_int {
         let oe = end.min(cend);
         if os == cbase && oe == cend {
             // Whole chunk: free its object, a fresh purgeable one in its place.
+            // A system call copying to or from it now ([`copying`]) is the
+            // guest's own doing, as on Linux, where `MADV_DONTNEED` zaps the
+            // pages under a copy and the copy lands in the old page or the
+            // new one: here in the old object or the fresh one.
             let ok = crate::wick_guest::replacing(cbase, csize, false, || {
                 let mut a = cbase;
                 // SAFETY: a fixed purgeable allocation over the chunk's range.
@@ -324,7 +543,9 @@ pub unsafe fn discard(start: u64, len: u64, prot: c_int) -> c_int {
             o.dead[i as usize] = (o.dead[i as usize] + (olen / page) as u32).min(per_chunk);
             // Reclaim this chunk once enough of it is dead (a trigger only: the
             // move below drops pages by current content, not by this count).
-            if o.dead[i as usize] as u64 * 100 >= per_chunk as u64 * RECLAIM_DEAD_RATIO_PERCENT {
+            // A chunk a system call is copying to or from now is left for a
+            // later discard ([`copying`]), its count kept.
+            if o.dead[i as usize] as u64 * 100 >= per_chunk as u64 * RECLAIM_DEAD_RATIO_PERCENT && o.busy[i as usize] == 0 {
                 // SAFETY: chunk `i` of this owned range.
                 if unsafe { reclaim_chunk(cbase, csize, page) } {
                     o.dead[i as usize] = 0;
@@ -445,6 +666,8 @@ unsafe fn reclaim_chunk(cbase: u64, csize: u64, page: u64) -> bool {
                 && a == cbase
         };
         if made {
+            #[cfg(test)]
+            test_hook(&IN_RECLAIM);
             // Each run of one protection: its live pages written back through
             // read-write, then the protection it had.
             let mut k = 0;

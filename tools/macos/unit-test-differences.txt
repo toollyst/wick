@@ -66,7 +66,9 @@
 # thread, then each failure alone unsigned and signed:
 #   vmm --lib: 1038 tests; 850 pass, 138 fail, 50 ignored (the ext:: helpers
 #   their parent tests run in a child process). All 138 fail unsigned alone
-#   with CreateVm(Error(1)) and pass signed alone.
+#   with CreateVm(Error(1)) and pass signed alone. Counted again on
+#   2026-11-18 by check-unit-tests.py --crate vmm: 1155 tests; 932 pass,
+#   139 fail as listed, 84 ignored (not each run alone again).
 #   cpu-template-helper: 30 tests; 25 pass, 5 fail (no-hvf); 31 and 26
 #   since 2026-11-18 (test_ioreg_listing_with_a_non_utf8_byte_ahead_of_the_firmware_line).
 #   compat-kvm-ioctls: 122 tests; 34 pass, 86 fail, 2 ignored (counted again
@@ -88,7 +90,10 @@
 #   Pass (names, a name in two of a crate's binaries counted once):
 #   acpi-tables 22, clippy-tracing 17, firecracker 89, rebase-snap 3,
 #   snapshot-editor 6, utils 16, wick-ext 1, wick-version 2, compat-libc 30,
-#   compat-memfd 3, compat-std 1, compat-userfaultfd 5, compat-vmm-sys-util 26.
+#   compat-memfd 3, compat-std 1, compat-userfaultfd 5, compat-vmm-sys-util 26;
+#   counted again on 2026-11-18 by check-unit-tests.py for two of them:
+#   compat-libc 114 (1 ignored, the timed timed_a_copy_into_owned_memory),
+#   compat-userfaultfd 17 (1 ignored).
 #   No tests: log-instrument, log-instrument-macros, seccompiler,
 #   compat-event-manager, compat-kvm-bindings, compat-micro-http, compat-os,
 #   compat-vhost, compat-vm-memory.

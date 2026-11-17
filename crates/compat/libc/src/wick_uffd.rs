@@ -529,6 +529,9 @@ static LOCK: Mutex<()> = Mutex::new(());
 /// caller that finds it held first counts itself in `tests::LOCK_WAITS`, so
 /// that a test can tell, with no timing, that a thread waits for it.
 fn lock() -> std::sync::MutexGuard<'static, ()> {
+    // The lock order (`wick_owned`'s module doc): this lock, then the owned
+    // ranges', never this one under that one.
+    debug_assert!(!crate::wick_owned::held_here(), "wick_uffd's lock taken under wick_owned's");
     #[cfg(test)]
     match LOCK.try_lock() {
         Ok(guard) => {
@@ -1048,6 +1051,9 @@ fn leave(ctx: usize) {
 /// woken. Returns false if `addr` is not a missing registered page.
 /// Async-signal-safe.
 pub fn fault(addr: u64, write: bool) -> bool {
+    // No thread waits for a fill holding the owned ranges' lock, which a
+    // discard takes under the lock the fill needs (`wick_owned`'s lock order).
+    debug_assert!(!crate::wick_owned::held_here(), "a page fault waited for under wick_owned's lock");
     #[cfg(test)]
     tests::fault_hook(addr);
     let Found::In(range, page, page_addr, g1, Some(ctx)) = lookup(addr, |r, page| {
@@ -3027,16 +3033,42 @@ pub mod syscalls {
         unsafe { *libc::__error() }
     }
 
-    /// Calls `call` with the buffers `fault` faults in.
-    fn with_pages(fault: impl Fn() -> bool, mut call: impl FnMut() -> ssize_t) -> ssize_t {
-        if REGISTERED.load(core::sync::atomic::Ordering::Acquire) == 0 {
-            return call();
-        }
-        fault();
-        loop {
-            let ret = call();
-            if ret >= 0 || errno() != libc::EFAULT || !fault() {
-                return ret;
+    /// Calls `call`, which copies to or from the buffers `bufs` lists, with
+    /// the owned guest-memory chunks they touch counted busy for the call
+    /// (`wick_owned::copying`: the reclaim leaves them alone, with or without
+    /// a userfaultfd), and with the pages `fault` faults in.
+    fn with_pages(
+        bufs: crate::wick_owned::Buffers<'_>,
+        fault: impl Fn() -> bool,
+        mut call: impl FnMut() -> ssize_t,
+    ) -> ssize_t {
+        crate::wick_owned::copying(bufs, || {
+            if REGISTERED.load(core::sync::atomic::Ordering::Acquire) == 0 {
+                return call();
+            }
+            fault();
+            loop {
+                let ret = call();
+                if ret >= 0 || errno() != libc::EFAULT || !fault() {
+                    return ret;
+                }
+            }
+        })
+    }
+
+    /// One buffer, as [`with_pages`] takes them.
+    fn one(buf: u64, len: size_t) -> impl Fn(&mut dyn FnMut(u64, u64)) {
+        move |f| f(buf, len as u64)
+    }
+
+    /// The buffers of an iovec array of `count` entries, as [`with_pages`]
+    /// takes them.
+    fn iovs(iov: *const iovec, count: c_int) -> impl Fn(&mut dyn FnMut(u64, u64)) {
+        move |f| {
+            for i in 0..count.max(0) as usize {
+                // SAFETY: the caller's iovec array has `count` entries.
+                let v = unsafe { &*iov.add(i) };
+                f(v.iov_base as u64, v.iov_len as u64);
             }
         }
     }
@@ -3111,6 +3143,7 @@ pub mod syscalls {
     pub unsafe fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
         // SAFETY: the caller's contract.
         with_pages(
+            &one(buf as u64, count),
             || prefault(buf as u64, count as u64, true),
             || unsafe { libc::read(fd, buf, count) },
         )
@@ -3123,6 +3156,7 @@ pub mod syscalls {
     pub unsafe fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
         // SAFETY: the caller's contract.
         let ret = with_pages(
+            &one(buf as u64, count),
             || prefault(buf as u64, count as u64, false),
             || unsafe { libc::write(fd, buf, count) },
         );
@@ -3136,6 +3170,7 @@ pub mod syscalls {
     pub unsafe fn pread(fd: c_int, buf: *mut c_void, count: size_t, offset: off_t) -> ssize_t {
         // SAFETY: the caller's contract.
         with_pages(
+            &one(buf as u64, count),
             || prefault(buf as u64, count as u64, true),
             || unsafe { libc::pread(fd, buf, count, offset) },
         )
@@ -3148,6 +3183,7 @@ pub mod syscalls {
     pub unsafe fn pwrite(fd: c_int, buf: *const c_void, count: size_t, offset: off_t) -> ssize_t {
         // SAFETY: the caller's contract.
         with_pages(
+            &one(buf as u64, count),
             || prefault(buf as u64, count as u64, false),
             || unsafe { libc::pwrite(fd, buf, count, offset) },
         )
@@ -3160,6 +3196,7 @@ pub mod syscalls {
     pub unsafe fn readv(fd: c_int, iov: *const iovec, iovcnt: c_int) -> ssize_t {
         // SAFETY: the caller's contract.
         with_pages(
+            &iovs(iov, iovcnt),
             || iov_pages(iov, iovcnt, true),
             || unsafe { libc::readv(fd, iov, iovcnt) },
         )
@@ -3172,6 +3209,7 @@ pub mod syscalls {
     pub unsafe fn writev(fd: c_int, iov: *const iovec, iovcnt: c_int) -> ssize_t {
         // SAFETY: the caller's contract.
         let ret = with_pages(
+            &iovs(iov, iovcnt),
             || iov_pages(iov, iovcnt, false),
             || unsafe { libc::writev(fd, iov, iovcnt) },
         );
@@ -3185,6 +3223,7 @@ pub mod syscalls {
     pub unsafe fn preadv(fd: c_int, iov: *const iovec, iovcnt: c_int, offset: off_t) -> ssize_t {
         // SAFETY: the caller's contract.
         with_pages(
+            &iovs(iov, iovcnt),
             || iov_pages(iov, iovcnt, true),
             || unsafe { libc::preadv(fd, iov, iovcnt, offset) },
         )
@@ -3197,6 +3236,7 @@ pub mod syscalls {
     pub unsafe fn pwritev(fd: c_int, iov: *const iovec, iovcnt: c_int, offset: off_t) -> ssize_t {
         // SAFETY: the caller's contract.
         with_pages(
+            &iovs(iov, iovcnt),
             || iov_pages(iov, iovcnt, false),
             || unsafe { libc::pwritev(fd, iov, iovcnt, offset) },
         )
@@ -3209,6 +3249,7 @@ pub mod syscalls {
     pub unsafe fn recv(socket: c_int, buf: *mut c_void, len: size_t, flags: c_int) -> ssize_t {
         // SAFETY: the caller's contract.
         with_pages(
+            &one(buf as u64, len),
             || prefault(buf as u64, len as u64, true),
             || unsafe { libc::recv(socket, buf, len, flags) },
         )
@@ -3221,6 +3262,7 @@ pub mod syscalls {
     pub unsafe fn send(socket: c_int, buf: *const c_void, len: size_t, flags: c_int) -> ssize_t {
         // SAFETY: the caller's contract.
         let ret = with_pages(
+            &one(buf as u64, len),
             || prefault(buf as u64, len as u64, false),
             || unsafe { libc::send(socket, buf, len, flags) },
         );
@@ -3241,6 +3283,7 @@ pub mod syscalls {
     ) -> ssize_t {
         // SAFETY: the caller's contract.
         with_pages(
+            &one(buf as u64, len),
             || prefault(buf as u64, len as u64, true),
             || unsafe { libc::recvfrom(socket, buf, len, flags, addr, addrlen) },
         )
@@ -3260,6 +3303,7 @@ pub mod syscalls {
     ) -> ssize_t {
         // SAFETY: the caller's contract.
         let ret = with_pages(
+            &one(buf as u64, len),
             || prefault(buf as u64, len as u64, false),
             || unsafe { libc::sendto(socket, buf, len, flags, addr, addrlen) },
         );
@@ -3275,6 +3319,7 @@ pub mod syscalls {
         let (iov, n) = unsafe { ((*msg).msg_iov, (*msg).msg_iovlen) };
         // SAFETY: the caller's contract.
         with_pages(
+            &iovs(iov, n),
             || iov_pages(iov, n, true),
             || unsafe { libc::recvmsg(fd, msg, flags) },
         )
@@ -3289,6 +3334,7 @@ pub mod syscalls {
         let (iov, n) = unsafe { ((*msg).msg_iov, (*msg).msg_iovlen) };
         // SAFETY: the caller's contract.
         let ret = with_pages(
+            &iovs(iov, n),
             || iov_pages(iov, n, false),
             || unsafe { libc::sendmsg(fd, msg, flags) },
         );
@@ -3735,6 +3781,431 @@ mod tests {
         assert_eq!((word(5), word(4), word(31), word(32)), (0x5a5a_5a5a_5a5a_5a5a, 0x5a5a_5a5a_5a5a_5a5a, 0, 0));
         // SAFETY: plain call.
         unsafe { libc::alarm(0) };
+    }
+
+    /// A chunk of owned guest memory, every byte `fill`, and a file of one
+    /// page of `byte`: `(base, pages, page size, file, path)`.
+    fn owned_chunk_and_file(fill: u8, byte: u8) -> (u64, u64, u64, std::fs::File, std::path::PathBuf) {
+        let ps = test_page_size();
+        let chunk = crate::wick_owned::CHUNK;
+        // SAFETY: a fresh reservation, a chunk past its size to align it.
+        let raw = unsafe {
+            libc::mmap(ptr::null_mut(), (2 * chunk) as usize, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE, -1, 0)
+        };
+        assert_ne!(raw, libc::MAP_FAILED);
+        let base = (raw as u64).next_multiple_of(chunk);
+        // SAFETY: the reserved, chunk-aligned range.
+        let p = unsafe { crate::wick_owned::allocate(base as *mut _, chunk as usize, libc::PROT_READ | libc::PROT_WRITE) };
+        assert_eq!(p as u64, base);
+        // SAFETY: the chunk just made.
+        unsafe { ptr::write_bytes(base as *mut u8, fill, chunk as usize) };
+        let path = std::env::temp_dir().join(std::format!("wick-gate-{}-{}", std::process::id(), base));
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut file, &std::vec![byte; ps as usize]).unwrap();
+        (base, chunk / ps, ps, file, path)
+    }
+
+    /// One-page discards of pages 32 to `last` of the chunk at `base` (half
+    /// the chunk's pages): the last crosses half the chunk dead.
+    fn discard_half(base: u64, pages: u64, ps: u64) -> u64 {
+        let last = 32 + pages / 2 - 1;
+        for i in 32..=last {
+            // SAFETY: a page of the owned chunk.
+            assert_eq!(unsafe { crate::linux_items::madvise((base + i * ps) as *mut _, ps as usize, libc::MADV_DONTNEED) }, 0, "discard of page {i}");
+        }
+        last
+    }
+
+    /// Sets the owned-memory hook `hook` to `f`.
+    fn set_hook(hook: &crate::wick_owned::TestHook, f: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+        *hook.lock().unwrap() = f;
+    }
+
+    /// Whether the page at `at` holds `byte` in every byte.
+    fn page_is(at: u64, ps: u64, byte: u8) -> bool {
+        // SAFETY: a readable page of the caller's.
+        unsafe { std::slice::from_raw_parts(at as *const u8, ps as usize) }.iter().all(|&b| b == byte)
+    }
+
+    /// A `pread` into (`write` false) or a `pwrite` out of (`write` true) a
+    /// page of an owned chunk, held in flight by a test hook once its chunk
+    /// is counted (`wick_owned::copying`), while a discard pushes the chunk
+    /// past half dead: the reclaim leaves the chunk, its dead count kept, the
+    /// copy then lands whole, and the next discard reclaims the chunk with
+    /// the copy's data in it. Before, the reclaim replaced the chunk's object
+    /// under the copy: a `pread` wrote into the old object, freed, or into
+    /// the fresh one before the live pages were written back over it (the
+    /// guest's block read lost), and a `pwrite` read the fresh object's
+    /// zeros (zeros written to the guest's disk). Without the count, the
+    /// test lets the copy go from inside the reclaim's window
+    /// (`wick_owned::IN_RECLAIM`), so it fails each time.
+    fn copy_in_flight_survives_the_reclaim(write: bool) {
+        // SAFETY: plain call.
+        unsafe { libc::alarm(30) };
+        let (base, pages, ps, file, path) = owned_chunk_and_file(0x5a, 0xa7);
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        let at = base + 10 * ps;
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = std::sync::Mutex::new(go_rx);
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        set_hook(
+            &crate::wick_owned::IN_FLIGHT,
+            Some(std::sync::Arc::new(move || {
+                if std::thread::current().name() == Some("copier") {
+                    parked_tx.send(()).unwrap();
+                    go_rx.lock().unwrap().recv().unwrap();
+                }
+            })),
+        );
+        {
+            let (go_tx, done) = (go_tx.clone(), done.clone());
+            set_hook(
+                &crate::wick_owned::IN_RECLAIM,
+                Some(std::sync::Arc::new(move || {
+                    let _ = go_tx.send(());
+                    while !done.load(Ordering::SeqCst) {
+                        std::thread::yield_now();
+                    }
+                })),
+            );
+        }
+        let copier = {
+            let done = done.clone();
+            std::thread::Builder::new()
+                .name("copier".into())
+                .spawn(move || {
+                    // SAFETY: a page of the owned chunk, which stays mapped.
+                    let n = unsafe {
+                        if write {
+                            super::syscalls::pwrite(fd, at as *const core::ffi::c_void, ps as usize, 0)
+                        } else {
+                            super::syscalls::pread(fd, at as *mut core::ffi::c_void, ps as usize, 0)
+                        }
+                    };
+                    let e = std::io::Error::last_os_error();
+                    done.store(true, Ordering::SeqCst);
+                    (n, e)
+                })
+                .unwrap()
+        };
+        parked_rx.recv().unwrap();
+        let counted = crate::wick_owned::busy(at);
+        let last = discard_half(base, pages, ps);
+        let dead = crate::wick_owned::dead_pages(base);
+        let _ = go_tx.send(());
+        let (n, e) = copier.join().unwrap();
+        set_hook(&crate::wick_owned::IN_FLIGHT, None);
+        set_hook(&crate::wick_owned::IN_RECLAIM, None);
+        let landed = |byte| if write { std::fs::read(&path).unwrap().iter().all(|&b| b == byte) } else { page_is(at, ps, byte) };
+        let byte = if write { 0x5a } else { 0xa7 };
+        assert!(n == ps as isize && landed(byte), "the copy: {n} ({e}), its data landed: {}", landed(byte));
+        assert_eq!(dead, (pages / 2) as u32, "the reclaim left the chunk a copy was in flight in");
+        assert_eq!(counted, 1, "the copy in flight counted its chunk");
+        assert_eq!(crate::wick_owned::busy(at), 0);
+        // The next discard reclaims the chunk, with the copy's data in it.
+        // SAFETY: a page of the owned chunk.
+        assert_eq!(unsafe { crate::linux_items::madvise((base + (last + 1) * ps) as *mut _, ps as usize, libc::MADV_DONTNEED) }, 0);
+        assert_eq!(crate::wick_owned::dead_pages(base), 0, "reclaimed by the next discard");
+        assert!(landed(byte) && page_is(at, ps, byte), "the copy's data after the reclaim");
+        assert!(page_is(base, 8, 0x5a), "a live page after the reclaim");
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        // SAFETY: plain call.
+        unsafe { libc::alarm(0) };
+    }
+
+    /// (`copy_in_flight_survives_the_reclaim`) A `pread` into the chunk, as
+    /// the async block engine's worker reads a guest's block request.
+    #[test]
+    fn test_a_pread_in_flight_keeps_its_data_through_a_reclaim() {
+        if in_own_process("wick_uffd::tests::test_a_pread_in_flight_keeps_its_data_through_a_reclaim") {
+            copy_in_flight_survives_the_reclaim(false);
+        }
+    }
+
+    /// (`copy_in_flight_survives_the_reclaim`) A `pwrite` out of the chunk,
+    /// as the async block engine's worker writes a guest's block request.
+    #[test]
+    fn test_a_pwrite_in_flight_writes_the_guests_data_through_a_reclaim() {
+        if in_own_process("wick_uffd::tests::test_a_pwrite_in_flight_writes_the_guests_data_through_a_reclaim") {
+            copy_in_flight_survives_the_reclaim(true);
+        }
+    }
+
+    /// A `pread` into an owned chunk that starts while the reclaim of that
+    /// chunk is in its window (a test hook in it, `wick_owned::IN_RECLAIM`,
+    /// lets it start and waits until it has either finished or is waiting
+    /// for the owned ranges' lock) waits for the reclaim, then reads into the
+    /// chunk as the reclaim left it: its data and the chunk's live pages are
+    /// all there. Before, it read into the fresh object while the reclaim
+    /// was writing the live pages back (with the fresh object mapped with no
+    /// access, it failed with `EFAULT`).
+    #[test]
+    fn test_a_pread_arriving_during_a_reclaim_waits_for_it() {
+        if !in_own_process("wick_uffd::tests::test_a_pread_arriving_during_a_reclaim_waits_for_it") {
+            return;
+        }
+        // SAFETY: plain call.
+        unsafe { libc::alarm(30) };
+        let (base, pages, ps, file, path) = owned_chunk_and_file(0x5a, 0xa7);
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        let at = base + 10 * ps;
+        let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let reader = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                start_rx.recv().unwrap();
+                // SAFETY: a page of the owned chunk, which stays mapped.
+                let n = unsafe { super::syscalls::pread(fd, at as *mut core::ffi::c_void, ps as usize, 0) };
+                let e = std::io::Error::last_os_error();
+                done.store(true, Ordering::SeqCst);
+                (n, e)
+            })
+        };
+        {
+            let done = done.clone();
+            set_hook(
+                &crate::wick_owned::IN_RECLAIM,
+                Some(std::sync::Arc::new(move || {
+                    start_tx.send(()).unwrap();
+                    while !done.load(Ordering::SeqCst) && crate::wick_owned::GATE_WAITERS.load(Ordering::SeqCst) == 0 {
+                        std::thread::yield_now();
+                    }
+                })),
+            );
+        }
+        discard_half(base, pages, ps);
+        set_hook(&crate::wick_owned::IN_RECLAIM, None);
+        assert_eq!(crate::wick_owned::dead_pages(base), 0, "the chunk was reclaimed");
+        let (n, e) = reader.join().unwrap();
+        assert_eq!(n, ps as isize, "the pread: {e}");
+        assert!(page_is(at, ps, 0xa7), "the pread's data");
+        assert!(page_is(at + ps, 8, 0x5a) && page_is(base, 8, 0x5a), "the live pages");
+        assert_eq!(crate::wick_owned::busy(at), 0);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        // SAFETY: plain call.
+        unsafe { libc::alarm(0) };
+    }
+
+    /// A `pread` into a page a userfaultfd has not filled, in an owned chunk:
+    /// it counts its chunk busy and then waits for the page's fill, which
+    /// the handler gives only after a discard has pushed the chunk past half
+    /// dead (the discard holds `wick_uffd`'s lock, which the fill needs, and
+    /// takes the owned ranges'). Nothing deadlocks: the copy does not hold
+    /// the owned ranges' lock while it waits (`wick_owned`'s lock order), the
+    /// reclaim leaves the busy chunk, and the fill and the read then land.
+    /// Under `alarm(30)`.
+    #[test]
+    fn test_a_counted_pread_waiting_for_a_fill_does_not_block_a_discard() {
+        if !in_own_process("wick_uffd::tests::test_a_counted_pread_waiting_for_a_fill_does_not_block_a_discard") {
+            return;
+        }
+        // SAFETY: plain call.
+        unsafe { libc::alarm(30) };
+        init().unwrap();
+        let ps = test_page_size();
+        let chunk = crate::wick_owned::CHUNK;
+        let pages = chunk / ps;
+        // SAFETY: a fresh reservation, a chunk past its size to align it.
+        let raw = unsafe {
+            libc::mmap(ptr::null_mut(), (2 * chunk) as usize, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE, -1, 0)
+        };
+        assert_ne!(raw, libc::MAP_FAILED);
+        let base = (raw as u64).next_multiple_of(chunk);
+        // SAFETY: the reserved, chunk-aligned range.
+        let p = unsafe { crate::wick_owned::allocate(base as *mut _, chunk as usize, libc::PROT_READ | libc::PROT_WRITE) };
+        assert_eq!(p as u64, base);
+        let (ctx, user) = create(FEATURE_EVENT_REMOVE, true, true).unwrap();
+        register(ctx, base, chunk).unwrap();
+        let (chan, mine) = (channel(user), channel(user));
+        let ask = move |chan: c_int, head: [u64; 4], payload: &[u8]| {
+            let mut msg = record(head);
+            msg.extend_from_slice(payload);
+            assert!(write_full(chan, &msg));
+            let mut reply = [0u8; proto::RECORD];
+            assert!(read_full(chan, &mut reply));
+            words(&reply)[0] as i64
+        };
+        let data = std::vec![0x5au8; ps as usize];
+        for i in (0..pages).filter(|&i| i != 10) {
+            assert_eq!(ask(mine, [proto::OP_COPY, base + i * ps, ps, 0], &data), ps as i64, "fill {i}");
+        }
+        let path = std::env::temp_dir().join(std::format!("wick-gate-{}-{}", std::process::id(), base));
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut file, &std::vec![0xa7u8; ps as usize]).unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        // The handler: page faults held until `serve`, then filled with
+        // 0x3c; remove events unregister their range.
+        let (stop, serve) = (std::sync::Arc::new(AtomicBool::new(false)), std::sync::Arc::new(AtomicBool::new(false)));
+        let counts = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let handler = {
+            let (stop, serve, counts) = (stop.clone(), serve.clone(), counts.clone());
+            std::thread::spawn(move || {
+                let fill = std::vec![0x3cu8; ps as usize];
+                let mut held: Vec<u64> = Vec::new();
+                while !stop.load(Ordering::SeqCst) {
+                    loop {
+                        let mut rec = [0u8; proto::RECORD];
+                        // SAFETY: reads one record into a local buffer.
+                        let n = unsafe { libc::read(user, rec.as_mut_ptr().cast(), proto::RECORD) };
+                        if n <= 0 {
+                            break;
+                        }
+                        let w = words(&rec);
+                        if w[0] == proto::EVENT_PAGEFAULT {
+                            counts[0].fetch_add(1, Ordering::SeqCst);
+                            held.push(w[1] - w[1] % ps);
+                        } else if w[0] == proto::EVENT_REMOVE {
+                            counts[1].fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(ask(chan, [proto::OP_UNREGISTER, w[1], w[2] - w[1], 0], &[]), 0);
+                        }
+                    }
+                    if serve.load(Ordering::SeqCst) {
+                        held.retain(|&at| ask(chan, [proto::OP_COPY, at, ps, 0], &fill) == err(libc::EAGAIN));
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let at = base + 10 * ps;
+        let reader = std::thread::spawn(move || {
+            // SAFETY: a page of the owned chunk, which stays mapped.
+            let n = unsafe { super::syscalls::pread(fd, at as *mut core::ffi::c_void, ps as usize, 0) };
+            (n, std::io::Error::last_os_error())
+        });
+        until("the pread's page fault event", || counts[0].load(Ordering::SeqCst) == 1);
+        let counted = crate::wick_owned::busy(at);
+        let last = discard_half(base, pages, ps);
+        until("the remove events read", || counts[1].load(Ordering::SeqCst) == pages / 2);
+        assert_eq!(crate::wick_owned::dead_pages(base), (pages / 2) as u32, "the reclaim left the busy chunk");
+        assert_eq!(counted, 1, "the waiting pread counted its chunk");
+        serve.store(true, Ordering::SeqCst);
+        let (n, e) = reader.join().unwrap();
+        assert_eq!(n, ps as isize, "the pread: {e}");
+        assert!(page_is(at, ps, 0xa7), "the pread's data");
+        assert_eq!(crate::wick_owned::busy(at), 0);
+        // SAFETY: a page of the owned chunk.
+        assert_eq!(unsafe { crate::linux_items::madvise((base + (last + 1) * ps) as *mut _, ps as usize, libc::MADV_DONTNEED) }, 0);
+        until("the last remove event read", || counts[1].load(Ordering::SeqCst) == pages / 2 + 1);
+        assert_eq!(crate::wick_owned::dead_pages(base), 0, "reclaimed by the next discard");
+        assert!(page_is(at, ps, 0xa7), "the pread's data after the reclaim");
+        assert_eq!(counts[0].load(Ordering::SeqCst), 1, "no page fault event but the pread's");
+        stop.store(true, Ordering::SeqCst);
+        handler.join().unwrap();
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        // SAFETY: plain call.
+        unsafe { libc::alarm(0) };
+        close(&[chan, mine, user]);
+    }
+
+    /// A copy's count of its chunk is undone however the call ends: a
+    /// `pread` refused (`EBADF`), a `readv` that fails part way (`EFAULT`,
+    /// its second buffer unmapped), and a call that panics. A count left
+    /// behind would keep the chunk from every reclaim for good.
+    #[test]
+    fn test_a_copy_that_fails_or_panics_leaves_no_count() {
+        let (base, _pages, ps, file, path) = owned_chunk_and_file(0x5a, 0xa7);
+        let at = base + 3 * ps;
+        // SAFETY: a page of the owned chunk; no descriptor -1.
+        assert_eq!(unsafe { super::syscalls::pread(-1, at as *mut core::ffi::c_void, ps as usize, 0) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(crate::wick_owned::busy(at), 0, "after EBADF");
+        let iov = [
+            libc::iovec { iov_base: at as *mut core::ffi::c_void, iov_len: 16 },
+            libc::iovec { iov_base: 0x10 as *mut core::ffi::c_void, iov_len: 16 },
+        ];
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        // SAFETY: the iovec array; the second buffer is not mapped, which
+        // the call reports.
+        let n = unsafe { super::syscalls::preadv(fd, iov.as_ptr(), 2, 0) };
+        assert!(n == -1 || n == 16, "{n}");
+        assert_eq!(crate::wick_owned::busy(at), 0, "after a failed readv");
+        let bufs = |f: &mut dyn FnMut(u64, u64)| f(at, ps);
+        let during = core::cell::Cell::new(0);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::wick_owned::copying(&bufs, || {
+                during.set(crate::wick_owned::busy(at));
+                panic!("mid-call");
+            })
+        }));
+        assert!(r.is_err());
+        assert_eq!(during.get(), 1, "counted during the call");
+        assert_eq!(crate::wick_owned::busy(at), 0, "after a panic");
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The cost of the copy gate (`wick_owned::copying`) per system call:
+    /// `pread` of 4 KiB from a cached file and `recvmsg` of a 1500-byte
+    /// datagram from a socket pair (a block request of the async engine; a
+    /// frame of the net device's Unix datagram endpoint), each into owned
+    /// guest memory and into the heap (the control: before the gate it is
+    /// the same call; with it, two atomic loads). Prints ns per call, the
+    /// median of 7 batches, as GATE lines. Ignored: a measurement, run by
+    /// hand (`--ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn timed_a_copy_into_owned_memory() {
+        const N: usize = 50_000;
+        let ps = test_page_size();
+        let chunk = crate::wick_owned::CHUNK;
+        // SAFETY: a fresh reservation, a chunk past its size to align it.
+        let raw = unsafe {
+            libc::mmap(ptr::null_mut(), (2 * chunk) as usize, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE, -1, 0)
+        };
+        let base = (raw as u64).next_multiple_of(chunk);
+        // SAFETY: the reserved, chunk-aligned range.
+        let p = unsafe { crate::wick_owned::allocate(base as *mut _, chunk as usize, libc::PROT_READ | libc::PROT_WRITE) };
+        assert_eq!(p as u64, base);
+        // SAFETY: the chunk just made.
+        unsafe { ptr::write_bytes(base as *mut u8, 0x5a, chunk as usize) };
+        let mut heap = std::vec![0x5au8; ps as usize];
+        let path = std::env::temp_dir().join(std::format!("wick-gate-timed-{}", std::process::id()));
+        std::fs::write(&path, std::vec![0xa7u8; 4096]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        let mut sv = [0; 2];
+        // SAFETY: two descriptors filled by the call.
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sv.as_mut_ptr()) }, 0);
+        let frame = [0x11u8; 1500];
+        let median = |f: &mut dyn FnMut()| {
+            let mut v: Vec<f64> = (0..7)
+                .map(|_| {
+                    let a = Instant::now();
+                    for _ in 0..N {
+                        f();
+                    }
+                    a.elapsed().as_nanos() as f64 / N as f64
+                })
+                .collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (v[3], v[0], v[6])
+        };
+        for (name, at) in [("heap", heap.as_mut_ptr() as u64), ("owned", base + 5 * ps)] {
+            let (m, lo, hi) = median(&mut || {
+                // SAFETY: a page of the caller's.
+                assert_eq!(unsafe { super::syscalls::pread(fd, at as *mut core::ffi::c_void, 4096, 0) }, 4096);
+            });
+            std::println!("GATE pread4k {name} median_ns={m:.0} min_ns={lo:.0} max_ns={hi:.0}");
+            let (m, lo, hi) = median(&mut || {
+                // SAFETY: a local frame; a page of the caller's for the receive.
+                unsafe {
+                    assert_eq!(libc::send(sv[0], frame.as_ptr().cast(), frame.len(), 0), 1500);
+                    let mut iov = libc::iovec { iov_base: at as *mut core::ffi::c_void, iov_len: 1500 };
+                    let mut msg: libc::msghdr = core::mem::zeroed();
+                    msg.msg_iov = &mut iov;
+                    msg.msg_iovlen = 1;
+                    assert_eq!(super::syscalls::recvmsg(sv[1], &mut msg, 0), 1500);
+                }
+            });
+            std::println!("GATE recvmsg1500 {name} median_ns={m:.0} min_ns={lo:.0} max_ns={hi:.0}");
+        }
+        close(&sv);
+        let _ = std::fs::remove_file(&path);
     }
 
     fn err(e: c_int) -> i64 {

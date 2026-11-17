@@ -196,7 +196,11 @@ guest):
   protection before and after, the charge, and a later touch's one event;
   `test_owned_reclaim_leaves_missing_pages_out_of_stage_2` under Hypervisor.framework). A chunk with a page that is
   neither missing nor readable is left as it is, its charge pinned, until a later discard finds it readable
-  (`test_a_reclaim_leaves_a_chunk_with_an_unreadable_page`; Firecracker makes no part of a chunk so). The 50% trigger is a macOS difference by
+  (`test_a_reclaim_leaves_a_chunk_with_an_unreadable_page`; Firecracker makes no part of a chunk so). A chunk a
+  system call is copying to or from on another thread (the Async block engine's `pread` and `pwrite`) is busy, counted
+  by the compatibility libc's copy wrappers, and left for a later discard; a call arriving during a reclaim waits for
+  it (`test_a_pread_in_flight_keeps_its_data_through_a_reclaim`, `test_a_pread_arriving_during_a_reclaim_waits_for_it`).
+  The 50% trigger is a macOS difference by
   an OS gap, not by choice: Windows and Linux's memory cgroup reclaim at the commit/charge limit, when an allocation
   is refused; macOS has no refused commit — a purgeable charge grows until jetsam kills — so it reclaims proactively
   at this ratio (the constant is cross-referenced to the Windows dead-chunk reclaim).

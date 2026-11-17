@@ -203,6 +203,24 @@ has the per-control details and results.
 
 ## Fixed defects
 
+- **macOS: a block request on the Async engine, in flight while a balloon or discard pushed its 2 MiB chunk of guest
+  memory past half dead, could lose the guest's data or write zeros to its disk** (from 632a5574, which added the
+  reclaim of owned guest memory; fixed in the commit that adds this entry). The Async engine's workers copy a
+  request with `pread` and `pwrite` straight into and out of guest memory, on threads of their own, while the reclaim
+  replaces a chunk's object on the main thread: a read landing in the window went into the freed object, or into the
+  fresh one before the live pages were written back over it, and was lost; a write read the fresh object's zeros and
+  wrote them to the disk image. From 94bc1d05, which maps the fresh object with no access, such a copy failed with
+  `EFAULT` instead, an I/O error to the guest. Only the guest's own memory and disk image were hit, and only when the
+  guest itself discarded memory in the chunk its request used. Now each of those system calls counts the owned
+  chunks it touches busy for its length (`wick_owned::copying`, from the compatibility libc's copy wrappers), the
+  reclaim leaves a busy chunk for a later discard, and a call that arrives during a reclaim waits for it
+  (`test_a_pread_in_flight_keeps_its_data_through_a_reclaim`,
+  `test_a_pwrite_in_flight_writes_the_guests_data_through_a_reclaim`,
+  `test_a_pread_arriving_during_a_reclaim_waits_for_it`, each failing without the count with `EFAULT`; a copy waiting
+  for a userfaultfd fill does not block the discard, `test_a_counted_pread_waiting_for_a_fill_does_not_block_a_discard`;
+  the count is undone however the call ends, `test_a_copy_that_fails_or_panics_leaves_no_count`). The Sync engine,
+  the net device and the other devices copy on the main thread, which is the one that reclaims, and the vCPUs are
+  held out by the unmapped stage 2.
 - **macOS: on a userfaultfd restore, a guest that inflated its balloon past half of a 2 MiB chunk hung its own VMM**
   (from 632a5574, which added the reclaim of owned guest memory; fixed in the commit that adds this entry). Once a
   chunk of owned guest memory is half dead (balloon or userfaultfd discards), the reclaim moves its live pages into a
