@@ -52,6 +52,13 @@ spec = importlib.util.spec_from_file_location("bt", os.path.join(os.environ["ROO
 bt = importlib.util.module_from_spec(spec); spec.loader.exec_module(bt)
 bt.fetch(sys.argv[1], bt.KERNEL); bt.fetch(sys.argv[1], bt.ROOTFS)
 PY
+# Without root first: every uffd-charge case's arguments parse behind the
+# jailer's own options. The uffd-charge stage runs root-only, so a mismatch
+# between the probe and jailer-test.py would otherwise show only in CI (run
+# 44002585606: the probe read the jailer's `--id` as its MiB count and
+# aborted). This runs the built probe parse-only and fails here if it breaks.
+python3 -I -B "$ROOT/tools/macos/jailer-test.py" --uffd-charge-arg-check \
+    --uffd-charge-probe "$TARGET_DIR/$PROFILE/examples/uffd_charge_probe"
 # -B: root writes no bytecode into the source tree (jailer-test.py imports
 # boot-test.py and jailer-cgroup-test.py by path), which would leave a
 # root-owned __pycache__ the user's own runs then cannot write.

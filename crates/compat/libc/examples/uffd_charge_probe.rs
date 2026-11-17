@@ -239,11 +239,45 @@ mod probe {
         println!("UFFD-CHARGE reusable: footprint {} MiB ({})", footprint_mib() - start, task_counts());
     }
 
+    /// The probe's own positional arguments: `MIB [MODE [then-read]]`. The
+    /// jailer runs the exec-file with its own options in front of them
+    /// (`--id <id> --start-time-us <n> --start-time-cpu-us <n>
+    /// --parent-cpu-time-us <n>`, src/jailer/src/env.rs `exec_command`), each
+    /// an option and its value, so the probe drops any leading `--name value`
+    /// pair and reads the positional arguments that follow, as the resource
+    /// limit probe (tools/macos/jailer-test.py) reads its last argument.
+    /// None are dropped when the probe is run on its own (no `--` option in
+    /// front), so both forms parse. A mode name never starts with `--`.
+    fn positionals() -> Vec<String> {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            if args[i].starts_with("--") {
+                i += 2; // the jailer's option and its value
+            } else {
+                out.push(args[i].clone());
+                i += 1;
+            }
+        }
+        out
+    }
+
     pub fn main() {
-        let args: Vec<String> = std::env::args().collect();
-        let mib: u64 = args.get(1).and_then(|a| a.parse().ok()).expect("usage: uffd_charge_probe MIB [MODE]");
-        let mode = args.get(2).map(String::as_str).unwrap_or("");
-        let then_read = args.get(3).map(String::as_str) == Some("then-read");
+        let args = positionals();
+        let mib: u64 =
+            args.first().and_then(|a| a.parse().ok()).expect("usage: uffd_charge_probe MIB [MODE [then-read]]");
+        let mode = args.get(1).map(String::as_str).unwrap_or("");
+        let then_read = args.get(2).map(String::as_str) == Some("then-read");
+        // The jailer runs this stage root-only (CI's macos job), so a mismatch
+        // between the arguments the probe parses and those jailer-test.py
+        // passes shows only there. WICK_UFFD_PARSE_ONLY lets a non-root check
+        // run the probe for every case and read back what it parsed, before
+        // any allocation (jailer-test.py `--uffd-charge-arg-check`).
+        if std::env::var_os("WICK_UFFD_PARSE_ONLY").is_some() {
+            println!("UFFD-CHARGE parsed MIB={mib} MODE={mode} then_read={then_read}");
+            return;
+        }
         // SAFETY: sysconf has no preconditions.
         let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
         let start = footprint_mib();

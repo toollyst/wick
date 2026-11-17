@@ -853,6 +853,40 @@ def stage_memory(ctx):
     return "guest writes 700 MiB; " + ", ".join(results)
 
 
+# The uffd-charge cases: (name, the probe's arguments, must it be killed, its role, what it does). The arguments are
+# positional (MIB [MODE]); the jailer runs the exec-file with its own options in front of them (`--id`,
+# `--start-time-us`, ...: src/jailer/src/env.rs `exec_command`), which the probe drops (uffd_charge_probe
+# `positionals`). uffd_charge_arg_check runs each case's probe without root, so an argument mismatch fails there and
+# not only in the root stage.
+UFFD_CHARGE_CASES = (
+    ("uffd-charge", ["64"], False, "charged once", "64 MiB filled and read"),
+    ("uffd-charge-view", ["64", "second-view"], True, "control", "the same with a second view read"),
+    ("views-only", ["256", "views-only"], False, "the gap", "256 MiB written only through removed views"),
+    ("views-only-purgeable", ["256", "views-only-purgeable"], True, "the gap's control", "the same, purgeable"),
+    ("reusable", ["256", "reusable"], False, "the gap", "256 MiB written, made reusable and written again"),
+    ("uffd-charge-purgeable", ["128", "purgeable"], True, "the design", "128 MiB of a purgeable object filled"),
+)
+
+
+def uffd_charge_arg_check(probe):
+    """Without root: every uffd-charge case's arguments parse when the jailer's own options are in front of them.
+    Runs the probe with WICK_UFFD_PARSE_ONLY, which parses the arguments, prints what it read and exits before any
+    allocation, after the same options the jailer prepends (src/jailer/src/env.rs `exec_command`: `--id <id>
+    --start-time-us <n> --start-time-cpu-us <n> --parent-cpu-time-us <n>`). A probe that reads the wrong argument
+    (the base case read `--id` as the MiB count and aborted: run 44002585606) fails here, not only in the root
+    stage CI runs."""
+    prepend = ["--id", "uffd-charge-arg-check", "--start-time-us", "1", "--start-time-cpu-us", "2",
+               "--parent-cpu-time-us", "3"]
+    for name, args, _kill, _role, _what in UFFD_CHARGE_CASES:
+        out = subprocess.run([probe] + prepend + args, capture_output=True, text=True,
+                             env={**os.environ, "WICK_UFFD_PARSE_ONLY": "1"})
+        want = f"UFFD-CHARGE parsed MIB={args[0]} MODE={args[1] if len(args) > 1 else ''} then_read=false"
+        check(out.returncode == 0 and want in out.stdout,
+              f"{name}: the probe did not parse {args!r} behind the jailer's options: exit {out.returncode}, "
+              f"stdout {out.stdout!r}, stderr {out.stderr!r} (wanted {want!r})")
+    print(f"uffd-charge arg-check passed: {len(UFFD_CHARGE_CASES)} cases parse behind the jailer's options")
+
+
 def stage_uffd_charge(ctx):
     """What the jail's memory limit counts, with crates/compat/libc's uffd_charge_probe run by the jailer under
     memory.max of 96 MiB (a fatal jetsam limit on the process's phys_footprint, overlay/jailer/platform/macos/mod.rs
@@ -872,17 +906,11 @@ def stage_uffd_charge(ctx):
     - The gap's control, must be killed: the first way on a purgeable object, which the task owns and which is
       charged by the object.
     - The design being made for guest memory, must be killed during the fills, before the read (no "filled" line):
-      128 MiB of a purgeable object filled through a userfaultfd, each page charged at its fill, as on Linux."""
-    cases = (
-        ("uffd-charge", ["64"], False, "charged once", "64 MiB filled and read"),
-        ("uffd-charge-view", ["64", "second-view"], True, "control", "the same with a second view read"),
-        ("views-only", ["256", "views-only"], False, "the gap", "256 MiB written only through removed views"),
-        ("views-only-purgeable", ["256", "views-only-purgeable"], True, "the gap's control", "the same, purgeable"),
-        ("reusable", ["256", "reusable"], False, "the gap", "256 MiB written, made reusable and written again"),
-        ("uffd-charge-purgeable", ["128", "purgeable"], True, "the design", "128 MiB of a purgeable object filled"),
-    )
+      128 MiB of a purgeable object filled through a userfaultfd, each page charged at its fill, as on Linux.
+    The cases are UFFD_CHARGE_CASES, which uffd_charge_arg_check also runs (without root) to catch an argument
+    mismatch between the probe and this file before the root stage does."""
     results = []
-    for name, args, expect_kill, role, what in cases:
+    for name, args, expect_kill, role, what in UFFD_CHARGE_CASES:
         chroot_of(ctx.base, ctx.uffd_charge_probe, name)
         rc, out = run_jailer(ctx, jailer_base(ctx, name, ctx.uffd_charge_probe)
                              + ["--cgroup-version", "2", "--cgroup", f"memory.max={96 << 20}", "--"] + args,
@@ -1617,8 +1645,15 @@ def main():
     p.add_argument("stages", nargs="*", help=f"stages (default: all): {', '.join(STAGES)}")
     p.add_argument("--freeze-self-check", action="store_true",
                    help="check the freeze stage's judgement of frozen and thawed without root, then exit")
+    p.add_argument("--uffd-charge-arg-check", action="store_true",
+                   help="check every uffd-charge case's arguments parse (needs --uffd-charge-probe), then exit")
     if "--probe-self-check" in sys.argv[1:]:
         self_check_probe()
+        return
+    if "--uffd-charge-arg-check" in sys.argv[1:]:
+        if "--uffd-charge-probe" not in sys.argv[1:]:
+            p.error("--uffd-charge-arg-check needs --uffd-charge-probe")
+        uffd_charge_arg_check(sys.argv[sys.argv.index("--uffd-charge-probe") + 1])
         return
     if "--freeze-self-check" in sys.argv[1:]:
         _cgroup_test().self_check_freeze(types.SimpleNamespace(**globals()))
