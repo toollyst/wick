@@ -45,7 +45,12 @@
 //!   Linux) are taken off the section commit that the cover leaves, up to the
 //!   bytes given.
 //! - **The kill**: `TerminateJobObject` with 137, the line below on the
-//!   jailer's standard error naming the count, its parts and the poll before.
+//!   jailer's standard error naming the count, its parts, how late this poll's
+//!   tick woke it, and the poll before (when, what it counted, how long it
+//!   took and how late it woke).
+//! - **The count's thread is time-critical** ([`raise_poll_priority`]), above
+//!   every thread of the jail: a jail keeping every CPU busy at normal
+//!   priority delayed a normal-priority count by up to 188 ms (POLLGAP).
 //! - **A process of the job that the jailer cannot open or read** ends the
 //!   jail the same way: the count cannot be taken, so the jail does not run
 //!   uncounted.
@@ -62,7 +67,10 @@
 //! and release, one run each); what a process commits during the call and
 //! after it, and the call's own time over 50 rounds, alone and after a freeze
 //! of the job, is TERMREC's (`test_terminating_a_jail_on_record`, not yet
-//! run). A process that swaps its cover for usable private commit between two
+//! run). Between polls the commit a process can take is not bounded in
+//! bytes, only by the time to the next poll, which is the host's scheduling:
+//! two polls were 6090 us apart once on a loaded CI runner (CI run
+//! 44108132406, before the thread was time-critical). A process that swaps its cover for usable private commit between two
 //! reads of the cover holds up to twice `memory.max` of usable memory until
 //! the next read, within 100 ms. Windows tells no user-mode process of a
 //! section's creation (`ObRegisterCallbacks` takes process, thread and
@@ -94,8 +102,9 @@ use windows_sys::Win32::System::JobObjects::{
     TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, GetCurrentProcess, GetExitCodeProcess, INFINITE,
-    OpenProcess, PROCESS_QUERY_INFORMATION, SetWaitableTimer, TIMER_ALL_ACCESS, TerminateProcess, WaitForMultipleObjects,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, GetCurrentProcess, GetCurrentThread, GetExitCodeProcess,
+    INFINITE, OpenProcess, PROCESS_QUERY_INFORMATION, SetThreadPriority, SetWaitableTimer, THREAD_PRIORITY_TIME_CRITICAL,
+    TIMER_ALL_ACCESS, TerminateProcess, WaitForMultipleObjects,
 };
 
 #[link(name = "kernel32")]
@@ -307,6 +316,16 @@ pub(super) struct Ended {
     pub polls: u64,
 }
 
+/// The poll before the current one, for the kill's line: when it began, what
+/// it counted, how long it took, and how late its tick woke the thread.
+#[derive(Clone, Copy)]
+struct Before {
+    at: Instant,
+    counted: u64,
+    took: Duration,
+    late: Duration,
+}
+
 struct Jail {
     job: OwnedHandle,
     limit: u64,
@@ -316,7 +335,7 @@ struct Jail {
     polls: u64,
     walks: u64,
     longest_walk: Duration,
-    before: Option<(Instant, u64)>,
+    before: Option<Before>,
     first: Option<Instant>,
     /// The poll past the limit: its start, and the end of its count.
     past: Option<(Instant, Instant)>,
@@ -363,8 +382,9 @@ impl Jail {
         Ok(c)
     }
 
-    /// One poll: `Err` with the line to end the jail with.
-    fn poll(&mut self) -> Result<(), String> {
+    /// One poll: `Err` with the line to end the jail with. `late`: how long
+    /// after its tick's due time the thread woke for it ([`PollTimer::late`]).
+    fn poll(&mut self, late: Duration) -> Result<(), String> {
         let now = Instant::now();
         self.first.get_or_insert(now);
         self.polls += 1;
@@ -378,24 +398,36 @@ impl Jail {
             self.past = Some((now, Instant::now()));
             let before = self.before.map_or_else(
                 || "no poll before it".to_string(),
-                |(t, n)| format!("the poll before, {} us earlier, counted {n}", now.duration_since(t).as_micros()),
+                |b| {
+                    format!(
+                        "the poll before, {} us earlier, counted {}, took {} us and woke {} us after its tick",
+                        now.duration_since(b.at).as_micros(),
+                        b.counted,
+                        b.took.as_micros(),
+                        b.late.as_micros()
+                    )
+                },
             );
             return Err(format!(
                 "the jail's memory, {} bytes (private commit {}, section commit {}, of which {} paid by charge pages and {} \
-                 large pages), is past the memory limit (memory.max {}): the jail is ended with {KILLED}; {before}; {} polls, \
-                 {} reads of the cover, the longest {} us",
+                 large pages), is past the memory limit (memory.max {}): the jail is ended with {KILLED}; this poll woke {} us \
+                 after its tick; {before}; {} polls, {} reads of the cover, the longest {} us; a poll every {} us, the cover \
+                 read every {} us",
                 c.total(),
                 c.private,
                 c.shared,
                 c.covered,
                 c.large,
                 self.limit,
+                late.as_micros(),
                 self.polls,
                 self.walks,
                 self.longest_walk.as_micros(),
+                POLL.as_micros(),
+                WALK.as_micros(),
             ));
         }
-        self.before = Some((now, c.total()));
+        self.before = Some(Before { at: now, counted: c.total(), took: now.elapsed(), late });
         Ok(())
     }
 }
@@ -441,6 +473,11 @@ impl PollTimer {
         Ok(t)
     }
 
+    /// How long after the due time of the tick just taken it is now.
+    fn late(&self) -> Duration {
+        Instant::now().saturating_duration_since(self.next)
+    }
+
     /// Sets the timer due at the schedule's next tick: [`POLL`] after the
     /// last one's due time, or at once if that is past.
     fn arm(&mut self) -> io::Result<()> {
@@ -457,6 +494,24 @@ impl PollTimer {
         }
         Ok(())
     }
+}
+
+/// Raises the calling thread, the count's, to `THREAD_PRIORITY_TIME_CRITICAL`
+/// (15 in a normal-priority process, above every thread of the jail, whose
+/// processes the jailer leaves at normal priority), so that a jail keeping
+/// every CPU busy does not delay its own count. POLLGAP on fc-win (Windows
+/// Server 2022 20348, 8 vCPUs, one spinning thread per CPU at normal
+/// priority, 2000 polls each, three runs in one boot): at normal priority the
+/// polls were a median 16.0 ms apart, 99th percentile 157 ms, greatest 173
+/// to 188 ms, 1060 to 1089 of 1999 gaps past 2 ms; time-critical, a median 976 us,
+/// 99th percentile 1.47 ms, greatest 1.50 to 1.52 ms, none past 2 ms, as on
+/// the idle host (`test_poll_gaps_under_load_on_record`).
+fn raise_poll_priority() -> io::Result<()> {
+    // SAFETY: this thread's pseudo handle.
+    if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Counts the jail of `job` against `limit` bytes until `firecracker` ends,
@@ -491,15 +546,25 @@ pub(super) fn watch(
     };
     std::thread::Builder::new().name("memory.max".into()).spawn(move || {
         let waits = [timer.timer.as_raw_handle(), firecracker.as_raw_handle()];
+        // A count that cannot be raised above the jail ends it, as one that
+        // cannot be taken does.
+        let mut raised = raise_poll_priority().map_err(|e| format!("the count's thread cannot be made time-critical: {e}"));
         loop {
-            // SAFETY: two handles this thread holds.
-            let r = unsafe { WaitForMultipleObjects(2, waits.as_ptr(), 0, INFINITE) };
-            let result = match r.wrapping_sub(WAIT_OBJECT_0) {
-                // The next tick is set before the poll, so that the poll's
-                // time is in the wait.
-                0 => timer.arm().map_err(|e| format!("setting the next poll: {e}")).and_then(|()| jail.poll()),
-                1 => return None,
-                _ => Err(format!("waiting for the next poll: {}", io::Error::last_os_error())),
+            let result = if let Err(line) = std::mem::replace(&mut raised, Ok(())) {
+                Err(line)
+            } else {
+                // SAFETY: two handles this thread holds.
+                let r = unsafe { WaitForMultipleObjects(2, waits.as_ptr(), 0, INFINITE) };
+                match r.wrapping_sub(WAIT_OBJECT_0) {
+                    // The next tick is set before the poll, so that the poll's
+                    // time is in the wait.
+                    0 => {
+                        let late = timer.late();
+                        timer.arm().map_err(|e| format!("setting the next poll: {e}")).and_then(|()| jail.poll(late))
+                    }
+                    1 => return None,
+                    _ => Err(format!("waiting for the next poll: {}", io::Error::last_os_error())),
+                }
             };
             if let Err(line) = result {
                 eprintln!("jailer: memory.max: {line}");
@@ -672,6 +737,87 @@ mod tests {
             control.0, control.1, control.2, control.3, control.4
         );
         assert!(total <= 550, "500 ticks of the poll's timer took {total} ms, not about 500 (every 1 ms)");
+    }
+
+    // How far apart the count's polls are with every CPU busy (POLLGAP): the
+    // poll thread's loop as `watch` runs it (the timer's wait, its lateness,
+    // the next tick armed, then the count's queries of the job and its
+    // process: `pids`, `open`'s `IsProcessInJob`, `counters`), 2000 polls
+    // each, with this host idle and with one spinning thread per CPU at
+    // normal priority, as a jailed Firecracker's threads are; each without
+    // and with [`raise_poll_priority`], in this order, in one run. Printed:
+    // the gaps between polls' starts and the ticks' lateness, least, median,
+    // 99th percentile and greatest, and the gaps past 2 ms. A record:
+    // asserts only that every poll was made.
+    #[test]
+    #[ignore = "a record (POLLGAP): it keeps every CPU busy for seconds; run on fc-win and the PC"]
+    fn test_poll_gaps_under_load_on_record() {
+        use std::sync::atomic::AtomicBool;
+        const POLLS: usize = 2000;
+        let (job, p) = jail();
+        let run = |label: &str, raise: bool| {
+            let job = job.as_raw_handle() as usize;
+            let process = p.process.as_raw_handle() as usize;
+            let (gaps, lates) = std::thread::spawn(move || {
+                if raise {
+                    raise_poll_priority().unwrap();
+                }
+                let mut timer = PollTimer::new().unwrap();
+                let (mut gaps, mut lates) = (Vec::with_capacity(POLLS), Vec::with_capacity(POLLS));
+                let mut last: Option<Instant> = None;
+                for _ in 0..POLLS {
+                    // SAFETY: our timer.
+                    assert_eq!(unsafe { WaitForSingleObject(timer.timer.as_raw_handle(), 1000) }, WAIT_OBJECT_0);
+                    let late = timer.late();
+                    timer.arm().unwrap();
+                    let now = Instant::now();
+                    if let Some(l) = last {
+                        gaps.push(now.duration_since(l).as_micros());
+                    }
+                    last = Some(now);
+                    lates.push(late.as_micros());
+                    let ids = pids(job as HANDLE).unwrap();
+                    assert!(!ids.is_empty());
+                    let mut inside = 0;
+                    // SAFETY: handles the test holds.
+                    unsafe { IsProcessInJob(process as HANDLE, job as HANDLE, &mut inside) };
+                    let _ = counters(process as HANDLE);
+                }
+                (gaps, lates)
+            })
+            .join()
+            .unwrap();
+            let stats = |mut v: Vec<u128>| {
+                v.sort_unstable();
+                let n = v.len();
+                let over = v.iter().filter(|&&x| x > 2000).count();
+                format!("least {} median {} p99 {} greatest {} us, {over} past 2 ms", v[0], v[n / 2], v[n * 99 / 100], v[n - 1])
+            };
+            let polls = lates.len();
+            println!("POLLGAP {label}: {polls} polls; gaps {}; lateness {}", stats(gaps), stats(lates));
+            assert_eq!(polls, POLLS);
+        };
+        run("idle, normal priority", false);
+        run("idle, time-critical", true);
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let stop = Arc::new(AtomicBool::new(false));
+        let hogs: Vec<_> = (0..cpus)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(200));
+        run(&format!("{cpus} CPUs busy at normal priority, normal priority"), false);
+        run(&format!("{cpus} CPUs busy at normal priority, time-critical"), true);
+        stop.store(true, Ordering::Relaxed);
+        for h in hogs {
+            h.join().unwrap();
+        }
     }
 
     // A section given to a process of the jail is counted, and one past the

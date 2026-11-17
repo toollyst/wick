@@ -250,7 +250,10 @@ crate tests to the kit's upload run whatever failed before them, where runs
   its own too, with its own result: pagefile-backed sections past
   `memory.max` end the jail with 137 at the jailer's next count, and
   temporary-file sections (page cache) are allowed (docs/COMPATIBILITY.md,
-  the `memory.max` row). `x2storm` in a step of its own, which accepts its
+  the `memory.max` row); the jailer's kill line, with its polls' timing,
+  is in the stage's summary and each run's output in
+  `sections-<id>.txt`, and the stage fails a poll thread starved past the
+  cover's read period (`WALK`). `x2storm` in a step of its own, which accepts its
   N/A (exit code 3) only on a runner whose processor is not AMD, as the
   `x2apic` step does. The job's summary lists `bindlink`'s step, so that
   a green job does not read as every stage passing.

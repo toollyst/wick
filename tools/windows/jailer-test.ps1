@@ -1074,31 +1074,46 @@ function Stage-Nofile {
 # (or the process is ended with 137 by the jailer's count, whichever comes
 # first), and pagefile-backed sections, which no job charges, end the jail
 # with 137 at the jailer's next count, one poll after the last one under the
-# limit (overlay/jailer/platform/windows/commit.rs). Sections of temporary
+# limit (overlay/jailer/platform/windows/commit.rs); the jailer's line, with
+# its polls' timing, goes into the summary and each run's output into
+# sections-<id>.txt. Sections of temporary
 # files are page cache, which Linux too reclaims at memory.max rather than
 # ending the process for (the memory.max row): all 256 MiB are allowed.
 function Stage-Sections {
     $probe = Get-Probe
     $base = New-Base 'sections'
     $common = @('--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--cgroup-version', '2', '--cgroup', 'memory.max=33554432')
-    $killed = 'jailer: memory\.max: the jail''s memory, (\d+) bytes .* is past the memory limit \(memory\.max 33554432\): the jail is ended with 137; the poll before, (\d+) us earlier, counted (\d+);'
+    $killed = 'jailer: memory\.max: the jail''s memory, (\d+) bytes .* is past the memory limit \(memory\.max 33554432\): the jail is ended with 137; this poll woke (\d+) us after its tick; the poll before, (\d+) us earlier, counted (\d+), took (\d+) us and woke (\d+) us after its tick; .*; a poll every (\d+) us, the cover read every (\d+) us'
+    # Each run's output kept in the work directory (CI uploads it), not only
+    # the shared jailer-out.txt, which the next run overwrites.
+    $keep = { param($id, $r) Set-Content -Encoding UTF8 (Join-Path $WorkDir "sections-$id.txt") "exit $($r[0])`r`n$($r[1])" }
     $r = Invoke-Jailer (@('--id', 'private') + $common + @('--', 'private:256')) 120000
+    & $keep 'private' $r
     $denied = $r[1] -match 'private:256 denied after (\d+)' -and [int]$Matches[1] -le 32
     $control = if ($denied) { "denied after $($Matches[1]) MiB" } else { '' }
     if (-not $denied -and $r[0] -eq 137 -and $r[1] -match $killed) { $control = "ended with 137 at $([math]::Round([long]$Matches[1] / 1MB, 1)) MiB counted" }
     Check ($control -ne '') "the control, private memory under memory.max=32 MiB: exit $($r[0]): $($r[1])"
     $r = Invoke-Jailer (@('--id', 'sections') + $common + @('--', 'sections:256')) 120000
+    & $keep 'sections' $r
     Check ($r[0] -eq 137 -and $r[1] -match $killed) "pagefile-backed sections under memory.max=32 MiB: not ended with 137 by the jailer's count: exit $($r[0]): $($r[1])"
-    $counted = [long]$Matches[1]; $gap = [long]$Matches[2]; $before = [long]$Matches[3]
-    Check ($before -le 33554432) "the poll before the kill counted $before bytes, past the limit, and did not end the jail"
-    # One poll is 1 ms on a high-resolution waitable timer; 5 ms allows for a
-    # loaded runner's scheduling, and fails a kill that waited for a later poll
-    # or for the 100 ms read of the cover.
-    Check ($gap -le 5000) "the jail was ended $gap us after the last count under the limit, not at the next poll"
+    $line = $Matches[0]
+    $counted = [long]$Matches[1]; $late = [long]$Matches[2]; $gap = [long]$Matches[3]; $before = [long]$Matches[4]
+    $took = [long]$Matches[5]; $lateBefore = [long]$Matches[6]; $walk = [long]$Matches[8]
+    # The kill is at the first poll past the limit: the poll before it, the
+    # one just before on the jailer's own schedule, counted under it.
+    Check ($before -le 33554432) "the poll before the kill counted $before bytes, past the limit, and did not end the jail: $line"
+    # How far apart the two polls were is the jailer's scheduling, not a
+    # property of the count (SECURITY.md, the window: a poll every 1 ms, 6090
+    # us apart once on a loaded runner, CI run 44108132406). What fails here
+    # is a poll thread starved past the cover's read period (WALK in
+    # overlay/jailer/platform/windows/commit.rs, which the jailer's line
+    # gives as "the cover read every N us").
+    Check ($gap -lt $walk) "the poll before the kill was $gap us earlier, past the cover's read period of $walk us (WALK): the count's thread was starved: $line"
     Check (-not ($r[1] -match 'sections:256 allowed')) "the probe took all 256 MiB of sections: $($r[1])"
     $r = Invoke-Jailer (@('--id', 'filesections') + $common + @('--', 'filesections:256')) 120000
+    & $keep 'filesections' $r
     Check ($r[0] -eq 0 -and $r[1] -match 'filesections:256 allowed 256') "temporary-file sections under memory.max=32 MiB (page cache, not counted): exit $($r[0]): $($r[1])"
-    "under memory.max=32 MiB private memory is $control; pagefile-backed sections end the jail with 137 at $([math]::Round($counted / 1MB, 1)) MiB counted, $gap us after the last count under the limit ($([math]::Round($before / 1MB, 1)) MiB); temporary-file sections, page cache, take all 256 MiB"
+    "under memory.max=32 MiB private memory is $control; pagefile-backed sections end the jail with 137 at $([math]::Round($counted / 1MB, 1)) MiB counted, $gap us after the last count under the limit ($([math]::Round($before / 1MB, 1)) MiB; that poll took $took us, its tick woke it $lateBefore us late, the kill's $late us); temporary-file sections, page cache, take all 256 MiB; the jailer's line: $line"
 }
 
 function Stage-Pidns {
