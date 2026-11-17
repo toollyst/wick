@@ -1,0 +1,11 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The toolchain Firecracker builds with (lib/firecracker/rust-toolchain.toml),
+# so the frame crate is checked here with the compiler that builds it into
+# wick-ext. rustup reads this file from the working directory: run cargo
+# from crates/fs.
+[toolchain]
+channel = "1.97.0"
+profile = "minimal"
+components = ["clippy"]

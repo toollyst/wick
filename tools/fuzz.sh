@@ -53,6 +53,7 @@ host_targets() {
     if [[ "${1:-}" == all || "$(uname -s)" == Darwin ]]; then
         echo uffd_protocol
     fi
+    echo fs_frame
 }
 
 # Windows: the targets are built with AddressSanitizer, whose runtime is a
@@ -115,6 +116,9 @@ target_args() {
     whp_irqchip) echo "-max_len=8192" ;;
     # A sequence of WHP exits' fields, about 20 bytes each.
     whp_exit) echo "-max_len=4096" ;;
+    # Frames of up to a few KiB (the bounds checks do not depend on the
+    # payload's size) and a few hundred tracker operations.
+    fs_frame) echo "-max_len=16384" ;;
     *) die "unknown target '$1' (tools/fuzz.sh --list)" ;;
     esac
 }

@@ -4,15 +4,16 @@
 #
 # Dependency policy (CONTRIBUTING.md, "Dependencies"): the checks CI and the
 # release workflow run on lib/firecracker's Cargo.lock (with wick's patches)
-# and tools/vhost-user-blk's.
+# tools/vhost-user-blk's and crates/fs's.
 #
 #   tools/check-dependencies.sh
 #
 # 1. cargo-deny with upstream's own policy (lib/firecracker/deny.toml) on
 #    lib/firecracker, as upstream runs it, so wick never accepts what upstream
 #    would refuse.
-# 2. cargo-deny with wick's policy (tools/deny.toml, and
-#    tools/vhost-user-blk/deny.toml for the test backend), warnings as errors:
+# 2. cargo-deny with wick's policy (tools/deny.toml,
+#    tools/vhost-user-blk/deny.toml for the test backend and crates/fs/deny.toml
+#    for host folder sharing), warnings as errors:
 #    RustSec advisories (vulnerable, unmaintained, unsound, yanked), licenses,
 #    banned and duplicate crates, and a closed list of sources.
 # 3. tools/linux/check-dependency-sources.py: every crate taken from git is
@@ -44,7 +45,7 @@ have="$("$DENY" --version)"
 recorded="$(sed -n 's/^# upstream-deny-sha256: //p' "$ROOT/tools/deny.toml")"
 actual="$(sha256 "$UPSTREAM_DIR/deny.toml")"
 [[ "$recorded" == "$actual" ]] \
-    || die "lib/firecracker/deny.toml (sha256 $actual) is not the file tools/deny.toml was made from ($recorded); carry its changes over to tools/deny.toml and tools/vhost-user-blk/deny.toml"
+    || die "lib/firecracker/deny.toml (sha256 $actual) is not the file tools/deny.toml was made from ($recorded); carry its changes over to tools/deny.toml, tools/vhost-user-blk/deny.toml and crates/fs/deny.toml"
 
 failed=()
 run() {
@@ -61,19 +62,24 @@ run() {
 
 fc="$UPSTREAM_DIR/Cargo.toml"
 vub="$ROOT/tools/vhost-user-blk/Cargo.toml"
+fs="$ROOT/crates/fs/Cargo.toml"
 run "upstream's policy, lib/firecracker" \
     "$DENY" --manifest-path "$fc" --locked check --config "$UPSTREAM_DIR/deny.toml"
 run "wick's policy, lib/firecracker" \
     "$DENY" --manifest-path "$fc" --locked check --config "$ROOT/tools/deny.toml" -D warnings
 run "wick's policy, tools/vhost-user-blk" \
     "$DENY" --manifest-path "$vub" --locked check --config "$ROOT/tools/vhost-user-blk/deny.toml" -D warnings
+run "wick's policy, crates/fs" \
+    "$DENY" --manifest-path "$fs" --locked check --config "$ROOT/crates/fs/deny.toml" -D warnings
 
 # The git checkouts the next check compares with crates.io.
 (cd "$UPSTREAM_DIR" && cargo fetch --locked -q)
 (cd "$ROOT/tools/vhost-user-blk" && cargo fetch --locked -q)
+(cd "$ROOT/crates/fs" && cargo fetch --locked -q)
 run "git dependencies are upstream's crates.io releases" \
     python3 -I "$ROOT/tools/linux/check-dependency-sources.py" \
-    "${CARGO_HOME:-$HOME/.cargo}/git/checkouts" "$ROOT/tools/vhost-user-blk/Cargo.lock"
+    "${CARGO_HOME:-$HOME/.cargo}/git/checkouts" "$ROOT/tools/vhost-user-blk/Cargo.lock" \
+    "$ROOT/crates/fs/Cargo.lock"
 
 ((${#failed[@]} == 0)) || die "dependency checks failed: $(IFS=,; echo "${failed[*]}")"
 echo "dependency checks passed"

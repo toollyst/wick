@@ -232,12 +232,13 @@ cargo install --locked cargo-deny --version 0.19.0   # upstream's version, see b
 tools/check-dependencies.sh
 ```
 
-They cover `lib/firecracker/Cargo.lock` (with wick's patches) and
-`tools/vhost-user-blk/Cargo.lock`, for every target:
+They cover `lib/firecracker/Cargo.lock` (with wick's patches),
+`tools/vhost-user-blk/Cargo.lock` and `crates/fs/Cargo.lock`, for every target:
 
 - cargo-deny with upstream's own policy (`lib/firecracker/deny.toml`), as
-  upstream runs it, and with wick's (`tools/deny.toml`, and
-  `tools/vhost-user-blk/deny.toml` for the test backend), warnings as errors:
+  upstream runs it, and with wick's (`tools/deny.toml`,
+  `tools/vhost-user-blk/deny.toml` for the test backend and
+  `crates/fs/deny.toml` for host folder sharing), warnings as errors:
   RustSec advisories (vulnerable, unmaintained, unsound, yanked crates);
   licenses from upstream's list, all compatible with Apache-2.0 (MIT,
   Apache-2.0, BSD-3-Clause, 0BSD, ISC, Unicode-3.0); upstream's banned
@@ -472,6 +473,7 @@ compiles wick's sources directly, so upstream's workspace does not change.
 | `uffd_protocol` (macOS) | `crates/compat/libc/src/wick_uffd.rs` | the requests and records a page fault handler process sends | the state Linux's `UFFDIO_*` leave memory in; no descriptor left open |
 | `whp_irqchip` | `crates/compat/kvm-ioctls/src/whp/irqchip.rs` (built on any host) | any sequence of the port and MMIO accesses the WHP run loop hands it (PICs, ELCR, PIT, speaker port, I/O APIC), interrupt lines, MSI routes, PIT state from a snapshot file, and a snapshot at any point | a VM restored from the snapshot saves the same state and answers every later access as the original does (but for what follows the host clock); each MSI's interrupt request carries its vector and destination |
 | `whp_exit` | `crates/compat/kvm-ioctls/src/whp/exit.rs` (built on any host) | the fields of a sequence of WHP vCPU exits, which the guest controls | a reference written from the x86 architecture (the Intel SDM: port I/O sizes, 32-bit register writes zero-extending, `WRMSR` taking `EDX:EAX`, CPUID's OSXSAVE and OSPKE) and KVM's hypercall ABI: instruction length, port and memory access direction, size and kind, MSR accesses, the `RAX` an `IN` leaves, the hypercall answered (`-KVM_EPERM` from any privilege level but 0, the low 32 bits outside 64-bit code, as KVM) |
+| `fs_frame` | `crates/fs/frame` | any byte stream either side of the virtio-fs device's socket could be sent, and any sequence of requests and replies | every accepted frame is within the format's bounds, comes from a side that sends its kind, carries exactly the payload its header announces and re-encodes to the same bytes; the VMM's tracker of requests in flight refuses exactly what a model written in the target refuses, and never reserves more than its reply budget |
 
 The crate's library also compiles, from their sources, WHP backend modules
 that use nothing but `core`, so that their unit tests run on every host:

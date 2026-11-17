@@ -58,7 +58,7 @@ say() { ((quiet)) || echo "$@"; }
 allowed() {
     local p="$1"
     case "$p" in
-        "$WICK_ROOT"/build/*|"$WICK_ROOT"/dist|"$WICK_ROOT"/fuzz/target) return 0 ;;
+        "$WICK_ROOT"/build/*|"$WICK_ROOT"/dist|"$WICK_ROOT"/fuzz/target|"$WICK_ROOT"/crates/fs/target) return 0 ;;
         "$UPSTREAM_DIR"/build/cargo_target|"$UPSTREAM_DIR"/build/vhost-user-blk) return 0 ;;
         "$UPSTREAM_DIR"/build/devctr-cache) return 0 ;;
         /tmp/wick-bt-*|/private/tmp/wick-bt-*|/tmp/wick-jt-*|/private/tmp/wick-jt-*) return 0 ;;
@@ -258,7 +258,7 @@ clean_runs "$WICK_ROOT/build/boot-test" '^[0-9]{8}-[0-9]{6}$'
 clean_runs "$WICK_ROOT/build/jailer-test" '^[0-9]{8}-[0-9]{6}$'
 clean_runs "$linux_workdir" '^results-[0-9]{8}-[0-9]{6}$'
 if ((all)); then
-    for p in "$WICK_ROOT/build" "$WICK_ROOT/dist" "$WICK_ROOT/fuzz/target" \
+    for p in "$WICK_ROOT/build" "$WICK_ROOT/dist" "$WICK_ROOT/fuzz/target" "$WICK_ROOT/crates/fs/target" \
         "$UPSTREAM_DIR/build/cargo_target" "$UPSTREAM_DIR/build/vhost-user-blk" \
         "$UPSTREAM_DIR/build/devctr-cache"; do
         if [[ "$p" == "$WICK_ROOT/build" ]]; then

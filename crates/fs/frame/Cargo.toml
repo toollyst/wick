@@ -1,0 +1,18 @@
+[package]
+name = "wick-fs-frame"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The frames between wick's virtio-fs device and its file server, wick-fsd."
+
+# No dependencies, and none to be added: the VMM links this crate
+# (docs/design-fs.md §4.1), so it adds no code beyond its own.
+[dependencies]
+
+[lib]
+bench = false
+
+[lints]
+workspace = true

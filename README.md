@@ -152,6 +152,7 @@ overlay/vmm/       new vmm modules (vmm::platform, vmm::ext), compiled into upst
 crates/compat/     Linux-only dependencies on macOS and Windows (libc, kvm-ioctls, vmm-sys-util, ...)
 crates/ext/        wick's own features, behind vmm::ext
 crates/version/    the version the binaries report
+crates/fs/         host folder sharing (being built: the VMM↔server frame format so far)
 tools/             setup, patch export and check, rebase, generators, Linux tests against upstream, boot tests, release
 ```
 
@@ -199,7 +200,8 @@ The short version; the [full roadmap](docs/ROADMAP.md) has the status of every r
   limits, the freezer; Windows: the jail drive and token, Job Object limits, the freezer, the mitigation profile, `--daemonize`; both:
   `--netns` as a directory of network endpoints)
 - [ ] Images everywhere: x86_64 images on Apple silicon (FEX-Emu with hardware TSO), arm64 images on Windows
-- [ ] Desktop devices: user-mode networking, virtio-fs (designed, no code yet: [design](docs/design-fs.md))
+- [ ] Desktop devices: user-mode networking, virtio-fs (designed, being built: the frame format between the VMM and
+  the file server exists, nothing a guest can use yet: [design](docs/design-fs.md))
 - [ ] GPU: headless Vulkan for a guest (designed, no code yet: [design](docs/design-gpu.md))
 - [ ] Distribution: release binaries, Homebrew, automatic rebase attempts on new upstream tags
 
@@ -250,7 +252,8 @@ space inside an arm64 guest, through FEX-Emu with Apple's hardware TSO, is plann
 <details>
 <summary><b>Can a guest share host folders or use the host's GPU?</b></summary>
 
-Not yet: wick has neither today. Both are designed, with no code yet, and both will be off by default.
+Not yet: wick has neither today. Both are designed and will be off by default. Host folders are being built (so far
+only the frame format between the VMM and the file server, nothing a guest can use); the GPU has no code yet.
 
 - **Host folders:** virtio-fs, served by a separate process that confines itself on each host and never sees guest
   memory ([design](docs/design-fs.md), [roadmap](docs/ROADMAP.md#m7-desktop-devices) M7).

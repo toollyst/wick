@@ -1173,6 +1173,53 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # Host folder sharing's own workspace (crates/fs, docs/design-fs.md): the
+  # frames the virtio-fs device and wick-fsd exchange, checked with
+  # Firecracker's toolchain (crates/fs/rust-toolchain.toml, which rustup reads
+  # from the working directory) and Firecracker's lints, on every host wick
+  # builds for. Its fuzz target, fs_frame, runs in the fuzz job; its
+  # Cargo.lock is in the dependencies job's checks.
+  fs:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: crates/fs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Clippy, warnings as errors
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Unit tests
+        id: fs_units
+        run: cargo test --locked 2>&1 | tee "$RUNNER_TEMP/tests.log"
+      # Every test's result in one format (tools/ci-results.py, results.tsv),
+      # for the docs' run claims; a step that did not run gives no rows.
+      - name: Results in one format
+        if: always() && steps.fs_units.conclusion != 'skipped' && runner.os != 'Windows'
+        working-directory: ${{ github.workspace }}
+        env:
+          WICK_RESULTS_JOB: fs (${{ matrix.runner }})
+        run: |
+          f="$RUNNER_TEMP/tests.log"
+          if [ -f "$f" ]; then python3 -I tools/ci-results.py add libtest "$f" --out "$RUNNER_TEMP/results.tsv"; fi
+          r="$RUNNER_TEMP/results.tsv"
+          if [ -f "$r" ]; then python3 -I tools/ci-results.py validate "$r"; else echo "no results: no test step wrote its output"; fi
+      - name: Upload the results
+        if: always() && steps.fs_units.conclusion != 'skipped' && runner.os != 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-fs-${{ matrix.runner }}
+          path: ${{ runner.temp }}/results.tsv
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Windows: the POSIX layer and the crates built over it, tested natively,
   # and the firecracker binary on the WHP backend.
   windows:

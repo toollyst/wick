@@ -1,0 +1,42 @@
+# Copyright 2026 toollyst contributors.
+# SPDX-License-Identifier: Apache-2.0
+#
+# cargo-deny policy for crates/fs's Cargo.lock (host folder sharing): the
+# same advisories, licenses and bans as tools/deny.toml (upstream's, from
+# lib/firecracker/deny.toml), with this graph's sources. The frame crate the
+# VMM links has no dependencies; the server's (wick-fsd, later) come from
+# crates.io only. tools/check-dependencies.sh runs it.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Unicode-3.0",
+]
+# Fewer crates than Firecracker: an allowed license no crate uses is not a problem.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "deny"
+deny = [
+    { name = "serde_derive", version = ">1.0.171, < 1.0.184" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -235,7 +235,9 @@ images and OCI images run unchanged.
 Through `wick-ext` (`PUT /extensions/{name}`): user-mode networking (no vmnet or host switch needed), virtio-fs, a
 capability query API.
 
-**virtio-fs: designed, no code yet** ([design-fs.md](design-fs.md)). The plan:
+**virtio-fs: designed, being built** ([design-fs.md](design-fs.md)). Built so far: the frame format between the
+device and the server (`crates/fs/frame`, its unit tests and the `fs_frame` fuzz target); nothing a guest can use
+yet. The plan:
 
 - The device in Firecracker only copies bounded, unparsed requests between the virtqueues and one socket.
 - A separate server, `wick-fsd`, one per share, parses FUSE and does the file operations. It never sees guest

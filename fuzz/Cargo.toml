@@ -23,6 +23,10 @@ libc = "0.2.189"
 # src/lib.rs takes it, as the real `whp::ffi::report` does (log = "0.4.33" there).
 log = "0.4.33"
 
+# The frames between the virtio-fs device and wick-fsd (fs_frame); a crate
+# without dependencies, taken by path from crates/fs's workspace.
+wick-fs-frame = { path = "../crates/fs/frame" }
+
 # The compatibility crates Firecracker builds with (docs/ARCHITECTURE.md).
 [patch.crates-io]
 libc = { path = "../crates/compat/libc" }
@@ -65,6 +69,13 @@ bench = false
 [[bin]]
 name = "whp_exit"
 path = "fuzz_targets/whp_exit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fs_frame"
+path = "fuzz_targets/fs_frame.rs"
 test = false
 doc = false
 bench = false

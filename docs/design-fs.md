@@ -1,7 +1,10 @@
 # Host folder sharing (fs): design
 
-**Status: design and plan only. There is no code yet.** Nothing here describes what wick does today: today
-`PUT /extensions/fs` is refused as an unknown extension (`crates/ext/src/lib.rs`, `test_unknown_extension_is_rejected`).
+**Status: design and plan, being built. Only the frame format exists** (`crates/fs/frame`: the frames of §4.1, the
+hello that checks the share id and protocol version, and the VMM's tracker of requests in flight; its unit tests and
+the `fs_frame` fuzz target). Nothing a guest can use exists yet, and nothing here describes what wick does today:
+today `PUT /extensions/fs` is refused as an unknown extension (`crates/ext/src/lib.rs`,
+`test_unknown_extension_is_rejected`).
 The work is the virtio-fs item of [M7](ROADMAP.md#m7-desktop-devices). Every "is", "does" and "returns" below about
 fs, `wick-fsd` or the fs device describes the design, not shipped behaviour.
 
@@ -286,11 +289,16 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
 - At `attach_boot_devices`, before the sandbox narrows, the device connects to `socket`. The socket is in the jail
   root under the jailer, as vhost-user-blk's socket is (PORTING row 14). Failure means boot fails, with the error.
   Hot-plug is refused (`update` → error) in v1.
-- Frame: `{u32 len, u64 cookie, u32 writable_cap, u16 queue, bytes}` → reply `{u32 len, u64 cookie, bytes}`.
-  - `len ≤ 1 MiB + 4 KiB`. The writable capacity of a chain must hold `fuse_out_header`, or the chain is completed
-    with used length 0. Linux's driver then fails the request.
-  - Total in-flight bytes are capped (e.g. 16 MiB). At the cap the VMM stops popping the queue, so the VMM's memory
-    cannot grow without bound (queue_size × 1 MiB would otherwise be 256 MiB).
+- Frame (built: `crates/fs/frame`, whose doc comment has the byte layout): a 24-byte little-endian header
+  `{u32 len, u16 kind, u16 queue, u64 cookie, u32 writable_cap, u32 reserved}`, then the payload. Kinds: hello (each
+  side's first frame: protocol version and share id, checked by the other side), request (VMM → server: a chain's
+  readable bytes) and reply (server → VMM: the bytes for that chain).
+  - `len ≤ 1 MiB + 4 KiB`, checked from the header alone, before any payload is buffered. The writable capacity of a
+    chain must hold `fuse_out_header`, or the chain is completed with used length 0. Linux's driver then fails the
+    request.
+  - The reply bytes the VMM waits for are capped at 16 MiB (`MAX_IN_FLIGHT_REPLY_BYTES`, the sum of the waiting
+    requests' `writable_cap`). At the cap the VMM stops popping the queue, so its memory cannot grow without bound
+    (queue_size × 1 MiB would otherwise be 256 MiB).
   - **The server is untrusted input to the VMM too:** a reply longer than `writable_cap`, an unknown or duplicate
     cookie, or a short frame marks the device `DEVICE_NEEDS_RESET` and closes the socket. It never makes an
     out-of-bounds write.

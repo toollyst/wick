@@ -33,6 +33,7 @@ crates/
   compat/<crate>/         Linux-only dependencies, rebuilt for macOS and Windows with the same API
   ext/                    wick-ext: wick's features behind vmm::ext
   version/                wick-version: the version string every binary reports
+  fs/                     host folder sharing (a workspace of its own): frame/, the VMM↔server frames
 tools/                    everything you run by hand or in CI (below)
   macos/                  run, test, boot-test, jailer-test and the integration harness on Apple silicon
   windows/                boot test, jailer test, integration harness and host probes for a Windows PC
@@ -46,6 +47,9 @@ docs/                     these pages
 
 Cargo always runs in `lib/firecracker`. Upstream's workspace is the only workspace: its patched manifest lists
 `crates/compat/*`, `crates/ext` and `crates/version` as members, so there is one `Cargo.lock` and one set of lints.
+The exceptions build outside Firecracker: `fuzz/`, `tools/vhost-user-blk/` and `crates/fs/` (host folder sharing,
+[design-fs.md](design-fs.md)). `crates/fs` is a workspace of its own so that its file server will never link the
+compatibility `libc`; it uses Firecracker's toolchain and lints, and cargo runs from `crates/fs`.
 Editors need to know that too; `.vscode/settings.json` points rust-analyzer at `lib/firecracker/Cargo.toml`.
 
 ### The compatibility crates

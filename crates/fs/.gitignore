@@ -1,0 +1,2 @@
+# cargo output when run from crates/fs (CI and local runs).
+/target/
