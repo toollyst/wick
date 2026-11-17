@@ -3028,6 +3028,109 @@ mod tests {
         assert_eq!(at(poff), 0x77, "guest rewrote the page and the host sees it: stage 2 followed");
     }
 
+    /// The reclaim of a mostly-dead chunk moves the pages that are not
+    /// currently zero and drops the zero ones, deciding by CURRENT content,
+    /// never by the dead marks: a page the guest re-wrote to non-zero after it
+    /// was discarded (dead-marked, but the guest's write was not seen by this
+    /// library) is MOVED, not dropped, so its data survives. The pinned charge
+    /// falls to the live set. This is requirement (a) (a re-written dead page
+    /// survives) and (c) (pinned → live set) of the reclaim.
+    #[test]
+    fn test_owned_reclaim_keeps_rewritten_dead_page_and_drops_zero_pages() {
+        let page = host_page_size();
+        let (vm, mut vcpu, _c, _l) = vm_with_memory(1, &FILL);
+        let (base, _len, ipa) = owned_slot_written(&vm, &mut vcpu, 2 << 20); // one chunk, all 0x77
+        let npages = (2u64 << 20) / page;
+        let at = |p: u64| -> u64 { unsafe { std::ptr::read_volatile((base + p * page) as *const u64) } };
+
+        // Zero the first half-but-one pages (dead-marked, below the 50% trigger).
+        let bulk = npages / 2 - 1;
+        // SAFETY: pages of the owned range.
+        assert_eq!(unsafe { libc::wick_owned::discard(base, bulk * page, libc::PROT_READ | libc::PROT_WRITE) }, 0);
+        assert_eq!(libc::wick_owned::dead_pages(base), bulk as u32, "bulk counted dead");
+        assert_eq!(at(0), 0, "a bulk page reads zero");
+
+        // The guest re-writes one of those dead-marked pages to non-zero; this
+        // library does not see it, so the page stays dead-marked but is live.
+        let live_again = 10u64;
+        guest_pass(&mut vcpu, ipa + live_again * page, ipa + (live_again + 1) * page);
+        assert_eq!(at(live_again), 0x77, "the dead-marked page is live again");
+
+        let before = phys_footprint();
+        // One more page crosses 50% dead and triggers the reclaim of the chunk.
+        // SAFETY: a page of the owned range.
+        assert_eq!(unsafe { libc::wick_owned::discard(base + bulk * page, page, libc::PROT_READ | libc::PROT_WRITE) }, 0);
+        let after = phys_footprint();
+
+        assert_eq!(libc::wick_owned::dead_pages(base), 0, "the chunk was reclaimed (dead reset)");
+        // Content, not history: the re-written page was MOVED, not dropped.
+        assert_eq!(at(live_again), 0x77, "a re-written dead-marked page survives the reclaim (by content, not by the dead mark)");
+        assert_eq!(at(0), 0, "a truly-zero page is dropped");
+        assert_eq!(at(5), 0, "another truly-zero page is dropped");
+        assert_eq!(at(npages - 1), 0x77, "a never-discarded page keeps its data");
+        // Pinned → live set: the dropped pages' charge came back (~bulk pages).
+        let returned = before as i64 - after as i64;
+        assert!(
+            returned >= (bulk - 4) as i64 * page as i64,
+            "reclaim returns the dead pages' charge (want ~{} pages, was {} KiB)",
+            bulk,
+            returned >> 10
+        );
+    }
+
+    /// The reclaim moves a chunk's live pages under a quiesce the replace hook
+    /// gives (the chunk's guest slot is unmapped, so a guest access stalls and
+    /// cannot write the old object). A second vCPU writes a page the reclaim
+    /// would otherwise drop (it is zero/dead), racing the reclaim; the write
+    /// must not be lost -- it is either seen by the scan (non-zero, moved) or
+    /// stalls and lands in the fresh object. Without the quiesce a write
+    /// landing in the freed old object between the scan and the replace would
+    /// be lost (the page would read zero after); this runs the race many times
+    /// so such a window would be hit. Requirement (b) of the reclaim.
+    #[test]
+    fn test_owned_reclaim_racing_guest_write_is_not_lost() {
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let page = host_page_size();
+        let (vm, mut vcpu0, _c, _l) = vm_with_memory(1, &FILL);
+        let (base, _len, ipa) = owned_slot_written(&vm, &mut vcpu0, 2 << 20); // one chunk 0x77
+        let npages = (2u64 << 20) / page;
+        let bulk = npages / 2 - 1; // the dead bulk, one below the 50% trigger
+        let at = |p: u64| -> u64 { unsafe { std::ptr::read_volatile((base + p * page) as *const u64) } };
+
+        let vm = Arc::new(vm);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<u64>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (vmb, bb) = (vm.clone(), barrier.clone());
+        // The racing writer: its own vCPU, writing the page it is told to, in
+        // step with the main thread's reclaim through the barrier.
+        let writer = thread::spawn(move || {
+            let mut v1 = vmb.create_vcpu(1).unwrap();
+            let mut kvi = kvm_vcpu_init::default();
+            vmb.get_preferred_target(&mut kvi).unwrap();
+            v1.vcpu_init(&kvi).unwrap();
+            while let Ok(addr) = go_rx.recv() {
+                bb.wait();
+                guest_pass(&mut v1, addr, addr + page); // writes 0x77 to that page
+                done_tx.send(()).unwrap();
+            }
+        });
+
+        for _ in 0..24 {
+            // Rebuild the dead bulk and re-zero page 0 (the raced page).
+            assert_eq!(unsafe { libc::wick_owned::discard(base, bulk * page, rw) }, 0);
+            assert_eq!(at(0), 0, "page 0 is dead (zero) before the race");
+            go_tx.send(ipa).unwrap(); // the writer will write page 0 (guest addr `ipa`)
+            barrier.wait(); // release the writer and the reclaim together
+            // Cross 50% dead -> reclaim chunk 0, racing the writer's page-0 write.
+            assert_eq!(unsafe { libc::wick_owned::discard(base + bulk * page, page, rw) }, 0);
+            done_rx.recv().unwrap();
+            assert_eq!(at(0), 0x77, "the racing write to a reclaimed page was not lost");
+        }
+        drop(go_tx);
+        writer.join().unwrap();
+    }
+
     /// Guest programs: at [`GUEST_BASE`], writes X3 to X1, then to X4 (MMIO:
     /// the exit); at `GUEST_BASE + 16`, reads X1 into X5 and writes it to X4.
     const STORE_THEN_LOAD: [u32; 7] = [

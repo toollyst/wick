@@ -68,12 +68,12 @@
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
 #   cpu-template-helper: 30 tests; 25 pass, 5 fail (no-hvf).
-#   compat-kvm-ioctls: 118 tests; 34 pass, 82 fail, 2 ignored (counted again
-#   on 2026-11-17, after the four *_charged_once tests, the three
-#   test_owned_* guest-memory tests, and the ignored
-#   timed_vcpu_fault_throughput, by
+#   compat-kvm-ioctls: 120 tests; 34 pass, 84 fail, 2 ignored (counted again
+#   on 2026-11-17, after the four *_charged_once tests, the five
+#   test_owned_* guest-memory tests (three discard, two reclaim), and the
+#   ignored timed_vcpu_fault_throughput, by
 #   check-unit-tests.py --crate compat-kvm-ioctls), all
-#   no-hvf: 81 with Error(1) at hv_vm_create, and the vCPU thread's latency
+#   no-hvf: 83 with Error(1) at hv_vm_create, and the vCPU thread's latency
 #   tier's test_a_wfi_ends_when_its_timer_is_due, which fails on a runner
 #   before it makes its VM, at its own requirement of a launcher that raised
 #   no timer coalescing, since the runners' processes are coalesced as
@@ -172,6 +172,8 @@ no-hvf compat-kvm-ioctls hvf::vm::tests::test_one_change_across_pieces_mapped_ap
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_os_lock_is_a_register_as_on_kvm
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_owned_guest_memory_is_charged_and_usable
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_owned_partial_discard_zeroes_and_pins_the_charge
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_owned_reclaim_keeps_rewritten_dead_page_and_drops_zero_pages
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_owned_reclaim_racing_guest_write_is_not_lost
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_owned_whole_chunk_discard_returns_the_charge
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_psci_version_is_the_vms
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_ptrauth_is_a_vcpu_feature

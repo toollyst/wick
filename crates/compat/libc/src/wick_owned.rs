@@ -70,6 +70,19 @@ const KERN_SUCCESS: c_int = 0;
 /// charged again, which would let a guest past the limit (linux_items `madvise`).
 const MADV_ZERO: c_int = 11;
 
+/// A chunk is reclaimed once at least this fraction of its pages have been
+/// zeroed by partial discards. This is a TRIGGER heuristic only -- it decides
+/// WHEN to consider a chunk, never WHICH pages to drop (that is by current
+/// content; see [`reclaim_chunk`]). The mechanism (move the live pages to a
+/// fresh object, free the old) mirrors the Windows dead-chunk reclaim
+/// (`wick_uffd::reclaim_at_touch`, `windows_mm`). The TRIGGER differs by an OS
+/// gap, not by choice: Windows (and Linux's memory cgroup) reclaim at the
+/// commit/charge limit, when an allocation is refused; macOS has no refused
+/// commit -- a purgeable charge grows until jetsam kills, with nothing to
+/// react to -- so macOS reclaims proactively at this ratio. Keep the two in
+/// step when either changes (the parity rule).
+const RECLAIM_DEAD_RATIO_PERCENT: u64 = 50;
+
 /// One range of guest memory made of purgeable chunks. The chunks are
 /// `[base, base + len)` split every [`CHUNK`] bytes (the last chunk is shorter
 /// when `len` is not a multiple of `CHUNK`). `dead[i]` counts the pages of
@@ -285,11 +298,113 @@ pub unsafe fn discard(start: u64, len: u64, prot: c_int) -> c_int {
             if !ok {
                 return -1; // `errno` set by `madvise`.
             }
-            let dead = &mut o.dead[i as usize];
-            *dead = (*dead + (olen / page) as u32).min((csize / page) as u32);
+            let per_chunk = (csize / page) as u32;
+            o.dead[i as usize] = (o.dead[i as usize] + (olen / page) as u32).min(per_chunk);
+            // Reclaim this chunk once enough of it is dead (a trigger only: the
+            // move below drops pages by current content, not by this count).
+            if o.dead[i as usize] as u64 * 100 >= per_chunk as u64 * RECLAIM_DEAD_RATIO_PERCENT {
+                // SAFETY: chunk `i` of this owned range.
+                if unsafe { reclaim_chunk(cbase, csize, page, prot) } {
+                    o.dead[i as usize] = 0;
+                }
+                // A failed reclaim leaves the count; the next discard retries.
+            }
         }
     }
     0
+}
+
+/// Whether the `len` bytes at `p` are all zero.
+fn is_zero(p: u64, len: u64) -> bool {
+    // SAFETY: `p` is a mapped, 8-byte-aligned page of the caller's.
+    let words = unsafe { std::slice::from_raw_parts(p as *const u64, (len / 8) as usize) };
+    words.iter().all(|&w| w == 0)
+}
+
+/// Reclaims chunk `[cbase, cbase + csize)`: under the quiesce the replace hook
+/// gives ([`crate::wick_guest::replacing`] unmaps the chunk's guest slot, so a
+/// guest access stalls and cannot write the old object), scans the chunk's
+/// CURRENT content and replaces its object with a fresh purgeable one holding
+/// only the pages that are not currently all-zero. The all-zero pages are
+/// dropped -- they re-fault to zero, which the guest cannot tell from their
+/// old value whatever its history -- so the pinned charge falls to the live
+/// (non-zero) set.
+///
+/// The drop is decided by CONTENT, never by the dead marks: the guest can
+/// re-write a zeroed page to non-zero without this library seeing it (it
+/// writes the purgeable object through stage 2, not through a `libc` call), so
+/// a dead mark is not a safe drop oracle -- trusting it would drop a
+/// re-written live page and lose the guest's data. A page the move copies is
+/// taken out before the object is replaced and written back after, all while
+/// the chunk is quiesced, so no guest write can reach the freed object.
+/// Returns whether the chunk was replaced (`false` leaves it as it was).
+///
+/// # Safety
+/// `[cbase, cbase + csize)` is a chunk of a range this process owns.
+unsafe fn reclaim_chunk(cbase: u64, csize: u64, page: u64, prot: c_int) -> bool {
+    crate::wick_guest::replacing(cbase, csize, false, || {
+        let npages = csize / page;
+        // Scan: the offsets (in pages) of the chunk's live (non-zero) pages.
+        let live: Vec<u64> = (0..npages).filter(|&p| !is_zero(cbase + p * page, page)).collect();
+
+        // Replace the chunk's object with a fresh purgeable one. When the
+        // chunk is wholly zero this is all the reclaim does (the charge goes
+        // back entirely); otherwise the live pages are saved first and written
+        // back after, so only they are charged again.
+        // The live pages are saved in a temporary mapping (not `malloc`, whose
+        // `free` keeps the memory in its pool and so would hold the charge the
+        // reclaim is giving back); `munmap` returns it to the kernel at once.
+        let bytes = live.len() * page as usize;
+        let tmp = if bytes == 0 {
+            libc::MAP_FAILED.cast::<u8>()
+        } else {
+            // SAFETY: a fresh anonymous mapping for the live pages.
+            let t = unsafe {
+                libc::mmap(core::ptr::null_mut(), bytes, VM_PROT_RW, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+            };
+            if t == libc::MAP_FAILED {
+                return false;
+            }
+            for (k, &p) in live.iter().enumerate() {
+                // SAFETY: src a live page of the chunk, dst its slot in `t`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping((cbase + p * page) as *const u8, t.cast::<u8>().add(k * page as usize), page as usize)
+                };
+            }
+            t.cast::<u8>()
+        };
+
+        let mut a = cbase;
+        // SAFETY: a fixed purgeable allocation over the chunk's range.
+        let made = unsafe {
+            mach_vm_allocate(mach_task_self_, &mut a, csize, VM_FLAGS_OVERWRITE | VM_FLAGS_PURGABLE) == KERN_SUCCESS
+                && a == cbase
+        };
+        if made {
+            // Write the live pages back FIRST, while the fresh object is still
+            // the read-write `mach_vm_allocate` made it, THEN restrict the
+            // protection. Protecting first would, for a non-RW `prot`, make the
+            // copy-back store into a read-only mapping and raise SIGBUS. (Owned
+            // ranges are guest RAM, always `VM_PROT_RW`, so the restrict branch
+            // is not reached today; the order is correct for when it is, as in
+            // `allocate` and the whole-chunk discard, where protect is last.)
+            for (k, &p) in live.iter().enumerate() {
+                // SAFETY: src the saved page, dst the fresh page of the chunk.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(tmp.add(k * page as usize), (cbase + p * page) as *mut u8, page as usize)
+                };
+            }
+            if prot != VM_PROT_RW {
+                // SAFETY: over the fresh chunk just made.
+                unsafe { mach_vm_protect(mach_task_self_, cbase, csize, 0, prot) };
+            }
+        }
+        if bytes != 0 {
+            // SAFETY: the mapping from `mmap` above, of `bytes`.
+            unsafe { libc::munmap(tmp.cast::<c_void>(), bytes) };
+        }
+        made
+    })
 }
 
 #[cfg(test)]
