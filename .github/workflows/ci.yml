@@ -2423,10 +2423,13 @@ jobs:
       # WHP under the lockdown tokens the jailer could give Firecracker
       # (docs/windows-jail-reach.md): each WHP step's HRESULT in this
       # elevated process, then in a child whose lockdown token restricts to
-      # the four session groups and the jail's SID (as now), to the jail's
-      # SID alone, and to it alone without the WHP DLLs loaded before the
-      # revert; and the SDDL of the devices the partition opens. A record
-      # for now, never failing the job.
+      # the jail's SID with the four session groups (as now), alone (with
+      # and without the WHP DLLs loaded before the revert, and with the
+      # partition made before it), with each group alone and with the
+      # hypervisorPlatform capability SID; and in an AppContainer with and
+      # without that capability. Each child opens WHP's devices itself; the
+      # SDDL of the devices the partition opens. A record for now, never
+      # failing the job.
       - name: fs-probe whp-token (a record)
         if: (success() || failure()) && steps.kit.outcome == 'success'
         continue-on-error: true

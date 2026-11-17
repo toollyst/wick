@@ -22,7 +22,7 @@ In short:
 ## How it was measured
 
 - **Host.** Windows Server 2022 build 20348 on a GCP VM (8 vCPUs). The host has no Hyper-V, so WHP's own devices
-  are not on it (see "Not measured yet").
+  are not on it; they are measured on CI's runner ("WHP under the jail's SID alone").
 - **Jailer.** A debug build of the jailer from the Windows jail code as it is on main. The jail's token construction
   (overlay/jailer/platform/windows/mod.rs, `RESTRICTING_SIDS`, `vm_sid`) has not changed since it was built.
 - **The probe.** `tools/windows/fs-probe.rs` (commit 803121f6) carries the jailer's handover mark, as
@@ -188,12 +188,33 @@ I/O control: it answered 0xC0000010, 0xC000000D or 0xC0000002, or completed it.
 - Firecracker reverts to the lockdown token first thing in `main` and loads what it needs later. Every DLL and
   registry key it uses after that must move before the revert, under the initial token, as Chromium's sandbox warms
   up before it locks down. That includes WHP's, Winsock's and anything else loaded lazily.
-- WHP's own device must still open under the new token. Whether it does is not measured: this host has no Hyper-V.
-  The measurement is `fs-probe whp-token` (elevated): each WHP step's result in the probe itself, then in a child
-  under the lockdown token as now, under the jail's SID alone, and under it alone without the WHP DLLs loaded before
-  the revert; and the security descriptors of the devices the partition opens. CI's windows-guest job runs it as a
-  record, which no result is drawn from yet.
+- WHP's own device must still open under the new token. **It does not** (below, "WHP under the jail's SID alone").
 - Paths the operator gives Firecracker outside its jail would need to grant the jail's SID.
+
+**WHP under the jail's SID alone.** `fs-probe whp-token` in CI's windows-guest job (Windows Server 2025 build 26100;
+the run is in docs/COMPATIBILITY.md's `--chroot-base-dir` row; the runner's built-in administrator, not elevated):
+- In the probe itself and under the lockdown token as now, every step returned `S_OK` (capability, partition,
+  processor count, setup, two memory maps, a vCPU) and the vCPU's one run exited at the guest's HLT. The partition
+  opens one device, `\Device\VidExo`, at `WHvSetupPartition`, granted `0x00120089` (read).
+- Under the jail's SID alone (the WHP DLLs loaded before the revert), `WHvGetCapability(HypervisorPresent)` returned
+  `S_OK` with the answer 0: WHP reports no hypervisor. Without the DLLs loaded before the revert, `WinHvPlatform.dll`
+  does not load (126).
+- `\Device\VidExo`'s security: `O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1201bf;;;AU)(A;;0x1201bf;;;S-1-15-3-1024-1350733694-1533467442-3402045280-1710179238-1008639688-2282869650-3611451526-669908847)S:AI(ML;;NW;;;LW)`.
+  Read, write and execute go to Authenticated Users and to one capability, which a lockdown token restricted to the
+  jail's SID cannot pass: the restricting SIDs' check finds no entry for them ([Microsoft Learn, Restricted
+  Tokens](https://learn.microsoft.com/windows/win32/secauthz/restricted-tokens)). The capability's SID is
+  `DeriveCapabilitySidsFromName("hypervisorPlatform")`: the SHA-256 of the name in upper case, UTF-16LE, as eight
+  sub-authorities after `S-1-15-3-1024` (computed, and checked by the probe against the descriptor).
+- `\Device\HvService`: `O:BAD:P(A;;FA;;;SY)(A;;0x1201bf;;;BA)(A;;FR;;;WD)S:AI(ML;;NW;;;LW)`. `\Device\HvSocket`,
+  `HvSocketSystem`, `VMBus` and `RootVMBus` refuse the probe's open of the device object itself (`0xC000000D`,
+  `0xC000000E`).
+
+So the token cannot be the jail's SID alone for the VMM. The probe's next record measures the candidates: the jail's
+SID with Authenticated Users, with each other group alone, and with the `hypervisorPlatform` capability SID (if
+`CreateRestrictedToken` takes it as a restricting SID); the partition made and set up before the revert; an
+AppContainer with and without that capability; and in each, `\Device\VidExo` and `\Device\HvService` opened
+directly. `fs-probe jail-variants` measures the reach of the first and third tokens as above. The API process, which
+needs no WHP, keeps the jail's SID alone whichever wins.
 
 **What does not work.**
 - `CreateRestrictedToken` refuses ALL APPLICATION PACKAGES (`S-1-15-2-1`) and ALL RESTRICTED APPLICATION PACKAGES
@@ -225,7 +246,8 @@ I/O control: it answered 0xC0000010, 0xC000000D or 0xC0000002, or completed it.
 
 ## Not measured yet
 
-- WHP's own devices, and anything a host with Hyper-V adds to the lists above (this host has no Hyper-V).
+- Anything a host with Hyper-V adds to the lists above (this host has no Hyper-V); WHP's devices are measured
+  above, on CI's runner.
 - A desktop Windows 10 or 11, whose services and drivers differ: rerun `list-objects` and `devjail` there.
 - What the I/O controls of each reached driver accept beyond the undefined one. No driver's or service's own checks
   were attacked.
