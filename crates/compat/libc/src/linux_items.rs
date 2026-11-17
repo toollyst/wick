@@ -506,6 +506,18 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
         set_errno(libc::EINVAL);
         return -1;
     }
+    // Drop the owned-memory registry entry BEFORE the mapping is torn down,
+    // not after: once `libc::munmap` frees the address the kernel may hand it
+    // to a concurrent `allocate` for the next guest region (the vmm tests run
+    // in parallel and reuse addresses this way), and that `allocate` would
+    // find a stale entry still covering the range and trip its overlap check.
+    // `forget` and `allocate` serialize on the registry lock, so removing the
+    // entry before the `munmap` below means any `allocate` that later wins the
+    // freed address -- it can only do so after that `munmap` -- sees no entry.
+    // A `munmap` of a valid range does not fail; were it to, the entry is
+    // already gone, which merely routes a later discard of the still-mapped
+    // range down the plain (non-owned) path.
+    crate::wick_owned::forget(start, len as u64);
     // The registration of what it unmaps goes in the same step, as Linux's
     // goes with the vma.
     let unmap = || {
@@ -518,10 +530,6 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
     let rc = crate::wick_uffd::unmapping(start, len as u64, false, unmap, |rc| *rc == 0);
     if rc == 0 {
         crate::wick_uffd::note_mapping(start, len as u64, false);
-        // Owned guest memory in this range is gone with the mapping; drop its
-        // registry entry so a later guest region at the same address is not
-        // taken for the old one (`wick_owned::forget`).
-        crate::wick_owned::forget(start, len as u64);
         tell_guest(start, len as u64, true);
     }
     rc
