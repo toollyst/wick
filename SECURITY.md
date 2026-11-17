@@ -234,9 +234,12 @@ has the per-control details and results.
   (`test_a_reclaim_reads_no_missing_page`, which hung until its alarm on the code before;
   `test_owned_reclaim_leaves_missing_pages_out_of_stage_2` under Hypervisor.framework). Mapped read-write, as
   before, the fresh object would also have let the chunk's other missing pages read as zeros with no page fault
-  event; the hang came first, so that was not reached. A chunk with a page that is neither missing nor readable is
-  now left as it is (`test_a_reclaim_leaves_a_chunk_with_an_unreadable_page`, whose read ended the VMM with a fault
-  on the code before; Firecracker makes no part of a chunk so, as virtio-mem protects and discards whole slots).
+  event; the hang came first, so that was not reached. A page that is neither missing nor readable (whose read ended
+  the VMM with a fault on the code before) is read under a read access given for the scan and the save only, under
+  the quiesce, and keeps its data and its protection
+  (`test_a_reclaim_keeps_an_unreadable_pages_data_and_protection`). That part is defensive, not reachable from
+  Firecracker: virtio-mem protects and discards whole slots, and slots are whole 2 MiB chunks (vstate/memory.rs
+  `update_slot`; memory_hotplug.rs, blocks of at least 2 MiB and slots a multiple of them).
 - **Windows: a userfaultfd copy whose commit the job's limit refused in part filled its later pages from the source's start** (from d0fbafae, which made a fill at the limit go on where it was; fixed in the commit that adds this entry). A fill of a reserved section commits its pages first; refused, it fills the pages that fit and goes on with the rest once a reclaim gave room back. The copy's callback was given each part's destination but not its offset into the source, so every part after the first was filled from the source's first bytes: the guest read another page's contents in those pages, with no error. Only a copy that met the job's memory limit in its middle was hit. Now each part is copied from its own offset (`test_a_copy_whose_commit_is_refused_in_part_fills_each_page_from_its_own_bytes`, which scripts the commit's refusals; it failed on the code before).
 - **macOS: stage 2 did not follow the host's protection of guest memory** (from the macOS backend's start; its tests
   and this entry, then under "Not at parity yet", in 2e942d5a; fixed in the commit that moved it here). On Linux each

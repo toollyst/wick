@@ -3996,16 +3996,18 @@ mod tests {
         close(&[chan, mine, user]);
     }
 
-    /// The reclaim of an owned chunk (`wick_owned`) does not read a page the
-    /// process may not read that is not missing (guest memory made
-    /// `PROT_NONE`, which Firecracker does not do to a part of a chunk:
-    /// virtio-mem protects and discards whole slots, whole chunks): it
-    /// leaves the chunk as it was, its dead count kept (the charge stays
-    /// pinned), the page's data and protection unchanged. Before, the reclaim
-    /// read it and the VMM died of the fault.
+    /// The reclaim of an owned chunk (`wick_owned`) holding pages that are
+    /// not missing and that the process may not read (guest memory made
+    /// `PROT_NONE`, which Firecracker does not do to part of a chunk:
+    /// virtio-mem protects and discards whole slots, whole chunks): it reads
+    /// them under a read access given for the scan and the save only, and
+    /// they come out of it with their data and their protection, a live one
+    /// and a zero one alike, beside a read-only live page. Before, such a
+    /// chunk was left unreclaimed, its charge pinned (and before that, the
+    /// reclaim's read of the page killed the process).
     #[test]
-    fn test_a_reclaim_leaves_a_chunk_with_an_unreadable_page() {
-        if !in_own_process("wick_uffd::tests::test_a_reclaim_leaves_a_chunk_with_an_unreadable_page") {
+    fn test_a_reclaim_keeps_an_unreadable_pages_data_and_protection() {
+        if !in_own_process("wick_uffd::tests::test_a_reclaim_keeps_an_unreadable_pages_data_and_protection") {
             return;
         }
         // SAFETY: plain call.
@@ -4023,31 +4025,31 @@ mod tests {
         // SAFETY: the reserved, chunk-aligned range.
         let p = unsafe { crate::wick_owned::allocate(base as *mut _, chunk as usize, libc::PROT_READ | libc::PROT_WRITE) };
         assert_eq!(p as u64, base);
-        for i in 0..pages {
-            // SAFETY: a page of the chunk.
-            unsafe { ptr::write_volatile((base + i * ps) as *mut u64, 0x5a5a_5a5a_5a5a_5a5a) };
-        }
-        // SAFETY: a page of the chunk; the compatibility mprotect.
-        assert_eq!(unsafe { crate::linux_items::mprotect((base + 5 * ps) as *mut _, ps as usize, libc::PROT_NONE) }, 0);
-        let half = pages / 2;
-        for i in 32..32 + half {
+        // SAFETY: the chunk just made.
+        unsafe { ptr::write_bytes(base as *mut u8, 0x5a, chunk as usize) };
+        // SAFETY: page 6 of the chunk.
+        unsafe { ptr::write_bytes((base + 6 * ps) as *mut u8, 0, ps as usize) };
+        let protect = |i: u64, prot: c_int| {
+            // SAFETY: a page of the chunk; the compatibility mprotect.
+            assert_eq!(unsafe { crate::linux_items::mprotect((base + i * ps) as *mut _, ps as usize, prot) }, 0);
+        };
+        protect(5, libc::PROT_NONE);
+        protect(6, libc::PROT_NONE);
+        protect(7, libc::PROT_READ);
+        let last = 32 + pages / 2 - 1;
+        for i in 32..=last {
             // SAFETY: a page of the owned chunk.
             assert_eq!(unsafe { crate::linux_items::madvise((base + i * ps) as *mut _, ps as usize, libc::MADV_DONTNEED) }, 0, "discard of page {i}");
         }
-        assert_eq!(crate::wick_owned::dead_pages(base), half as u32, "the chunk was left as it was");
-        assert_eq!(raw_protections(base + 5 * ps, base + 6 * ps)[0], libc::PROT_NONE);
-        // SAFETY: a page of the chunk; the compatibility mprotect.
-        assert_eq!(unsafe { crate::linux_items::mprotect((base + 5 * ps) as *mut _, ps as usize, libc::PROT_READ | libc::PROT_WRITE) }, 0);
-        // SAFETY: pages of the chunk.
-        let word = |i: u64| unsafe { ptr::read_volatile((base + i * ps) as *const u64) };
-        assert_eq!(word(5), 0x5a5a_5a5a_5a5a_5a5a, "the unreadable page kept its data");
-        assert_eq!(word(4), 0x5a5a_5a5a_5a5a_5a5a);
-        assert_eq!(word(32), 0, "a discarded page reads zero");
-        // Readable again, the next discard reclaims the chunk.
-        // SAFETY: a page of the owned chunk.
-        assert_eq!(unsafe { crate::linux_items::madvise((base + 31 * ps) as *mut _, ps as usize, libc::MADV_DONTNEED) }, 0);
-        assert_eq!(crate::wick_owned::dead_pages(base), 0, "reclaimed once every page is readable");
-        assert_eq!((word(5), word(4), word(31), word(32)), (0x5a5a_5a5a_5a5a_5a5a, 0x5a5a_5a5a_5a5a_5a5a, 0, 0));
+        assert_eq!(crate::wick_owned::dead_pages(base), 0, "the chunk was reclaimed");
+        let at = |i: u64| raw_protections(base + i * ps, base + (i + 1) * ps)[0];
+        assert_eq!((at(4), at(5), at(6), at(7), at(8)), (libc::PROT_READ | libc::PROT_WRITE, libc::PROT_NONE, libc::PROT_NONE, libc::PROT_READ, libc::PROT_READ | libc::PROT_WRITE), "protections after");
+        protect(5, libc::PROT_READ);
+        protect(6, libc::PROT_READ);
+        assert!(page_is(base + 5 * ps, ps, 0x5a), "the unreadable live page kept its data");
+        assert!(page_is(base + 6 * ps, ps, 0), "the unreadable zero page reads zero");
+        assert!(page_is(base + 7 * ps, ps, 0x5a) && page_is(base + 4 * ps, ps, 0x5a) && page_is(base + (last + 1) * ps, ps, 0x5a), "the live pages");
+        assert!(page_is(base + 32 * ps, ps, 0), "a discarded page reads zero");
         // SAFETY: plain call.
         unsafe { libc::alarm(0) };
     }

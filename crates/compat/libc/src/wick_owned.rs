@@ -592,13 +592,19 @@ fn is_zero(p: u64, len: u64) -> bool {
 /// fresh object is mapped with no access and each page then gets back the
 /// protection it had, by runs, so no page is more accessible than before at
 /// any time (a fresh object mapped read-write, as before, would make a
-/// missing page read as zeros without a fault). A chunk with a page that is
-/// not missing and that this may not read (`PROT_NONE` guest memory) is not
-/// reclaimed: its dead count stays, its charge stays pinned, and a later
-/// discard tries again (`test_a_reclaim_leaves_a_chunk_with_an_unreadable_page`).
-/// Firecracker never makes part of a chunk so: virtio-mem protects and
-/// discards whole slots, whole chunks (`vstate/memory.rs` `update_slot`).
-/// Returns whether the chunk was replaced (`false` leaves it as it was).
+/// missing page read as zeros without a fault). A page that is not missing
+/// and that this may not read (`PROT_NONE` guest memory) is given read
+/// access for the scan and the save only, under the quiesce, and gets its
+/// own protection back with the others (or on the old object, when the
+/// replace is not made), its data kept
+/// (`test_a_reclaim_keeps_an_unreadable_pages_data_and_protection`). This is
+/// defensive: Firecracker never makes part of a chunk so, as virtio-mem
+/// protects and discards whole slots, and a slot is whole chunks
+/// (`vstate/memory.rs` `update_slot`; `memory_hotplug.rs`: blocks of at
+/// least 2 MiB, slots a multiple of them). A chunk with a page in no
+/// mapping is not reclaimed: its dead count stays and a later discard tries
+/// again. Returns whether the chunk was replaced (`false` leaves it as it
+/// was).
 ///
 /// # Safety
 /// `[cbase, cbase + csize)` is a chunk of a range this process owns. When a
@@ -616,10 +622,35 @@ unsafe fn reclaim_chunk(cbase: u64, csize: u64, page: u64) -> bool {
     });
     // Each page's protection as it is now, given back after the replace.
     let prot = crate::wick_uffd::raw_protections(cbase, cbase + csize);
-    if prot.iter().any(|&p| p < 0) || (0..npages).any(|p| !missing[p] && prot[p] & libc::PROT_READ == 0) {
+    if prot.iter().any(|&p| p < 0) {
         return false;
     }
+    // The runs of pages that are not missing and may not be read: read
+    // access for the scan and the save only.
+    let mut unreadable: Vec<(usize, usize)> = Vec::new();
+    for p in (0..npages).filter(|&p| !missing[p] && prot[p] & libc::PROT_READ == 0) {
+        match unreadable.last_mut() {
+            Some((_, e)) if *e == p && prot[p] == prot[p - 1] => *e = p + 1,
+            _ => unreadable.push((p, p + 1)),
+        }
+    }
+    // Gives the old object's unreadable pages their protection back.
+    let undo = |upto: usize| {
+        for &(s, e) in &unreadable[..upto] {
+            restore(cbase + s as u64 * page, (e - s) as u64 * page, prot[s]);
+        }
+    };
     crate::wick_guest::replacing(cbase, csize, false, || {
+        for (i, &(s, e)) in unreadable.iter().enumerate() {
+            // SAFETY: pages of the chunk, quiesced.
+            let kr = unsafe {
+                mach_vm_protect(mach_task_self_, cbase + s as u64 * page, (e - s) as u64 * page, 0, prot[s] | libc::PROT_READ)
+            };
+            if kr != KERN_SUCCESS {
+                undo(i);
+                return false;
+            }
+        }
         // Scan: the offsets (in pages) of the chunk's live (non-zero) pages.
         let live: Vec<usize> = (0..npages).filter(|&p| !missing[p] && !is_zero(cbase + p as u64 * page, page)).collect();
 
@@ -635,6 +666,7 @@ unsafe fn reclaim_chunk(cbase: u64, csize: u64, page: u64) -> bool {
                 libc::mmap(core::ptr::null_mut(), bytes, VM_PROT_RW, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
             };
             if t == libc::MAP_FAILED {
+                undo(unreadable.len());
                 return false;
             }
             for (k, &p) in live.iter().enumerate() {
@@ -693,11 +725,13 @@ unsafe fn reclaim_chunk(cbase: u64, csize: u64, page: u64) -> bool {
                         k += 1;
                     }
                 }
-                if prot[s] != libc::PROT_NONE && (!writes || prot[s] != VM_PROT_RW) {
+                if if writes { prot[s] != VM_PROT_RW } else { prot[s] != libc::PROT_NONE } {
                     restore(at, len, prot[s]);
                 }
                 s = e;
             }
+        } else {
+            undo(unreadable.len());
         }
         if bytes != 0 {
             // SAFETY: the mapping from `mmap` above, of `bytes`.
@@ -707,8 +741,8 @@ unsafe fn reclaim_chunk(cbase: u64, csize: u64, page: u64) -> bool {
     })
 }
 
-/// Gives `[at, at + len)` of a chunk just replaced protection `prot`. The
-/// chunk's pages hold the guest's memory and nothing else has them: a
+/// Gives `[at, at + len)` of a chunk just replaced (or of one the replace
+/// was not made over) protection `prot`. The chunk's pages hold the guest's memory and nothing else has them: a
 /// protection that cannot be given would leave the guest's live pages
 /// unreachable or its missing ones reachable, so the process ends with the
 /// reason, as a guest range that cannot be mapped again does

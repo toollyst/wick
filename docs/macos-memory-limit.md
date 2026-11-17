@@ -194,9 +194,10 @@ guest):
   The fresh object is mapped with no access and each page then gets back the protection it had, run by run, so no
   page is ever more reachable than before (`test_a_reclaim_reads_no_missing_page`, every page class's content and
   protection before and after, the charge, and a later touch's one event;
-  `test_owned_reclaim_leaves_missing_pages_out_of_stage_2` under Hypervisor.framework). A chunk with a page that is
-  neither missing nor readable is left as it is, its charge pinned, until a later discard finds it readable
-  (`test_a_reclaim_leaves_a_chunk_with_an_unreadable_page`; Firecracker makes no part of a chunk so). A chunk a
+  `test_owned_reclaim_leaves_missing_pages_out_of_stage_2` under Hypervisor.framework). A page that is neither
+  missing nor readable is read under a read access given for the scan and the save only, and keeps its data and its
+  protection (`test_a_reclaim_keeps_an_unreadable_pages_data_and_protection`; defensive: Firecracker makes no part of
+  a chunk so, as virtio-mem protects and discards whole slots of whole chunks). A chunk a
   system call is copying to or from on another thread (the Async block engine's `pread` and `pwrite`) is busy, counted
   by the compatibility libc's copy wrappers, and left for a later discard; a call arriving during a reclaim waits for
   it (`test_a_pread_in_flight_keeps_its_data_through_a_reclaim`, `test_a_pread_arriving_during_a_reclaim_waits_for_it`).
