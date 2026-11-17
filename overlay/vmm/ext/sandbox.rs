@@ -2706,6 +2706,146 @@ mod macos {
             })
         }
 
+        // The owned guest-memory path (docs/macos-memory-limit.md: guest RAM
+        // committed as purgeable 2 MiB chunks so the jail's memory limit bounds
+        // a compromised VMM) uses only calls the profile allows, in the phase
+        // each runs in: the carve (mach_vm_allocate purgeable + mach_vm_protect)
+        // at boot, the setup phase; a partial discard (madvise MADV_ZERO), a
+        // whole-chunk discard (mach_vm_allocate again) and the reclaim (an
+        // mmap/munmap temporary for the live pages + mach_vm_allocate replace +
+        // mach_vm_protect) while the guest runs, the run (narrowed) phase. This
+        // runs the whole path -- allocate, both discards, a reclaim it
+        // triggers, and the munmap that frees it -- under BOTH the setup profile
+        // and the run profile.
+        //
+        // How a denial shows, in each: in the setup and the run profile alike a
+        // denial is the kill, not an error. The default rule is `(deny default
+        // (with send-signal SIGKILL))`, and the system call, Mach trap and MIG
+        // routine rules deny a number they do not list with SIGKILL (PROFILE,
+        // default_rule); the only operations denied with an error instead are
+        // DENIED_WITH_ERROR's (the host's privileged port, the disk-space
+        // information), which this path does not ask for. mmap, munmap, mprotect
+        // and madvise are decided by their numbers (none is in
+        // UNFILTERED_SYSCALLS, whose calls an operation rule decides), and they
+        // and the mach_vm_allocate and mach_vm_protect traps are on the run
+        // lists (SYSCALLS, MACH_TRAPS), which hold in both phases. So a denial
+        // ends the child before OWNED-OK. But a failure that is not a denial (the
+        // kernel refusing an mmap or a mach_vm_allocate) would not end it, and
+        // the reclaim skips a failure silently (reclaim_chunk returns false,
+        // discard still returns 0, the dead count stays), so the child also
+        // checks that the reclaim was made (the chunk's dead count reset, which
+        // only a replaced chunk gets), what it kept and dropped by content, and
+        // that the whole-chunk discard left zeros.
+        //
+        // No VM: with no guest registered the replace hook is absent, so the
+        // discards and the reclaim run their change in place
+        // (wick_guest::replacing), the same memory calls the profile must let
+        // through.
+        #[test]
+        fn test_owned_memory_path_survives_each_profile() {
+            for phase in ["setup", "run"] {
+                let out = child("owned_memory_child", &[("WICK_TEST_CASE", phase)]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(stdout.contains("SANDBOXED"), "{phase}: {}", text(&out));
+                assert!(out.status.success() && stdout.contains("OWNED-OK"), "{phase}: {}", text(&out));
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_owned_memory_path_survives_each_profile in a separate process"]
+        fn owned_memory_child() {
+            use std::ffi::c_void;
+            let phase = std::env::var("WICK_TEST_CASE").unwrap();
+            select(Policy::Default);
+            apply().unwrap();
+            if phase == "run" {
+                narrow().unwrap();
+            }
+            // SAFETY: a write of a fixed buffer to stdout.
+            unsafe { libc::write(1, c"SANDBOXED\n".as_ptr().cast(), 10) };
+
+            const CHUNK: u64 = 2 << 20;
+            let rw = libc::PROT_READ | libc::PROT_WRITE;
+            // SAFETY: `sysconf` has no preconditions.
+            let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            let len = 2 * CHUNK;
+            // Reserve len + CHUNK and take a CHUNK-aligned base inside it (the
+            // over-allocated PROT_NONE reservation guest RAM is carved from).
+            // SAFETY: a fresh anonymous reservation.
+            let raw = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    usize::try_from(len + CHUNK).unwrap(),
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(raw, libc::MAP_FAILED, "reserve");
+            let base = ((raw as u64) + CHUNK - 1) & !(CHUNK - 1);
+
+            // Carve: commit the range as owned purgeable guest RAM (setup's
+            // mach_vm_allocate purgeable + mach_vm_protect).
+            // SAFETY: the reserved, chunk-aligned range, nothing else maps it.
+            let p = unsafe { libc::wick_owned::allocate(base as *mut c_void, usize::try_from(len).unwrap(), rw) };
+            assert_eq!(p as u64, base, "allocate returns its range");
+            // Make every page live (non-zero), so a reclaim has pages to move.
+            for i in 0..(len / page) {
+                // SAFETY: a mapped, writable page of the owned range.
+                unsafe { core::ptr::write_volatile((base + i * page) as *mut u64, 0x77) };
+            }
+
+            // The first word of page `p` of the range (each was written 0x77).
+            let at = |p: u64| -> u64 {
+                // SAFETY: a mapped page of the owned range.
+                unsafe { core::ptr::read_volatile((base + p * page) as *const u64) }
+            };
+            let per_chunk = CHUNK / page;
+
+            // Partial discard of most of chunk 0 (madvise MADV_ZERO), one page
+            // below the 50% reclaim trigger.
+            let bulk = per_chunk / 2 - 1;
+            // SAFETY: pages of the owned range.
+            assert_eq!(unsafe { libc::wick_owned::discard(base, bulk * page, rw) }, 0, "partial discard");
+            // The pages are counted dead: the registry has the range, so the
+            // count after the reclaim below reads that chunk, not a missing one.
+            assert_eq!(
+                libc::wick_owned::dead_pages(base),
+                u32::try_from(bulk).unwrap(),
+                "the partial discard counted its pages dead"
+            );
+            assert_eq!(at(0), 0, "a discarded page reads zero");
+            // Re-write a discarded page so the chunk has a live page the reclaim
+            // must move, not drop.
+            // SAFETY: a mapped page of the owned range.
+            unsafe { core::ptr::write_volatile((base + 10 * page) as *mut u64, 0x77) };
+            // One more page crosses 50% dead and triggers the reclaim of chunk 0
+            // (mmap/munmap temporary + mach_vm_allocate replace + mach_vm_protect).
+            // SAFETY: a page of the owned range.
+            assert_eq!(unsafe { libc::wick_owned::discard(base + bulk * page, page, rw) }, 0, "trigger reclaim");
+            // The reclaim was made: discard resets a chunk's dead count only when
+            // reclaim_chunk replaced it; a failed reclaim leaves the count.
+            assert_eq!(libc::wick_owned::dead_pages(base), 0, "the reclaim replaced chunk 0 (its dead count reset)");
+            // And by content: the re-written page was moved, the zero pages
+            // dropped, the never-discarded tail kept.
+            assert_eq!(at(10), 0x77, "the re-written page survived the reclaim");
+            assert_eq!(at(0), 0, "a dropped page reads zero");
+            assert_eq!(at(bulk), 0, "the page that triggered the reclaim reads zero");
+            assert_eq!(at(per_chunk - 1), 0x77, "chunk 0's live tail kept its data");
+
+            // Whole-chunk discard of chunk 1 (mach_vm_allocate purgeable replace).
+            // SAFETY: the second chunk of the owned range.
+            assert_eq!(unsafe { libc::wick_owned::discard(base + CHUNK, CHUNK, rw) }, 0, "whole-chunk discard");
+            assert!((per_chunk..2 * per_chunk).all(|p| at(p) == 0), "chunk 1 reads zero after its whole discard");
+            assert_eq!(libc::wick_owned::dead_pages(base + CHUNK), 0, "a whole discard leaves no dead count");
+            // Free it (munmap + the registry's forget).
+            // SAFETY: the owned range just made.
+            assert_eq!(unsafe { libc::munmap(base as *mut c_void, usize::try_from(len).unwrap()) }, 0, "munmap");
+
+            println!("OWNED-OK");
+        }
+
         // What the allowance of EXCEPTION_MIG_ROUTINES lets the process do
         // itself: its own `mach_exception_raise` message, sent to a kernel
         // object it holds (its task port; the id alone picks the routine,

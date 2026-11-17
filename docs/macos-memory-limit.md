@@ -1,9 +1,9 @@
 # macOS: what the jail's memory limit counts
 
-The detail behind SECURITY.md, "macOS: the jail's memory limit does not bound a compromised VMM": the two ways a
-process holds memory that the limit does not count, what each of macOS's counters says about it, why the sandbox
-profile does not remove them, what was looked at for a bound per process, and the fix being designed. Every figure
-names the command that gives it.
+The detail behind SECURITY.md, "macOS: the jail's memory limit bounds a compromised VMM's guest memory, not its
+own": the two ways a process holds memory that the limit does not count, what each of macOS's counters says about
+it, why the sandbox profile does not remove them, what was looked at for a bound per process, and the fix that
+bounds guest memory. Every figure names the command that gives it.
 
 In short: on macOS the jail's `memory.max` is a jetsam limit on the process's phys_footprint ledger. That ledger is
 charged when a page is entered into one of the task's mappings, and a process can keep anonymous memory resident that
@@ -148,15 +148,60 @@ shmem page when it is added (mm/shmem.c :1818), and a `UFFDIO_COPY` page at the 
 counterpart: removing a mapping does not uncharge a page another mapping holds, and `MADV_FREE` pages stay charged
 until the kernel frees them.
 
-## The fix being designed
+## The fix: guest memory as objects the task owns
 
-Guest memory as objects the task owns: purgeable, nonvolatile objects (`mach_vm_allocate` with `VM_FLAGS_PURGABLE`),
-charged by the object to the task's `purgeable_nonvolatile` ledger, part of the footprint, whatever maps or writes
-their pages, the Hypervisor.framework's stage 2 and a userfaultfd fill's mapping included (the purgeable rows above).
-That closes the gap for guest memory, and also counts a page the guest and the VMM both touched once. It does not
-close it for the VMM's own memory (its heap, buffers, anything it maps for itself): a compromised VMM can still hold
-anonymous memory of its own either way. Known limits of the design, being measured before any code: the objects must
-be small enough to give back whole (a discard gives a purgeable object's charge back only when the whole object
-goes), and guest memory made by a `File` snapshot restore (`MAP_PRIVATE` of the memory file) or shared with a
-vhost-user backend (the compatibility memfd, a POSIX shared memory object) cannot be such an object as it is. Not
-done; until then, SECURITY.md's "Not at parity yet" holds.
+Guest RAM is committed as objects the task owns: purgeable, nonvolatile objects (`mach_vm_allocate` with
+`VM_FLAGS_PURGABLE`), charged by the object to the task's `purgeable_nonvolatile` ledger, part of the footprint,
+whatever maps or writes their pages, the Hypervisor.framework's stage 2 and a userfaultfd fill's mapping included
+(the purgeable rows above). That closes the gap for guest memory, and also counts a page the guest and the VMM both
+touched once: 64 MiB written by the guest and read by the VMM is charged 64 MiB, and 64 MiB a userfaultfd filled
+and both then read is charged 64 MiB, at the fills, where plain memory is charged 128 in the same run
+(`test_owned_anonymous_guest_memory_is_charged_once`, `test_owned_guest_read_of_filled_pages_is_charged_once`, next
+to `test_anonymous_guest_memory_is_charged_once` and `test_a_guest_read_of_filled_pages_is_charged_once`). It does
+not close it for the VMM's own memory (its heap, buffers, anything it maps for itself): a
+compromised VMM can still hold anonymous memory of its own either way, so SECURITY.md keeps the entry under "Not at
+parity yet" for that part.
+
+The implementation ([crates/compat/libc/src/wick_owned.rs](../crates/compat/libc/src/wick_owned.rs), macOS only;
+used from [the single guest-RAM commit](../lib/firecracker/src/vmm/src/vstate/memory.rs), `owned_guest_commit`, the
+`fd == -1` anonymous boot or userfaultfd-restore memory, not a `File` restore's `fd`-backed mapping or a huge-page
+guest):
+
+- **Allocate.** The usable guest range is carved into 2 MiB chunks, each its own purgeable object
+  (`mach_vm_allocate` with `VM_FLAGS_PURGABLE | VM_FLAGS_OVERWRITE` over the `PROT_NONE` reservation, then the
+  protection). Per chunk, because a purgeable object gives its charge back only when the whole object is released: a
+  sub-range freed within a larger object frees nothing. Proven charged and usable under a live guest
+  (`test_owned_guest_memory_is_charged_and_usable`).
+- **Discard** (a balloon inflate or a userfaultfd `UFFDIO_ZEROPAGE`, through the compatibility libc's
+  `discard_piece`). A whole chunk is replaced with a fresh purgeable object, which gives the whole chunk's charge
+  back (`test_owned_whole_chunk_discard_returns_the_charge`). A partial chunk is zeroed in place with
+  `madvise(MADV_ZERO)` (not `MADV_FREE_REUSABLE`, which would be the bypass of "the second way" above, and not
+  `VM_BEHAVIOR_ZERO`, a Mach call the run-phase profile does not allow): the object keeps the pages, so the charge
+  stays pinned, and the count of such dead pages per chunk is kept (`test_owned_partial_discard_zeroes_and_pins_the_charge`).
+- **Reclaim.** Once a chunk crosses `RECLAIM_DEAD_RATIO_PERCENT` (50%) dead — a trigger only — its object is
+  replaced with a fresh purgeable one holding only the pages that are **currently** not all-zero, so the pinned
+  charge falls to the live set. The drop is decided by current page **content**, never by the dead count: the guest
+  can re-write a zeroed page to non-zero without the compatibility libc seeing it (it writes the object through
+  stage 2, not through a `libc` call), so a dead mark is not a safe drop oracle; the scan reads each page and moves
+  every page that is not currently zero, and drops only the pages that are (they re-fault to zero, which the guest
+  cannot tell from their old value). The move runs under the quiesce the replace hook gives (the chunk's guest slot
+  is unmapped, so a guest access stalls and cannot write the old object), with the live pages copied out to an
+  `mmap`/`munmap` temporary and back, so no guest write reaches the freed object
+  (`test_owned_reclaim_keeps_rewritten_dead_page_and_drops_zero_pages`,
+  `test_owned_reclaim_racing_guest_write_is_not_lost` over its 24 rounds). The 50% trigger is a macOS difference by
+  an OS gap, not by choice: Windows and Linux's memory cgroup reclaim at the commit/charge limit, when an allocation
+  is refused; macOS has no refused commit — a purgeable charge grows until jetsam kills — so it reclaims proactively
+  at this ratio (the constant is cross-referenced to the Windows dead-chunk reclaim).
+
+Every chunk's object is freed and dropped from the registry when the range is unmapped (the compatibility libc's
+`munmap`, the registry's `forget`), before the mapping is torn down so a reused address never matches a stale entry.
+The owned path uses only calls the sandbox profile allows in each phase: under both the setup and the run profile,
+where a denial is the kill, the carve, both discards and a reclaim are made and checked, the reclaim by its chunk's
+dead count reset and by what it kept and dropped (`test_owned_memory_path_survives_each_profile`).
+
+Remaining, under "Not at parity yet": the VMM's own memory (its heap, buffers) is not bounded, and guest memory made
+by a `File` snapshot restore (`MAP_PRIVATE` of the memory file) or shared with a vhost-user backend (the
+compatibility memfd, a POSIX shared memory object) cannot be a purgeable object as it is, nor is a huge-page
+guest's committed as one, so that guest memory is not charged this way either: it is charged once for each mapping
+that touched it (SECURITY.md, "macOS: a page is charged to the memory limit once for each mapping that touched
+it"), twice for a page the guest and the VMM both touched.

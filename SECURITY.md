@@ -927,10 +927,18 @@ upstream Firecracker and its jailer.
   phys_footprint ledger, and the process is killed with SIGKILL past it (xnu-12377.121.6 bsd/kern/kern_memorystatus.c
   :261, osfmk/kern/task.c `task_set_phys_footprint_limit_internal` :7602, the ledger's limit :7649). Measured on an
   M1 Pro, macOS 27.2, 64 MiB at a time, three rounds each the same: phys_footprint counts a page once for each
-  mapping that has touched it. Guest memory the guest wrote (Hypervisor.framework's stage 2) and the VMM then read
-  is charged 128 MiB, anonymous or a shared memory object as the compatibility memfd makes
-  (`test_anonymous_guest_memory_is_charged_once`, `test_shared_guest_memory_is_charged_once`), and so is memory a
-  userfaultfd filled that the guest and then the VMM read (`test_a_guest_read_of_filled_pages_is_charged_once`). A
+  mapping that has touched it. Plain guest memory the guest wrote (Hypervisor.framework's stage 2) and the VMM then
+  read is charged 128 MiB, anonymous or a shared memory object as the compatibility memfd makes
+  (`test_anonymous_guest_memory_is_charged_once`, `test_shared_guest_memory_is_charged_once`), and so is plain memory
+  a userfaultfd filled that the guest and then the VMM read (`test_a_guest_read_of_filled_pages_is_charged_once`).
+  Firecracker's anonymous guest RAM is not plain memory since the owned-memory fix (next entry): the boot's memory
+  and a userfaultfd restore's (vstate/memory.rs `owned_guest_commit`: `fd == -1`, no huge pages) are purgeable
+  objects the task owns, charged by the object whatever maps them, so the same steps are charged once, 64 MiB, in
+  the same run as the plain ones' 128 (`test_owned_anonymous_guest_memory_is_charged_once`: the guest's write +64,
+  the VMM's read +0; `test_owned_guest_read_of_filled_pages_is_charged_once`: the fills +64, the guest's and the
+  VMM's reads +0, so a filled page is charged at the fill, as on Linux). Still charged once for each mapping is the
+  guest memory that is not owned: a `File` snapshot restore's (`MAP_PRIVATE` of the memory file), a vhost-user
+  backend's (the compatibility memfd) and a huge-page guest's. On plain memory a
   userfaultfd fill writes through a mapping of the pages made for it and taken away once it is done
   (`libc::wick_uffd::fill_view`), so the fill itself is charged nothing and the pages are charged by the mappings
   that touch them after: 64 MiB filled and read by the guest alone is charged 64 MiB
@@ -943,32 +951,47 @@ upstream Firecracker and its jailer.
   charges a page to the memory cgroup once, when it is allocated (v6.12 mm/memory.c `alloc_anon_folio` :4711,
   mm/shmem.c :1818; mm/memcontrol.c `commit_charge` :2370 refuses a second charge), and a `UFFDIO_COPY` page at the
   fill (mm/userfaultfd.c `mfill_atomic_pte_copy` :302), whatever then maps it, KVM's stage 2 included. So a jailed
-  VMM is killed by jetsam when the pages both its guest and it have touched (a device's queues and buffers; every
-  page, when it writes a snapshot's memory) reach half of what Linux would let them be. The three tests that make a
-  VM and ask for one charge where two mappings touched the pages fail today and are listed as no-hvf
-  (tools/macos/unit-test-differences.txt; CI's runners make no VM, this Mac is where they run). The other way, a
-  page a userfaultfd filled and nothing has touched yet is held and charged to no one until something touches it,
-  where Linux charged it at the fill. For a VMM that works as it should, that is at most the registered memory the
+  VMM whose guest memory is not owned (a `File` restore, a vhost-user backend, huge pages) is killed by jetsam when
+  the pages both its guest and it have touched (a device's queues and buffers; every page, when it writes a
+  snapshot's memory) reach half of what Linux would let them be. The three tests that make a VM and ask for one
+  charge where two mappings touched plain pages fail and are listed as no-hvf, as the record of that
+  (tools/macos/unit-test-differences.txt; CI's runners make no VM, this Mac is where they run). The other way, on
+  plain memory (a huge-page guest restored through a userfaultfd), a page a userfaultfd filled and nothing has
+  touched yet is held and charged to no one until something touches it, where Linux charged it at the fill. For a VMM that works as it should, that is at most the registered memory the
   handler filled ahead of the guest's accesses (a fill in answer to a fault is followed by the access that
   faulted); a compromised VMM can hold any amount that way (next entry). The kill at the limit: under the jailer's
   memory.max of 96 MiB, a process that fills 64 MiB through a userfaultfd and reads it lives, and the same with a
   second mapping of the pages read too, as the alias was, is killed at the read (`jailer-test uffd-charge`, no VM,
-  root, in CI's macos job; not run on this Mac, where root is not used). A fix for two mappings is being designed,
-  not done; until then, give a jail's `memory.max` room for twice the guest memory the VMM will touch.
-- **macOS: the jail's memory limit does not bound a compromised VMM.** The limit is a jetsam limit on the process's
-  phys_footprint (entry above), and a process can keep memory resident that this ledger does not count: anonymous
-  memory written only through a second mapping of it that is then removed (the calls a userfaultfd fill makes, which
-  the run-phase profile allows for that), or made reusable (`MADV_FREE_REUSABLE`) and written again. No counter per
-  process that was found serves as a bound either. So a compromised jailed VMM can hold memory past `memory.max`,
-  bounded by the host's memory and swap, not by the jail; macOS's memory-pressure jetsam of the whole host still
-  applies. Linux's memory cgroup charges every page when it is allocated, so a VMM in a cgroup cannot.
-  The accounting is xnu's known, public behaviour, not a new vulnerability; wick's part is what it means for the
-  jail. Under memory.max of 96 MiB, 256 MiB held either way must live, which records the gap, and the first way on
-  a purgeable object, charged by the object, must be killed (`jailer-test uffd-charge`, root, CI's macos job; not
-  run on this Mac). Not fixed; being designed: guest memory as objects the task owns (purgeable, nonvolatile),
-  charged by the object whatever maps them, which closes it for guest memory, not for the VMM's own memory. The
-  mechanics, the measurements and the probe for each, what was looked at for a bound per process, and the public
-  sources: [docs/macos-memory-limit.md](docs/macos-memory-limit.md).
+  root, in CI's macos job; not run on this Mac, where root is not used). The owned-memory fix charges the boot's
+  and a userfaultfd restore's guest RAM once (above); for a `File` restore, a vhost-user backend's memfd and a
+  huge-page guest it is not done, so for those give a jail's `memory.max` room for twice the guest memory the VMM
+  will touch.
+- **macOS: the jail's memory limit bounds a compromised VMM's guest memory, not its own.** The limit is a jetsam
+  limit on the process's phys_footprint (entry above), and a process can keep memory resident that this ledger does
+  not count: anonymous memory written only through a second mapping of it that is then removed (the calls a
+  userfaultfd fill makes, which the run-phase profile allows for that), or made reusable (`MADV_FREE_REUSABLE`) and
+  written again. No counter per process that was found serves as a bound either. So a compromised jailed VMM could
+  hold memory past `memory.max`, bounded by the host's memory and swap, not by the jail. Linux's memory cgroup
+  charges every page when it is allocated, so a VMM in a cgroup cannot. The accounting is xnu's known, public
+  behaviour, not a new vulnerability; wick's part is what it means for the jail.
+  Guest memory is now bounded: it is committed as objects the task owns — purgeable, nonvolatile 2 MiB chunks
+  (`mach_vm_allocate` with `VM_FLAGS_PURGABLE`), charged by the object to `purgeable_nonvolatile`, part of the
+  footprint, whatever maps or writes their pages (the Hypervisor.framework's stage 2 and a userfaultfd fill's
+  mapping included), so a write through a removed mapping is counted. A balloon or userfaultfd discard gives a whole
+  chunk's charge back, or zeroes a partial chunk with `madvise(MADV_ZERO)` and pins it; once a chunk is half dead a
+  reclaim, under the quiesce the guest-slot replace hook gives, replaces its object with one holding only the pages
+  that are currently non-zero (the drop decided by content, not by the discard history), so the pinned charge falls
+  to the live set (`crates/compat/libc/src/wick_owned.rs`; `test_owned_*` under Hypervisor.framework, and
+  `test_owned_memory_path_survives_each_profile` under both sandbox profiles). Under memory.max of 96 MiB, the first
+  way on a purgeable object is killed, and a userfaultfd that fills 128 MiB on a purgeable object is killed during
+  the fills, where the plain fills live (`jailer-test uffd-charge`, whose `uffd-charge-purgeable` case must be
+  killed and whose `uffd-charge` case must live; root, CI's macos job, not run on this Mac). Still here, under "Not at parity yet": the VMM's own memory (its heap, buffers)
+  is not bounded this way, and guest memory made by a `File` snapshot restore (`MAP_PRIVATE` of the memory file) or
+  shared with a vhost-user backend (the compatibility memfd) cannot be a purgeable object as it is, nor is a
+  huge-page guest's committed as one; macOS's
+  memory-pressure jetsam of the whole host still applies to both. The mechanics, the measurements and the probe for
+  each, what was looked at for a bound per process, and the public sources:
+  [docs/macos-memory-limit.md](docs/macos-memory-limit.md).
 - **macOS jailer: no namespaces in the kernel.** macOS has no network or PID namespaces (XNU's system calls,
   bsd/kern/syscalls.master, have no `unshare`, `setns` or `clone`): IP networking is denied by the sandbox; a
   jailed VMM uses Unix socket endpoints in the jail or in the directory `--netns` names, the jail's network.

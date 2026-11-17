@@ -2819,6 +2819,113 @@ mod tests {
         assert!(charged_once(charged), "{FOOTPRINT_MIB} MiB written by the guest and read by the host is charged {charged} MiB");
     }
 
+    /// A [`footprint_steps`] backing made as Firecracker commits anonymous
+    /// guest RAM on macOS (vstate/memory.rs `owned_guest_commit`: the boot's
+    /// memory and a userfaultfd restore's): a 2 MiB-aligned reservation, then
+    /// owned purgeable chunks over it (`libc::wick_owned::allocate`). The
+    /// reservation stays for the test.
+    fn owned_backing(len: usize) -> *mut libc::c_void {
+        const CHUNK: u64 = 2 << 20;
+        // SAFETY: a new anonymous reservation of the test's.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len + CHUNK as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "reserve");
+        let base = (raw as u64).next_multiple_of(CHUNK);
+        // SAFETY: the reserved, chunk-aligned range; nothing else maps it.
+        let mem = unsafe {
+            libc::wick_owned::allocate(base as *mut libc::c_void, len, libc::PROT_READ | libc::PROT_WRITE)
+        };
+        assert_eq!(mem as u64, base, "owned allocate returns its range");
+        mem
+    }
+
+    /// Whether `charged` MiB is one charge for [`FOOTPRINT_MIB`], bounded
+    /// below as well as above: owned memory is charged by the object, so a
+    /// result near zero would mean the pages were not charged at all (the
+    /// backing no longer owned), which must not pass as "once".
+    fn charged_exactly_once(charged: u64) -> bool {
+        charged_once(charged) && charged + 8 >= FOOTPRINT_MIB
+    }
+
+    /// The owned twin of [`test_anonymous_guest_memory_is_charged_once`]: the
+    /// same 64 MiB, written by the guest and then read by the host, in owned
+    /// purgeable chunks, is charged once (64 MiB), where the plain mapping
+    /// there is charged twice (128): a purgeable object is charged by the
+    /// object, not for each mapping that touched it, so the guest's stage 2
+    /// and the VMM's host mapping count a page once (docs/macos-memory-limit.md,
+    /// "The fix"). What Firecracker's boot memory is on macOS.
+    #[test]
+    fn test_owned_anonymous_guest_memory_is_charged_once() {
+        let charged = footprint_steps(
+            &FILL,
+            owned_backing,
+            &mut [
+                ("written by the guest", &mut |vcpu, _, ipa, len| guest_pass(vcpu, ipa, ipa + len)),
+                ("read by the host", &mut |_, mem, _, len| assert_eq!(host_pass(mem, len), 0x77 * (len / host_page_size()))),
+            ],
+            0,
+        );
+        assert!(
+            charged_exactly_once(charged),
+            "{FOOTPRINT_MIB} MiB of owned memory written by the guest and read by the host is charged {charged} MiB"
+        );
+    }
+
+    /// The owned twin of [`test_a_guest_read_of_filled_pages_is_charged_once`]:
+    /// the same 64 MiB, filled by a userfaultfd (through a view that is gone
+    /// after each fill), then read by the guest and by the host, in owned
+    /// purgeable chunks, is charged once (64 MiB, at the fills), where the
+    /// plain mapping there is charged twice (128). What a userfaultfd
+    /// restore's guest memory is on macOS; it also shows the registration
+    /// keeps the chunks owned (a fill through a removed view charges the
+    /// object, so a backing that lost them would read 128 here, or 0 at the
+    /// fills).
+    #[test]
+    fn test_owned_guest_read_of_filled_pages_is_charged_once() {
+        let page = host_page_size();
+        let uffd = std::cell::Cell::new(None::<(usize, libc::c_int)>);
+        let data = vec![0x5au8; page as usize];
+        let charged = footprint_steps(
+            &READ,
+            owned_backing,
+            &mut [
+                ("registered", &mut |_, mem, _, len| {
+                    let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+                    libc::wick_uffd::register(ctx, mem, len).unwrap();
+                    uffd.set(Some((ctx, user)));
+                }),
+                ("filled", &mut |_, mem, _, len| {
+                    let (ctx, _) = uffd.get().unwrap();
+                    for i in 0..len / page {
+                        // SAFETY: `data` holds a page.
+                        assert_eq!(unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), mem + i * page, page, false) }, Ok(page));
+                    }
+                }),
+                ("read by the guest", &mut |vcpu, _, ipa, len| guest_pass(vcpu, ipa, ipa + len)),
+                ("read by the host", &mut |_, mem, _, len| assert_eq!(host_pass(mem, len), 0x5a * (len / page))),
+                ("released", &mut |_, _, _, _| {
+                    let (_, user) = uffd.take().unwrap();
+                    // SAFETY: the user end.
+                    unsafe { libc::close(user) };
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }),
+            ],
+            1,
+        );
+        assert!(
+            charged_exactly_once(charged),
+            "{FOOTPRINT_MIB} MiB of owned memory filled and read by the guest and the host is charged {charged} MiB"
+        );
+    }
+
     #[test]
     fn test_madvise_dontneed_replaces_guest_pages() {
         replaced_pages(|ptr, len| {

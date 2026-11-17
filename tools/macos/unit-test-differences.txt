@@ -68,12 +68,13 @@
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
 #   cpu-template-helper: 30 tests; 25 pass, 5 fail (no-hvf).
-#   compat-kvm-ioctls: 120 tests; 34 pass, 84 fail, 2 ignored (counted again
-#   on 2026-11-17, after the four *_charged_once tests, the five
-#   test_owned_* guest-memory tests (three discard, two reclaim), and the
-#   ignored timed_vcpu_fault_throughput, by
+#   compat-kvm-ioctls: 122 tests; 34 pass, 86 fail, 2 ignored (counted again
+#   on 2026-11-17, after the four *_charged_once tests, the seven
+#   test_owned_* guest-memory tests (the allocation, two charged-once twins,
+#   two discards, two reclaims), and the ignored
+#   timed_vcpu_fault_throughput, by
 #   check-unit-tests.py --crate compat-kvm-ioctls), all
-#   no-hvf: 83 with Error(1) at hv_vm_create, and the vCPU thread's latency
+#   no-hvf: 85 with Error(1) at hv_vm_create, and the vCPU thread's latency
 #   tier's test_a_wfi_ends_when_its_timer_is_due, which fails on a runner
 #   before it makes its VM, at its own requirement of a launcher that raised
 #   no timer coalescing, since the runners' processes are coalesced as
@@ -99,9 +100,12 @@ no-hvf cpu-template-helper utils::tests::test_build_microvm
 
 # compat-kvm-ioctls: the Hypervisor.framework backend's own tests.
 # Three of the four *_charged_once tests also fail on this Mac, signed, by their
-# assertion: a page is charged to phys_footprint once for each mapping that
-# touched it (SECURITY.md, Not at parity yet); the fourth,
-# test_filled_pages_only_the_guest_reads_are_charged_once, passes here.
+# assertion: a plain page is charged to phys_footprint once for each mapping
+# that touched it (SECURITY.md, Not at parity yet); the fourth,
+# test_filled_pages_only_the_guest_reads_are_charged_once, passes here. Their
+# owned twins (test_owned_anonymous_guest_memory_is_charged_once,
+# test_owned_guest_read_of_filled_pages_is_charged_once: Firecracker's own
+# anonymous guest RAM) pass here: charged once, by the object.
 # CI's runners make no VM, so this Mac is where they run.
 no-hvf compat-kvm-ioctls hvf::debug::tests::test_a_running_vcpu_is_busy_for_a_dup_handle
 no-hvf compat-kvm-ioctls hvf::debug::tests::test_a_stopped_vcpu_reads_and_writes_from_a_dup_handle
@@ -170,7 +174,9 @@ no-hvf compat-kvm-ioctls hvf::vm::tests::test_no_guest_store_lands_after_a_host_
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_no_guest_store_lands_on_old_pages_after_a_discard_returned
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_one_change_across_pieces_mapped_apart_reaches_each
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_os_lock_is_a_register_as_on_kvm
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_owned_anonymous_guest_memory_is_charged_once
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_owned_guest_memory_is_charged_and_usable
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_owned_guest_read_of_filled_pages_is_charged_once
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_owned_partial_discard_zeroes_and_pins_the_charge
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_owned_reclaim_keeps_rewritten_dead_page_and_drops_zero_pages
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_owned_reclaim_racing_guest_write_is_not_lost
