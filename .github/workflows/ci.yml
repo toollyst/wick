@@ -1551,6 +1551,7 @@ jobs:
             tools/windows/jailer-test.ps1
             tools/windows/jail-probe.exe
             tools/windows/jail-parent.exe
+            tools/windows/fs-probe.exe
             tools/windows/job-freeze-probe.ps1
             tools/windows/memory-partition-probe.exe
             tools/windows/vmm-memory-record.py
@@ -2419,6 +2420,17 @@ jobs:
       - name: HOSTWARP before the guests
         continue-on-error: true
         run: .\winprobe.exe hostwarp 3
+      # WHP under the lockdown tokens the jailer could give Firecracker
+      # (docs/windows-jail-reach.md): each WHP step's HRESULT in this
+      # elevated process, then in a child whose lockdown token restricts to
+      # the four session groups and the jail's SID (as now), to the jail's
+      # SID alone, and to it alone without the WHP DLLs loaded before the
+      # revert; and the SDDL of the devices the partition opens. A record
+      # for now, never failing the job.
+      - name: fs-probe whp-token (a record)
+        if: (success() || failure()) && steps.kit.outcome == 'success'
+        continue-on-error: true
+        run: .\tools\windows\fs-probe.exe whp-token "$env:RUNNER_TEMP\whp-token"
       # Every stage of `all`, as a PC's default run has them, but hugepages
       # (its own step below), and diff-nospace, which needs the elevation
       # this runner has. Not in `all`: foreign-snapshot (it wants a state of

@@ -19,6 +19,16 @@
 //! fs-probe devices [<base>] each device object, opened by its name and by
 //!                         a name beneath it, and TCP, under (b), LPAC and a
 //!                         plain AppContainer; as `reach`
+//! fs-probe whp-token [<base>] the Windows Hypervisor Platform (capability,
+//!                         partition, setup, memory map, vCPU, one run to a
+//!                         HLT) in this process and in a child under each
+//!                         lockdown token the jailer could make (the four
+//!                         groups as now, the jail's SID alone, alone without
+//!                         the WHP DLLs preloaded), each child with the
+//!                         jail's initial token until it reverts; and the
+//!                         SDDL of the devices the partition opens. As an
+//!                         elevated administrator; <base> (default
+//!                         C:\w4\whptoken-<pid>) must not exist
 //! ```
 //!
 //! `reach` lists every named kernel object, named pipe, file and directory of
@@ -3543,6 +3553,11 @@ fn main() {
         Some("list-objects") => list_objects(&args[1]),
         Some("jail-variants") => jail_variants(&args[1], &args[2]),
         Some("jail-variant-child") => jail_variant_child(&args[1..]),
+        Some("whp-token") => {
+            let base = args.get(1).cloned().unwrap_or_else(|| format!(r"C:\w4\whptoken-{}", std::process::id()));
+            whp_token(&base);
+        }
+        Some("whp-token-child") => whp_token_child(&args[1..]),
         Some("child") => child(&args[1..]),
         Some("dummy") => dummy(&args[1]),
         Some("ea") => ea_limits(&args[1]),
@@ -3561,8 +3576,329 @@ fn main() {
             run(&base);
         }
         _ => {
-            eprintln!("usage: fs-probe run [<base>] | reach [<base>] | devices [<base>] | list-objects <file> | devjail <list> <port> <ip> <port> (under the jailer) | jail-variants <base> <ip:port> | ea <dir>");
+            eprintln!("usage: fs-probe run [<base>] | reach [<base>] | devices [<base>] | list-objects <file> | devjail <list> <port> <ip> <port> (under the jailer) | jail-variants <base> <ip:port> | whp-token [<base>] | ea <dir>");
             std::process::exit(2);
         }
     }
+}
+
+// `whp-token`: the Windows Hypervisor Platform under the jail's tokens.
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryInformationProcess(h: HANDLE, class: u32, buf: *mut c_void, len: u32, ret: *mut u32) -> i32;
+}
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryExW(name: *const u16, file: HANDLE, flags: u32) -> HANDLE;
+    fn VirtualAlloc(addr: *mut c_void, size: usize, ty: u32, protect: u32) -> *mut c_void;
+}
+#[link(name = "advapi32")]
+extern "system" {
+    fn IsTokenRestricted(t: HANDLE) -> i32;
+}
+
+/// `LOAD_LIBRARY_SEARCH_SYSTEM32`: as kvm-ioctls loads the WHP DLLs.
+const SEARCH_SYSTEM32: u32 = 0x800;
+/// `WHvPartitionPropertyCodeProcessorCount`.
+const WHV_PROCESSOR_COUNT: u32 = 0x1fff;
+/// `WHvRunVpExitReasonX64Halt`.
+const WHV_EXIT_HALT: u32 = 8;
+/// `sizeof(WHV_RUN_VP_EXIT_CONTEXT)`: exit reason and reserved word (8),
+/// `WHV_VP_EXIT_CONTEXT` (40), the union, whose largest member is
+/// `WHV_HYPERCALL_CONTEXT` (176) (WinHvPlatformDefs.h).
+const WHV_EXIT_CONTEXT_SIZE: u32 = 224;
+
+/// The name of the object behind handle `h`, or why there is none: asked on
+/// a thread of its own, since a name query can wait on a pipe for ever.
+fn object_name(h: HANDLE) -> String {
+    let hv = h as usize;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u64; 1024];
+        // SAFETY: a buffer of 8 KiB; ObjectNameInformation.
+        let st = unsafe { NtQueryObject(hv as HANDLE, 1, buf.as_mut_ptr().cast(), 8192, null_mut()) };
+        let _ = tx.send(if st < 0 { format!("<name {:#010x}>", st as u32) } else { counted(&buf) });
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(500)).unwrap_or_else(|_| "<name query did not return>".into())
+}
+
+/// The UNICODE_STRING at the start of `buf`.
+fn counted(buf: &[u64]) -> String {
+    // SAFETY: NtQueryObject wrote a UNICODE_STRING (length, maximum, pointer at 8) there.
+    unsafe {
+        let len = usize::from(*buf.as_ptr().cast::<u16>()) / 2;
+        let ptr = *buf.as_ptr().cast::<u8>().add(8).cast::<*const u16>();
+        if ptr.is_null() || len == 0 { String::new() } else { String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len)) }
+    }
+}
+
+/// This process's `File` handles: "<handle> <name> <granted access>".
+fn file_handles() -> Vec<String> {
+    let mut buf = vec![0u32; 8192];
+    let mut ret = 0u32;
+    // SAFETY: ProcessHandleTable (58) of this process into 32 KiB.
+    let st = unsafe { NtQueryInformationProcess(GetCurrentProcess(), 58, buf.as_mut_ptr().cast(), 32768, &mut ret) };
+    if st < 0 {
+        return vec![format!("<handle table {:#010x}>", st as u32)];
+    }
+    let mut out = Vec::new();
+    for &v in &buf[..ret as usize / 4] {
+        let h = v as usize as HANDLE;
+        let mut t = vec![0u64; 128];
+        // SAFETY: ObjectTypeInformation into 1 KiB.
+        if unsafe { NtQueryObject(h, 2, t.as_mut_ptr().cast(), 1024, null_mut()) } < 0 || counted(&t) != "File" {
+            continue;
+        }
+        out.push(format!("{:#x} {} {:#010x}", v, object_name(h), granted(h)));
+    }
+    out
+}
+
+/// One microVM's worth of WHP, step by step, through `m` (WinHvPlatform.dll):
+/// each step's HRESULT, the device handles the partition holds, and the exit
+/// of one run of a vCPU whose first instruction (at the reset vector) is HLT.
+/// Returns the device names the partition opened.
+fn whp_steps(tag: &str, m: HANDLE) -> Vec<String> {
+    type GetCap = unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
+    type Create = unsafe extern "system" fn(*mut HANDLE) -> i32;
+    type Part = unsafe extern "system" fn(HANDLE) -> i32;
+    type SetProp = unsafe extern "system" fn(HANDLE, u32, *const c_void, u32) -> i32;
+    type Vp = unsafe extern "system" fn(HANDLE, u32, u32) -> i32;
+    type DelVp = unsafe extern "system" fn(HANDLE, u32) -> i32;
+    type Map = unsafe extern "system" fn(HANDLE, *mut c_void, u64, u64, u32) -> i32;
+    type Run = unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32) -> i32;
+    let f = |name: &str| {
+        // SAFETY: a module handle and a NUL-terminated name.
+        let p = unsafe { GetProcAddress(m, format!("{name}\0").as_ptr()) };
+        if p.is_null() {
+            println!("{tag} {name} missing");
+        }
+        p
+    };
+    let names = ["WHvGetCapability", "WHvCreatePartition", "WHvSetPartitionProperty", "WHvSetupPartition", "WHvMapGpaRange", "WHvCreateVirtualProcessor", "WHvRunVirtualProcessor", "WHvDeleteVirtualProcessor", "WHvDeletePartition"];
+    let p: Vec<*const c_void> = names.iter().map(|n| f(n)).collect();
+    if p.iter().any(|x| x.is_null()) {
+        return Vec::new();
+    }
+    // SAFETY: the exports of WinHvPlatform.dll, with their documented signatures.
+    let (get_cap, create, set_prop, setup, map, create_vp, run, delete_vp, delete) = unsafe {
+        (
+            std::mem::transmute::<*const c_void, GetCap>(p[0]),
+            std::mem::transmute::<*const c_void, Create>(p[1]),
+            std::mem::transmute::<*const c_void, SetProp>(p[2]),
+            std::mem::transmute::<*const c_void, Part>(p[3]),
+            std::mem::transmute::<*const c_void, Map>(p[4]),
+            std::mem::transmute::<*const c_void, Vp>(p[5]),
+            std::mem::transmute::<*const c_void, Run>(p[6]),
+            std::mem::transmute::<*const c_void, DelVp>(p[7]),
+            std::mem::transmute::<*const c_void, Part>(p[8]),
+        )
+    };
+    let show = |step: &str, hr: i32| println!("{tag} {step} {:#010x}{}", hr as u32, if hr < 0 { " FAILED" } else { "" });
+    let mut devices = Vec::new();
+    let new_handles = |before: &[String], when: &str, devices: &mut Vec<String>| {
+        for h in file_handles() {
+            if !before.contains(&h) {
+                println!("{tag} handle-after-{when} {h}");
+                if let Some(name) = h.split(' ').nth(1) {
+                    devices.push(name.to_string());
+                }
+            }
+        }
+    };
+    let mut present = 0u32;
+    let mut written = 0u32;
+    // SAFETY: WHvCapabilityCodeHypervisorPresent into a BOOL.
+    let hr = unsafe { get_cap(0, (&raw mut present).cast(), 4, &mut written) };
+    show("WHvGetCapability(HypervisorPresent)", hr);
+    println!("{tag} hypervisor-present {present}");
+    if hr < 0 || present == 0 {
+        return devices;
+    }
+    let before = file_handles();
+    let mut part = null_mut();
+    // SAFETY: an out-pointer.
+    let hr = unsafe { create(&mut part) };
+    show("WHvCreatePartition", hr);
+    if hr < 0 {
+        return devices;
+    }
+    new_handles(&before, "create", &mut devices);
+    let before = file_handles();
+    let one = 1u32;
+    // SAFETY: the partition; a UINT32 property.
+    show("WHvSetPartitionProperty(ProcessorCount=1)", unsafe { set_prop(part, WHV_PROCESSOR_COUNT, (&raw const one).cast(), 4) });
+    // SAFETY: the partition.
+    let hr = unsafe { setup(part) };
+    show("WHvSetupPartition", hr);
+    new_handles(&before, "setup", &mut devices);
+    if hr >= 0 {
+        // SAFETY: two committed read-write pages of our own.
+        let mem = unsafe { VirtualAlloc(null_mut(), 0x2000, 0x3000, 0x04) };
+        assert!(!mem.is_null(), "VirtualAlloc {}", last());
+        // HLT where the reset vector may be: 0xFFFFFFF0 (CS base 0xFFFF0000,
+        // IP 0xFFF0, the architectural reset state) and 0xFFFF0 (a CS base
+        // of 0xF0000), each the last 16 bytes of a page of its own.
+        for (page, gpa) in [(0usize, 0xFFFF_F000u64), (0x1000, 0xF_F000)] {
+            // SAFETY: within the two pages.
+            unsafe { *mem.cast::<u8>().add(page + 0xFF0) = 0xF4 };
+            // SAFETY: the partition, our page; WHvMapGpaRangeFlagRead | Write | Execute.
+            show(&format!("WHvMapGpaRange({gpa:#x})"), unsafe { map(part, mem.cast::<u8>().add(page).cast(), gpa, 0x1000, 0x7) });
+        }
+        // SAFETY: the partition; vCPU 0, no flags.
+        let hr = unsafe { create_vp(part, 0, 0) };
+        show("WHvCreateVirtualProcessor", hr);
+        if hr >= 0 {
+            let mut ctx = [0u64; WHV_EXIT_CONTEXT_SIZE as usize / 8];
+            // SAFETY: the partition, vCPU 0, an exit context of its size.
+            let hr = unsafe { run(part, 0, ctx.as_mut_ptr().cast(), WHV_EXIT_CONTEXT_SIZE) };
+            show("WHvRunVirtualProcessor", hr);
+            if hr >= 0 {
+                let reason = ctx[0] as u32;
+                println!("{tag} exit-reason {reason:#x}{}", if reason == WHV_EXIT_HALT { " (X64Halt: the guest's HLT)" } else { " (not the HLT)" });
+                // WHvRunVpExitReasonMemoryAccess: the GPA (at 72: the union at
+                // 48, then 1 + 3 + 16 instruction bytes and the 4-byte access info).
+                if reason == 1 {
+                    println!("{tag} exit-gpa {:#x}", ctx[9]);
+                }
+            }
+            // SAFETY: the vCPU made above.
+            show("WHvDeleteVirtualProcessor", unsafe { delete_vp(part, 0) });
+        }
+    }
+    // SAFETY: the partition made above.
+    show("WHvDeletePartition", unsafe { delete(part) });
+    devices
+}
+
+/// Loads `dll` from System32 as kvm-ioctls does; prints the result.
+fn load_system32(tag: &str, what: &str, dll: &str) -> HANDLE {
+    // SAFETY: a NUL-terminated name.
+    let m = unsafe { LoadLibraryExW(wide(dll).as_ptr(), null_mut(), SEARCH_SYSTEM32) };
+    println!("{tag} {what} {dll} {}", if m.is_null() { last() } else { "loaded".into() });
+    m
+}
+
+/// The measurement: WHP in this (elevated) process as the control; the
+/// security of the device objects the partition opened and of every device
+/// whose name says WHP, VID or the hypervisor, as SDDL; then a child under
+/// each token the jailer could give Firecracker, each in a Job, with the
+/// jail's initial token on its main thread until it reverts.
+fn whp_token(base: &str) {
+    assert!(std::fs::metadata(base).is_err(), "{base} exists");
+    let own = own_token();
+    let user = token_sid(own, 1);
+    // TokenElevation (20): a DWORD.
+    let elevated = token_info(own, 20)[0] as u32 != 0;
+    println!("host user {user} elevated {elevated}");
+    let mut devices = Vec::new();
+    let m = load_system32("host", "load", "WinHvPlatform.dll");
+    if !m.is_null() {
+        devices = whp_steps("host", m);
+    }
+    let mut objs = Vec::new();
+    walk_objects("\\Device", &mut objs);
+    // VID (the virtualization infrastructure driver WinHvPlatform works
+    // through), WinHv and the hypervisor's other devices; not video ones.
+    let keys = ["winhv", "hypervisor", "hvsocket", "vmbus", "hvservice"];
+    for (_, path) in &objs {
+        let last = path.rsplit('\\').next().unwrap_or("").to_lowercase();
+        let vid = last.starts_with("vid") && !last.starts_with("video");
+        if (vid || keys.iter().any(|k| last.contains(k))) && !devices.contains(path) {
+            devices.push(path.clone());
+        }
+    }
+    for d in &devices {
+        // The device object itself (READ_CONTROL), not a name beneath it.
+        let device = d.split('\\').take(3).collect::<Vec<_>>().join("\\");
+        match open_object("Device", &device, 0x0002_0000) {
+            Ok(h) => println!("host device {device} sddl {}", handle_sddl(h.0)),
+            Err(st) => println!("host device {device} open {:#010x}", st as u32),
+        }
+    }
+    let parent_dir = std::path::Path::new(base).parent().unwrap().to_string_lossy().into_owned();
+    let parent_before = file_sddl(&parent_dir);
+    std::fs::create_dir(base).unwrap();
+    let r = std::collections::hash_map::RandomState::new();
+    let rnd = |i: u64| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = r.build_hasher();
+        h.write_u64(i);
+        h.finish() as u32
+    };
+    let jail_sid = format!("S-1-9-{}-{}-{}-{}", rnd(1), rnd(2), rnd(3), rnd(4));
+    let bin = format!("{base}\\bin");
+    std::fs::create_dir(&bin).unwrap();
+    let exe = format!("{bin}\\fs-probe.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    // As the jail's root: the jail's SID may read and run what is there.
+    assert_eq!(set_dacl(&bin, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;0x1200a9;;;{jail_sid})")), 0);
+    let logon = logon_sid(own);
+    let session = ["S-1-1-0", "S-1-5-32-545", "S-1-5-11", "S-1-5-4"];
+    // (name, the lockdown token's restricting SIDs besides the jail's, preload).
+    let variants: [(&str, Vec<&str>, bool); 3] = [
+        ("jail-as-now", session.to_vec(), true),
+        ("jail-own-sid", Vec::new(), true),
+        ("jail-own-sid-no-preload", Vec::new(), false),
+    ];
+    for (name, groups, preload) in &variants {
+        let mut restricting = vec![jail_sid.as_str()];
+        restricting.extend(groups.iter().copied());
+        // The lockdown token, as the jailer makes it: below medium integrity.
+        let primary = restricted_token(own, &user, &restricting, &[&user, &jail_sid]);
+        set_integrity(primary, "S-1-16-6144");
+        // The jailer's initial token: the jail's SID, the four groups, the
+        // logon SID and the user's, for the loader and the preload.
+        let mut all = vec![jail_sid.as_str()];
+        all.extend(session);
+        all.extend([logon.as_str(), user.as_str()]);
+        let initial = restricted_token(own, &user, &all, &[&user, &jail_sid]);
+        set_integrity(initial, "S-1-16-6144");
+        let who = Who::Restricted { primary, initial: impersonation(initial) };
+        let out = inheritable(GetStd(-11));
+        let cmd = format!("\"{exe}\" whp-token-child {name} {}", u8::from(*preload));
+        match start(&cmd, &bin, &who, null_mut(), null_mut(), &[out], [out, out, out], true) {
+            // SAFETY: the suspended child.
+            Ok(child) => unsafe {
+                ResumeThread(child.thread.0);
+                let w = WaitForSingleObject(child.process.0, 120_000);
+                let mut code = 0;
+                GetExitCodeProcess(child.process.0, &mut code);
+                if w != 0 {
+                    TerminateProcess(child.process.0, 1);
+                }
+                println!("host {name} child-exit {code:#x}{}", if w != 0 { " (timed out)" } else { "" });
+            },
+            Err(e) => println!("host {name} start {e}"),
+        }
+    }
+    let removed = std::fs::remove_dir_all(base);
+    println!("cleanup base removed {:?} exists-after {}", removed.map_err(|e| e.to_string()), std::fs::metadata(base).is_ok());
+    let parent_after = file_sddl(&parent_dir);
+    println!("cleanup {parent_dir} security {}", if parent_after == parent_before { "unchanged".to_string() } else { format!("CHANGED {parent_before} -> {parent_after}") });
+}
+
+/// A child of `whp-token`: the preload under the initial token (the WHP
+/// DLLs, as Firecracker would), the revert to the lockdown token, then WHP.
+fn whp_token_child(args: &[String]) {
+    let tag = &args[0];
+    let preload = args[1] == "1";
+    let mut m = null_mut();
+    if preload {
+        m = load_system32(tag, "preload", "WinHvPlatform.dll");
+        load_system32(tag, "preload", "WinHvEmulation.dll");
+    }
+    // SAFETY: plain call; the initial token goes.
+    let reverted = unsafe { RevertToSelf() } != 0;
+    // SAFETY: the pseudo handle of this process's token (GetCurrentProcessToken).
+    let restricted = unsafe { IsTokenRestricted(-4isize as HANDLE) } != 0;
+    println!("{tag} revert {reverted} token-restricted {restricted}");
+    if m.is_null() {
+        m = load_system32(tag, "load-after-revert", "WinHvPlatform.dll");
+        if m.is_null() {
+            return;
+        }
+    }
+    whp_steps(tag, m);
 }

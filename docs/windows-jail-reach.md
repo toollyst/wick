@@ -189,6 +189,10 @@ I/O control: it answered 0xC0000010, 0xC000000D or 0xC0000002, or completed it.
   registry key it uses after that must move before the revert, under the initial token, as Chromium's sandbox warms
   up before it locks down. That includes WHP's, Winsock's and anything else loaded lazily.
 - WHP's own device must still open under the new token. Whether it does is not measured: this host has no Hyper-V.
+  The measurement is `fs-probe whp-token` (elevated): each WHP step's result in the probe itself, then in a child
+  under the lockdown token as now, under the jail's SID alone, and under it alone without the WHP DLLs loaded before
+  the revert; and the security descriptors of the devices the partition opens. CI's windows-guest job runs it as a
+  record, which no result is drawn from yet.
 - Paths the operator gives Firecracker outside its jail would need to grant the jail's SID.
 
 **What does not work.**
