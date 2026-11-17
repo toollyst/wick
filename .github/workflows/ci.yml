@@ -1485,6 +1485,8 @@ jobs:
           rustc --edition 2021 --test -o "$RUNNER_TEMP/jail-parent-test.exe" tools/windows/jail-parent.rs
           "$RUNNER_TEMP/jail-parent-test.exe"
           rustc --edition 2021 -O -o tools/windows/memory-partition-probe.exe tools/windows/memory-partition-probe.rs
+          # Run by hand (docs/design-fs.md §6.3); built here so that it keeps building.
+          rustc --edition 2021 -O -C target-feature=+crt-static -o tools/windows/fs-probe.exe tools/windows/fs-probe.rs
       # The x2APIC record build, for boot-test.ps1 x2apic (the windows-guest
       # job and a PC): a release Firecracker with kvm-ioctls'
       # whp-x2apic-record feature, whose partitions are x2APICs on AMD hosts
