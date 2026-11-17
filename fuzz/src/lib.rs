@@ -47,9 +47,18 @@ pub mod hvf_exit;
 #[path = "../../crates/compat/kvm-ioctls/src/hvf/trng.rs"]
 mod trng;
 
+/// `whp::ffi::report` for the included `whp/exit.rs`, whose `RamRetries::note`
+/// RAMRETRY reporter calls `super::ffi::report` (`super` is this crate root
+/// here). The fuzz build does not log, so the shim drops the line; it takes the
+/// same `log::Level` the real `ffi::report` does (the `log` dependency).
+pub mod ffi {
+    pub fn report(_level: log::Level, _line: &str) {}
+}
+
 /// What the WHP run loop decides from a vCPU exit's fields
-/// (`crates/compat/kvm-ioctls/src/whp/exit.rs`), compiled from its source (it
-/// uses nothing but `core`), so it is fuzzed on any host.
+/// (`crates/compat/kvm-ioctls/src/whp/exit.rs`), compiled from its source. It
+/// uses `core`, plus `super::ffi::report`/`log` for one RAMRETRY line (the
+/// `ffi` shim above), so it is fuzzed on any host.
 #[allow(unreachable_pub, dead_code)]
 #[path = "../../crates/compat/kvm-ioctls/src/whp/exit.rs"]
 pub mod whp_exit;

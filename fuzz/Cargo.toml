@@ -19,6 +19,9 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.10"
 arbitrary = { version = "1.4.1", features = ["derive"] }
 libc = "0.2.189"
+# whp/exit.rs's RAMRETRY reporter names `log::Level`; the `ffi::report` shim in
+# src/lib.rs takes it, as the real `whp::ffi::report` does (log = "0.4.33" there).
+log = "0.4.33"
 
 # The compatibility crates Firecracker builds with (docs/ARCHITECTURE.md).
 [patch.crates-io]
