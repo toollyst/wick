@@ -8124,7 +8124,11 @@ mod fpu_tests {
                         got += n.unsigned_abs();
                     }
                     let word = |i: usize| u64::from_le_bytes(rec[i * 8..i * 8 + 8].try_into().unwrap());
-                    if word(0) != libc::wick_uffd::proto::EVENT_PAGEFAULT {
+                    // The mirror era posts page faults as `EVENT_PAGEFAULT2`
+                    // (its record carries the waiter's tag in word 3), not the
+                    // old `EVENT_PAGEFAULT`; this handler fills faults, so it
+                    // reads the type the kernel posts (`windows_uffd::fault`).
+                    if word(0) != libc::wick_uffd::proto::EVENT_PAGEFAULT2 {
                         continue;
                     }
                     let page = word(1) & !0xfff;
