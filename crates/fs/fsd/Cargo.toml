@@ -7,10 +7,12 @@ license.workspace = true
 publish = false
 description = "wick's virtio-fs file server: one confined process per shared host directory."
 
-# No dependencies beyond the frame crate of this workspace: the decoder and
-# the guest-name rules are safe Rust of their own (docs/design-fs.md §6).
+# No dependencies beyond this workspace's crates: the decoder and the
+# guest-name rules are safe Rust of their own (docs/design-fs.md §6), and the
+# host backends' system calls are wick-fs-sys's, the only unsafe code.
 [dependencies]
 wick-fs-frame = { path = "../frame" }
+wick-fs-sys = { path = "../sys" }
 
 [lib]
 bench = false

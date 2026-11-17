@@ -1,0 +1,35 @@
+[package]
+name = "wick-fs-sys"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The host system calls wick-fsd's directory backends make: one checked wrapper each, all of the server's unsafe code."
+
+# libc, the version Firecracker's own Cargo.lock has (lib/firecracker), and
+# nothing else. Linux and macOS only; on Windows the crate is empty.
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"
+
+[lib]
+bench = false
+
+# The workspace's lints but `unsafe_code`, which the workspace forbids: this
+# crate is where wick-fsd's system calls are, each unsafe block with its
+# SAFETY comment (undocumented_unsafe_blocks is an error here).
+[lints.rust]
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+ptr_as_ptr = "warn"
+undocumented_unsafe_blocks = "deny"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+exit = "warn"
+tests_outside_test_module = "warn"
+assertions_on_result_states = "warn"
+error_impl_error = "warn"
+or_fun_call = "warn"

@@ -14,15 +14,22 @@
 //!   [`record`] and the [`cache`] modes;
 //! - [`memdir`]: an in-memory `ConfinedDir` for tests and fuzzing.
 //!
-//! The host backends, confinement and the serving loop come in later
-//! commits; nothing here touches a host file system.
+//! The host directory, on Linux and macOS (the Windows one comes with its
+//! port): [`host`]'s `HostDir`, over the system calls of the `wick-fs-sys`
+//! crate, and `stage0`, the share's checks before anything is served.
+//!
+//! Confinement and the serving loop come in later commits; nothing here
+//! serves a guest yet.
 
 pub mod cache;
 pub mod dir;
 pub mod fuse;
 pub mod handles;
+pub mod host;
 pub mod inodes;
 pub mod limits;
 pub mod memdir;
 pub mod record;
 pub mod session;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod stage0;

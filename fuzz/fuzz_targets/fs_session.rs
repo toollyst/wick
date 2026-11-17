@@ -18,7 +18,11 @@
 //!   here from the replies says (a lookup counted only for a reply the
 //!   guest got, a forget never below 0, a node kept while a handle is open
 //!   and gone when neither holds it);
-//! - the backend has exactly as many opens as the session has handles.
+//! - the backend has exactly as many opens as the session has handles;
+//! - every node the guest holds is reachable while its object lives: a
+//!   GETATTR without a handle answers with the object's link count when it
+//!   has a name (links, renames and unlinks of its other names never lose
+//!   it) and, unlinked, while a handle of it is open.
 
 #![no_main]
 
@@ -342,6 +346,21 @@ fuzz_target!(|input: Input| {
         assert_eq!(s.dir().open_count(), u64::try_from(s.handles_open()).unwrap());
         assert_eq!(model.fhs.len(), s.handles_open());
         assert_eq!(s.nodes(), model.nodes.len() + 1, "nodes held beyond the model's");
+        if !s.destroyed() {
+            for (&nodeid, &(_, handles)) in &model.nodes {
+                let Some(id) = s.node_host_id(nodeid) else { continue };
+                let nlink = s.dir().nlink(id);
+                unique += 2;
+                let probe = request(Opcode::Getattr as u32, unique, nodeid, (0, 0), &[&[0u8; 16]]);
+                let r = s.handle(&probe, 1 << 12).unwrap();
+                let error = i32::from_le_bytes(r[4..8].try_into().unwrap());
+                if nlink.is_some_and(|n| n > 0) || handles > 0 {
+                    assert_eq!(error, 0, "node {nodeid} (nlink {nlink:?}, {handles} handles) lost");
+                    let shown = u32::from_le_bytes(r[16 + 16 + 64..16 + 16 + 68].try_into().unwrap());
+                    assert_eq!(Some(shown), nlink, "node {nodeid}'s link count");
+                }
+            }
+        }
     }
 });
 

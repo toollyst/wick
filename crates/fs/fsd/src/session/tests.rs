@@ -737,7 +737,7 @@ fn test_rename_exchange_is_einval_where_the_backend_refuses_it() {
 fn test_guest_xattrs_have_a_budget_and_no_system_namespace() {
     let mut t = T::with(Config {
         limits: Limits {
-            xattr_budget: 100,
+            xattr_budget: 200,
             ..Limits::default()
         },
         ..Config::default()
@@ -749,8 +749,8 @@ fn test_guest_xattrs_have_a_budget_and_no_system_namespace() {
     };
     t.ok(Opcode::Setxattr, f, &[&set(0, b"user.a", &[1; 40])]);
     t.ok(Opcode::Setxattr, f, &[&set(0, b"security.selinux", b"ctx")]);
-    // 4 + 6 + 40, 4 + 16 + 3: 73 of 100; 30 more bytes are over.
-    assert_eq!(t.err(Opcode::Setxattr, f, &[&set(0, b"user.b", &[0; 30])]), Errno::ENOSPC);
+    // 32 + 6 + 40, 32 + 16 + 3: 129 of 200; 32 + 6 + 40 more are over.
+    assert_eq!(t.err(Opcode::Setxattr, f, &[&set(0, b"user.b", &[0; 40])]), Errno::ENOSPC);
     assert_eq!(t.s.counters().xattr_refused, 1);
     // Replacing a value counts the new one only.
     t.ok(Opcode::Setxattr, f, &[&set(0, b"user.a", &[2; 50])]);
@@ -764,4 +764,16 @@ fn test_guest_xattrs_have_a_budget_and_no_system_namespace() {
     assert_eq!(t.err(Opcode::Removexattr, f, &[b"user.a\0"]), Errno::ENODATA);
     let get = [&le32(100)[..], &le32(0), b"user.a\0"].concat();
     assert_eq!(t.err(Opcode::Getxattr, f, &[&get]), Errno::ENODATA);
+    // Names: at most 120 bytes on every host (macOS's 127 less `wick.x.`).
+    let mut t = T::new();
+    let (f, fh) = t.create(ROOT, "f", 0o644);
+    t.release(f, fh);
+    let long = format!("user.{}", "n".repeat(115));
+    let longer = format!("user.{}", "n".repeat(116));
+    assert_eq!(t.err(Opcode::Setxattr, f, &[&set(0, longer.as_bytes(), b"")]), Errno::ERANGE);
+    let get = [&le32(100)[..], &le32(0), longer.as_bytes(), b"\0"].concat();
+    assert_eq!(t.err(Opcode::Getxattr, f, &[&get]), Errno::ERANGE);
+    assert_eq!(t.err(Opcode::Removexattr, f, &[&[longer.as_bytes(), b"\0"].concat()]), Errno::ERANGE);
+    t.ok(Opcode::Setxattr, f, &[&set(0, long.as_bytes(), b"")]);
+    t.ok(Opcode::Removexattr, f, &[&[long.as_bytes(), b"\0"].concat()]);
 }

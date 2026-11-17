@@ -239,7 +239,10 @@ capability query API.
 **virtio-fs: designed, being built** ([design-fs.md](design-fs.md)). Built so far: the frame format between the
 device and the server (`crates/fs/frame`, its unit tests and the `fs_frame` fuzz target), wick-fsd's bounded FUSE
 decoder and guest-name rules (`crates/fs/fsd/src/fuse`, its unit tests and the `fs_decode` fuzz target), its
-server core over an in-memory test directory (`crates/fs/fsd/src/session.rs`, the `fs_session` fuzz target), and guest kernels with
+server core over an in-memory test directory (`crates/fs/fsd/src/session.rs`, the `fs_session` fuzz target), its
+Linux and macOS host directory with stage 0's share checks (`crates/fs/fsd/src/host`, `crates/fs/sys`; the traversal
+corpus and swap race against a real directory, `test_traversal_corpus`, `test_swap_race`; the guest's links, renames
+and unlinks of held and open files over the model and the host, `crates/fs/fsd/tests/links.rs`), and guest kernels with
 `CONFIG_VIRTIO_FS` built by CI's `guest-kernels` job (`tools/linux/guest-kernel.sh`); nothing a guest can use yet. The plan:
 
 - The device in Firecracker only copies bounded, unparsed requests between the virtqueues and one socket.

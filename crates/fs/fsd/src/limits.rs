@@ -25,12 +25,27 @@ pub const DEFAULT_MAX_BYTES: u64 = 64 << 30;
 /// frame holds after its headers.
 pub const MAX_READ: usize = crate::fuse::MAX_WRITE as usize;
 
-/// Guest extended attributes a node may hold, counted as the stored
-/// encoding would be (per attribute 4 bytes of lengths, the name and the
-/// value). Provisional (docs/design-fs.md §4.2, Limits): set to what a
-/// default host file system holds beside the record once that is measured;
-/// ext4 keeps all of a file's attributes in one block, 4 KiB by default.
+/// What one guest extended attribute costs against the budget besides its
+/// name and value: at least what the tightest default host file system
+/// spends on an entry. ext4 spends 16 bytes of entry, the `wick.x.` part of
+/// the name and padding of both to 4 bytes, at most 29 bytes beyond the name
+/// and value (docs/design-fs.md §4.2, Limits; measured by
+/// tools/linux/xattr-budget.sh).
+pub const XATTR_ENTRY_COST: usize = 32;
+
+/// Guest extended attribute bytes a node may hold, each attribute charged
+/// [`XATTR_ENTRY_COST`] + its name + its value. 3 KiB: what default ext4
+/// holds beside the record, the least of the default Linux file systems
+/// (one 4028-byte value or 146 empty attributes, charged 4066 and 5002;
+/// docs/design-fs.md §4.2, Limits), less room for the host's own attributes
+/// (an SELinux label, ACLs).
 pub const DEFAULT_XATTR_BUDGET: usize = 3 << 10;
+
+/// The longest guest extended attribute name, in bytes, on every host
+/// (ERANGE beyond, as Linux's for a name over 255): macOS stores names of at
+/// most 127 bytes (`XATTR_MAXNAMELEN`), less the 7 of the `wick.x.` prefix
+/// (docs/design-fs.md §4.2, Limits).
+pub const GUEST_XATTR_NAME_MAX: usize = 120;
 
 /// The limits of one share.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

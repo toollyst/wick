@@ -292,6 +292,16 @@ impl MemDir {
         self.lock().objs.len()
     }
 
+    /// The hard links of the object `id`, if it still exists (open but
+    /// unlinked: 0).
+    pub fn nlink(&self, id: HostId) -> Option<u32> {
+        if id.volume != VOLUME {
+            return None;
+        }
+        let obj = u64::try_from(id.file).ok()?;
+        self.lock().objs.get(&obj).map(|o| o.nlink)
+    }
+
     /// How many opens are not closed.
     pub fn open_count(&self) -> u64 {
         self.lock().objs.values().map(|o| u64::from(o.opens)).sum()
@@ -490,8 +500,13 @@ impl ConfinedDir for MemDir {
         if id_of(*node) != expect {
             return Err(enoent());
         }
-        if !matches!(s.obj(*node)?.body, Body::File(_)) {
+        let o = s.obj(*node)?;
+        if !matches!(o.body, Body::File(_)) {
             return Err(Errno::EPERM.into());
+        }
+        // An unlinked object gets no name back (Linux's vfs_link: ENOENT).
+        if o.nlink == 0 {
+            return Err(enoent());
         }
         s.insert(*to.0, to.1.as_str(), *node)?;
         let o = s.obj_mut(*node)?;
@@ -599,7 +614,7 @@ impl ConfinedDir for MemDir {
         all.sort_by_key(|&(_, _, cookie)| cookie);
         for (name, obj, cookie) in all.into_iter().take(max) {
             out.push(DirEntry {
-                name: name.clone(),
+                name: name.as_bytes().to_vec(),
                 id: id_of(obj),
                 kind: s.obj(obj)?.kind(),
                 cookie: cookie.min(MAX_COOKIE),

@@ -148,10 +148,18 @@ name = "wick-fs-frame"
 version = "0.1.0"
 
 [[package]]
+name = "wick-fs-sys"
+version = "0.1.0"
+dependencies = [
+ "libc 0.2.189",
+]
+
+[[package]]
 name = "wick-fsd"
 version = "0.1.0"
 dependencies = [
  "wick-fs-frame",
+ "wick-fs-sys",
 ]
 
 [[package]]

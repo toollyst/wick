@@ -15,6 +15,7 @@ tools/linux/guest-ram-grain.c a record (LINUXGRAIN lines), run by CI's linux-boo
 tools/linux/guest-ram-record.py a record (GUESTRAM lines), run by the same linux-boot step
 tools/linux/jailer-cgroup-check.py a measurement of upstream's jailer on Linux, run by CI's linux job; tools/macos/jailer-cgroup-test.py follows it
 tools/linux/make-vmstate.py run by CI's linux-boot job: the snapshot state file the other hosts' foreign-snapshot tests refuse
+tools/linux/xattr-budget.sh a measurement (root, by hand) of how many extended attributes ext4, xfs, btrfs and tmpfs hold beside wick-fsd's record; docs/design-fs.md §4.2 cites it for the xattr budget
 tools/macos/boot-test.py run through tools/macos/boot-test.sh, which builds and signs the binaries
 tools/macos/enclave-refusal-test.py run by CI's "Nitro Enclave refused without the device" steps (linux-boot, macos)
 tools/macos/foreign-snapshot-test.py run by CI's macos job, "A snapshot made on Linux x86_64 is refused"

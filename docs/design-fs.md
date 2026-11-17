@@ -6,8 +6,9 @@ the `fs_frame` fuzz target), **wick-fsd's FUSE decoder and guest names** (`crate
 decoder of §6, the reply encoder and layer 1 of row 1 with the escape mapping of §6.3; their unit tests and the
 `fs_decode` fuzz target), **wick-fsd's server core over an in-memory directory** (`crates/fs/fsd/src/session.rs`
 and its tables, limits, record and cache modes, the `ConfinedDir` interface of the host backends and `MemDir`, a test
-backend; its unit tests and the `fs_session` fuzz target; no host backend, confinement or serving loop yet, so no
-server runs), and the guest kernels of row 21: CI's `guest-kernels` job builds upstream's CI kernel
+backend; its unit tests and the `fs_session` fuzz target), **its Linux and macOS host directory** (`crates/fs/fsd/src/host`
+and `crates/fs/sys`, the backend of §4.3, and stage 0's share checks, `stage0.rs`; their unit tests and the
+host-directory tests in `crates/fs/fsd/tests`; no confinement or serving loop yet, so no server runs), and the guest kernels of row 21: CI's `guest-kernels` job builds upstream's CI kernel
 (6.1, 6.18) with `CONFIG_VIRTIO_FS=y` (`tools/linux/guest-kernel.sh`), though nothing boots them yet. Nothing a guest
 can use exists yet, and nothing here describes what wick does today:
 today `PUT /extensions/fs` is refused as an unknown extension (`crates/ext/src/lib.rs`,
@@ -44,21 +45,21 @@ documented or measured; **measure** = the fix is designed, a measurement on the 
 
 | # | Known risk (source) | Fix (Linux / macOS / Windows) | Proof (test, §11) | Status |
 | --- | --- | --- | --- | --- |
-| 1 | Guest name escapes the share: `..`, `/`, absolute name in SYMLINK/RENAME/LINK (Kata CVE-2026-47243; virtiofsd name checks only 2026-11-06) | Layer 1, same code on all hosts: every guest name must be one component, not `.`/`..`, no `/` or NUL, at most 255 bytes of UTF-8, and none of the code points the Windows escape writes (U+F001–U+F01F, U+F022, U+F02A, U+F02F, U+F03A, U+F03C, U+F03E, U+F03F, U+F05C, U+F07C; `crates/fs/fsd/src/fuse/name.rs`, `test_every_name_taking_opcode_refuses_what_is_not_a_name`, `test_name_refuses_every_escape_image`), and every operation is relative to a held directory handle. Layer 2: L `openat2 RESOLVE_BENEATH\|NO_SYMLINKS\|NO_MAGICLINKS\|NO_XDEV` / M `O_RESOLVE_BENEATH` + `O_NOFOLLOW_ANY` (on macOS 27.2, 2026-11-13, a test program's `openat(dirfd, name, O_RESOLVE_BENEATH)` returned ENOTCAPABLE for `..`, `/etc/hosts` and `../etc/hosts` and opened `.`; the program is not in the repository) / W `NtCreateFile(RootDirectory, one component, OBJ_DONT_REPARSE)`, rename via `FILE_RENAME_INFORMATION.RootDirectory`. Layer 3: the OS sandbox (row 4) | Traversal corpus over every name-taking opcode, on every CI host, no VM; canaries outside the share untouched; **any refusal from layer 2 or 3 fails the test** (layer 1 must stop it); raw-virtqueue guest replay as in the Kata PoC | now (L, M); measure `OBJ_DONT_REPARSE` on W |
-| 2 | Symlink/junction swapped in mid-operation (TOCTOU; CVE-2016-9602) | Never follow links: L `RESOLVE_NO_SYMLINKS` / M `O_NOFOLLOW_ANY` / W `OBJ_DONT_REPARSE` + `FileAttributeTagInformation` after open, so any reparse point is shown as a link object and never traversed. Guest-made symlinks are emulated (regular file + record), so the host never has a real link the guest made | Race suite: host threads swap dirs ↔ symlinks/junctions/mount points for 10⁶ iterations while the harness operates; same assertions as 1 | now (L, M); measure on W |
-| 3 | Aliases: case folding, Unicode normalisation, 8.3 names (`PROGRA~1`), `/.vol`, ADS `file:stream` | Identity by (dev, ino) / FileId, never by name. M: compare the stored name (`fgetattrlist ATTR_CMN_NAME`) with the request, mismatch = ENOENT/EEXIST; never build `/.vol` paths. W: reject `:`; compare `FileNormalizedNameInformation` with the request (catches 8.3) | Corpus entries for each alias form; case/NFD variants | now (M); measure 8.3 check on W |
+| 1 | Guest name escapes the share: `..`, `/`, absolute name in SYMLINK/RENAME/LINK (Kata CVE-2026-47243; virtiofsd name checks only 2026-11-06) | Layer 1, same code on all hosts: every guest name must be one component, not `.`/`..`, no `/` or NUL, at most 255 bytes of UTF-8, and none of the code points the Windows escape writes (U+F001–U+F01F, U+F022, U+F02A, U+F02F, U+F03A, U+F03C, U+F03E, U+F03F, U+F05C, U+F07C; `crates/fs/fsd/src/fuse/name.rs`, `test_every_name_taking_opcode_refuses_what_is_not_a_name`, `test_name_refuses_every_escape_image`), and every operation is relative to a held directory handle. Layer 2: L `openat2 RESOLVE_BENEATH\|NO_SYMLINKS\|NO_MAGICLINKS\|NO_XDEV` / M `O_RESOLVE_BENEATH` + `O_NOFOLLOW_ANY` (on macOS 27.2, 2026-11-13, a test program's `openat(dirfd, name, O_RESOLVE_BENEATH)` returned ENOTCAPABLE for `..`, `/etc/hosts` and `../etc/hosts` and opened `.`; the program is not in the repository) / W `NtCreateFile(RootDirectory, one component, OBJ_DONT_REPARSE)`, rename via `FILE_RENAME_INFORMATION.RootDirectory`. Layer 3: the OS sandbox (row 4) | Traversal corpus over every name-taking opcode, on every CI host, no VM; canaries outside the share untouched; **any refusal from layer 2 or 3 fails the test** (layer 1 must stop it); raw-virtqueue guest replay as in the Kata PoC. Host side: `test_traversal_corpus` (38 names × every name-taking opcode, Linux and macOS) | now (L, M); measure `OBJ_DONT_REPARSE` on W |
+| 2 | Symlink/junction swapped in mid-operation (TOCTOU; CVE-2016-9602) | Never follow links: L `RESOLVE_NO_SYMLINKS` / M `O_NOFOLLOW_ANY` / W `OBJ_DONT_REPARSE` + `FileAttributeTagInformation` after open, so any reparse point is shown as a link object and never traversed. Guest-made symlinks are emulated (regular file + record), so the host never has a real link the guest made | Race suite: host threads swap dirs ↔ symlinks/junctions/mount points for 10⁶ iterations while the harness operates; same assertions as 1. Host side: `test_swap_race` (a directory ↔ a symlink to outside, swapped atomically without pause, 10⁵ rounds of about ten requests) | now (L, M); measure on W |
+| 3 | Aliases: case folding, Unicode normalisation, 8.3 names (`PROGRA~1`), `/.vol`, ADS `file:stream` | Identity by (dev, ino) / FileId, never by name. M: compare the stored name (`fgetattrlist ATTR_CMN_NAME`) with the request, mismatch = ENOENT/EEXIST; never build `/.vol` paths. W: reject `:`; compare `FileNormalizedNameInformation` with the request (catches 8.3) | Corpus entries for each alias form; case/NFD variants (`test_alias_names_refused`, `test_case_collision_is_eexist`) | now (M); measure 8.3 check on W |
 | 4 | The file server itself is taken over (parser bug) | Confine it so a takeover reaches only the share: L user/mount/pid/net namespaces + `pivot_root` into the share + seccomp (crosvm's fs list minus mknod/setresuid/capset) + `no_new_privs` + Landlock when present / M Seatbelt `(deny default)` with `file-read*`/`file-write*` only `(subpath share)`, no network/exec/fork/IOKit / W LPAC token (per-share AppContainer SID) + ACE on the share only + Job (memory, CPU, 1 process, kill on close) + wick's mitigation profile. **If any control cannot be set, wick-fsd does not start** | Per-host sandbox checks (`Seccomp: 2`, `CapEff: 0`; profile test; `TokenIsLessPrivilegedAppContainer`); an outside open from inside the server fails; one test per control proving refusal to start | now (L, M); measure LPAC + AF_UNIX + inherited handles on W |
 | 5 | Taken-over server attacks the VMM | It never gets guest memory (unlike vhost-user) and no handle to the VMM; the VMM validates every reply length/unique and caps frames | `fs_proxy` fuzz target: hostile descriptor chains **and** hostile replies | now |
 | 6 | FUSE parser bugs from guest-controlled lengths | Bounded decoder in its own crate; fuzzed like wick's existing targets | `fs_decode`, `fs_session` fuzz targets on CI (1 min) + nightly | now |
-| 7 | Host device nodes, FIFOs, sockets, setuid files (CVE-2020-35517, CVE-2023-2861, CVE-2022-0358) | Only regular files and directories are ever opened for I/O (`fstat` on the handle first); `mknod` never called; ownership, modes, setuid, devices, FIFOs live in a wick-private metadata record; server has no capabilities | Corpus: host FIFO/device/socket in the share; setuid bit never reaches the host | now |
+| 7 | Host device nodes, FIFOs, sockets, setuid files (CVE-2020-35517, CVE-2023-2861, CVE-2022-0358) | Only regular files and directories are ever opened for I/O (`fstat` on the handle first); `mknod` never called; ownership, modes, setuid, devices, FIFOs live in a wick-private metadata record; server has no capabilities | Corpus: host FIFO/device/socket in the share; setuid bit never reaches the host (`test_special_files_never_opened`, `test_host_device_node_never_opened`, `test_setuid_never_reaches_host`) | now |
 | 8 | Open by handle/id escapes (`open_by_handle_at` "shocker", `/.vol`, `FILE_OPEN_BY_FILE_ID`) | Never used; no `CAP_DAC_READ_SEARCH`; OS sandbox still applies | Open-by-id of an outside file from inside the server → denied | now (L); measure M `/.vol`, W open-by-id under LPAC |
 | 9 | Guest exhausts handles, inodes, CPU, disk | Server caps inode table, open handles, queue depth and READDIR page size (same numbers on all hosts; Windows has no per-process handle limit, so the cap is the server's own); VMM rate limiter = upstream's block-device `RateLimiter`; CPU/memory via cgroup / jetsam + jailer CPU limit / Job; disk: a server byte budget (same on all hosts) | Limit tests: ENFILE/EMFILE/backpressure at the same numbers on every host; queue flood keeps VMM in-flight bytes under the cap | now |
 | 10 | DAX: host truncates a file mapped into the guest → fault in the VMM | Not offered in v1 (ENOSYS) on any host | Guest mount with `dax` fails cleanly | now |
 | 11 | Socket between VMM and server hijacked | Accept once, check the peer (`SO_PEERCRED` / `LOCAL_PEERCRED` / `SIO_AF_UNIX_GETPEERPID` → SID), then unlink | Second connection refused; wrong peer refused | now |
-| 12 | Host apps act on guest-written files (Spotlight, Defender, IDEs following links) | Guest symlinks are plain files on the host, so no host tool follows them; refuse `/`, `~`, `/System`, `C:\`, `C:\Windows` as share roots by default; docs: use a dedicated directory, mark it `.metadata_never_index` | Guest `ln -s /etc/passwd x` → host sees a regular file | now (residual risk stated in SECURITY.md) |
+| 12 | Host apps act on guest-written files (Spotlight, Defender, IDEs following links) | Guest symlinks are plain files on the host, so no host tool follows them; refuse `/`, `~`, `/System`, `C:\`, `C:\Windows` as share roots by default; docs: use a dedicated directory, mark it `.metadata_never_index` | Guest `ln -s /etc/passwd x` → host sees a regular file (`test_guest_symlink_is_a_regular_file_on_host`) | now (residual risk stated in SECURITY.md) |
 | 13 | Windows: no "subpath" confinement for a process | Grant an inheritable ACE for the share's own AppContainer SID (Microsoft's `HcsGrantVmAccess` pattern), via an explicit `wick-fsd grant <dir>` / `revoke <dir>`; children with protected DACLs stay unreachable (fails closed). Chosen over a broker, which would parse guest names with full user rights | Outside open from the LPAC server → `ACCESS_DENIED`; revoke removes every ACE it added | measure on W |
 | 14 | A directory the host moves out of the share stays reachable through held handles | Host action, trusted in Firecracker's model; L Landlock and M Seatbelt check at access time; W ACL travels with the directory | Documented in SECURITY.md | limit (W), documented |
-| 15 | Case-insensitive APFS/NTFS gives names Linux treats as different | Default: refuse a case-insensitive root with an error naming the fix (case-sensitive APFS volume/sparse image; W per-directory case sensitivity, needs admin). With the operator's flag: exact-name lookups, EEXIST on case collisions | Case collision returns EEXIST on every host | now (limit: W needs admin for existing dirs) |
+| 15 | Case-insensitive APFS/NTFS gives names Linux treats as different | Default: refuse a case-insensitive root with an error naming the fix (case-sensitive APFS volume/sparse image; W per-directory case sensitivity, needs admin). With the operator's flag: exact-name lookups, EEXIST on case collisions | Case collision returns EEXIST on every host (`test_case_collision_is_eexist`) | now (limit: W needs admin for existing dirs) |
 | 16 | Host changes not notified to the guest (no inotify) | Impossible on every host: Linux's virtio-fs driver has no notification queue. Offer `cache=never` for shares edited on both sides | Documented; `cache=never` test | limit (all hosts, same) |
 | 17 | Snapshot with a live FUSE session | v1: snapshot refused with an API error naming virtio-fs (`snapshot_blocker` hook exists). Later: server state saved as paths and re-resolved beneath the root on restore | Snapshot create with fs → API error | now |
 | 18 | Feature off still adds attack surface | Cargo feature `fs`, default off; `wick-fsd` separate binary; no device/process/socket without config | Default build has no fs symbols; a planned boot-test stage `fs-off` shows no virtio device 26 | now |
@@ -357,19 +358,27 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
   - server-chosen node ids, never host inode numbers; a request's `nodeid` is looked up, never interpreted.
   - Identity = (volume id, file id) from the open handle: Linux `(st_dev, st_ino)`, macOS `(st_dev, st_ino)`,
     Windows `(VolumeSerialNumber, FileId 128-bit)`.
-  - Entries hold a directory handle (dirs) or (parent handle, name, identity) re-verified on reopen.
+  - Entries hold a directory handle (dirs), or on Linux and macOS a leaf: the names it is known by, each
+    re-verified against the identity at use (§4.3).
 - **Limits, identical on every host:**
   - inode entries;
   - open host handles (self-limited: Windows has no per-process handle limit [meas: `jailer-test.ps1 nofile`]);
   - worker threads; queued requests;
   - name ≤ 255 bytes;
-  - xattr value ≤ 64 KiB, list ≤ 64 KiB;
+  - xattr value ≤ 64 KiB, list ≤ 64 KiB; a guest xattr name ≤ 120 bytes, ERANGE beyond (macOS keeps names of at
+    most 127 bytes, `XATTR_MAXNAMELEN`, less the 7 of the `wick.x.` prefix; `GUEST_XATTR_NAME_MAX`);
   - READDIR reply ≤ the request size;
   - bytes the guest's writes may add in one run of the server (decision 7): 64 GiB by default, **provisional** until
     the jailer's `--fs-share` sets it per share (virtio-fs staging 11);
-  - guest xattrs per node, counted as stored (4 bytes of lengths, the name and the value per attribute): 3 KiB by
-    default, **provisional** until what a default host file system holds beside the record is measured; ext4, the
-    tightest, keeps all of a file's xattrs in its inode and one block, 4 KiB by default [inf: measure].
+  - guest xattrs per node: 3 KiB by default, each attribute charged 32 bytes (`XATTR_ENTRY_COST`) plus its name
+    and value. Default ext4 is the tightest Linux file system: beside the record it held one value of 4028 bytes, or
+    146 empty attributes, which the charge counts as 4066 and 5002 bytes, both over the budget; xfs, btrfs and tmpfs
+    held 16 KiB or more in one value and over 100000 empty attributes [meas: `tools/linux/xattr-budget.sh`, Docker on
+    an M1 Pro, Linux 7.0.14-linuxkit aarch64, 2026-11-18; 1 GiB images as `mkfs` makes them]. An ext4 entry costs 16
+    bytes, the name past `user.` and the value each padded to 4, so at most 29 bytes beyond what the guest named: a
+    charge of 4 per attribute (the earlier count) would let a guest of many short names past ext4's room, 32 does
+    not. The rest of the 4 KiB block is left for the host's own attributes (an SELinux label, ACLs). macOS (APFS) and
+    Windows (NTFS EAs, 64 KiB) hold more, so the budget is the same on every host;
 
   The defaults are `crates/fs/fsd/src/limits.rs`'s `DEFAULT_*` constants.
 
@@ -397,8 +406,8 @@ backend implements: Linux, macOS, Windows, and `MemDir`, an in-memory directory 
   (§6).
 - **Every name a backend returns is checked again** by the server, which skips (and counts) one that is not a guest
   name.
-- **Nodes and identity.** A node is what the node table holds: Linux an `O_PATH` descriptor; macOS a directory's
-  `O_SEARCH` descriptor or (parent, name, identity) for anything else; Windows a handle opened by id. Identity is
+- **Nodes and identity.** A node is what the node table holds: on Linux and macOS a directory's descriptor, or a
+  leaf for anything else (below); on Windows a handle opened by id. Identity is
   (volume, 128-bit file id). Every operation that acts on an object the guest found earlier (open, unlink, rmdir,
   link) is given the identity it expects and fails with ENOENT when the name now holds another object.
 - **Exact names.** A lookup whose stored name is not exactly the name asked for (an alias by case or normalization)
@@ -428,6 +437,121 @@ backend implements: Linux, macOS, Windows, and `MemDir`, an in-memory directory 
     in place of the source for overlayfs, and the server never makes device nodes on a host (they are emulated in
     the record, §4.2).
   - Both of `NOREPLACE` and `EXCHANGE`, or an unknown bit, is EINVAL, as Linux.
+  - A file system without the flag (macOS msdos: ENOTSUP from `renameatx_np`; Linux exfat and others: EINVAL from
+    `renameat2`) gives EINVAL on every host, Linux's answer (`test_stage0_and_renames_on_other_volumes`).
+
+**The Linux and macOS backend** (`crates/fs/fsd/src/host/unix.rs`; every system call in `crates/fs/sys`, the
+server's only unsafe code, `wick-fsd` itself forbids it):
+
+- **Nodes, the same on both hosts.** A directory is held open (`O_RDONLY|O_DIRECTORY`), identified once by
+  `(st_dev, st_ino)`. Any other object is one *leaf* per identity, which keeps:
+  - the names it is known by, as (held directory, name), the most recently used first, at most 8 (`NAMES_MAX`).
+    Every LOOKUP, CREATE and LINK that reaches it adds its name; the guest's UNLINK removes one; RENAME moves one
+    (and takes it from an object renamed over; EXCHANGE swaps them);
+  - once the guest has opened it, the descriptor of its widest open (read-write over write over read), kept
+    until the node is forgotten, as virtiofsd's `O_PATH` descriptor keeps the inode (`test_forget_frees_an_unlinked_file`).
+    It is the open's own descriptor, shared with the handle, so a node holds one descriptor at most (a
+    directory's, or a leaf's) and a handle one: within stage 0's `RLIMIT_NOFILE` of nodes plus handles plus 64. A
+    leaf only looked up holds none.
+
+  Each use finds the object by the first known name that still is it (`fstatat`, then the identity checked with
+  `fstat` on anything opened): a host's swap is ENOENT, never another object. When no known name is it:
+  - an object with no name at all (`nlink` 0: unlinked while the guest holds it) is served through the held
+    descriptor: GETATTR and SETATTR with or without the handle flag, a new OPEN the descriptor's access covers,
+    and truncation if it may write; LINK is ENOENT, as Linux's `link(2)` of an unlinked file;
+  - any other is looked for in the directories the server holds, at most 65536 entries per search
+    (`SEARCH_MAX`), each a guest name checked by `fstatat` (overlayfs's `d_ino` is not always `st_ino`). An
+    object the guest reaches has its parent's node held, so a name the leaf pushed out is found; one the host
+    moved out of every held directory is ENOENT.
+
+  So the guest's own links, renames and unlinks never make a live object ENOENT
+  (`crates/fs/fsd/tests/links.rs`: each sequence over `MemDir` and over the host directory: a link's other name
+  after an unlink, a node first reached by another name, one of two links renamed or exchanged, 20 links of one
+  file removed newest first, an open file renamed and its directory renamed while it is open, an unlinked file
+  open with I/O, FSYNC, FALLOCATE, GETATTR and SETATTR; the `fs_session` fuzz target checks after every request
+  that each node it holds answers GETATTR while its object has a name or a handle). Neither host uses `O_PATH`
+  (macOS has none) or reopens through `/proc` (§6.1). The server needs read access to every directory it holds;
+  a share's directories it cannot read are EACCES to the guest.
+- **Opens.** Linux: `openat2` with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV`.
+  macOS: `openat` with `O_NOFOLLOW_ANY|O_RESOLVE_BENEATH` (`O_NOFOLLOW` with `O_NOFOLLOW_ANY` is EINVAL on macOS 27.2,
+  and `O_NOFOLLOW_ANY` covers the last component; `test_open_never_follows_a_link_or_leaves_the_directory`). Always
+  `O_CLOEXEC|O_NOCTTY|O_NONBLOCK`, and only the access mode the guest asked for: the guest's `O_APPEND`, `O_TRUNC`,
+  `O_DIRECT`, `O_SYNC` and `O_NOATIME` never reach the host (`test_open_flags_never_reach_the_host`,
+  `test_opens_carry_no_guest_flag`). Its kernel positions appends and sends `SETATTR` for a truncation; a synchronous
+  write is the guest's `FSYNC`.
+- **No fallback.** A host without beneath-resolution is refused at start: Linux without `openat2` (before 5.6, or a
+  seccomp filter that denies it) and macOS without `O_RESOLVE_BENEATH` (decision 5). The probe opens `..` beneath
+  the share root and must be refused (`probe_beneath`).
+- **Refusals by layer 2.** The object's kind is read with `fstatat(..., AT_SYMLINK_NOFOLLOW)` before any open, so a
+  link or an escape only reaches an open if the host swapped it in since. The open then fails (`ELOOP`, Linux's
+  `EXDEV`, macOS's `ENOTCAPABLE`): a layer-2 refusal, EACCES to the guest and counted (`test_swap_race` sees them;
+  `test_traversal_corpus` fails on any).
+- **Host symlinks, FIFOs, sockets and devices** are shown (symlinks as symlinks, the others as regular files with
+  no permission) and never opened: their kind is read without opening, they carry no record or guest attribute,
+  and READLINK reads a symlink with `readlinkat`, checked against the node's identity before and after
+  (`test_special_files_never_opened`: a writer waiting on a host FIFO is never let through;
+  `test_host_device_node_never_opened` as root). A name beneath a host symlink is ENOTDIR.
+- **What the guest makes** of those kinds is a regular host file with a record and **no permission bits beyond the
+  server's own** (`0o600`), so host tools neither run it nor take it for what it stands for (row 12;
+  `test_guest_symlink_is_a_regular_file_on_host`). A regular file or directory gets the guest's permission bits plus
+  the server's own access; setuid, setgid and sticky never reach the host (`test_setuid_never_reaches_host`).
+- **Mount points beneath the share are not entered**, on both hosts: a name whose object is on another device is
+  EXDEV, though a listing shows it (`test_mount_point_beneath_the_share_is_exdev`). Linux's `RESOLVE_NO_XDEV` refuses
+  the crossing as well.
+- **Exact names.** A lookup checks that the name is stored as exactly those bytes where the host folds names: macOS
+  always (APFS and HFS+ fold Unicode normalization on every volume, and case on most), by `getattrlistat(...,
+  ATTR_CMN_NAME, FSOPT_NOFOLLOW)`; Linux in a casefold directory and on vfat and exfat, by listing the directory.
+  Another stored form is ENOENT to a lookup or unlink, EEXIST to a create, mkdir or rename onto it
+  (`test_alias_names_refused`, `test_case_collision_is_eexist`). An object renamed to its own other case is
+  renamed.
+- **Host names that are not guest names** (not UTF-8, an escape image of §6.3) are skipped by a listing and counted
+  (`names_skipped`); no guest name reaches them (`test_host_names_that_are_not_guest_names_are_skipped`).
+- **Extended attributes.** The record is `user.wick.stat` (Linux) or `wick.stat` (macOS); a guest attribute `n` is
+  `user.wick.x.n` or `wick.x.n`. The host's other attributes are neither listed nor touched, and the guest cannot
+  name the record (`test_host_xattrs_outside_the_prefix_are_not_shown`). Guest attribute names are at most 120 bytes
+  on every host (§4.2).
+- **Host hard links** to a file outside the share are that file. The server cannot tell where a file's other names
+  are, so a guest write reaches them; the guest sees the link count, and its unlink removes the share's name only
+  (`test_host_hard_link_to_a_file_outside_is_the_same_file`). It is the operator's to keep such links out of a share,
+  as with any program given the directory; a guest cannot make one (LINK takes a node the share holds).
+- **`fsync` and `fdatasync`**: Linux's own; on macOS both are `F_FULLFSYNC`, which asks the drive to write its cache
+  to stable storage as Linux's `fsync` does (macOS's `fsync` only hands the data to the drive, fsync(2)). A file
+  system without `F_FULLFSYNC` gets `fsync`. Slower on macOS, by the drive's flush.
+- **Errors are Linux's numbers.** Linux passes its errno through. macOS maps each error the backend can see:
+
+  | macOS | → Linux | macOS | → Linux |
+  | --- | --- | --- | --- |
+  | EAGAIN 35 | EAGAIN 11 | ENOATTR 93 | ENODATA 61 |
+  | ENAMETOOLONG 63 | 36 | EOVERFLOW 84 | 75 |
+  | ENOSYS 78 | 38 | EILSEQ 92 | 84 |
+  | ENOTEMPTY 66 | 39 | ENOTSUP 45, EOPNOTSUPP 102 | EOPNOTSUPP 95 |
+  | ELOOP 62 | 40 | ETIMEDOUT 60 | 110 |
+  | EDQUOT 69 | 122 | ESTALE 70 | 116 |
+  | EFTYPE 79 | EINVAL 22 | ENOTCAPABLE 107 | a layer-2 refusal (EACCES) |
+
+  Errors 1 to 34 but 11 have the same numbers on both (macOS's 11 is EDEADLK, unmapped). Any other is EIO. `crates/fs/sys` `MAC_TO_LINUX`
+  (`test_errno_table`, `test_errors_are_linux_numbers`).
+
+**Stage 0's share checks** (`crates/fs/fsd/src/stage0.rs`, with the operator's rights, before any guest byte), each
+a refusal that names the problem, none with a switch (`test_stage0_refusals`,
+`test_stage0_and_renames_on_other_volumes`):
+
+1. the canonical path (a link to a directory serves the directory; on macOS EPERM is reported as TCC's);
+2. not a refused root: the system's trees (Linux `/bin`, `/boot`, `/dev`, `/etc`, `/lib*`, `/proc`, `/root`, `/run`,
+   `/sbin`, `/sys`, `/usr`, `/var/lib`, `/var/log`, `/var/run`; macOS `/Applications`, `/Library`, `/System`, `/bin`,
+   `/cores`, `/dev`, `/etc`, `/private/etc`, `/private/var/db`, `/private/var/root`, `/sbin`, `/usr/bin`, `/usr/lib`,
+   `/usr/libexec`, `/usr/sbin`, `/usr/share`) and anything beneath them; directories that hold others' files
+   (`/`, `/home`, `/Users`, `/tmp`, `/private/tmp`, `/var`, `/Volumes`, `/mnt`, `/opt`, ...) themselves; the home
+   directory itself, and beneath it a directory whose first component starts with `.` (`~/.ssh`, `~/.config`) or,
+   on macOS, `~/Library` (`refused_root`, `test_refused_share_roots`);
+3. a directory, the same object the path names;
+4. not a volume's root, and on a local file system (NFS, SMB, AFP, WebDAV and FUSE file systems are refused);
+5. read-write only where the file system keeps extended attributes itself: Linux, an attribute read is not
+   ENOTSUP; macOS, the volume's `VOL_CAP_INT_EXTENDED_ATTR`, as on msdos and exfat macOS keeps attributes in `._`
+   AppleDouble files beside each file, which host tools and listings would see (measured: macOS 27.2 msdos image,
+   `fsetxattr` succeeded and made `._f`). Without, a share is served read-only, with no records;
+6. `RLIMIT_NOFILE` raised to the nodes and handles the limits allow plus 64, or refused if the hard limit is lower;
+7. beneath-resolution present, and names not folded by case unless the operator allowed it.
 
 ### 4.4 Cache modes
 
@@ -483,11 +607,11 @@ share root with the server user's rights".
 | # | Threat | Linux | macOS | Windows | Sources |
 | --- | --- | --- | --- | --- | --- |
 | 1 | **Traversal by name** (`..`, `/`, absolute name, `a/../..`) | boundary check: one component, not `.`/`..`, no `/` or NUL; operations are `*at(dirfd, name)` only; `openat2 RESOLVE_BENEATH`; pivot_root confinement | same check; `openat` + `O_RESOLVE_BENEATH` (xnu-11417; 15.4+ unconfirmed, §0 row 19) and `AT_RESOLVE_BENEATH` (26+, xnu-12377); XNU returns `ENOTCAPABLE` for `..` at the start dir and for absolute paths (`vfs_lookup.c` `lookup`, `namei`) [src]; Seatbelt `subpath` | same check, plus `\` and `:`; `NtCreateFile` with `RootDirectory` and a single component; rename/link use `FILE_RENAME_INFORMATION.RootDirectory` + simple name, **never** `RootDirectory=NULL` with a full path (allowed by the API [doc]); DACL confinement | Kata GHSA-2gv2-cffp-j227; virtiofsd 6ead577/35f851d; crosvm `validate_path_component`; libkrun (§3.1); [openat2(2)](https://man7.org/linux/man-pages/man2/openat2.2.html) [doc]; [FILE_RENAME_INFORMATION](https://learn.microsoft.com/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information) [doc] |
-| 2 | **Symlink/junction swap races (TOCTOU)**, host- or guest-side | `RESOLVE_NO_SYMLINKS\|RESOLVE_NO_MAGICLINKS`, `O_NOFOLLOW`, `AT_SYMLINK_NOFOLLOW`; operations on held fds (`fchmod`, `fstat`, `f*xattr` via `/proc/self/fd` only if needed, as virtiofsd) | `O_NOFOLLOW_ANY` (11+) [src: fcntl.h history], `AT_SYMLINK_NOFOLLOW_ANY`, `O_SYMLINK` for link objects, `XATTR_NOFOLLOW` | `OBJ_DONT_REPARSE` ("no reparse points will be followed ... fail with STATUS_REPARSE_POINT_ENCOUNTERED") [doc]; `FILE_OPEN_REPARSE_POINT` on the final component; then `FileAttributeTagInformation`: any reparse tag → not traversed (shown as a symlink or refused) [inf: measure on 20348/26300] | CVE-2016-9602; [OBJECT_ATTRIBUTES](https://learn.microsoft.com/windows/win32/api/ntdef/ns-ntdef-_object_attributes) [doc] |
+| 2 | **Symlink/junction swap races (TOCTOU)**, host- or guest-side | `RESOLVE_NO_SYMLINKS\|RESOLVE_NO_MAGICLINKS`, `O_NOFOLLOW`, `AT_SYMLINK_NOFOLLOW`; operations on fds opened and checked against the node's identity (`fchmod`, `fstat`, `f*xattr`; no `/proc/self/fd` reopen, §4.3) | `O_NOFOLLOW_ANY` (11+) [src: fcntl.h history], `AT_SYMLINK_NOFOLLOW_ANY`, `O_SYMLINK` for link objects, `XATTR_NOFOLLOW` | `OBJ_DONT_REPARSE` ("no reparse points will be followed ... fail with STATUS_REPARSE_POINT_ENCOUNTERED") [doc]; `FILE_OPEN_REPARSE_POINT` on the final component; then `FileAttributeTagInformation`: any reparse tag → not traversed (shown as a symlink or refused) [inf: measure on 20348/26300] | CVE-2016-9602; [OBJECT_ATTRIBUTES](https://learn.microsoft.com/windows/win32/api/ntdef/ns-ntdef-_object_attributes) [doc] |
 | 3 | **Crossing into another file system** (bind mounts, volume mount points, network mounts, devfs) | `RESOLVE_NO_XDEV`; v1 shows no submounts | compare `st_dev` after open; XNU's `RESOLVE_NOCROSSMOUNT`/`RESOLVE_NODEVFS`/`RESOLVE_LOCAL` are `__APPLE_API_PRIVATE` (`sys/paths.h`) [src], so they are not relied on | volume mount points are reparse points (`IO_REPARSE_TAG_MOUNT_POINT`) → refused by #2 | |
 | 4 | **Aliases** that bypass name-based logic: case folding, Unicode normalization, 8.3 names, `/.vol/<dev>/<ino>`, `..namedfork` | identity by `(dev, ino)`; casefold dirs (`FS_CASEFOLD_FL`) checked per directory | APFS is normalization-insensitive, and case-insensitive by default; after each lookup or create, compare the stored name (`fgetattrlist ATTR_CMN_NAME`) with the requested one, and treat a mismatch as ENOENT/EEXIST; never build `/.vol` paths (libkrun does); `/..namedfork/` cannot be reached since `/` is rejected (XNU `RESOLVE_NOXATTRS` is private) [src] | after open, compare `FileNormalizedNameInformation` (long-name form) with the request → catches `PROGRA~1`-style 8.3 aliases [inf: measure]; per-directory case sensitivity via `FileCaseSensitiveInformation` [doc] | [Case sensitivity (WSL docs)](https://learn.microsoft.com/windows/wsl/case-sensitivity) [doc] |
 | 5 | **Alternate data streams / EAs as a side channel** (`file:stream`, `dir::$INDEX_ALLOCATION`) | — | — | reject `:` in names (ADS syntax); the metadata EA is never guest-nameable | NTFS stream rules in FILE_RENAME_INFORMATION remarks [doc] |
-| 6 | **Special files**: opening host device nodes, FIFOs (blocking), sockets | never open a non-regular, non-directory object (check `fstat` on an `O_PATH` fd before reopening); never call `mknod` | same (`O_NOFOLLOW` + `fstat` before reading); FIFOs opened `O_NONBLOCK` only to stat, never for I/O | no device files on NTFS; `\\.\` names cannot be reached through relative names [inf]; reparse refused | CVE-2020-35517, CVE-2023-2861 |
+| 6 | **Special files**: opening host device nodes, FIFOs (blocking), sockets | never open a non-regular, non-directory object (its kind read with `fstatat(AT_SYMLINK_NOFOLLOW)` first, the opened object checked with `fstat`, §4.3); never call `mknod` | same (`O_NOFOLLOW` + `fstat` before reading); FIFOs opened `O_NONBLOCK` only to stat, never for I/O | no device files on NTFS; `\\.\` names cannot be reached through relative names [inf]; reparse refused | CVE-2020-35517, CVE-2023-2861 |
 | 7 | **setuid/setgid/file capabilities** on host objects | server unprivileged, no caps; host modes masked; emulated KILLPRIV semantics in the record (virtiofsd's fallocate/copy_file_range lesson, fc18227) [src] | same | same (no such bits on NTFS) | CVE-2022-0358 |
 | 8 | **xattrs/ACLs** | guest xattrs prefixed into `user.`; `security.capability` emulated in the record; POSIX ACLs EOPNOTSUPP | prefixed; `com.apple.*` (quarantine, provenance, ResourceFork, FinderInfo) not guest-settable | EAs are case-insensitive ASCII names, so guest xattrs go into one EA blob; host DACLs are never changed by guest chmod | virtiofsd `--xattrmap` doc [doc] |
 | 9 | **Ownership mapping** abused for privilege | emulated only; the server never calls `setresuid`/`fchown` with guest ids | same | same; not WSL's `$LX*` EAs (§3.1) | |
@@ -525,8 +649,10 @@ it means layer 1 let the request through.
   - Landlock first appeared in Linux 5.13 [doc], and upstream supports 5.10 hosts (docs/kernel-policy.md) [src], so it
     is an added layer, never the only one.
 - **Resolution:** `openat2(2)` (Linux 5.6+) with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV`
-  and a single component. `O_PATH` fds for inodes. Reopen through `/proc/self/fd` as virtiofsd does
-  (`passthrough/util.rs`), which needs `/proc` inside the namespace, read-only.
+  and a single component; no fallback (§4.3). Nodes as on macOS (§4.3): directories held open, anything else a
+  leaf found by its known names and checked at each use. Not `O_PATH` fds reopened through `/proc/self/fd` as
+  virtiofsd does (`passthrough/util.rs`): that needs `/proc` inside the namespace and a magic-link reopen, and would
+  make Linux behave unlike macOS when the host renames a file the guest holds.
 - **seccomp:** list like crosvm's `fs_device.policy` [src], minus `mknodat`, `setresuid`/`setresgid` and
   `capset` (ownership is emulated).
 - **No** file handles (`name_to_handle_at`), no `CAP_DAC_READ_SEARCH`, no DAX.
@@ -545,7 +671,8 @@ it means layer 1 let the request through.
 
   Root drops to the invoking uid. The memory limit is jetsam; the CPU limit uses the jailer's mechanism.
 - **Resolution:**
-  - `openat(dirfd, name, O_NOFOLLOW|O_NOFOLLOW_ANY|O_CLOEXEC)`, plus `O_RESOLVE_BENEATH` on 15.4+ (unconfirmed, §0 row 19);
+  - `openat(dirfd, name, O_NOFOLLOW_ANY|O_RESOLVE_BENEATH|O_CLOEXEC)` (§4.3; `O_NOFOLLOW` as well is EINVAL), with
+    `O_RESOLVE_BENEATH` on 15.4+ (unconfirmed, §0 row 19);
   - `*at` calls with `AT_SYMLINK_NOFOLLOW` (+`AT_SYMLINK_NOFOLLOW_ANY`, and `AT_RESOLVE_BENEATH` on 26+);
   - `renameatx_np(RENAME_EXCL|RENAME_SWAP)` for RENAME2;
   - xattrs only through fds (`f*xattr`, `XATTR_NOFOLLOW`), since macOS has no `*at` xattr calls.
@@ -554,9 +681,9 @@ it means layer 1 let the request through.
   xnu-11417 (taken to be macOS 15.4; unconfirmed, §0 row 19); `AT_RESOLVE_BENEATH` and `O_UNIQUE` in xnu-12377 (macOS 26) [src].
 
   On releases without `O_RESOLVE_BENEATH` the server refuses to start (decision 5 in §0).
-- **No `O_PATH`.** Directories are held as `O_SEARCH` (= `O_EXEC|O_DIRECTORY`) fds. Non-directories are held as
-  (parent fd, name, `(st_dev, st_ino)`) and reopened and checked per use. `O_EVTONLY` fds are a candidate O_PATH
-  substitute [inf: test access semantics].
+- **No `O_PATH`.** Directories are held as `O_RDONLY|O_DIRECTORY` fds, as on Linux (§4.3). Non-directories are
+  leaves: found by their known names and checked per use, or, unlinked, through the descriptor of the guest's
+  widest open (§4.3).
 - **Case and normalization:** APFS is case-insensitive by default and always normalization-insensitive, and names
   must be valid UTF-8. See §7 for the behaviour.
 - **TCC:** a share under `~/Documents`, `~/Desktop`, `~/Downloads`, iCloud or removable volumes needs the responsible
@@ -622,6 +749,8 @@ it means layer 1 let the request through.
 | `O_TMPFILE` (FUSE_TMPFILE), POSIX ACLs, ioctls | ENOSYS/EOPNOTSUPP, so applications fall back | | | |
 | Sparse files, fallocate, punch hole | supported; wick's `platform::fs` already has hole semantics per host | native | `F_PUNCHHOLE` | `FSCTL_SET_ZERO_DATA` |
 | Quotas / free space | `statfs` from the host volume | | | |
+| `fsync`, `fdatasync` | the data on stable storage when the call returns, as Linux's `fsync` (§4.3) | `fsync` / `fdatasync` | both `F_FULLFSYNC` (macOS's `fsync` stops at the drive's cache); slower by the drive's flush | — |
+| Open flags | only the access mode reaches the host; `O_APPEND`, `O_TRUNC`, `O_DIRECT`, `O_SYNC` are the guest kernel's (§4.3) | same | same | — |
 
 ---
 
@@ -675,7 +804,11 @@ it means layer 1 let the request through.
 | Native symlinks without privilege | yes | yes | **no** (privilege or Developer Mode): emulated everywhere |
 | Atomic `RENAME_EXCHANGE` | `renameat2` | `renameatx_np(RENAME_SWAP)` | **no**: NTFS has no exchange (`FILE_RENAME_INFORMATION`'s flags, §4.3); EINVAL |
 | `RENAME_WHITEOUT` | **no** on every host: the server makes no device nodes; EINVAL | | |
+| Serving without beneath-resolution | **no**: `openat2` required (5.6+, not denied by seccomp) | **no**: `O_RESOLVE_BENEATH` required | — |
+| A read-write share on a file system without extended attributes | **no** (vfat, exfat): read-only only | **no** (msdos, exfat: AppleDouble `._` files): read-only only | — |
 | Per-process handle limit | `RLIMIT_NOFILE` | `RLIMIT_NOFILE` | **none** [meas: `jailer-test.ps1 nofile`]: self-limit everywhere |
+| A file the guest holds, renamed or replaced by the host (a known difference) | served again only if its new name is in a directory the server holds (§4.3), else ENOENT, never another object. virtiofsd keeps serving it through its `O_PATH` descriptor wherever it went. wick reaches an object with a name only through a held directory, so an object the host moved out of the share is out of the guest's reach, and opened and never-opened nodes behave alike | the same as Linux: no `O_PATH` | the planned backend reopens by file id and so would keep serving it, as virtiofsd; to be decided with the port |
+| A new OPEN of an unlinked file the guest holds (the guest's `/proc/<pid>/fd/<n>`) | only for an access the descriptor of the guest's widest open covers, else ENOENT (virtiofsd reopens through `/proc`) | the same as Linux | — |
 | Host change notifications to the guest | **no** on any host (Linux driver) | no | no |
 | DAX | not in v1 on any host | | |
 | Snapshot with fs | refused on every host in v1 | | |
@@ -696,7 +829,6 @@ it means layer 1 let the request through.
    - `FILE_OPEN_BY_FILE_ID` under LPAC for an outside file.
 3. **macOS:**
    - Seatbelt `subpath` vs `/.vol` and firmlink aliases, and very deep paths;
-   - `O_EVTONLY` as an O_PATH stand-in;
    - whether a `sandbox_init`ed (non-App-Sandbox) process's files get `com.apple.quarantine`/`com.apple.provenance`;
    - which macOS release first has `O_RESOLVE_BENEATH` (decision 5 in §0 needs it);
 4. **Linux:** where unprivileged userns is disabled, a root launcher that drops (§0, decision 6). Open: how
@@ -708,7 +840,8 @@ it means layer 1 let the request through.
    these generically for future devices?
 8. **Read-only shares on macOS/Windows:** do atime updates on reads (virtiofsd notes this on Linux) matter to
    operators?
-9. Share roots: home and system locations are refused by default (§0, decision 8). Open: the exact list per host.
+9. Share roots: home and system locations are refused by default (§0, decision 8). The list per host is §4.3's,
+   stage 0 step 2 (`refused_root`).
 10. **Cache `auto` timeout:** 1 s, provisional (§4.4). Open: how soon a host-side edit must show in the guest,
     measured against the metadata requests a shorter timeout costs.
 
@@ -721,7 +854,9 @@ it means layer 1 let the request through.
    - a default build has no fs symbols;
    - with the feature but no config: no virtio device 26 in the guest, no socket, no process (a planned boot-test
      stage `fs-off` on each host).
-2. **Traversal corpus (host-side harness, no VM, every CI host).** A Rust harness speaks wick-fsd's frame protocol
+2. **Traversal corpus (host-side harness, no VM, every CI host).** Exists for Linux and macOS as
+   `test_traversal_corpus` (`crates/fs/fsd/tests/corpus.rs`), over the session and the host backend without the
+   frame layer; the confined re-run comes with commits 6 and 7. A Rust harness speaks wick-fsd's frame protocol
    and sends every name-taking opcode (LOOKUP, MKNOD, MKDIR, SYMLINK (name *and* target), UNLINK, RMDIR, RENAME,
    RENAME2, LINK, CREATE, TMPFILE, SETXATTR/GETXATTR names). Names:
    - `..`, `.`, `a/b`, `/etc/x`, `../../x`;
@@ -734,7 +869,8 @@ it means layer 1 let the request through.
    - canary files outside the share are unchanged and unread (Linux fanotify; macOS: the canary path is denied by
      the profile **and** the denial counter must be zero; Windows: canary with a SACL audit);
    - every refusal comes from the protocol layer (§5 test principle).
-3. **Race suite:**
+3. **Race suite** (exists for Linux and macOS as `test_swap_race`, directory ↔ symlink; junctions are Windows',
+   mount points need privileges a test lacks):
    - host threads swap directories ↔ symlinks / junctions / mount points and hard links while the harness issues
      operations, 10⁶ iterations, each loop under an alarm so that a hang fails the test;
    - the same assertions as 2.

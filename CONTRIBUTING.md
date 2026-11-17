@@ -461,6 +461,18 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   (baselines measured on AWS bare metal), and in CI the 5.10 and 6.18 guest
   kernel variants of the integration tests (6.1, upstream's default, runs).
 
+Host folder sharing (`crates/fs`) is its own workspace: run `cargo clippy
+--locked --all-targets -- -D warnings` and `cargo test --locked` from
+`crates/fs`, as CI's `fs` job does on each host. Its host-directory tests
+(`crates/fs/fsd/tests`) use a real directory under the temporary directory;
+on macOS some make and mount disk images with `hdiutil` (no root needed).
+Two Linux tests need a mount a user cannot make and are `#[ignore]`d:
+`cargo test --locked -- --ignored` runs them with
+`WICK_FS_TEST_CASEFOLD_DIR` (an empty directory with ext4's casefold flag)
+and `WICK_FS_TEST_NOXATTR_DIR` (a writable vfat or exfat directory); CI's
+`fs` job makes both with sudo. `WICK_FS_RACE_ITERATIONS` sets
+`test_swap_race`'s rounds (default 100000).
+
 ## Fuzzing
 
 wick's own code that takes input from a guest, or from another process,

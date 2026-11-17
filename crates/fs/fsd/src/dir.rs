@@ -105,8 +105,10 @@ pub struct RenameFlags {
 /// One directory entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirEntry {
-    /// The host's name, unescaped by the backend; the server checks it.
-    pub name: String,
+    /// The host's name, as bytes (unescaped by the backend): one that is
+    /// not a guest name (not UTF-8, an escape image, ...) is skipped and
+    /// counted by the server.
+    pub name: Vec<u8>,
     /// Its identity.
     pub id: HostId,
     /// Its kind.
@@ -187,9 +189,10 @@ pub const RECORD_LEN: usize = 40;
 
 /// A host's directory layer.
 pub trait ConfinedDir {
-    /// What the node table holds per node: Linux an `O_PATH` descriptor,
-    /// macOS a directory's `O_SEARCH` descriptor or (parent, name, id) for
-    /// anything else, Windows a handle opened by id.
+    /// What the node table holds per node: Linux and macOS a directory's
+    /// descriptor, or for anything else a leaf (the names it is known by and
+    /// the descriptor of the guest's widest open; docs/design-fs.md §4.3);
+    /// Windows a handle opened by id.
     type Node: Clone;
     /// An object open for I/O (a regular file) or listing (a directory).
     type Open;

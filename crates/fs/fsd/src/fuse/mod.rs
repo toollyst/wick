@@ -101,6 +101,7 @@ errnos! {
     EINVAL = 22,
     ENFILE = 23,
     EMFILE = 24,
+    ENOTTY = 25,
     ETXTBSY = 26,
     EFBIG = 27,
     ENOSPC = 28,
@@ -117,7 +118,9 @@ errnos! {
     EOVERFLOW = 75,
     EILSEQ = 84,
     EOPNOTSUPP = 95,
+    ETIMEDOUT = 110,
     ESTALE = 116,
+    EDQUOT = 122,
 }
 
 impl Errno {

@@ -48,7 +48,7 @@ use crate::fuse::name::{NAME_MAX, Name};
 use crate::fuse::{Errno, InHeader, KERNEL_MINOR_VERSION, KERNEL_VERSION, MAX_WRITE, OUT_HEADER_LEN, Opcode, PATH_MAX};
 use crate::handles::{Handles, Kind};
 use crate::inodes::{Forgot, Inodes, ROOT};
-use crate::limits::{Counters, Limits, MAX_READ};
+use crate::limits::{Counters, GUEST_XATTR_NAME_MAX, Limits, MAX_READ, XATTR_ENTRY_COST};
 use crate::record::{
     self, Record, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, S_ISGID,
 };
@@ -151,6 +151,18 @@ pub fn ino_of(id: HostId) -> u64 {
     x.max(1)
 }
 
+/// The permission bits a host object gets for a guest mode: the guest's
+/// for a regular file or directory; none for an emulated symlink, FIFO,
+/// socket or device, a regular host file host tools should neither run nor
+/// read as what it stands for (design-fs row 12). The backend adds the
+/// server's own access.
+fn host_perm(mode: u32) -> u16 {
+    match mode & S_IFMT {
+        S_IFREG | S_IFDIR => u16::try_from(mode & 0o777).unwrap_or(0),
+        _ => 0,
+    }
+}
+
 fn bits_u64(v: i64) -> u64 {
     u64::from_le_bytes(v.to_le_bytes())
 }
@@ -231,6 +243,11 @@ impl<D: ConfinedDir> Session<D> {
     /// The guest's lookups and open handles of a node, if held.
     pub fn node_counts(&self, nodeid: u64) -> Option<(u64, u32)> {
         self.inodes.counts(nodeid)
+    }
+
+    /// The host identity a held node stands for (tests and fuzzing).
+    pub fn node_host_id(&self, nodeid: u64) -> Option<HostId> {
+        self.inodes.get(nodeid).ok().map(|e| e.id)
     }
 
     /// Whether the tables keep their rules: every handle on a held node,
@@ -652,8 +669,7 @@ impl<D: ConfinedDir> Session<D> {
     fn finish_new(&mut self, node: &D::Node, record: &Record) -> Result<HostStat, Errno> {
         let r = self.dir.set_record(node, &record.encode());
         r.map_err(|e| self.dir_err(e))?;
-        let perm = u16::try_from(record.mode.unwrap_or(0) & 0o777).unwrap_or(0);
-        let r = self.dir.set_perm(node, perm);
+        let r = self.dir.set_perm(node, host_perm(record.mode.unwrap_or(0)));
         r.map_err(|e| self.dir_err(e))?;
         self.stat(node)
     }
@@ -710,7 +726,7 @@ impl<D: ConfinedDir> Session<D> {
             let mut r = record.unwrap_or_default();
             if s.valid & FATTR_MODE != 0 {
                 r.mode = Some((shown.mode & S_IFMT) | (s.mode & 0o7777));
-                let perm = u16::try_from(s.mode & 0o777).unwrap_or(0);
+                let perm = host_perm((shown.mode & S_IFMT) | (s.mode & 0o777));
                 let res = self.dir.set_perm(&node, perm);
                 res.map_err(|e| self.dir_err(e))?;
             }
@@ -1156,7 +1172,7 @@ impl<D: ConfinedDir> Session<D> {
                     // loop.
                     return Ok(out);
                 }
-                let Ok(name) = Name::new(e.name.as_bytes()) else {
+                let Ok(name) = Name::new(&e.name) else {
                     self.counters.names_skipped += 1;
                     after = e.cookie;
                     continue;
@@ -1315,10 +1331,13 @@ impl<D: ConfinedDir> Session<D> {
         Ok(Vec::new())
     }
 
-    /// `system.*` (POSIX ACLs and the like) is not the guest's to store.
+    /// `system.*` (POSIX ACLs and the like) is not the guest's to store; a
+    /// name longer than every host can hold is ERANGE.
     fn guest_xattr_name(name: &[u8]) -> Result<(), Errno> {
         if name.starts_with(b"system.") {
             Err(Errno::EOPNOTSUPP)
+        } else if name.len() > GUEST_XATTR_NAME_MAX {
+            Err(Errno::ERANGE)
         } else {
             Ok(())
         }
@@ -1346,9 +1365,9 @@ impl<D: ConfinedDir> Session<D> {
         let others: usize = list
             .iter()
             .filter(|(n, _)| n.as_slice() != name)
-            .map(|(n, len)| 4 + n.len() + len)
+            .map(|(n, len)| XATTR_ENTRY_COST + n.len() + len)
             .sum();
-        if others + 4 + name.len() + value.len() > self.config.limits.xattr_budget {
+        if others + XATTR_ENTRY_COST + name.len() + value.len() > self.config.limits.xattr_budget {
             self.counters.xattr_refused += 1;
             return Err(Errno::ENOSPC);
         }
