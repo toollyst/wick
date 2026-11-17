@@ -2007,6 +2007,13 @@ jobs:
           # the first run committed it, the child ended with 137, the
           # thread's stack refused inside WHP's run call at the limit.
           alone whp::vcpu::fpu_tests::test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages
+          # WHvTranslateGva (the emulator's walk, ungated) while the guest's
+          # page tables are moved as a register's move and the reclaim's
+          # move make them read-only, a placeholder, then a view, and while
+          # a page-table page is missing in userfaultfd guest RAM
+          # (TRANSLATEREC lines: each stage's result code for five flag
+          # sets; a stage stuck 30 s in the call fails the test).
+          alone whp::vcpu::fpu_tests::test_translate_gva_while_page_tables_move_or_are_missing_on_record
           # A vCPU thread's first run commits its stack 112 KiB below the
           # frame that called it (RUNSTACK line).
           alone whp::vcpu::fpu_tests::test_a_vcpu_threads_stack_is_committed_before_its_first_run

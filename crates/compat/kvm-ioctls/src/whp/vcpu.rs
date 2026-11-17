@@ -9233,6 +9233,241 @@ mod fpu_tests {
         assert!(wrong.is_empty(), "{wrong:?}");
     }
 
+    /// The record of `WHvTranslateGva`, the walk of the guest's page tables
+    /// the instruction emulator asks of WHP (`translate_cb`, emulate.rs) with
+    /// no gate and no exception in this process, while the tables' host
+    /// memory is moved or missing:
+    /// - as a userfaultfd register moves its memory
+    ///   (`libc::windows_mm::uffd_alias`): the private allocation made
+    ///   read-only for the copy, then given back as a placeholder, then a
+    ///   section's view mapped in its place;
+    /// - as the reclaim moves a chunk (`uffd_move_chunk`): the chunk's view
+    ///   read-only, then unmapped to its placeholder, then a new section's
+    ///   view;
+    /// - with a page-table page missing in userfaultfd-registered guest RAM
+    ///   (registered and not yet filled: a reserved section's page with no
+    ///   commit), as after a snapshot's restore, then filled.
+    ///
+    /// The tables are in chunk 1 (GPA 2-4 MiB: PML4 at 0x201000, PDPT at
+    /// 0x202000, PD at 0x203000) and map `0xffffffff80000000` to the 2 MiB
+    /// page at GPA 0, in chunk 0, which stays put; the vCPU in long mode
+    /// with CR3 there, not run. TRANSLATEREC lines: each stage's result code
+    /// (`WHV_TRANSLATE_GVA_RESULT_CODE`: 0 success, 1 page not present, 4 GPA
+    /// unmapped, 5 no read access, 6 no write access) and address for each
+    /// flag set, or the call's failure; a stage still in the call after 30 s
+    /// ends the child with a line naming it. Asserted only that the walk
+    /// succeeds where the tables are in place (before each move and after
+    /// it, and once the missing page is filled) and that no stage hangs: the
+    /// stages between are the record.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_translate_gva_while_page_tables_move_or_are_missing_on_record() {
+        let (code, text) = run_child("translate_gva_record_child", 1 << 30);
+        for l in text.lines().filter(|l| l.starts_with("TRANSLATEREC")) {
+            eprintln!("{l}");
+        }
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_translate_gva_while_page_tables_move_or_are_missing_on_record in a job of its own"]
+    fn translate_gva_record_child() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+            MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_NOACCESS, PAGE_READONLY,
+            PAGE_READWRITE, UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const CHUNK: usize = 2 << 20;
+        const LEN: usize = 2 * CHUNK;
+        const PAGE: u64 = 4096;
+        const CR3: u64 = 0x20_1000;
+        const GVA: u64 = 0xffff_ffff_8000_1234;
+        // PML4[511] -> PDPT, PDPT[510] -> PD, PD[0] -> the 2 MiB page at 0.
+        const TABLES: [(u64, u64); 3] = [(0x20_1000 + 511 * 8, 0x20_2000 | 7), (0x20_2000 + 510 * 8, 0x20_3000 | 7), (0x20_3000, 0x83)];
+        static STAGE: std::sync::Mutex<(String, Option<std::time::Instant>)> = std::sync::Mutex::new((String::new(), None));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let s = STAGE.lock().unwrap();
+                if s.1.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(30)) {
+                    println!("TRANSLATEREC stuck: 30 s in WHvTranslateGva at {}", s.0);
+                    std::process::exit(3);
+                }
+            }
+        });
+        let flag_sets: [(&str, whv::WHV_TRANSLATE_GVA_FLAGS); 5] = [
+            ("read+exempt", whv::WHvTranslateGvaFlagValidateRead | whv::WHvTranslateGvaFlagPrivilegeExempt),
+            ("write+exempt", whv::WHvTranslateGvaFlagValidateWrite | whv::WHvTranslateGvaFlagPrivilegeExempt),
+            ("read", whv::WHvTranslateGvaFlagValidateRead),
+            ("read+setbits", whv::WHvTranslateGvaFlagValidateRead | whv::WHvTranslateGvaFlagSetPageTableBits),
+            ("write+setbits", whv::WHvTranslateGvaFlagValidateWrite | whv::WHvTranslateGvaFlagSetPageTableBits),
+        ];
+        // Every flag set's walk at `stage`, printed; the first set's.
+        let record = |vcpu: &VcpuFd, stage: &str| -> Option<(i32, u64)> {
+            let mut first = None;
+            for (i, (name, flags)) in flag_sets.iter().enumerate() {
+                *STAGE.lock().unwrap() = (format!("{stage} {name}"), Some(std::time::Instant::now()));
+                let walk = vcpu.translate_walk(GVA, *flags);
+                STAGE.lock().unwrap().1 = None;
+                match walk {
+                    Ok((code, gpa)) => println!("TRANSLATEREC {stage} {name}: result {code}, gpa {gpa:#x}"),
+                    Err(ref e) => println!("TRANSLATEREC {stage} {name}: failed, errno {}", e.errno()),
+                }
+                if i == 0 {
+                    first = walk.ok();
+                }
+            }
+            first
+        };
+        let in_place = |walk: Option<(i32, u64)>, stage: &str| {
+            assert_eq!(walk, Some((whv::WHvTranslateGvaResultSuccess, 0x1234)), "{stage}: the walk with the tables in place");
+        };
+        // A VM with `host` as its RAM at GPA 0 and a vCPU in long mode with
+        // CR3 at the tables, not run.
+        let vm_over = |host: usize| {
+            let vm = super::super::VmFd::create().unwrap();
+            let region = kvm_bindings::kvm_userspace_memory_region {
+                slot: 0,
+                flags: 0,
+                guest_phys_addr: 0,
+                memory_size: LEN as u64,
+                userspace_addr: host as u64,
+            };
+            // SAFETY: the memory stays mapped (or a placeholder) while the VM has it.
+            unsafe { vm.set_user_memory_region(region) }.unwrap();
+            let vcpu = vm.create_vcpu(0).unwrap();
+            let mut s = vcpu.get_sregs().unwrap();
+            s.cr0 = 0x8000_0011; // PG, ET, PE
+            s.cr3 = CR3;
+            s.cr4 = 0x20; // PAE
+            s.efer = 0x500; // LME, LMA
+            s.cs.l = 1;
+            s.cs.db = 0;
+            vcpu.set_sregs(&s).unwrap();
+            (vm, vcpu)
+        };
+        let write_tables = |host: usize| {
+            for (gpa, entry) in TABLES {
+                // SAFETY: within the guest's RAM, 8-byte aligned.
+                unsafe { ((host as u64 + gpa) as *mut u64).write_volatile(entry) };
+            }
+        };
+        // SAFETY: the current process's pseudo handle.
+        let process = unsafe { GetCurrentProcess() };
+        // 4 MiB of placeholder, split into its two chunks.
+        let placeholders = || {
+            // SAFETY: reserves address space of our own.
+            let base = unsafe {
+                VirtualAlloc2(std::ptr::null_mut(), std::ptr::null(), LEN, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0)
+            } as usize;
+            assert_ne!(base, 0);
+            // SAFETY: splits our placeholder.
+            assert_ne!(unsafe { VirtualFree(base as *mut _, CHUNK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) }, 0);
+            base
+        };
+        let private = |at: usize| {
+            // SAFETY: commits private memory over our placeholder.
+            let p = unsafe {
+                VirtualAlloc2(
+                    std::ptr::null_mut(),
+                    at as *const _,
+                    CHUNK,
+                    MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } as usize;
+            assert_eq!(p, at);
+        };
+        let view = |at: usize| {
+            // SAFETY: a new pagefile-backed section, committed.
+            let s = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, CHUNK as u32, std::ptr::null()) };
+            assert!(!s.is_null());
+            // SAFETY: maps it over our placeholder; the view keeps the section.
+            let v = unsafe { MapViewOfFile3(s, process, at as *const _, 0, CHUNK, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0) };
+            assert_eq!(v.Value as usize, at);
+            // SAFETY: our handle; the view holds the section.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(s) };
+        };
+        let read_only = |at: usize| {
+            let mut old = 0;
+            // SAFETY: our committed memory.
+            assert_ne!(unsafe { VirtualProtect(at as *mut _, CHUNK, PAGE_READONLY, &mut old) }, 0);
+        };
+
+        // A register's move: private memory, read-only, a placeholder, a view.
+        let base = placeholders();
+        private(base);
+        private(base + CHUNK);
+        write_tables(base);
+        let (vm, vcpu) = vm_over(base);
+        in_place(record(&vcpu, "register: private"), "register: private");
+        read_only(base + CHUNK);
+        record(&vcpu, "register: read-only");
+        // SAFETY: gives the private allocation of chunk 1 back as a placeholder.
+        assert_ne!(unsafe { VirtualFree((base + CHUNK) as *mut _, CHUNK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) }, 0);
+        record(&vcpu, "register: placeholder");
+        view(base + CHUNK);
+        write_tables(base);
+        in_place(record(&vcpu, "register: view"), "register: view");
+        drop(vcpu);
+        drop(vm);
+
+        // The reclaim's move: a view, read-only, its placeholder, a new view.
+        let base = placeholders();
+        private(base);
+        view(base + CHUNK);
+        write_tables(base);
+        let (vm, vcpu) = vm_over(base);
+        in_place(record(&vcpu, "reclaim: view"), "reclaim: view");
+        read_only(base + CHUNK);
+        record(&vcpu, "reclaim: read-only");
+        // SAFETY: unmaps chunk 1's view, keeping its placeholder.
+        assert_ne!(unsafe { UnmapViewOfFile2(process, MEMORY_MAPPED_VIEW_ADDRESS { Value: (base + CHUNK) as *mut _ }, MEM_PRESERVE_PLACEHOLDER) }, 0);
+        record(&vcpu, "reclaim: placeholder");
+        view(base + CHUNK);
+        write_tables(base);
+        in_place(record(&vcpu, "reclaim: new view"), "reclaim: new view");
+        drop(vcpu);
+        drop(vm);
+
+        // A missing page-table page: guest RAM mapped and registered as
+        // Firecracker's at a restore, the PML4 and PDPT pages filled, the
+        // PD page missing, then filled.
+        // SAFETY: anonymous memory for the guest, never unmapped (the child ends).
+        let m = unsafe {
+            libc::mmap(std::ptr::null_mut(), LEN, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert_ne!(m, libc::MAP_FAILED);
+        let m = m as u64;
+        let (ctx, _user) = libc::wick_uffd::create(0, false, true).unwrap();
+        libc::wick_uffd::register(ctx, m, LEN as u64).unwrap();
+        let fill = |gpa: u64, entries: &[(u64, u64)]| {
+            let mut page = vec![0u8; PAGE as usize];
+            for &(at, entry) in entries {
+                let o = (at - gpa) as usize;
+                page[o..o + 8].copy_from_slice(&entry.to_le_bytes());
+            }
+            // SAFETY: `page` holds a page.
+            assert_eq!(unsafe { libc::wick_uffd::copy(ctx, page.as_ptr(), m + gpa, PAGE, true) }, Ok(PAGE));
+        };
+        fill(0x20_1000, &TABLES[..1]);
+        fill(0x20_2000, &TABLES[1..2]);
+        // The 2 MiB page at 0 filled, so that only the PD page is missing.
+        assert_eq!(libc::wick_uffd::zeropage(ctx, m, CHUNK as u64, true), Ok(CHUNK as u64));
+        let (vm, vcpu) = vm_over(m as usize);
+        println!("TRANSLATEREC missing: the PD page missing {}", libc::wick_uffd::is_missing(m + 0x20_3000));
+        record(&vcpu, "missing: PD page missing");
+        fill(0x20_3000, &TABLES[2..]);
+        in_place(record(&vcpu, "missing: PD page filled"), "missing: PD page filled");
+        drop(vcpu);
+        drop(vm);
+    }
+
     /// Runs the child test `child` (this module's, `#[ignore]`d) in a
     /// process of its own, in a job that may commit `limit` bytes (set
     /// before the child maps anything: it sleeps 300 ms first): its exit
