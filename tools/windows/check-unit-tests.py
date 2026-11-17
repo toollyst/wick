@@ -37,7 +37,25 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIST = ROOT / "tools" / "windows" / "unit-test-differences.txt"
-KINDS = {"whp-pc", "whp-limit", "error-text", "linux-path", "bug"}
+KINDS = {"whp-pc", "whp-limit", "error-text", "linux-path", "bug", "xsave-template"}
+
+# The xsave-template kind: a test that applies Intel's static CPU templates
+# (C3, T2, T2S, T2CL) to a vCPU and expects them taken on the CPU models they
+# support. Their leaf 0xD leaves out AVX-512's three XSAVE components, and
+# kvm-ioctls' WHP backend refuses such a table on a host whose partition has
+# them (KVM_SET_CPUID2, crates/compat/kvm-ioctls/src/whp/vcpu.rs
+# `set_cpuid2`): WHP has no XSETBV exit and fixes a partition's components
+# when it is made. The condition is the host's, measured here and printed,
+# not read from the test: an Intel CPU of a model the templates support
+# (src/vmm/src/arch/x86_64/cpu_model.rs SKYLAKE_FMS, CASCADE_LAKE_FMS,
+# ICE_LAKE_FMS; static_cpu_templates/mod.rs `get_supported_cpu_models`), as
+# Windows names it (family, model as displayed, stepping), and AVX-512's
+# components among the XSAVE features Windows enabled
+# (GetEnabledXStateFeatures). Where it holds, the test must fail with the
+# backend's refusal naming AVX-512; elsewhere it must pass.
+TEMPLATE_MODELS = {(6, 0x55, 4): "Skylake", (6, 0x55, 7): "Cascade Lake", (6, 0x6A, 6): "Ice Lake"}
+AVX512 = 0xE0
+XSAVE_REFUSAL = "leaves out the XSAVE state components AVX-512"
 
 # Each package and its cargo test arguments. firecracker: its example
 # seccomp_jailer uses std::os::unix and does not build on Windows, so its
@@ -134,6 +152,61 @@ def died(output):
     return found
 
 
+def xsave_template_condition(vendor, identifier, xstate):
+    """(holds, words): whether the xsave-template condition holds on a CPU
+    of `vendor` that Windows identifies as `identifier` ("Intel64 Family 6
+    Model 106 Stepping 6") with the enabled XSAVE features `xstate`, and
+    the line that says so."""
+    m = re.search(r"Family (\d+) Model (\d+) Stepping (\d+)", identifier)
+    fms = tuple(int(x) for x in m.groups()) if m else None
+    model = TEMPLATE_MODELS.get(fms) if vendor == "GenuineIntel" else None
+    avx512 = xstate & AVX512 == AVX512
+    words = (
+        f"{vendor} {identifier} ({'Intel static templates model: ' + model if model else 'no model of Intel static templates'}), "
+        f"enabled XSAVE features {xstate:#x} (AVX-512 {AVX512:#x}: {'yes' if avx512 else 'no'})"
+    )
+    return model is not None and avx512, words
+
+
+def host_xsave_template():
+    """xsave_template_condition() of this Windows host: its first
+    processor's identifier and vendor (HKLM\\HARDWARE\\DESCRIPTION\\System\\
+    CentralProcessor\\0), and GetEnabledXStateFeatures."""
+    import ctypes
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+        identifier = winreg.QueryValueEx(key, "Identifier")[0]
+        vendor = winreg.QueryValueEx(key, "VendorIdentifier")[0]
+    enabled = ctypes.windll.kernel32.GetEnabledXStateFeatures
+    enabled.restype = ctypes.c_uint64
+    return xsave_template_condition(vendor, identifier, enabled())
+
+
+def failure_text(output, test):
+    """What libtest printed for `test` in its failures ("---- <test> stdout
+    ----" up to the next such line or the failures' list), or ""."""
+    head = f"---- {test} stdout ----"
+    at = output.find(head)
+    if at < 0:
+        return ""
+    rest = output[at + len(head):]
+    ends = [i for i in (rest.find("\n---- "), rest.find("\nfailures:")) if i >= 0]
+    return rest[: min(ends)] if ends else rest
+
+
+def xsave_template_problem(test, result, text, holds, words):
+    """The problem with an xsave-template entry's result, or None."""
+    if holds:
+        if result == "FAILED" and XSAVE_REFUSAL in text:
+            return None
+        how = "passes" if result == "ok" else f"is {result} without the refusal naming AVX-512"
+        return f"{test}: listed as xsave-template, and on this host ({words}) it must fail with the XSAVE refusal; it {how}"
+    if result == "ok":
+        return None
+    return f"{test}: listed as xsave-template, and on this host ({words}) it must pass; it is {result}"
+
+
 def selftest():
     """died() on a process that ended in a test, and on one whose tests failed."""
     aborted = (
@@ -176,6 +249,29 @@ def selftest():
     # Lines that do not add up to the counts: the section is named.
     lost = "     Running tests\\x.rs (x-1.exe)\n\nrunning 2 tests\ntest b::y ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored;\n"
     assert results_of(lost)[1] == ["Running tests\\x.rs (x-1.exe): libtest counted 2 passed, 0 failed, 0 ignored, its lines 1, 0, 0"], results_of(lost)
+    # The xsave-template condition: CI run 44177456759's Intel Xeon Platinum
+    # 8370C (Ice Lake, AVX-512 enabled) holds it; an AMD EPYC 9V74 with
+    # AVX-512 and an EPYC 7763 without do not, nor an Ice Lake without
+    # AVX-512 enabled.
+    assert xsave_template_condition("GenuineIntel", "Intel64 Family 6 Model 106 Stepping 6, GenuineIntel", 0x2E7)[0]
+    assert not xsave_template_condition("AuthenticAMD", "AMD64 Family 25 Model 17 Stepping 1, AuthenticAMD", 0x2E7)[0]
+    assert not xsave_template_condition("AuthenticAMD", "AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD", 0x207)[0]
+    assert not xsave_template_condition("GenuineIntel", "Intel64 Family 6 Model 106 Stepping 6, GenuineIntel", 0x207)[0]
+    assert not xsave_template_condition("GenuineIntel", "Intel64 Family 6 Model 143 Stepping 8, GenuineIntel", 0x2E7)[0]
+    refused = (
+        "---- a::test_configure_vcpu stdout ----\n"
+        "whp: KVM_SET_CPUID2 refused: the CPUID's leaf 0xD leaves out the XSAVE state components AVX-512 opmask (0xe0)\n"
+        "thread panicked\n\n---- a::other stdout ----\nx\n\nfailures:\n    a::other\n"
+    )
+    text = failure_text(refused, "a::test_configure_vcpu")
+    assert XSAVE_REFUSAL in text and "a::other" not in text, text
+    assert failure_text(refused, "a::none") == ""
+    t = "a::test_configure_vcpu"
+    assert xsave_template_problem(t, "FAILED", text, True, "w") is None
+    assert xsave_template_problem(t, "ok", "", True, "w") is not None
+    assert xsave_template_problem(t, "FAILED", "another panic", True, "w") is not None
+    assert xsave_template_problem(t, "ok", "", False, "w") is None
+    assert xsave_template_problem(t, "FAILED", text, False, "w") is not None
     print("check-unit-tests: selftest ok")
 
 
@@ -246,6 +342,10 @@ def main():
 
     problems = []
     counts = []
+    holds, words = False, ""
+    if any(k == "xsave-template" for (k, _, _) in entries):
+        holds, words = host_xsave_template()
+        print(f"xsave-template condition {'holds' if holds else 'does not hold'}: {words}", flush=True)
     for package, args in RUNS:
         results, built, code, cut, ended, unknown = run(package, args, out_dir)
         if not built:
@@ -262,10 +362,17 @@ def main():
             )
         listed = {t: k for (k, p, t) in entries if p == package}
         n = {"ok": 0, "FAILED": 0, "ignored": 0}
+        output = None
         for test, result in sorted(results.items()):
             n[result] += 1
             kind = listed.get(test)
-            if result == "FAILED" and kind is None:
+            if kind == "xsave-template":
+                if output is None:
+                    output = (out_dir / f"{package}.log").read_bytes().decode("utf-8", errors="replace")
+                problem = xsave_template_problem(test, result, failure_text(output, test), holds, words)
+                if problem:
+                    problems.append(f"{package} {problem}")
+            elif result == "FAILED" and kind is None:
                 problems.append(f"{package} {test}: fails, and is not listed")
             elif result == "FAILED" and kind == "whp-pc" and opts.whp:
                 problems.append(f"{package} {test}: whp-pc, and fails on this WHP machine")
@@ -283,6 +390,8 @@ def main():
 
     lines = ["## Windows unit tests" + (" (WHP)" if opts.whp else ""), ""]
     lines += [f"- {p}: {n['ok']} passed, {n['FAILED']} failed, {n['ignored']} ignored" for p, n in counts]
+    if words:
+        lines += ["", f"xsave-template condition {'holds' if holds else 'does not hold'}: {words}"]
     lines += ["", f"{len(entries)} listed differences; {len(problems)} problem(s)."]
     lines += [f"- {p}" for p in problems]
     text = "\n".join(lines) + "\n"

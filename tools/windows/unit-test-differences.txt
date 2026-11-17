@@ -18,6 +18,13 @@
 #   linux-path  the test names a Linux path or builds JSON from a host path
 #   bug         a wick bug or an unexplained difference, to fix (root cause
 #               first)
+#   xsave-template  applies Intel's static CPU templates to a vCPU and
+#               expects them taken: fails on a host whose condition holds,
+#               with the backend's KVM_SET_CPUID2 refusal naming AVX-512, and
+#               must pass elsewhere. The condition is measured by the checker
+#               on the host and printed with the run (an Intel CPU of a model
+#               those templates support, with AVX-512's XSAVE components
+#               enabled): check-unit-tests.py, TEMPLATE_MODELS
 #
 # First measured on Windows Server 2022 without WHP (fc-win), the tree of
 # 51be34e (main's acc6b6d) plus the MSR change, 4 test threads: vmm --lib 974 tests, 794 pass,
@@ -174,3 +181,18 @@ whp-limit vmm vstate::vm::tests::test_restore_state_resource_allocator
 whp-limit vmm vstate::vm::tests::test_too_many_regions
 #   (SetUserMemoryRegion(Error(87)) from test_utils' setup_vm_with_memory;
 #   test_too_many_regions: its first region, "iteration 0")
+
+# vmm: Intel's static CPU templates (C3, T2, T2CL here) leave AVX-512's three
+# XSAVE components out of leaf 0xD; WHP has no XSETBV exit and fixes a
+# partition's components when it is made, so the backend refuses such a
+# table where the host's partition has them (crates/compat/kvm-ioctls/src/
+# whp/vcpu.rs `set_cpuid2`; docs/COMPATIBILITY.md, Static CPU templates).
+# test_configure_vcpu expects each template taken on the models it supports.
+# CI run 44177456759 (85285bfd), the first in its window on an Intel runner,
+# an Intel Xeon Platinum 8370C (Ice Lake, AVX-512): refused three times,
+# "leaves out the XSAVE state components AVX-512 opmask, AVX-512 ZMM_Hi256,
+# AVX-512 Hi16_ZMM (0xe0)", and the T2 assert (vcpu.rs:958) failed. On AMD
+# runners the Intel templates are refused for the vendor before any CPUID
+# is set and the test passes (EPYC 7763 without AVX-512, EPYC 9V74 with it:
+# runs 44149408520, 44167134500).
+xsave-template vmm arch::x86_64::vcpu::tests::test_configure_vcpu
