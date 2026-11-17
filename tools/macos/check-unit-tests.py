@@ -8,6 +8,10 @@ Every test of every crate below runs (one thread, each binary under a time
 limit), and the check fails on:
   - a failure the list does not name;
   - a listed test that passes (or is ignored, or did not run);
+  - a crate whose counts (tests passed, failed as listed, ignored) are not
+    the ones the list's header gives it in a `count` line, or that has none
+    (a figure in prose would go stale unnoticed: compat-libc's said 30 when
+    it had 109);
   - a listed name that is not a test of its crate;
   - a test binary that does not finish in time, or does not build;
   - a file a crate's tests leave in their endpoint directory that
@@ -111,6 +115,29 @@ def read_differences(path):
                 errors.append(f"{path}:{n}: listed twice: {crate} {test}")
             entries[(crate, test)] = kind
     return entries, errors
+
+
+COUNT = re.compile(r"^#\s+count (\S+) (\d+) pass (\d+) fail (\d+) ignored$")
+
+
+def read_counts(path):
+    """{crate: (pass, fail as listed, ignored)} from the list's `count`
+    header lines, and the errors of those lines."""
+    counts, errors = {}, []
+    with open(path) as f:
+        for n, line in enumerate(f, 1):
+            line = line.rstrip("\n")
+            if not re.match(r"^#\s+count ", line):
+                continue
+            m = COUNT.match(line)
+            if not m:
+                errors.append(f"{path}:{n}: not '#   count <crate> <n> pass <n> fail <n> ignored': {line}")
+                continue
+            crate = m.group(1)
+            if crate in counts:
+                errors.append(f"{path}:{n}: a second count for {crate}")
+            counts[crate] = tuple(int(m.group(i)) for i in (2, 3, 4))
+    return counts, errors
 
 
 def read_litter(path):
@@ -294,12 +321,17 @@ def main():
     rows = []
     counts = []
     entries, errors = read_differences(a.differences)
+    header, count_errors = read_counts(a.differences)
+    errors += count_errors
     litter, litter_errors = read_litter(a.litter)
     errors += litter_errors
     all_crates = crates()
     for crate in litter:
         if crate not in all_crates:
             errors.append(f"{a.litter}: crate {crate} is not one this check runs")
+    for crate in header:
+        if crate not in all_crates:
+            errors.append(f"{a.differences}: count for {crate}, which is not a crate this check runs")
     for crate, test in entries:
         if crate not in all_crates:
             errors.append(f"listed crate {crate} is not one this check runs ({', '.join(all_crates)})")
@@ -392,6 +424,16 @@ def main():
                 f"{len(failed - want)} fail unlisted, {len(ignored)} ignored")
         counts.append(line)
         print(line, flush=True)
+        got = (len(ran - failed), len(failed & want), len(ignored))
+        if crate not in header:
+            shown = os.path.relpath(a.differences, ROOT)
+            shown = a.differences if shown.startswith("..") else shown
+            errors.append(f"{crate}: no count line in {shown}'s header; "
+                          f"its counts are '#   count {crate} {got[0]} pass {got[1]} fail {got[2]} ignored'")
+        elif finished and header[crate] != got:
+            had = header[crate]
+            errors.append(f"{crate}: the header counts {had[0]} pass, {had[1]} fail, {had[2]} ignored; "
+                          f"the run counts {got[0]} pass, {got[1]} fail, {got[2]} ignored")
     total = f"all: {totals['pass']} pass, {totals['listed']} fail as listed, {totals['ignored']} ignored"
     print(total)
     for e in errors:

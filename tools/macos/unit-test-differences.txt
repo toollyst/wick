@@ -62,41 +62,54 @@
 #   error-text  the test builds Linux's error text from a Linux errno number
 #   bug         a wick bug or difference to fix (root cause first)
 #
-# Measured on an M1 Pro, macOS 27.2, 2026-11-13, unsigned (as CI), one test
-# thread, then each failure alone unsigned and signed:
-#   vmm --lib: 1038 tests; 850 pass, 138 fail, 50 ignored (the ext:: helpers
-#   their parent tests run in a child process). All 138 fail unsigned alone
-#   with CreateVm(Error(1)) and pass signed alone. Counted again on
-#   2026-11-18 by check-unit-tests.py --crate vmm: 1155 tests; 932 pass,
-#   139 fail as listed, 84 ignored (not each run alone again).
-#   cpu-template-helper: 30 tests; 25 pass, 5 fail (no-hvf); 31 and 26
-#   since 2026-11-18 (test_ioreg_listing_with_a_non_utf8_byte_ahead_of_the_firmware_line).
-#   compat-kvm-ioctls: 122 tests; 34 pass, 86 fail, 2 ignored (counted again
-#   on 2026-11-17, after the four *_charged_once tests, the seven
-#   test_owned_* guest-memory tests (the allocation, two charged-once twins,
-#   two discards, two reclaims), and the ignored
-#   timed_vcpu_fault_throughput, by
-#   check-unit-tests.py --crate compat-kvm-ioctls); 123 and 87 since
-#   2026-11-18 (test_owned_reclaim_leaves_missing_pages_out_of_stage_2), all
-#   no-hvf: 86 with Error(1) at hv_vm_create, and the vCPU thread's latency
-#   tier's test_a_wfi_ends_when_its_timer_is_due, which fails on a runner
-#   before it makes its VM, at its own requirement of a launcher that raised
-#   no timer coalescing, since the runners' processes are coalesced as
-#   background ones (timer-coalescing.py's output in the same job); so CI
-#   never runs it, and its figures are this Mac's. PV time's refusal where
-#   it is not offered is checked without a VM
-#   (test_the_attribute_is_enxio_where_pv_time_is_not_offered, which passes
-#   on the runners, macOS 26).
-#   Pass (names, a name in two of a crate's binaries counted once):
-#   acpi-tables 22, clippy-tracing 17, firecracker 89, rebase-snap 3,
-#   snapshot-editor 6, utils 16, wick-ext 1, wick-version 2, compat-libc 30,
-#   compat-memfd 3, compat-std 1, compat-userfaultfd 5, compat-vmm-sys-util 26;
-#   counted again on 2026-11-18 by check-unit-tests.py for two of them:
-#   compat-libc 117 (1 ignored, the timed timed_a_copy_into_owned_memory),
-#   compat-userfaultfd 17 (1 ignored).
-#   No tests: log-instrument, log-instrument-macros, seccompiler,
-#   compat-event-manager, compat-kvm-bindings, compat-micro-http, compat-os,
-#   compat-vhost, compat-vm-memory.
+# Counts: for each crate check-unit-tests.py runs, its tests that pass, that
+# fail as listed below, and that are ignored, as it counts them (unsigned,
+# one test thread, as on CI's runners; a name in two of a crate's binaries
+# counted once). check-unit-tests.py fails on a crate whose run does not give
+# its line's three numbers, or that has no line, so a test added or removed
+# changes its crate's line in the same commit. Counted on an M1 Pro, macOS
+# 27.2, 2026-11-18, by check-unit-tests.py over every crate.
+#   count vmm 932 pass 139 fail 84 ignored
+#   count acpi-tables 22 pass 0 fail 0 ignored
+#   count clippy-tracing 17 pass 0 fail 0 ignored
+#   count cpu-template-helper 26 pass 5 fail 0 ignored
+#   count firecracker 97 pass 0 fail 1 ignored
+#   count log-instrument 0 pass 0 fail 0 ignored
+#   count log-instrument-macros 0 pass 0 fail 0 ignored
+#   count rebase-snap 3 pass 0 fail 0 ignored
+#   count seccompiler 0 pass 0 fail 0 ignored
+#   count snapshot-editor 6 pass 0 fail 0 ignored
+#   count utils 16 pass 0 fail 0 ignored
+#   count wick-ext 1 pass 0 fail 0 ignored
+#   count wick-version 2 pass 0 fail 0 ignored
+#   count compat-event-manager 0 pass 0 fail 0 ignored
+#   count compat-kvm-bindings 0 pass 0 fail 0 ignored
+#   count compat-kvm-ioctls 34 pass 87 fail 2 ignored
+#   count compat-libc 117 pass 0 fail 1 ignored
+#   count compat-memfd 5 pass 0 fail 0 ignored
+#   count compat-micro-http 0 pass 0 fail 0 ignored
+#   count compat-os 9 pass 0 fail 0 ignored
+#   count compat-polling 0 pass 0 fail 0 ignored
+#   count compat-std 1 pass 0 fail 0 ignored
+#   count compat-userfaultfd 17 pass 0 fail 1 ignored
+#   count compat-vhost 0 pass 0 fail 0 ignored
+#   count compat-vm-memory 0 pass 0 fail 0 ignored
+#   count compat-vmm-sys-util 38 pass 0 fail 0 ignored
+#
+# What the counts do not say:
+#   vmm: its ignored tests include the ext:: helpers their parent tests run
+#   in a child process. On 2026-11-13 each listed failure (138 then) failed
+#   unsigned alone with CreateVm(Error(1)) and passed signed alone.
+#   compat-kvm-ioctls: every listed failure is no-hvf: Error(1) at
+#   hv_vm_create, but for the vCPU thread's latency tier's
+#   test_a_wfi_ends_when_its_timer_is_due, which fails on a runner before it
+#   makes its VM, at its own requirement of a launcher that raised no timer
+#   coalescing, since the runners' processes are coalesced as background ones
+#   (timer-coalescing.py's output in the same job); so CI never runs it, and
+#   its figures are this Mac's. PV time's refusal where it is not offered is
+#   checked without a VM (test_the_attribute_is_enxio_where_pv_time_is_not_offered,
+#   which passes on the runners, macOS 26).
+#   cpu-template-helper: its listed failures build a microVM (no-hvf).
 
 # cpu-template-helper: builds a microVM (the fingerprint's dump too).
 no-hvf cpu-template-helper tests::test_fingerprint_dump_command

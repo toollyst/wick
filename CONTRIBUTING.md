@@ -339,7 +339,10 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   but the jailer's (which need root) as CI's runners do, without
   Hypervisor.framework, and fails on any failure
   `tools/macos/unit-test-differences.txt` does not list with its reason, on a
-  listed test that passes, and on a listed name that is not a test. A test
+  listed test that passes, on a listed name that is not a test, and on a
+  crate whose counts (passing, failing as listed, ignored) are not its
+  `count` line in that file's header: a test added or removed changes the
+  line in the same commit. A test
   that creates a VM is listed `no-hvf`; `tools/macos/test.sh` runs it on a
   Mac, signed, in a process of its own. Each test binary gets an empty
   directory of its own for the endpoints of interfaces named without `/`
