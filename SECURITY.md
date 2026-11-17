@@ -192,9 +192,10 @@ Firecracker's code runs (`test_another_value_is_refused`, `ext::malloc_config` u
 jail`).
 
 On Windows Firecracker's heap is the process heap (`HeapAlloc`, Rust's `System`), with no type isolation either,
-through wick's allocator (`libc::wick_alloc`), which changes only what a refusal at the memory limit does: a reclaim,
-then the end with 137 (Fixed defects below; `test_the_heaps_allocator_is_wicks`, and Firecracker's start line,
-which `boot-test.ps1 boot` checks).
+through wick's allocator (`libc::wick_alloc`), which changes only what a refusal does: by the size asked, null above
+the host's commit limit, 137 above what the job's limit holds, else a reclaim, then the end with 137 (Fixed defects
+below; `test_the_heaps_allocator_is_wicks`, and Firecracker's debug line at a VM's build, which `boot-test.ps1 boot`
+checks).
 
 Every planned mechanism above has been measured on its host with a probe
 ([`tools/windows/winprobe.c`](tools/windows/winprobe.c) on Windows); the [roadmap](docs/ROADMAP.md), milestone M5,
@@ -699,7 +700,13 @@ has the per-control details and results.
   error calls `std::process::abort` (`__fastfail`), where Linux's memory cgroup reclaims and then kills the VMM with
   SIGKILL at the page it cannot charge (v6.1 mm/memcontrol.c `try_charge_memcg` :2681, :2705 to :2706, :2729;
   mm/memory.c `do_anonymous_page` :4117 charges a heap page at its first touch). Now every Windows binary that
-  links the VMM has wick's allocator (`libc::wick_alloc`, `vmm::ext::allocator`): at a refusal the reclaim runs
+  links the VMM has wick's allocator (`libc::wick_alloc`, `vmm::ext::allocator`), which answers a refusal by the
+  size asked, as Linux answers malloc (mm/util.c `__vm_enough_memory` :1002 to :1006 refuses only above RAM and
+  swap; mm/mmap.c :2552 to :2554 asks no memory cgroup): above the host's commit limit, null, as the system's
+  allocator (`test_a_heap_allocation_above_the_hosts_commit_limit_is_refused_as_the_systems`); above what the
+  job's limit holds in all, 137 and a line saying so, where Linux gives it and kills at the touch past the limit,
+  so a reservation never touched, which lives on Linux, ends here
+  (`test_a_heap_allocation_more_than_the_job_limit_holds_ends_with_137_and_says_so`); else the reclaim runs
   once and the allocation is asked again if it gave something back, else the VMM ends with 137 and a line naming
   the size and what the reclaim gave back; no reclaim runs with a lock of wick's memory layer held, in the
   exception handler or on the reclaim's own thread, where the VMM ends at once
@@ -710,10 +717,11 @@ has the per-control details and results.
   `try_reserve` sites (a register's record bitmaps, the reclaim's lists and discard guards) answer `ENOMEM` as
   before (`test_a_guarded_fallible_site_answers_enomem_at_the_limit`, which ended with 137 with the guard taken
   out). Upstream's and std's fallible growth (`fs::read_to_string` of the config file, the metadata file and a CPU
-  template; `read_to_end` of a snapshot's state and of the seccomp filters) now ends the VMM with 137 at the limit
-  where it returned an out-of-memory error, as Linux's memory cgroup kills there. Firecracker says at its start
-  which allocator its heap runs with (`boot-test.ps1 boot`; `test_the_heaps_allocator_is_wicks`). Windows Server
-  2022 20348 and 2025 26100.
+  template; `read_to_end` of a snapshot's state and of the seccomp filters) answers its error above the host's
+  RAM and pagefile, as on Linux, and ends the VMM with 137 for a growth the limit cannot hold in all or one that
+  fits the limit but not what is left of it, where it returned an out-of-memory error, as Linux's memory cgroup
+  kills at the touch. Firecracker names its heap's allocator in a debug line at a VM's build (`boot-test.ps1
+  boot`; `test_the_heaps_allocator_is_wicks`). Windows Server 2022 20348 and 2025 26100.
 - **Windows: a register that could not give a page holding memory its protection returned with the page more open
   than `mprotect` made it** (from b0dfb35b, the Windows userfaultfd's start; found by reading, review of the fix
   above, not observed). The section's view is mapped read-write and each run of pages that holds memory gets its

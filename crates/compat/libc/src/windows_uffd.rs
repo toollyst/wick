@@ -8247,21 +8247,26 @@ mod tests {
                 std::eprintln!("{child}: {l}");
             }
             let line = std::format!("wick: heap: {kind} of 1048576 bytes");
-            if code != Some(137) || !text.contains(&line) || !text.contains("the reclaim gave back 0 bytes") {
-                failed.push(std::format!("{child}: exit {code:x?}, the line {}", text.contains(&line)));
+            let read = text.contains("HEAPEND the host's commit limit read at the job's limit: Some(");
+            if code != Some(137) || !text.contains(&line) || !text.contains("the reclaim gave back 0 bytes") || !read {
+                failed.push(std::format!("{child}: exit {code:x?}, the line {}, the commit limit read {read}", text.contains(&line)));
             }
         }
         assert!(failed.is_empty(), "{failed:?}");
     }
 
     /// [`test_a_heap_allocation_refused_at_the_limit_ends_with_137_and_a_line`]'s
-    /// three children: no room left, then the allocation.
+    /// three children: no room left, then the allocation. Each first reads
+    /// the host's commit limit as the refusal does (`wick_alloc`), with the
+    /// job's limit reached: the read does not fail there.
     fn heap_end(kind: &str) {
         watchdog(60);
         std::thread::sleep(std::time::Duration::from_millis(300));
         let mut small: std::vec::Vec<u8> = std::vec::Vec::with_capacity(16);
         small.push(1);
         let held = no_room_left();
+        let total = crate::wick_alloc::host_commit_limit();
+        crate::windows_mm::say_at_the_limit(format_args!("HEAPEND the host's commit limit read at the job's limit: {total:?}"));
         let v: std::vec::Vec<u8> = match kind {
             "zeroed" => std::vec![0u8; 1 << 20],
             "realloc" => {
@@ -8290,6 +8295,117 @@ mod tests {
     #[ignore = "run by test_a_heap_allocation_refused_at_the_limit_ends_with_137_and_a_line in a job of its own"]
     fn heap_end_realloc_child() {
         heap_end("realloc");
+    }
+
+    /// HEAPABOVE: a heap allocation of more than the host can commit at all
+    /// (its commit limit, `wick_alloc::host_commit_limit`, and 1 GiB) is
+    /// refused as the system's allocator refuses it, as Linux's malloc is
+    /// above RAM and swap (v6.1 mm/util.c :1002 to :1006): a `try_reserve`
+    /// outside wick's guard answers its error and the process lives, in a
+    /// job and in none; an infallible allocation ends with Rust's
+    /// allocation error (0xC0000409, "memory allocation of N bytes
+    /// failed"); neither says a line of wick's. On 6ef1c85e both ended with
+    /// 137 and a line that blamed the memory limit.
+    #[test]
+    fn test_a_heap_allocation_above_the_hosts_commit_limit_is_refused_as_the_systems() {
+        let mut failed = std::vec::Vec::new();
+        let abort = Some(0xC000_0409u32.cast_signed());
+        for (child, limit, want_code, want) in [
+            ("heap_above_reserve_child", Some(96 << 20), Some(0), "HEAPABOVE try_reserve: Err"),
+            ("heap_above_reserve_child", None, Some(0), "HEAPABOVE try_reserve: Err"),
+            ("heap_above_alloc_child", Some(96 << 20), abort, "memory allocation of "),
+        ] {
+            let (code, text) = run_child(child, limit);
+            for l in text.lines().filter(|l| l.starts_with("wick:") || l.starts_with("HEAP") || l.contains("memory allocation")) {
+                std::eprintln!("{child} (job {limit:?}): {l}");
+            }
+            if code != want_code || !text.contains(want) || text.contains("wick: heap") {
+                failed.push(std::format!("{child} (job {limit:?}): exit {code:x?}, said {}", text.contains(want)));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    /// [`test_a_heap_allocation_above_the_hosts_commit_limit_is_refused_as_the_systems`]'s
+    /// size: the host's commit limit and 1 GiB.
+    fn above_the_host() -> usize {
+        crate::wick_alloc::host_commit_limit().expect("the host's commit limit") + (1 << 30)
+    }
+
+    #[test]
+    #[ignore = "run by test_a_heap_allocation_above_the_hosts_commit_limit_is_refused_as_the_systems"]
+    fn heap_above_reserve_child() {
+        watchdog(60);
+        // In the job before asking (the parent assigns it after the spawn).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let size = above_the_host();
+        let mut v: std::vec::Vec<u8> = std::vec::Vec::new();
+        let r = v.try_reserve_exact(size);
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "HEAPABOVE try_reserve: {} ({size} bytes)",
+            if r.is_err() { "Err" } else { "Ok" }
+        ));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    #[ignore = "run by test_a_heap_allocation_above_the_hosts_commit_limit_is_refused_as_the_systems"]
+    fn heap_above_alloc_child() {
+        watchdog(60);
+        // In the job before asking (the parent assigns it after the spawn).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let v: std::vec::Vec<u8> = std::vec::Vec::with_capacity(above_the_host());
+        crate::windows_mm::say_at_the_limit(format_args!("HEAPABOVE the allocation was made ({} bytes)", v.capacity()));
+        core::hint::black_box(v);
+    }
+
+    /// HEAPPAST: a heap allocation of more than the job's limit holds in
+    /// all (200 MiB in a job of 96 MiB), but not more than the host can
+    /// commit, ends with 137 and a line saying so and what Linux does
+    /// there, with no reclaim: Linux's malloc gives it (mm/util.c :1002 to
+    /// :1006 ask RAM and swap, not the memory cgroup) and the cgroup kills
+    /// the VMM at the touch of the page past the limit (mm/memory.c :4117);
+    /// Windows commits it at the allocation. The same for a `try_reserve`
+    /// outside wick's guard (std's `read_to_end` with a large size hint).
+    /// On 6ef1c85e both ended with 137 and the line of a limit reached
+    /// ("the reclaim gave back 0 bytes").
+    #[test]
+    fn test_a_heap_allocation_more_than_the_job_limit_holds_ends_with_137_and_says_so() {
+        let mut failed = std::vec::Vec::new();
+        for child in ["heap_past_alloc_child", "heap_past_reserve_child"] {
+            let (code, text) = run_child(child, Some(96 << 20));
+            for l in text.lines().filter(|l| l.starts_with("wick:") || l.starts_with("HEAP") || l.contains("memory allocation")) {
+                std::eprintln!("{child}: {l}");
+            }
+            let line = "of 209715200 bytes (from 0) is more than the memory limit of 100663296 bytes (the jail's memory.max) holds in all, so no reclaim ran";
+            if code != Some(137) || !text.contains(line) || !text.contains("at the touch of the page past the limit") {
+                failed.push(std::format!("{child}: exit {code:x?}, the line {}", text.contains(line)));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_heap_allocation_more_than_the_job_limit_holds_ends_with_137_and_says_so"]
+    fn heap_past_alloc_child() {
+        watchdog(60);
+        // In the job before asking (the parent assigns it after the spawn).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let v: std::vec::Vec<u8> = std::vec::Vec::with_capacity(200 << 20);
+        crate::windows_mm::say_at_the_limit(format_args!("HEAPPAST the allocation was made ({} bytes)", v.capacity()));
+        core::hint::black_box(v);
+    }
+
+    #[test]
+    #[ignore = "run by test_a_heap_allocation_more_than_the_job_limit_holds_ends_with_137_and_says_so"]
+    fn heap_past_reserve_child() {
+        watchdog(60);
+        // In the job before asking (the parent assigns it after the spawn).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut v: std::vec::Vec<u8> = std::vec::Vec::new();
+        let r = v.try_reserve_exact(200 << 20);
+        crate::windows_mm::say_at_the_limit(format_args!("HEAPPAST try_reserve: {}", if r.is_err() { "Err" } else { "Ok" }));
+        core::hint::black_box(v);
     }
 
     /// HEAPRECLAIM: a heap allocation the job's limit refuses where the

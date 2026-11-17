@@ -9,27 +9,38 @@
 //! 0xC0000409 and no reclaim. On success it costs the check of the system
 //! call's result only.
 //!
-//! Firecracker says at its start which allocator it runs with ([`say`]),
-//! from the allocator itself (`libc::wick_alloc::installed`), and
-//! `boot-test.ps1`'s boot stage checks the line, so that the tests of the
-//! allocator (`libc`'s `test_a_heap_allocation_*`) are of the one the
-//! binary uses.
+//! Firecracker says which allocator it runs with, from the allocator itself
+//! (`libc::wick_alloc::installed`): a build that lost [`ALLOCATOR`] says so
+//! at its start, as an error line ([`say_at_start`]); a correct one says it
+//! at debug level when it builds a VM ([`say_at_build`]), after the logger
+//! has its level, and `boot-test.ps1`'s boot stage, which runs Firecracker
+//! at `--level Debug`, checks that line, so that the tests of the allocator
+//! (`libc`'s `test_a_heap_allocation_*`) are of the one the binary uses.
 
 #[global_allocator]
 static ALLOCATOR: libc::wick_alloc::Allocator = libc::wick_alloc::Allocator;
 
-/// Says which allocator the process's heap runs with: wick's, as an info
-/// line, else an error line (a build that lost [`ALLOCATOR`]).
-pub fn say() {
-    if libc::wick_alloc::installed() {
-        crate::logger::info_unrestricted!(
-            "wick: the heap's allocator is wick's: an allocation the memory limit refuses reclaims once, then ends the VMM with 137"
-        );
-    } else {
+/// At the start, before the logger has the level asked for: an error line
+/// if the heap's allocator is not wick's, nothing if it is.
+pub fn say_at_start() {
+    if !libc::wick_alloc::installed() {
         crate::logger::error_unrestricted!(
             "wick: the heap's allocator is not wick's: an allocation the memory limit refuses ends the VMM with 0xC0000409"
         );
     }
+}
+
+/// At a VM's build, once a process: a debug line if the heap's allocator is
+/// wick's (a fact that never changes in a correct build).
+pub fn say_at_build() {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        if libc::wick_alloc::installed() {
+            crate::logger::debug!(
+                "wick: the heap's allocator is wick's: an allocation the memory limit refuses reclaims once, then ends the VMM with 137"
+            );
+        }
+    });
 }
 
 #[cfg(test)]

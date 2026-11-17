@@ -480,18 +480,25 @@ semantics on Win32. The details are in the comments of each
     docs/COMPATIBILITY.md).
 - **The heap at the memory limit = wick's allocator (`libc::wick_alloc`).** Every Windows binary that links the
   VMM (Firecracker, `snapshot-editor`, `cpu-template-helper`) has it as its heap's allocator
-  (`vmm::ext::allocator`): the system's heap, and at a refusal what Linux's memory cgroup does at a charge it cannot
-  make: the reclaim (`wick_uffd::reclaim_at_touch`), the allocation once more if the reclaim gave something back,
-  then the end with 137 and a line naming the size asked and what the reclaim gave back
-  (`test_a_heap_allocation_refused_at_the_limit_ends_with_137_and_a_line`,
-  `test_a_heap_allocation_refused_at_the_limit_is_made_after_the_reclaim`). No reclaim runs where it would take what
+  (`vmm::ext::allocator`): the system's heap, and at a refusal an answer by the size asked, as Linux answers malloc
+  (its mmap refused only above RAM and swap, v6.1 mm/util.c :1002 to :1006; the memory cgroup charging at the
+  touch). Above the host's commit limit: null, as the system's allocator answers
+  (`test_a_heap_allocation_above_the_hosts_commit_limit_is_refused_as_the_systems`). Above what the job's limit
+  holds in all: the end with 137 and a line saying so, where Linux gives it and kills at the touch past the limit
+  (`test_a_heap_allocation_more_than_the_job_limit_holds_ends_with_137_and_says_so`). Any other size: what Linux's
+  memory cgroup does at a charge it cannot make: the reclaim (`wick_uffd::reclaim_at_touch`), the allocation once
+  more if the reclaim gave something back, then the end with 137 and a line naming the size asked and what the
+  reclaim gave back (`test_a_heap_allocation_refused_at_the_limit_ends_with_137_and_a_line`,
+  `test_a_heap_allocation_refused_at_the_limit_is_made_after_the_reclaim`). Both limits are read by a system call
+  into a buffer on the stack (`GlobalMemoryStatusEx`, `QueryInformationJobObject`). No reclaim runs where it would take what
   the thread holds: a lock of wick's memory layer (`windows_stacklock::held_here`, which every such lock keeps), the
   exception handler (`windows_mm::in_the_handler`, two writes of the thread's TLS an exception) or the reclaim's own
   thread; there the process ends at once (`test_a_heap_allocation_refused_where_no_reclaim_may_run_ends_with_137`).
   wick's own `try_reserve` sites run under `wick_alloc::fallible` and answer `ENOMEM` as before
   (`test_a_guarded_fallible_site_answers_enomem_at_the_limit`). An allocation that succeeds costs the check of the
-  system call's result only. Firecracker says at its start which allocator its heap runs with, and
-  `boot-test.ps1 boot` checks the line (`test_the_heaps_allocator_is_wicks` in the VMM's own tests).
+  system call's result only. Firecracker says which allocator its heap runs with, in a debug line when it builds a
+  VM (an error line at its start if it is not wick's), and `boot-test.ps1 boot`, at `--level Debug`, checks the
+  line (`test_the_heaps_allocator_is_wicks` in the VMM's own tests).
 - **memfd = unnamed temporary file**, unlinked at once with
   `FILE_FLAG_DELETE_ON_CLOSE` and POSIX delete. Size seals (`SealShrink`,
   `SealGrow`) attach a section of that size to the fd, so the OS refuses to

@@ -142,7 +142,7 @@ static EXTENSION: OnceLock<Box<dyn Extension>> = OnceLock::new();
 /// Registers the process-wide extension. Only the first call takes effect.
 pub fn register(extension: Box<dyn Extension>) -> Result<(), ExtError> {
     #[cfg(windows)]
-    allocator::say();
+    allocator::say_at_start();
     EXTENSION
         .set(extension)
         .map_err(|_| ExtError("an extension is already registered".to_string()))
@@ -226,6 +226,8 @@ pub(crate) fn attach_boot_devices(
     cmdline: &mut Cmdline,
     event_manager: &mut EventManager,
 ) -> Result<(), ExtError> {
+    #[cfg(windows)]
+    allocator::say_at_build();
     let Some(extension) = registered() else {
         return Ok(());
     };

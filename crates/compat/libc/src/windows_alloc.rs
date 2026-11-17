@@ -14,24 +14,32 @@
 //! the process with `std::process::abort` (0xC0000409), and no reclaim is
 //! tried.
 //!
+//! What a refusal means depends on the size asked, as on Linux, where
+//! malloc's mmap is refused only for a size above the host's RAM and swap
+//! (v6.1 mm/util.c `__vm_enough_memory` :1002 to :1006, the default
+//! `OVERCOMMIT_GUESS`), the memory cgroup not asked there (mm/mmap.c
+//! `mmap_region` :2552 to :2554 asks `security_vm_enough_memory_mm` only),
+//! and is charged at a page's first touch (mm/memory.c :4117). So, with the
+//! host's commit limit (RAM and pagefile, [`host_commit_limit`]) as Linux's
+//! RAM and swap and the job's memory limit ([`job_memory_limit`]) as
+//! `memory.max`:
+//! 1. a size above the host's commit limit: null, as the system's allocator
+//!    answers: a `try_reserve` gets its error and an infallible allocation
+//!    ends with Rust's allocation error, as malloc's NULL does on Linux;
+//! 2. a size above the job's limit, not above the host's: the end with 137
+//!    and a line saying the limit cannot hold it in all, no reclaim. Linux's
+//!    malloc gives it and the cgroup kills the VMM at the touch of the page
+//!    past the limit; Windows commits it at the allocation, so a
+//!    reservation never touched, which lives on Linux, ends here;
+//! 3. any other size: the limit is reached, and the reclaim may make room
+//!    (below).
+//! Not in a job (unjailed), the host's commit limit is the limit of 1 and 3,
+//! and there is no 2. A limit that cannot be read is no limit for 1 and 2:
+//! a refusal is never turned into an allocation error by a failed read.
+//!
 //! A refused allocation, and only that, costs anything: on success the
 //! allocator is the system's call and one check of its result
-//! ([`Allocator`]). Refused:
-//! - inside a [`fallible`] call (wick's own `try_reserve` sites, which
-//!   answer `ENOMEM`), it returns null, as the system's would;
-//! - on a thread that holds a lock of wick's memory layer
-//!   (`windows_stacklock::held_here`, kept by every such lock), that runs the
-//!   process's exception handler (`windows_mm::in_the_handler`), or that is
-//!   the reclaim's own (`wick_uffd::on_the_reclaimer`), it ends the process
-//!   at once: the reclaim takes those locks and that thread, and the
-//!   handler and the reclaimer allocate nothing by design;
-//! - else the reclaim runs (`wick_uffd::reclaim_at_touch`, as a lazy page's
-//!   refused commit asks it), and the allocation is tried once more if it
-//!   gave something back;
-//! - still refused, the process ends with 137 and a line naming the size
-//!   asked, whether a reclaim ran and what it gave back
-//!   (`windows_mm::end_at_the_limit`, which allocates nothing).
-
+//! ([`Allocator`]). Refused, with a size of the third kind:
 use core::cell::Cell;
 use std::alloc::{GlobalAlloc, Layout, System};
 
@@ -133,6 +141,68 @@ pub fn installed() -> bool {
     ASKED.with(|a| a.replace(0)) == 2
 }
 
+/// The host's commit limit in bytes: `GlobalMemoryStatusEx`'s
+/// `ullTotalPageFile`, which Learn (`MEMORYSTATUSEX`) gives as "the current
+/// committed memory limit for the system or the current process, whichever
+/// is smaller"; a job memory limit (the jailer's `memory.max`) does not
+/// lower it (read 0x83fc5a000 in a job of 96 MiB at its limit, as out of a
+/// job, on Windows Server 2022 20348, the same as `GetPerformanceInfo`'s
+/// `CommitLimit` times `PageSize`). A system call into a buffer on the
+/// stack, with no lock; `test_a_heap_allocation_refused_at_the_limit_ends_with_137_and_a_line`
+/// reads it with the job's limit reached, which proves it does not fail
+/// there, not that it never allocates. `GetPerformanceInfo` is not used:
+/// at the job's limit it fails (error 1450, `ERROR_NO_SYSTEM_RESOURCES`)
+/// unless something freed heap before, as its count of the host's
+/// processes, threads and handles needs memory. `None` if it cannot be
+/// read.
+pub(crate) fn host_commit_limit() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data.
+    let mut status: MEMORYSTATUSEX = unsafe { core::mem::zeroed() };
+    status.dwLength = u32::try_from(core::mem::size_of_val(&status)).ok()?;
+    // SAFETY: a structure whose length is set.
+    if unsafe { GlobalMemoryStatusEx(&raw mut status) } == 0 {
+        return None;
+    }
+    usize::try_from(status.ullTotalPageFile).ok()
+}
+
+/// The memory limit of the job this process is in, in bytes: the least of
+/// its job memory limit (the jailer's `memory.max`) and its per-process
+/// one, those it has; `None` out of a job, with neither, or when the query
+/// fails. Only the immediate job is asked (Learn, QueryInformationJobObject:
+/// "If the job is nested, the immediate job of the calling process is
+/// used"), the jail's own in the jailer's nesting. A system call into a
+/// buffer on the stack: no lock, no heap.
+pub(crate) fn job_memory_limit() -> Option<usize> {
+    use windows_sys::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    };
+    // SAFETY: plain data.
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { core::mem::zeroed() };
+    // SAFETY: the job of this process; a buffer of the size given.
+    let ok = unsafe {
+        QueryInformationJobObject(
+            core::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            (&raw mut info).cast(),
+            u32::try_from(core::mem::size_of_val(&info)).ok()?,
+            core::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let flags = info.BasicLimitInformation.LimitFlags;
+    let job = (flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0).then_some(info.JobMemoryLimit);
+    let process = (flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0).then_some(info.ProcessMemoryLimit);
+    match (job, process) {
+        (Some(j), Some(p)) => Some(j.min(p)),
+        (j, p) => j.or(p),
+    }
+}
+
 /// Why a refused allocation on this thread ends the process with no
 /// reclaim, if it does: the reclaim takes the locks of wick's memory layer
 /// and its own thread, and the exception handler's thread may be any.
@@ -169,6 +239,24 @@ fn refused(size: usize, kind: Kind, again: impl FnOnce() -> *mut u8) -> *mut u8 
         Kind::Realloc(old) => old,
         _ => 0,
     };
+    // 1: more than the host can commit at all, as Linux's malloc is refused
+    // above RAM and swap. A commit limit at or under the job's is the
+    // process's own limit (`ullTotalPageFile` is the smaller of the two),
+    // not the host's: the size is left to 2.
+    let job = job_memory_limit();
+    if host_commit_limit().is_some_and(|total| size > total && job.is_none_or(|limit| total > limit)) {
+        return core::ptr::null_mut();
+    }
+    // 2: more than the job's limit holds in all: no reclaim can make room.
+    if let Some(limit) = job.filter(|&limit| size > limit) {
+        crate::windows_mm::end_at_the_limit(format_args!(
+            "wick: heap: {what} of {size} bytes (from {from}) is more than the memory limit of {limit} bytes (the \
+             jail's memory.max) holds in all, so no reclaim ran; Linux's malloc gives it and the cgroup OOM killer \
+             ends the VMM at the touch of the page past the limit, Windows commits it at the allocation; the VMM \
+             ends (exit {})",
+            crate::windows_mm::OOM_EXIT
+        ));
+    }
     if let Some(why) = no_reclaim_here() {
         crate::windows_mm::end_at_the_limit(format_args!(
             "wick: heap: {what} of {size} bytes (from {from}) was refused at the memory limit (the jail's \

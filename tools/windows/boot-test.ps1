@@ -2359,7 +2359,9 @@ function Stage-Boot {
     # The heap's allocator Firecracker says it runs with: wick's, which
     # reclaims and then ends the VMM with 137 at the memory limit
     # (vmm::ext::allocator; its tests are libc's test_a_heap_allocation_*).
-    Check ($said -match "wick: the heap's allocator is wick's") "the heap's allocator is wick's (Firecracker's start line)"
+    # A debug line at the VM's build, which this VM's --level Debug shows
+    # (Start-Vm).
+    Check ($said -match "wick: the heap's allocator is wick's") "the heap's allocator is wick's (Firecracker's debug line at the VM's build)"
     return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), serial input after 30 s of silence and after a full FIFO, reset exits 0; SRSO: {2}; MSRREC the MSRs the guest reached that are #GP(0), as on KVM: {3}; RAMRETRY the most runs again in a row of one guest RAM access: $ramretry; the heap's allocator: wick's" -f $dt, $host_dt, (($srso -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | '), $msrs)
 }
 
