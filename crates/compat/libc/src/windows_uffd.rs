@@ -3750,6 +3750,84 @@ mod tests {
         unsafe { CloseHandle(section) };
     }
 
+    /// MIRRORCHARGE: the mirror is a pagefile-backed shared section, which
+    /// Windows does not charge to the job's commit (the windows-sandbox probe
+    /// measured 640 MiB of shared section as a 2–6 MiB job peak on fc-win,
+    /// 2026-11-10: pagefile-backed shared sections escape the job's memory
+    /// limit), so each userfaultfd's one-page (`MIRROR_WORDS` × 8 B = 2 KiB,
+    /// rounded to a 4 KiB page) mirror needs no `memory.max` carve-out. Here N
+    /// mirrors, each with its first word written (the VMM writes the words
+    /// read-write), add far less than a private page each to the process's
+    /// private commit (`PROCESS_MEMORY_COUNTERS_EX.PrivateUsage`), which the
+    /// job's memory limit counts (`private_commit`); N private pages would be
+    /// N × 4 KiB.
+    #[test]
+    fn test_the_mirror_is_not_charged_as_private_commit() {
+        const N: usize = 256;
+        let before = private_commit();
+        let mut held = std::vec::Vec::with_capacity(N);
+        for _ in 0..N {
+            let (section, view) = new_mirror().unwrap();
+            // SAFETY: the read-write mirror view just mapped; a shared commit.
+            unsafe { (*view).store(0xabcd, Ordering::SeqCst) };
+            held.push((section, view));
+        }
+        let delta = private_commit().saturating_sub(before);
+        let as_private = N * PAGE as usize;
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "MIRRORCHARGE {N} mirrors added {delta} B of private commit ({as_private} B if each were a private page)"
+        ));
+        // Charged as private pages, the delta would be N × 4 KiB (1 MiB);
+        // shared, it is a small fraction (the Vec and the handles aside).
+        assert!(
+            delta < as_private / 4,
+            "the mirrors charged {delta} B of private commit for {N} mirrors (a private page each would be {as_private} B)"
+        );
+        for (section, view) in held {
+            // SAFETY: a mirror view and section handle this test owns.
+            unsafe {
+                unmap_mirror(view);
+                CloseHandle(section);
+            }
+        }
+    }
+
+    /// MIRRORRELEASE: a userfaultfd's mirror is given back at its release. Each
+    /// `create` wires a mirror; closing the user descriptor ends the serving
+    /// thread, which runs `destroy` — it takes the mirror away (so a later
+    /// `enter` reads it gone), drains the enter/leave count, then unmaps the
+    /// view and closes the section, and gives up the kernel end last (it clears
+    /// the fd after the `CloseHandle`, so an fd of -1 means the section was
+    /// closed). 48 made and released — three times `MAX_CTX`, so every slot is
+    /// reused — each leave the context's mirror and section pointers null
+    /// again: the section handle and the view do not leak. The drain closes the
+    /// write-after-close race the macOS side had: a waiter's record write or an
+    /// `OP_MIRROR` in flight cannot reach a section the release freed meanwhile.
+    #[test]
+    fn test_a_userfaultfds_mirror_is_given_back_at_its_release() {
+        for _ in 0..48 {
+            let (ctx, user) = create(0, false, true).unwrap();
+            assert!(!CTXS[ctx].mirror.load(Ordering::SeqCst).is_null(), "a mirror at create");
+            assert!(!CTXS[ctx].section.load(Ordering::SeqCst).is_null(), "a section at create");
+            // Close the user end through the libc (detaching its descriptor
+            // state, as a caller's `close` does): the serve thread then releases
+            // the userfaultfd and ends.
+            // SAFETY: the user descriptor this test owns.
+            assert_eq!(unsafe { crate::close(user) }, 0);
+            // `destroy` gives up the kernel end last. A bound for a failure only.
+            let t = std::time::Instant::now();
+            while CTXS[ctx].fd.load(Ordering::SeqCst) >= 0 {
+                assert!(t.elapsed() < std::time::Duration::from_secs(60), "the userfaultfd was not released");
+                std::thread::yield_now();
+            }
+            // The fd is -1, so `destroy` ran past its `CloseHandle(section)`:
+            // the section is closed and its pointer null, and the view is
+            // unmapped and its pointer null.
+            assert!(CTXS[ctx].section.load(Ordering::SeqCst).is_null(), "the section is freed at release");
+            assert!(CTXS[ctx].mirror.load(Ordering::SeqCst).is_null(), "the mirror is freed at release");
+        }
+    }
+
     /// PROBECOST: the fill path's time per page with the stack probe of its
     /// locks as the stack reclaim's step 3 will have it (`windows_stacklock::probe`,
     /// which writes nothing; in tests only until then) and with the probe
@@ -3832,6 +3910,81 @@ mod tests {
             }
         }
         PROBING.with(|p| p.set(was));
+        // SAFETY: closes the user end.
+        unsafe { ws::closesocket(sock(user)) };
+    }
+
+    /// MIRRORCOST (R1): the waiter mirror's cost on the common fault path is
+    /// below the measurement's resolution, far below the fault round-trip. It
+    /// times the fault+serve+wake round-trip per page — the kernel side stores
+    /// the waiter's tag in its mirror word before the record (`fault`) and the
+    /// wake clears it (`wake_where`): two relaxed stores and a load+CAS a fault,
+    /// no system call. The mutation control adds `GetCurrentProcessId` calls to
+    /// each serve. Note that call is user-mode on Windows (it reads the PID from
+    /// the TEB, ≈ 1 ns), not a syscall as `getpid` is on Linux, so one of them
+    /// is invisible against the ≈ tens-of-µs round-trip (the `mirror+1 getpid`
+    /// row matches `mirror`); it takes `GETPID_REPS` of them (≈ tens of µs) to
+    /// show as a clear drop, which calibrates the measurement — it resolves a
+    /// cost of tens of µs a serve. The mirror's own additions, a handful of
+    /// uncontended atomics fewer and cheaper than even one of those reads, do
+    /// not show at all, so the mirror's per-fault cost is below that
+    /// resolution: negligible. Interleaved as a shared-load control. Run with
+    /// `--release --ignored --nocapture`.
+    #[test]
+    #[ignore = "a record: run with --release --ignored --nocapture"]
+    fn test_the_mirror_cost_on_record() {
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+        const ROUND: u64 = 4 << 20;
+        const PAGES: u64 = ROUND / PAGE;
+        const ROUNDS: u64 = 5;
+        /// The control's `GetCurrentProcessId` block per serve, enough of the
+        /// user-mode reads (≈ 1 ns each) to show over the round-trip's noise
+        /// (one, and even a thousand, is lost in it).
+        const GETPID_REPS: u64 = 30000;
+        let len = 3 * ROUNDS * ROUND;
+        let (ctx, user) = create(0, false, true).unwrap();
+        let mem = map_noreserve(len as usize);
+        register(ctx, mem, len).unwrap();
+        let next = core::cell::Cell::new(mem);
+        let slice = || {
+            let at = next.get();
+            next.set(at + ROUND);
+            at
+        };
+        // `getpids` extra syscalls per serve: 0 (the mirror alone), 1 (one
+        // syscall, below the round-trip's noise), or `GETPID_REPS` (the floor).
+        let faults = |getpids: u64| {
+            let at = slice();
+            let t = std::time::Instant::now();
+            let reader = std::thread::spawn(move || {
+                for p in 0..PAGES {
+                    // SAFETY: registered memory; the read waits for the fill.
+                    assert_eq!(unsafe { core::ptr::read_volatile((at + p * PAGE) as *const u8) }, 0x6b);
+                }
+            });
+            for _ in 0..PAGES {
+                for _ in 0..getpids {
+                    // SAFETY: plain call; a syscall of the control's block.
+                    core::hint::black_box(unsafe { GetCurrentProcessId() });
+                }
+                assert_eq!(serve_one(user, ctx, 0x6b)[0], proto::EVENT_PAGEFAULT2);
+            }
+            reader.join().unwrap();
+            t.elapsed().as_secs_f64() * 1e6 / PAGES as f64
+        };
+        let (mut plain, mut one, mut floor) = (std::vec::Vec::new(), std::vec::Vec::new(), std::vec::Vec::new());
+        for _ in 0..ROUNDS {
+            plain.push(faults(0));
+            one.push(faults(1));
+            floor.push(faults(GETPID_REPS));
+        }
+        for (name, v) in [("mirror", &mut plain), ("mirror+1 getpid", &mut one), ("mirror+30000 getpid", &mut floor)] {
+            v.sort_by(f64::total_cmp);
+            std::println!(
+                "MIRRORCOST {name}: {:.2} us a page least, {:.2} median, of {ROUNDS} rounds of {PAGES} pages",
+                v[0], v[2]
+            );
+        }
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }

@@ -602,6 +602,59 @@ has the per-control details and results.
     before and each mapping gone; `test_a_readers_mirror_goes_with_it`). The release's wait for the threads using
     the userfaultfd also closes a race of its own: before, a waiter's write of its record could reach a kernel end
     the release had closed meanwhile, or a descriptor that had taken its number (found by reading).
+- **Windows: a userfaultfd page fault event whose waiter was woken before it was read was still read** (from
+  b0dfb35b, the Windows userfaultfd's start; found by reading, not observed in a VM; fixed in the commit that added
+  this entry). The same defect, and the same Linux semantics, as the macOS one above: a wake takes each waiting fault
+  off the queue, read or not (v6.12 fs/userfaultfd.c `userfaultfd_wake_function` :141), where here the event was a
+  record left in the userfaultfd's socket, so a fault on a page unregistered before its record was read was served
+  with a `UFFDIO_COPY`, `ENOENT`, which Firecracker's handler panics on. Now each Windows userfaultfd has a waiter
+  mirror, the twin of the macOS one, and the `userfaultfd` crate returns a page fault only while its waiter waits
+  (`test_an_unread_fault_unregistered_is_not_read`, `test_an_unread_fault_filled_with_a_wake_is_not_read`,
+  `test_an_unread_fault_woken_is_read_once_as_its_new_fault`, `test_a_blocking_read_waits_past_a_woken_waiters_record`;
+  the first three and the last failed before the change; `test_an_unread_fault_filled_without_a_wake_is_still_read`
+  passes on both; `test_waits_reads_the_mirror_word` checks the slot read and the `EBADMSG` past the table). What the
+  Windows mirror is, as a channel, differing from the macOS twin only in the OS primitives:
+  - It is an **unnamed** pagefile-backed section of one page (256 words, one per waiter slot, `MIRROR_WORDS`), which
+    the VMM maps read-write and each reader maps read-only. Its direction is VMM to handler only: the VMM never reads
+    what a reader could write, and a reader cannot write it. A reader's handle comes from a **distinct**
+    reduced-access `DuplicateHandle` that asks for `FILE_MAP_READ` (`SECTION_MAP_READ`) alone, never
+    `DUPLICATE_SAME_ACCESS` (`dup_mirror_read_only`, not the crate's default handle send), and the section's DACL
+    grants Everyone (`WD`) only `SECTION_QUERY | SECTION_MAP_READ` and no write, so a reader's handle cannot be
+    re-duplicated up to `SECTION_MAP_WRITE` — the access check reads the DACL with the caller's token and finds no
+    write ACE — and its read-only view cannot be made writable (`ERROR_ACCESS_DENIED`)
+    (`test_a_mirror_handle_a_reader_gets_maps_read_only`, `test_a_read_only_mirror_view_cannot_be_made_writable`,
+    `test_a_mirror_handle_a_reader_gets_cannot_be_re_duplicated_to_writable`). The section has no name at any point, so
+    no `OpenFileMappingW` can reach it; a reader reaches it only through the handle the VMM duplicates
+    (`test_the_mirror_section_has_no_name`). The DACL grants Everyone, not the creator's SID, because a reader's token
+    is not known when the section is made (a jailed reader is in another token); it is never narrowed to the creator,
+    and it grants read, never write.
+  - The transport is a push, not a pull: the VMM, which is privileged and unjailed, opens the reader with
+    `PROCESS_DUP_HANDLE` and duplicates the read-only handle into it, the `OP_MIRROR` reply carrying the handle value
+    (`serve_mirror`), where the macOS twin passes a descriptor over the socket (`SCM_RIGHTS`). This is the one
+    direction a jail allows: a jailed process cannot `OpenProcess(PROCESS_DUP_HANDLE)` its unjailed peer, but the
+    privileged side can open and push into the jailed child (the windows-sandbox probe measured both on fc-win,
+    2026-11-10). The reader checks the handle's section is the table's size before it maps (`EPROTO` otherwise,
+    `map_mirror_handle`) and fails the read if the mirror cannot be set up, never reading without the check
+    (`test_a_kernel_side_without_the_mirror_fails_the_read`: a serving thread that predates the mirror answers
+    `OP_MIRROR` with `-EINVAL`). A reader that predates the mirror fails on the first page fault, whose event type is
+    now `EVENT_PAGEFAULT2` (`test_a_page_fault_record_is_no_type_a_reader_before_the_mirror_decodes`); the two backends'
+    `proto` constants are kept in step by a cross-import test (`test_the_mirror_proto_matches_the_macos_twin`).
+  - The section is not charged to the jail's `memory.max`: a pagefile-backed shared section is not charged to the
+    job's commit (the windows-sandbox probe measured 640 MiB of shared section as a 2–6 MiB job peak, fc-win,
+    2026-11-10), so the one page a userfaultfd needs no carve-out — 256 mirrors added well under a page of private
+    commit each (144 bytes a mirror in a 256-mirror run, the incidental per-context bookkeeping, not the shared
+    section, which is the number that varies run to run; a private page each would be 4 KiB, 1 MiB over the 256),
+    not a page (`test_the_mirror_is_not_charged_as_private_commit`). The mirror's cost on the fault path
+    is below the measurement's resolution: a fault round-trip is about 28 µs a page with the mirror and the same with
+    a single extra user-mode PID read, against 77 µs with 30000 of them a serve (the control that shows the
+    measurement resolves a per-serve cost), so the mirror's handful of uncontended atomics do not show
+    (`test_the_mirror_cost_on_record`, MIRRORCOST).
+  - One mirror a userfaultfd (at most 16, `MAX_CTX`), given back at its release on both sides: the VMM unmaps the
+    view and closes the section once no thread uses it (an enter/leave count the release drains before it frees,
+    `destroy`), and a reader unmaps its view when it is dropped. The drain closes the same write-after-close race the
+    macOS side had: a waiter's write of its record, or an `OP_MIRROR` in flight, cannot reach a section the release
+    freed meanwhile. The Windows sandbox blocks child-process creation and does not name objects (it is not Seatbelt),
+    so the unnamed section needs no path rule.
 - **macOS: a memfd and a waiter mirror had a name anyone could guess while they were made** (the memfd from
   9fc77c46, the compatibility memfd's start; the mirror from bdf94c63; under "Not at parity yet" in a554ef2c; fixed in
   the commit that moved it here). On Linux a memfd has no name: its file is made unlinked (v6.12 mm/memfd.c :393,
