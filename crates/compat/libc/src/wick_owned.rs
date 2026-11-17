@@ -109,7 +109,7 @@ fn chunks(base: u64, len: u64) -> impl Iterator<Item = (u64, u64)> {
 pub unsafe fn allocate(addr: *mut c_void, len: usize, prot: c_int) -> *mut c_void {
     let base = addr as u64;
     let len = len as u64;
-    debug_assert!(base % CHUNK == 0, "owned guest memory must be chunk-aligned: {base:#x}");
+    debug_assert!(base.is_multiple_of(CHUNK), "owned guest memory must be chunk-aligned: {base:#x}");
     debug_assert!(len > 0, "owned guest memory must be non-empty");
     // The range must be freshly reserved: not already an owned range (so the
     // carve preserves nothing, and no earlier guest's chunks are overwritten).
@@ -181,6 +181,21 @@ pub(crate) fn is_owned(start: u64, len: u64) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .any(|o| o.base <= start && end <= o.base + o.len)
+}
+
+/// Forgets every owned range that lies within `[start, start + len)`, called
+/// when that memory is unmapped ([`crate::linux_items`]'s `munmap`): the
+/// unmap frees the chunks' objects, so the registry must drop their entries
+/// too. Without this the entry outlives the mapping, and when the kernel gives
+/// the same address to the next guest region [`is_owned`] matches a range that
+/// is no longer owned (routing its discard down the owned path) and
+/// [`allocate`]'s overlap check trips. Returns whether it forgot any.
+pub(crate) fn forget(start: u64, len: u64) -> bool {
+    let end = start.saturating_add(len);
+    let mut owned = OWNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let before = owned.len();
+    owned.retain(|o| !(start <= o.base && o.base + o.len <= end));
+    owned.len() != before
 }
 
 /// The host page size.
@@ -275,4 +290,68 @@ pub unsafe fn discard(start: u64, len: u64, prot: c_int) -> c_int {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reserves `len + CHUNK` bytes and returns a `CHUNK`-aligned base in them.
+    fn reserve(len: u64) -> u64 {
+        // SAFETY: a fresh anonymous reservation.
+        let raw = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                (len + CHUNK) as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "reserve");
+        (raw as u64).next_multiple_of(CHUNK)
+    }
+
+    /// An owned range is forgotten when it is unmapped, so the kernel can give
+    /// its address to the next guest region without the registry taking the new
+    /// one for the old (the macOS CI regression: a dropped region's entry
+    /// outlived it, and the upstream `vstate::memory` tests, which reuse the
+    /// address, tripped `allocate`'s overlap check).
+    #[test]
+    fn an_owned_range_is_forgotten_on_munmap_so_its_address_reuses_cleanly() {
+        let len = 2 * CHUNK;
+        let base = reserve(len);
+        // SAFETY: the reserved, chunk-aligned range.
+        let p = unsafe { allocate(base as *mut c_void, len as usize, VM_PROT_RW) };
+        assert_eq!(p as u64, base, "allocate returns its range");
+        assert!(is_owned(base, len), "registered after allocate");
+
+        // Unmap it as the guest region's `Drop` does: the entry is forgotten.
+        // SAFETY: the owned range just made.
+        assert_eq!(unsafe { crate::munmap(base as *mut c_void, len as usize) }, 0, "munmap");
+        assert!(!is_owned(base, len), "forgotten on munmap");
+
+        // The kernel reuses the address for the next region; a second owned
+        // range there must allocate cleanly (before the fix a stale entry made
+        // it overlap). Reserve the same address again, then allocate.
+        // SAFETY: the address is free; a fixed reservation of it.
+        let raw2 = unsafe {
+            libc::mmap(
+                base as *mut c_void,
+                len as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(raw2 as u64, base, "the freed address is reusable");
+        // SAFETY: the freshly reserved range at the reused address.
+        let p2 = unsafe { allocate(base as *mut c_void, len as usize, VM_PROT_RW) };
+        assert_eq!(p2 as u64, base, "the reused address allocates cleanly (no stale overlap)");
+        assert!(is_owned(base, len));
+        // SAFETY: the second owned range; cleans up.
+        unsafe { crate::munmap(base as *mut c_void, len as usize) };
+    }
 }

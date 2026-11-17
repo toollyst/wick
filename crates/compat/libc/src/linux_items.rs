@@ -518,6 +518,10 @@ pub unsafe fn munmap(addr: *mut c_void, len: size_t) -> c_int {
     let rc = crate::wick_uffd::unmapping(start, len as u64, false, unmap, |rc| *rc == 0);
     if rc == 0 {
         crate::wick_uffd::note_mapping(start, len as u64, false);
+        // Owned guest memory in this range is gone with the mapping; drop its
+        // registry entry so a later guest region at the same address is not
+        // taken for the old one (`wick_owned::forget`).
+        crate::wick_owned::forget(start, len as u64);
         tell_guest(start, len as u64, true);
     }
     rc
