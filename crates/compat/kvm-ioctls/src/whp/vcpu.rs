@@ -9349,7 +9349,8 @@ mod fpu_tests {
     /// of `ROUNDS` rounds: mode 1 and the dirty log cleared, two passes;
     /// mode 2 (reads only), two passes; the chunk's even pages discarded
     /// (dead: committed and charged, as a balloon's scattered pages are);
-    /// the hold made again, to the limit; one of the dead pages filled
+    /// the hold made again, to the limit and its page-table slack
+    /// (below); one of the dead pages filled
     /// again, which takes nothing new (its commit and charge are still
     /// there) and asks no reclaim; a fresh page filled (in chunk 0, from GPA
     /// 1 MiB, one a round, never committed), which the limit refuses, so
@@ -9404,8 +9405,8 @@ mod fpu_tests {
     #[ignore = "run by test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages in a job of its own"]
     fn moved_under_a_vcpu_child() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-            VirtualQuery,
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualQuery,
         };
         const MAILBOX: u64 = 0x7000;
         const CHUNK: u64 = 2 << 20;
@@ -9563,10 +9564,36 @@ mod fpu_tests {
             std::hint::black_box(&a);
         }
         commit_stack();
+        // The hold's page-table slack: a 2 MiB region reserved with its
+        // first page committed before the limit, so its page table is there.
+        // The ballast's blocks are each a fresh allocation that needs a page
+        // table of its own, so the ballast's 4 KiB tail can leave one page
+        // of room a single-page commit may still use where a page table
+        // already is (as a fill's page in chunk 0 is, chunk 0's table there
+        // from the mailbox): a fresh page's fill then commits without a
+        // reclaim, and the chunk is not moved, though the job counts that
+        // page (its committed figure, QueryInformationJobObject class 28,
+        // rises by the page) and stays at its limit, so the limit still
+        // holds and the round only missed the reclaim path. Measured in a
+        // libc reproduction of this round without a vCPU (fc-win, Windows
+        // Server 2022 20348): 4 of 64 rounds filled the fresh page with 0
+        // reclaims, each raising the job's committed figure by the one page
+        // to the limit; with the slack taken, 0 of 62. Taking it a page at a
+        // time in `hold(true)`, after the ballast, leaves no room even for a
+        // page-table-free commit, so every at-limit round reclaims (the
+        // enforcement this test checks).
+        // SAFETY: new address space of our own.
+        let slack = unsafe { VirtualAlloc(std::ptr::null(), CHUNK as usize, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert!(slack != 0);
+        // SAFETY: the first page of the region just reserved; its page table
+        // is committed with it.
+        assert!(!unsafe { VirtualAlloc(slack as *const core::ffi::c_void, PAGE as usize, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        let mut slack_taken = 0usize;
         // The hold: commit made until the job refuses it, then pages down
         // to 4 KiB, never touched (its list allocated here, before the
-        // limit). Made again in each round; 1 MiB of it, its last blocks,
-        // given back after the round's move.
+        // limit), then the page-table slack above a page at a time. Made
+        // again in each round; the slack and 1 MiB of the ballast's last
+        // blocks given back after the round's move.
         let mut ballast: Vec<(usize, usize)> = Vec::with_capacity(100_000);
         let mut held = 0usize;
         let mut hold = |to_the_limit: bool| {
@@ -9582,8 +9609,24 @@ mod fpu_tests {
                     }
                 }
                 assert!(ballast.len() < ballast.capacity(), "the hold's list is full");
-                held = held.max(ballast.iter().map(|b| b.1).sum());
+                // The page-table slack: pages of the region above, committed
+                // where its table already is, until the job refuses one too.
+                while (slack_taken + 2) * PAGE as usize <= CHUNK as usize {
+                    let p = (slack + (slack_taken + 1) * PAGE as usize) as *const core::ffi::c_void;
+                    // SAFETY: a page of our slack region, never accessed.
+                    if unsafe { VirtualAlloc(p, PAGE as usize, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+                        break;
+                    }
+                    slack_taken += 1;
+                }
+                held = held.max(ballast.iter().map(|b| b.1).sum::<usize>() + slack_taken * PAGE as usize);
             } else {
+                if slack_taken > 0 {
+                    // SAFETY: the slack pages taken above; decommitted,
+                    // keeping the reservation and its table.
+                    unsafe { VirtualFree((slack + PAGE as usize) as *mut core::ffi::c_void, slack_taken * PAGE as usize, MEM_DECOMMIT) };
+                    slack_taken = 0;
+                }
                 let mut freed = 0;
                 while freed < 1 << 20 {
                     let (b, size) = ballast.pop().expect("no hold left to give back");
@@ -9603,6 +9646,9 @@ mod fpu_tests {
             // SAFETY: our ballast.
             unsafe { VirtualFree(b as *mut core::ffi::c_void, 0, MEM_RELEASE) };
         }
+        // SAFETY: the slack region reserved above (its last take given back
+        // in the last round's `hold(false)`).
+        unsafe { VirtualFree(slack as *mut core::ffi::c_void, 0, MEM_RELEASE) };
         mailbox(0).store(3, Ordering::SeqCst);
         let end = runner.join().unwrap();
         runrec();
