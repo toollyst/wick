@@ -20,7 +20,7 @@ use common::*;
 use wick_fs_sys as sys;
 use wick_fsd::fuse::{Errno, Opcode};
 use wick_fsd::host::unix::{GUEST_XATTR_PREFIX, Options, RECORD_XATTR};
-use wick_fsd::limits::Limits;
+use wick_fsd::limits::{Limits, descriptors};
 use wick_fsd::session::Config;
 use wick_fsd::stage0::{self, Share};
 
@@ -196,12 +196,19 @@ fn test_open_flags_never_reach_the_host() {
     h.release(f, fh);
 }
 
+/// A share with limits small enough for any host's descriptor limit, so
+/// that what a case checks never depends on the runner's (that the default
+/// limits fit every stock host is `limits::tests`).
 fn share(dir: &Path, read_only: bool) -> Share {
     Share {
         dir: dir.to_path_buf(),
         read_only,
         case_insensitive_ok: true,
-        limits: Limits::default(),
+        limits: Limits {
+            max_nodes: 256,
+            max_handles: 64,
+            ..Limits::default()
+        },
     }
 }
 
@@ -227,27 +234,60 @@ fn test_stage0_refusals() {
     std::os::unix::fs::symlink(home.join("src"), base.join("link")).unwrap();
     stage0::open(&share(&base.join("link"), false), Some(&home)).unwrap();
     stage0::open(&share(&home.join("src"), false), Some(&home)).unwrap();
-    // More descriptors than the hard limit allows.
+    // One descriptor more than this host's limit allows (macOS: the lower
+    // of the hard RLIMIT_NOFILE and kern.maxfilesperproc), whatever it is.
     let (_, hard) = sys::nofile().unwrap();
-    if let Ok(nodes) = usize::try_from(hard) {
+    let small = share(&home.join("src"), false).limits;
+    let spare = descriptors(&small) - 256;
+    if let Some(nodes) = hard.checked_sub(spare).and_then(|n| n.checked_add(1)).and_then(|n| usize::try_from(n).ok()) {
         let big = Share {
             limits: Limits {
                 max_nodes: nodes,
-                ..Limits::default()
+                ..small
             },
             ..share(&home.join("src"), false)
         };
+        assert_eq!(descriptors(&big.limits), hard + 1);
         let e = stage0::open(&big, Some(&home)).unwrap_err();
-        assert!(e.0.contains("RLIMIT_NOFILE"), "{}", e.0);
+        assert!(e.0.contains("RLIMIT_NOFILE") && e.0.contains(&format!("({hard})")), "{}", e.0);
+        // And exactly the limit is served.
+        let fits = Share {
+            limits: Limits {
+                max_nodes: nodes - 1,
+                ..small
+            },
+            ..big
+        };
+        stage0::open(&fits, Some(&home)).unwrap();
     }
     remove(&base);
 }
 
+/// What an exchange of `A` ("a") and `B` ("b") in `dir` did, given its
+/// reply `e`: done (each name has the other's bytes) or EINVAL with both
+/// unchanged; anything else fails, and so does a reply the files belie.
+fn exchange_outcome(dir: &Path, e: i32) -> &'static str {
+    let read = |n: &str| std::fs::read(dir.join(n)).map_err(|e| e.kind());
+    let now = (read("A"), read("B"));
+    let (a, b) = (Ok(b"a".to_vec()), Ok(b"b".to_vec()));
+    if e == 0 {
+        assert_eq!(now, (b, a), "the exchange returned 0: A and B must have swapped");
+        "exchanged"
+    } else {
+        assert_eq!(errno(e), Errno::EINVAL, "an exchange is done or EINVAL");
+        assert_eq!(now, (a, b), "an exchange refused with EINVAL changed the files");
+        "EINVAL, both unchanged"
+    }
+}
+
 /// The case refusal and the volume root, on macOS disk images (no root
 /// needed); the file system without native extended attributes (msdos:
-/// macOS would keep them in `._` files) is served read-only only, and
-/// renames there have no exchange (EINVAL, as Linux's on such a file
-/// system).
+/// macOS would keep them in `._` files) is served read-only only, and an
+/// exchange there is EINVAL with nothing changed, as Linux's on a file
+/// system without it: the volume reports no `VOL_CAP_INT_RENAME_SWAP`, so
+/// the backend never asks it (`sys::rename_swap`; macOS 26.7.2's msdos
+/// returned 0 to `RENAME_SWAP`, CI run 44188936001, and what it did there
+/// is printed below).
 #[cfg(target_os = "macos")]
 #[test]
 fn test_stage0_and_renames_on_other_volumes() {
@@ -286,10 +326,26 @@ fn test_stage0_and_renames_on_other_volumes() {
     // The backend itself, read-write, to see its renames.
     std::fs::write(dir.join("A"), b"a").unwrap();
     std::fs::write(dir.join("B"), b"b").unwrap();
+    let held = std::fs::File::open(&dir).unwrap();
+    let swap = sys::rename_swap(std::os::fd::AsFd::as_fd(&held)).unwrap();
+    // The host's own answer, for the record (the backend does not depend
+    // on it): renameatx_np(RENAME_SWAP) of two other files.
+    std::fs::write(dir.join("C"), b"c").unwrap();
+    std::fs::write(dir.join("D"), b"d").unwrap();
+    let host = sys::rename(std::os::fd::AsFd::as_fd(&held), b"C", std::os::fd::AsFd::as_fd(&held), b"D", false, true);
+    let after = |n: &str| std::fs::read(dir.join(n)).map(|v| String::from_utf8_lossy(&v).into_owned()).ok();
+    eprintln!(
+        "msdos on this macOS: VOL_CAP_INT_RENAME_SWAP {swap}; renameatx_np(RENAME_SWAP) {host:?}, then C {:?} D {:?}",
+        after("C"),
+        after("D")
+    );
     let mut s = session_over(&dir, Options { case_insensitive_ok: true }, Config::default()).unwrap();
     let (e, _) = call(&mut s, Opcode::Rename2, ROOT, &[&rn2(ROOT, 2), &name(b"A"), &name(b"B")]);
-    assert_eq!(errno(e), Errno::EINVAL, "no RENAME_SWAP on msdos");
-    assert_eq!(std::fs::read(dir.join("A")).unwrap(), b"a");
+    let outcome = exchange_outcome(&dir, e);
+    eprintln!("exchange on msdos: {outcome}");
+    if !swap {
+        assert_eq!(outcome, "EINVAL, both unchanged", "a volume without the capability is never asked");
+    }
 }
 
 /// Linux: a file system without user extended attributes is served
@@ -325,7 +381,6 @@ fn test_stage0_and_renames_on_other_volumes() {
     let (e, _) = call(&mut s, Opcode::Lookup, ROOT, &[&name(b"A")]);
     assert_eq!(e, 0);
     let (e, _) = call(&mut s, Opcode::Rename2, ROOT, &[&rn2(ROOT, 2), &name(b"A"), &name(b"B")]);
-    eprintln!("exchange on {}: {:?}", dir.display(), if e == 0 { None } else { Some(errno(e)) });
-    assert!(e == 0 || errno(e) == Errno::EINVAL, "an exchange is done or EINVAL");
+    eprintln!("exchange on {}: {}", dir.display(), exchange_outcome(&dir, e));
     remove(&dir);
 }

@@ -106,7 +106,11 @@ fn test_swap_race() {
                 }
                 h.raw(Opcode::Forget as u32, inner, &[&le64(1)], 0);
             }
-            let _ = h.call(Opcode::Mkdir, node, &[&le32(0o755), &le32(0), &name(b"sub")]);
+            // The new directory's node forgotten, as a guest kernel does
+            // (the node limit is the default's, 8192).
+            if let (0, e) = h.call(Opcode::Mkdir, node, &[&le32(0o755), &le32(0), &name(b"sub")]) {
+                h.raw(Opcode::Forget as u32, u64_at(&e, 0), &[&le64(1)], 0);
+            }
             let _ = h.call(Opcode::Rmdir, node, &[&name(b"sub")]);
         } else {
             links += 1;
@@ -143,4 +147,5 @@ fn test_swap_race() {
         h.s.counters().layer_refusals
     );
     assert!(dirs > 0 && links > 0, "the swap was seen both ways");
+    assert_eq!(h.s.nodes(), 1, "every node the rounds took was forgotten");
 }

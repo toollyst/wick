@@ -361,8 +361,22 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
   - Entries hold a directory handle (dirs), or on Linux and macOS a leaf: the names it is known by, each
     re-verified against the identity at use (§4.3).
 - **Limits, identical on every host:**
-  - inode entries;
-  - open host handles (self-limited: Windows has no per-process handle limit [meas: `jailer-test.ps1 nofile`]);
+  - inode entries: 8192 by default (`DEFAULT_MAX_NODES`);
+  - open host handles: 1024 by default (`DEFAULT_MAX_HANDLES`; self-limited: Windows has no per-process handle limit
+    [meas: `jailer-test.ps1 nofile`]);
+  - the descriptors these let the server hold at once, `limits::descriptors`: one per node, one per handle, and 64 spare
+    (`SPARE_FDS`: the standard streams, the connection, and what one request opens and closes before its reply), 9280 by
+    default. Stage 0 refuses a share whose host limit is below it, so the server itself never meets EMFILE mid-run, and
+    never lowers a limit the operator set. The defaults fit the lowest stock limit with 960 to spare
+    (`test_default_limits_fit_stock_hosts`): macOS enforces the lower of `RLIMIT_NOFILE` and `kern.maxfilesperproc` (xnu
+    `proc_limitgetcur_nofile`) [src], which is `OPEN_MAX`, 10240, on a Mac with 8 GB or less (`bsd_scale_setup` scales
+    it only for a scale above 2; `scale_setup` gives 2 below 8 GB and memory / 4 GB above) [src]; 122880 on a 32 GB M1
+    Pro, where a soft limit of 200000 still stopped at 122880 descriptors [meas: `os.open` until EMFILE after
+    `setrlimit`, macOS 27.2, 2026-11-18]; GitHub's ubuntu-latest (Ubuntu 26.04) and ubuntu-24.04-arm runners have a hard
+    limit of 65536 (CI run 44188936001, which refused the earlier defaults, 65536 nodes and 4096 handles, 69696
+    descriptors); a systemd service, and a login shell started by one, 524288 (`DefaultLimitNOFILE=1024:524288`,
+    systemd-system.conf(5)) [doc]. Windows has no such limit. The cost is the guest's: a guest that keeps more than 8192
+    objects looked up gets ENFILE (§10, question 11);
   - worker threads; queued requests;
   - name ≤ 255 bytes;
   - xattr value ≤ 64 KiB, list ≤ 64 KiB; a guest xattr name ≤ 120 bytes, ERANGE beyond (macOS keeps names of at
@@ -437,8 +451,16 @@ backend implements: Linux, macOS, Windows, and `MemDir`, an in-memory directory 
     in place of the source for overlayfs, and the server never makes device nodes on a host (they are emulated in
     the record, §4.2).
   - Both of `NOREPLACE` and `EXCHANGE`, or an unknown bit, is EINVAL, as Linux.
-  - A file system without the flag (macOS msdos: ENOTSUP from `renameatx_np`; Linux exfat and others: EINVAL from
-    `renameat2`) gives EINVAL on every host, Linux's answer (`test_stage0_and_renames_on_other_volumes`).
+  - A file system without the flag gives EINVAL on every host, Linux's answer, with nothing changed
+    (`test_stage0_and_renames_on_other_volumes`, which checks the files: 0 must be a real exchange). Linux: a file
+    system without it refuses it (`renameat2`, EINVAL); vfat has it (exchanged on Linux 7.0.14). macOS: xnu hands
+    `RENAME_SWAP` to the file system (`vn_rename`) [src], and one without it may not refuse it: msdos on macOS 26.7.2
+    returned 0 (CI run 44188936001), where macOS 27.2's msdos and exfat (FSKit modules; Apple's msdos module's
+    `renameItem` takes no swap option [src]) and HFS+ give ENOTSUP [meas: `getattrlist(ATTR_VOL_CAPABILITIES)` and
+    `renameatx_np` on `hdiutil` images, macOS 27.2, 2026-11-18]. So the backend asks the volume once, at start
+    (`sys::rename_swap`: `VOL_CAP_INT_RENAME_SWAP`, reported by APFS, not by HFS+, msdos or exfat, same probe), and
+    never passes the flag to a volume that does not report it. `RENAME_EXCL` needs no such check: xnu refuses an
+    existing target itself (`renameat_internal`) [src], on msdos and exfat too (EEXIST, same probe).
 
 **The Linux and macOS backend** (`crates/fs/fsd/src/host/unix.rs`; every system call in `crates/fs/sys`, the
 server's only unsafe code, `wick-fsd` itself forbids it):
@@ -451,8 +473,12 @@ server's only unsafe code, `wick-fsd` itself forbids it):
   - once the guest has opened it, the descriptor of its widest open (read-write over write over read), kept
     until the node is forgotten, as virtiofsd's `O_PATH` descriptor keeps the inode (`test_forget_frees_an_unlinked_file`).
     It is the open's own descriptor, shared with the handle, so a node holds one descriptor at most (a
-    directory's, or a leaf's) and a handle one: within stage 0's `RLIMIT_NOFILE` of nodes plus handles plus 64. A
-    leaf only looked up holds none.
+    directory's, or a leaf's) and a handle one: within stage 0's limit of nodes plus handles plus 64 (§4.2,
+    Limits). A leaf only looked up holds none. A directory has one descriptor per identity, held by its node
+    alone: a leaf's names refer to their directories without keeping them open, and a name whose directory the
+    guest forgot is dropped (a guest kernel keeps a parent's node while a child's entry lives, so an honest
+    guest loses no name it uses), so a guest that links a file into directories and forgets them holds no more
+    descriptors (`test_one_descriptor_per_node_and_handle`, which counts them after each step).
 
   Each use finds the object by the first known name that still is it (`fstatat`, then the identity checked with
   `fstat` on anything opened): a host's swap is ENOENT, never another object. When no known name is it:
@@ -550,7 +576,8 @@ a refusal that names the problem, none with a switch (`test_stage0_refusals`,
    ENOTSUP; macOS, the volume's `VOL_CAP_INT_EXTENDED_ATTR`, as on msdos and exfat macOS keeps attributes in `._`
    AppleDouble files beside each file, which host tools and listings would see (measured: macOS 27.2 msdos image,
    `fsetxattr` succeeded and made `._f`). Without, a share is served read-only, with no records;
-6. `RLIMIT_NOFILE` raised to the nodes and handles the limits allow plus 64, or refused if the hard limit is lower;
+6. `RLIMIT_NOFILE` raised to the descriptors the limits let the server hold (`limits::descriptors`, §4.2) and read
+   back, or refused if the hard limit is lower (macOS: or `kern.maxfilesperproc`, which xnu enforces when lower);
 7. beneath-resolution present, and names not folded by case unless the operator allowed it.
 
 ### 4.4 Cache modes
@@ -802,11 +829,11 @@ it means layer 1 let the request through.
 | Containment of dirs the host moves out | Landlock (dynamic) [inf] | Seatbelt (dynamic) [inf] | **no** (static ACLs): documented |
 | Case-sensitive share without admin | yes | case-sensitive APFS volume/image | **no** for existing dirs (admin + empty dir) |
 | Native symlinks without privilege | yes | yes | **no** (privilege or Developer Mode): emulated everywhere |
-| Atomic `RENAME_EXCHANGE` | `renameat2` | `renameatx_np(RENAME_SWAP)` | **no**: NTFS has no exchange (`FILE_RENAME_INFORMATION`'s flags, §4.3); EINVAL |
+| Atomic `RENAME_EXCHANGE` | `renameat2` (EINVAL where the file system has none) | `renameatx_np(RENAME_SWAP)` on a volume that reports `VOL_CAP_INT_RENAME_SWAP` (APFS); EINVAL on others (HFS+, msdos, exfat; §4.3) | **no**: NTFS has no exchange (`FILE_RENAME_INFORMATION`'s flags, §4.3); EINVAL |
 | `RENAME_WHITEOUT` | **no** on every host: the server makes no device nodes; EINVAL | | |
 | Serving without beneath-resolution | **no**: `openat2` required (5.6+, not denied by seccomp) | **no**: `O_RESOLVE_BENEATH` required | — |
 | A read-write share on a file system without extended attributes | **no** (vfat, exfat): read-only only | **no** (msdos, exfat: AppleDouble `._` files): read-only only | — |
-| Per-process handle limit | `RLIMIT_NOFILE` | `RLIMIT_NOFILE` | **none** [meas: `jailer-test.ps1 nofile`]: self-limit everywhere |
+| Per-process handle limit | `RLIMIT_NOFILE` | `RLIMIT_NOFILE`, enforced as at most `kern.maxfilesperproc` (10240 on a Mac with 8 GB or less) | **none** [meas: `jailer-test.ps1 nofile`]: self-limit everywhere |
 | A file the guest holds, renamed or replaced by the host (a known difference) | served again only if its new name is in a directory the server holds (§4.3), else ENOENT, never another object. virtiofsd keeps serving it through its `O_PATH` descriptor wherever it went. wick reaches an object with a name only through a held directory, so an object the host moved out of the share is out of the guest's reach, and opened and never-opened nodes behave alike | the same as Linux: no `O_PATH` | the planned backend reopens by file id and so would keep serving it, as virtiofsd; to be decided with the port |
 | A new OPEN of an unlinked file the guest holds (the guest's `/proc/<pid>/fd/<n>`) | only for an access the descriptor of the guest's widest open covers, else ENOENT (virtiofsd reopens through `/proc`) | the same as Linux | — |
 | Host change notifications to the guest | **no** on any host (Linux driver) | no | no |
@@ -844,6 +871,15 @@ it means layer 1 let the request through.
    stage 0 step 2 (`refused_root`).
 10. **Cache `auto` timeout:** 1 s, provisional (§4.4). Open: how soon a host-side edit must show in the guest,
     measured against the metadata requests a shorter timeout costs.
+11. **Nodes against descriptors:** each node holds a descriptor (a directory's own; a leaf's once opened), so the node
+    limit is bound by the smallest stock descriptor limit, 8192 nodes (§4.2, Limits). A Linux guest keeps a node while
+    its dentry is cached and forgets only under memory pressure, and Linux's virtio-fs driver has no notification queue
+    to ask it to drop entries (`fs/fuse/virtio_fs.c`: hiprio and request queues only) [src], so a guest that walks more
+    than 8192 objects (a large checkout, `npm install`) gets ENFILE where virtiofsd, which holds an `O_PATH` descriptor
+    per inode under a limit raised to `fs.nr_open`, would not. Recommendation: decouple the two, nodes bounded by memory
+    (a node is a few hundred bytes) and descriptors by a cache of held directories closed least recently used first and
+    reopened by name beneath a held parent as leaves are now, so the descriptor bound stays fixed and the node limit can
+    be 2^20; its own commit, with the leaf tests and the race over it.
 
 ---
 

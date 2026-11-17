@@ -14,8 +14,10 @@
 //! 4. not a volume's root (a mount point), and on a local file system;
 //! 5. read-write: the file system stores extended attributes itself (the
 //!    metadata record lives in one); a read-only share is served without;
-//! 6. `RLIMIT_NOFILE` raised to what the limits need (held directories and
-//!    open handles), or refused if the hard limit is below it;
+//! 6. `RLIMIT_NOFILE` raised to the most descriptors the limits let the
+//!    server hold ([`descriptors`]), read back, or refused if the hard limit
+//!    is below it (macOS: or `kern.maxfilesperproc`, which xnu enforces when
+//!    it is lower);
 //! 7. [`HostDir::new`]: beneath-resolution present, and names not folded by
 //!    case unless the operator allowed it.
 
@@ -25,7 +27,13 @@ use std::path::{Component, Path, PathBuf};
 use wick_fs_sys as sys;
 
 use crate::host::unix::{HostDir, Options, RECORD_XATTR, Refusal};
-use crate::limits::Limits;
+use crate::limits::{Limits, SPARE_FDS, descriptors};
+
+/// What bounds the server's descriptors, as a refusal names it.
+#[cfg(target_os = "linux")]
+const LIMIT: &str = "hard RLIMIT_NOFILE";
+#[cfg(target_os = "macos")]
+const LIMIT: &str = "descriptor limit (the lower of the hard RLIMIT_NOFILE and kern.maxfilesperproc)";
 
 /// One share as the operator gives it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,10 +47,6 @@ pub struct Share {
     /// The share's limits.
     pub limits: Limits,
 }
-
-/// Descriptors the server needs besides held directories and handles (the
-/// socket, the standard streams, a listing's reopen).
-const SPARE_FDS: u64 = 64;
 
 /// Directories a share may never be, nor be beneath: the system's own and
 /// where credentials and start-up files live. Host tools read what a guest
@@ -201,19 +205,23 @@ pub fn open(share: &Share, home: Option<&Path>) -> Result<HostDir, Refusal> {
             )));
         }
     }
-    let need = u64::try_from(share.limits.max_nodes)
-        .unwrap_or(u64::MAX)
-        .saturating_add(u64::try_from(share.limits.max_handles).unwrap_or(u64::MAX))
-        .saturating_add(SPARE_FDS);
+    let need = descriptors(&share.limits);
     let (soft, hard) = sys::nofile().map_err(|e| Refusal(format!("RLIMIT_NOFILE: {e:?}")))?;
     if soft < need {
         if hard < need {
             return Err(Refusal(format!(
-                "RLIMIT_NOFILE's hard limit ({hard}) is below the {need} descriptors this share's limits need \
+                "the {LIMIT} ({hard}) is below the {need} descriptors this share's limits may hold open \
                  (nodes + handles + {SPARE_FDS}); raise it, or lower the limits"
             )));
         }
         sys::set_nofile(need).map_err(|e| Refusal(format!("RLIMIT_NOFILE to {need}: {e:?}")))?;
+        // What the kernel enforces now, read back, never assumed.
+        let (now, _) = sys::nofile().map_err(|e| Refusal(format!("RLIMIT_NOFILE: {e:?}")))?;
+        if now < need {
+            return Err(Refusal(format!(
+                "the {LIMIT} is {now} after raising it to {need}, below what this share's limits may hold open"
+            )));
+        }
     }
     HostDir::new(
         root,

@@ -5,7 +5,8 @@
 //! §6.2): [`ConfinedDir`] over a held directory descriptor, one checked
 //! component at a time, through `wick_fs_sys`.
 //!
-//! - **Nodes.** A directory is held open (`O_RDONLY | O_DIRECTORY`). Any
+//! - **Nodes.** A directory is held open (`O_RDONLY | O_DIRECTORY`), one
+//!   descriptor per identity, by its node only. Any
 //!   other object is one [`Leaf`] per identity: the names it is known by
 //!   beneath held directories (most recent first, kept as the guest looks up,
 //!   creates, links, renames and unlinks), and, once the guest has opened
@@ -153,9 +154,11 @@ pub struct Leaf {
 
 #[derive(Debug, Default)]
 struct LeafState {
-    /// (directory, name), the most recently used first, at most
-    /// [`NAMES_MAX`].
-    names: Vec<(Arc<DirFd>, Box<[u8]>)>,
+    /// (directory, its identity, name), the most recently used first, at
+    /// most [`NAMES_MAX`]. The directory is held by its own node, never by a
+    /// leaf's name: a name whose directory the guest forgot is dropped, so a
+    /// node holds one descriptor at most ([`crate::limits::descriptors`]).
+    names: Vec<(Weak<DirFd>, HostId, Box<[u8]>)>,
     /// The widest descriptor the guest has had of it, kept until the node
     /// is forgotten (as virtiofsd's `O_PATH` descriptor keeps the inode).
     held: Option<(Arc<File>, OpenMode)>,
@@ -169,17 +172,27 @@ impl Leaf {
     /// Puts `(dir, name)` first.
     fn add_name(&self, dir: &Arc<DirFd>, name: &[u8]) {
         let mut st = lock(&self.state);
-        st.names.retain(|(d, n)| !(d.id == dir.id && **n == *name));
-        st.names.insert(0, (dir.clone(), name.into()));
+        st.names.retain(|(d, id, n)| d.strong_count() > 0 && !(*id == dir.id && **n == *name));
+        st.names.insert(0, (Arc::downgrade(dir), dir.id, name.into()));
         st.names.truncate(NAMES_MAX);
     }
 
     fn remove_name(&self, dir: HostId, name: &[u8]) {
-        lock(&self.state).names.retain(|(d, n)| !(d.id == dir && **n == *name));
+        lock(&self.state).names.retain(|(_, id, n)| !(*id == dir && **n == *name));
     }
 
+    /// The names whose directory is still held, the others dropped.
     fn names(&self) -> Vec<(Arc<DirFd>, Box<[u8]>)> {
-        lock(&self.state).names.clone()
+        let mut st = lock(&self.state);
+        let mut live = Vec::with_capacity(st.names.len());
+        st.names.retain(|(d, _, n)| match d.upgrade() {
+            Some(d) => {
+                live.push((d, n.clone()));
+                true
+            }
+            None => false,
+        });
+        live
     }
 
     fn held(&self) -> Option<(Arc<File>, OpenMode)> {
@@ -282,6 +295,9 @@ pub struct HostDir {
     leaves: Mutex<Registry<Leaf>>,
     /// Each directory the server holds, for the search of a leaf's name.
     dirs: Mutex<Registry<DirFd>>,
+    /// The volume takes an exchange ([`sys::rename_swap`]); else EINVAL,
+    /// without asking it.
+    swap: bool,
 }
 
 /// Whether names beneath `fd` are folded. macOS: always checked, as APFS
@@ -334,6 +350,8 @@ impl HostDir {
             id: id_of(&st),
             folds,
         });
+        let swap = sys::rename_swap(root.fd.as_fd())
+            .map_err(|e| Refusal(format!("cannot read the share's volume capabilities: {e:?}")))?;
         let mut dirs = Registry::new();
         dirs.insert(root.id, &root);
         Ok(HostDir {
@@ -341,6 +359,7 @@ impl HostDir {
             dev: st.dev,
             leaves: Mutex::new(Registry::new()),
             dirs: Mutex::new(dirs),
+            swap,
         })
     }
 
@@ -393,8 +412,13 @@ impl HostDir {
         Ok(st)
     }
 
-    /// Opens the directory `name` beneath `parent`, which must be `want`.
+    /// The directory `name` beneath `parent`, which must be `want`: the
+    /// descriptor already held for that identity (one per directory, so a
+    /// node holds one at most), else opened.
     fn hold_dir(&self, parent: &DirFd, name: &[u8], want: &sys::Stat) -> Result<Arc<DirFd>, DirError> {
+        if let Some(d) = lock(&self.dirs).get(id_of(want)) {
+            return Ok(d);
+        }
         let fd = sys::open_dir(parent.fd.as_fd(), name).map_err(open_err)?;
         let st = sys::fstat(fd.as_fd()).map_err(err)?;
         if (st.dev, st.ino) != (want.dev, want.ino) {
@@ -753,6 +777,13 @@ impl ConfinedDir for HostDir {
             Err(e) if e.0 == sys::errno::ENOENT => None,
             Err(e) => return Err(err(e)),
         };
+        // A volume that does not report an exchange is never asked for one
+        // (macOS: one may answer 0 without it, `sys::rename_swap`); a
+        // missing target is ENOENT first, as Linux finds both names before
+        // the file system sees the flag.
+        if flags.exchange && !self.swap {
+            return Err(if target.is_none() { enoent() } else { DirError::Errno(Errno::EINVAL) });
+        }
         let r = sys::rename(
             fd.fd.as_fd(),
             from.1.as_bytes(),

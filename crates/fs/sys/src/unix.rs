@@ -942,41 +942,46 @@ pub fn stored_name(dir: BorrowedFd<'_>, name: &[u8]) -> Result<Vec<u8>> {
     Ok(stored.to_vec())
 }
 
+/// macOS: the volume's interface capabilities (`fgetattrlist`,
+/// `ATTR_VOL_CAPABILITIES`): those it has, of those it reports on.
+#[cfg(target_os = "macos")]
+fn interfaces(fd: BorrowedFd<'_>) -> Result<(u32, u32)> {
+    let mut list = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // u32 length, then vol_capabilities_attr_t: capabilities[4], valid[4].
+    let mut buf = [0u8; 4 + 32];
+    // SAFETY: a valid descriptor, attribute list and buffer of the length
+    // passed.
+    check(unsafe {
+        libc::fgetattrlist(
+            fd.as_raw_fd(),
+            (&mut list as *mut libc::attrlist).cast::<c_void>(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+        )
+    })?;
+    let word = |i: usize| u32::from_ne_bytes([buf[4 + i * 4], buf[5 + i * 4], buf[6 + i * 4], buf[7 + i * 4]]);
+    Ok((word(libc::VOL_CAPABILITIES_INTERFACES), word(4 + libc::VOL_CAPABILITIES_INTERFACES)))
+}
+
 /// Whether the file system of `fd` stores extended attributes itself.
-/// macOS: the volume's `VOL_CAP_INT_EXTENDED_ATTR` (`fgetattrlist`,
-/// `ATTR_VOL_CAPABILITIES`), as on a volume without it (msdos, exfat) the
-/// kernel emulates them in `._` AppleDouble files next to each file, which
-/// host tools and the share's listings would see. Linux: an attribute read
-/// on `fd` is not ENOTSUP/EOPNOTSUPP.
+/// macOS: the volume's `VOL_CAP_INT_EXTENDED_ATTR`, as on a volume without
+/// it (msdos, exfat) the kernel emulates them in `._` AppleDouble files next
+/// to each file, which host tools and the share's listings would see. Linux:
+/// an attribute read on `fd` is not ENOTSUP/EOPNOTSUPP.
 pub fn xattr_native(fd: BorrowedFd<'_>, probe_name: &[u8]) -> Result<bool> {
     #[cfg(target_os = "macos")]
     {
         let _ = probe_name;
-        let mut list = libc::attrlist {
-            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
-            reserved: 0,
-            commonattr: 0,
-            volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES,
-            dirattr: 0,
-            fileattr: 0,
-            forkattr: 0,
-        };
-        // u32 length, then vol_capabilities_attr_t: capabilities[4], valid[4].
-        let mut buf = [0u8; 4 + 32];
-        // SAFETY: a valid descriptor, attribute list and buffer of the
-        // length passed.
-        check(unsafe {
-            libc::fgetattrlist(
-                fd.as_raw_fd(),
-                (&mut list as *mut libc::attrlist).cast::<c_void>(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                0,
-            )
-        })?;
-        let word = |i: usize| u32::from_ne_bytes([buf[4 + i * 4], buf[5 + i * 4], buf[6 + i * 4], buf[7 + i * 4]]);
-        let caps = word(libc::VOL_CAPABILITIES_INTERFACES);
-        let valid = word(4 + libc::VOL_CAPABILITIES_INTERFACES);
+        let (caps, valid) = interfaces(fd)?;
         let bit = libc::VOL_CAP_INT_EXTENDED_ATTR;
         Ok(valid & bit != 0 && caps & bit != 0)
     }
@@ -987,6 +992,29 @@ pub fn xattr_native(fd: BorrowedFd<'_>, probe_name: &[u8]) -> Result<bool> {
             Err(e) if e.0 == libc::ENOTSUP || e.0 == libc::EOPNOTSUPP => Ok(false),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Whether [`rename`]'s `exchange` may be asked of the file system of `fd`.
+/// macOS: the volume reports `VOL_CAP_INT_RENAME_SWAP` and has it. xnu hands
+/// `RENAME_SWAP` to the file system (`vn_rename`), which answers for it: a
+/// volume without it may refuse it (msdos and exfat on macOS 27.2, served by
+/// FSKit modules whose `renameItem` takes no swap: ENOTSUP) or, as msdos on
+/// macOS 26.7.2 did (CI run 44188936001), return 0, so the flag is never
+/// passed to a volume that does not report it. `RENAME_EXCL` needs no such
+/// check: xnu's `renameat_internal` refuses an existing target itself.
+/// Linux: true, the file system refuses a flag it lacks (EINVAL).
+pub fn rename_swap(fd: BorrowedFd<'_>) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let (caps, valid) = interfaces(fd)?;
+        let bit = libc::VOL_CAP_INT_RENAME_SWAP;
+        Ok(valid & bit != 0 && caps & bit != 0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = fd;
+        Ok(true)
     }
 }
 
@@ -1219,7 +1247,12 @@ impl Drop for DirReader {
     }
 }
 
-/// The soft and hard `RLIMIT_NOFILE`.
+/// The descriptors this process may have open: the soft and hard
+/// `RLIMIT_NOFILE` as the kernel enforces them. macOS: each at most
+/// `kern.maxfilesperproc`, as xnu enforces the lower of the two
+/// (`proc_limitgetcur_nofile`) and keeps a larger `RLIMIT_NOFILE` without
+/// complaint (measured: a soft limit of 200000 stops at 122880 descriptors
+/// where `kern.maxfilesperproc` is 122880).
 pub fn nofile() -> Result<(u64, u64)> {
     let mut r = libc::rlimit {
         rlim_cur: 0,
@@ -1228,18 +1261,50 @@ pub fn nofile() -> Result<(u64, u64)> {
     // SAFETY: a valid output buffer.
     check(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) })?;
     #[allow(clippy::useless_conversion)]
-    Ok((u64::from(r.rlim_cur), u64::from(r.rlim_max)))
+    let (soft, hard) = (u64::from(r.rlim_cur), u64::from(r.rlim_max));
+    #[cfg(target_os = "macos")]
+    {
+        let per_proc = maxfilesperproc()?;
+        Ok((soft.min(per_proc), hard.min(per_proc)))
+    }
+    #[cfg(target_os = "linux")]
+    Ok((soft, hard))
 }
 
-/// Sets the soft `RLIMIT_NOFILE` to `soft` (at most the hard limit).
+/// macOS: `kern.maxfilesperproc`.
+#[cfg(target_os = "macos")]
+pub fn maxfilesperproc() -> Result<u64> {
+    let mut v: c_int = 0;
+    let mut len = std::mem::size_of::<c_int>();
+    // SAFETY: a NUL-terminated name and an output buffer of the length
+    // passed.
+    check(unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&mut v as *mut c_int).cast::<c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    })?;
+    u64::try_from(v).map_err(|_| HostErrno(libc::EINVAL))
+}
+
+/// Sets the soft `RLIMIT_NOFILE` to `soft` (at most the hard limit). The
+/// caller reads [`nofile`] back: on macOS the kernel keeps a value above
+/// `kern.maxfilesperproc` and enforces the lower one.
 pub fn set_nofile(soft: u64) -> Result<()> {
-    let (_, hard) = nofile()?;
-    let soft = soft.min(hard);
-    #[allow(clippy::useless_conversion)]
-    let r = libc::rlimit {
-        rlim_cur: soft.try_into().map_err(|_| HostErrno(libc::EINVAL))?,
-        rlim_max: hard.try_into().map_err(|_| HostErrno(libc::EINVAL))?,
+    let mut r = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
     };
+    // SAFETY: a valid output buffer.
+    check(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) })?;
+    #[allow(clippy::useless_conversion)]
+    {
+        let soft = soft.min(u64::from(r.rlim_max));
+        r.rlim_cur = soft.try_into().map_err(|_| HostErrno(libc::EINVAL))?;
+    }
     // SAFETY: a valid input buffer.
     check(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) }).map(drop)
 }

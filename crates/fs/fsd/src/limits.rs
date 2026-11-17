@@ -10,11 +10,41 @@
 //! handle before the backend opens (EMFILE), bytes before they are written
 //! (ENOSPC). The queue of requests is the serving loop's (a later commit).
 
-/// Nodes the guest may hold at once, the root included.
-pub const DEFAULT_MAX_NODES: usize = 1 << 16;
+/// Nodes the guest may hold at once, the root included. With
+/// [`DEFAULT_MAX_HANDLES`] and [`SPARE_FDS`], 9280 descriptors at most
+/// ([`descriptors`]): under [`LOWEST_STOCK_NOFILE`] with 960 to spare, so a
+/// default share starts on every stock host (docs/design-fs.md §4.2,
+/// Limits).
+pub const DEFAULT_MAX_NODES: usize = 8192;
 
 /// Handles the guest may hold open at once.
-pub const DEFAULT_MAX_HANDLES: usize = 4096;
+pub const DEFAULT_MAX_HANDLES: usize = 1024;
+
+/// Descriptors the server may have open besides one per node and one per
+/// handle: the standard streams, the connection, and those a request opens
+/// and closes before its reply (a directory reopened to list or search it,
+/// a descriptor for metadata, a directory opened by a lookup before its
+/// node is added).
+pub const SPARE_FDS: u64 = 64;
+
+/// The lowest per-process descriptor limit of the stock hosts the server
+/// runs on: macOS on a Mac with 8 GB of memory or less, whose
+/// `kern.maxfilesperproc` is `OPEN_MAX` (xnu `bsd_scale_setup` scales it
+/// only above 8 GB; GitHub's macos-latest runner has 7 GB). Linux's stock
+/// hard limits are higher: 65536 on GitHub's ubuntu runners, 524288 for a
+/// systemd service or a login shell (`DefaultLimitNOFILE=1024:524288`).
+pub const LOWEST_STOCK_NOFILE: u64 = 10240;
+
+/// The most descriptors a share with `limits` can hold open at once: one
+/// per node (a directory's own; a leaf's widest open, once opened), one per
+/// handle, and [`SPARE_FDS`]. Stage 0 refuses a share whose host limit is
+/// below it, so the server never meets EMFILE itself.
+pub fn descriptors(limits: &Limits) -> u64 {
+    u64::try_from(limits.max_nodes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(limits.max_handles).unwrap_or(u64::MAX))
+        .saturating_add(SPARE_FDS)
+}
 
 /// Bytes the guest's writes may add to the share in one run of the server
 /// (docs/design-fs.md decision 7). Provisional, until the jailer's
@@ -95,4 +125,30 @@ pub struct Counters {
     pub forgets_unmatched: u64,
     /// Requests whose reply did not fit the guest's buffers.
     pub replies_too_long: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A default share starts on every stock host: its most descriptors fit
+    /// the lowest stock limit (a Mac's `kern.maxfilesperproc` of 10240) and
+    /// so GitHub's ubuntu runners' hard limit of 65536 (CI run 44188936001
+    /// refused the old defaults' 69696 there).
+    #[test]
+    fn test_default_limits_fit_stock_hosts() {
+        let need = descriptors(&Limits::default());
+        assert_eq!(need, 9280);
+        assert!(need <= LOWEST_STOCK_NOFILE, "{need} > {LOWEST_STOCK_NOFILE}");
+        assert!(need <= 65536, "{need} > 65536");
+    }
+
+    #[test]
+    fn test_descriptors_saturate() {
+        let l = Limits {
+            max_nodes: usize::MAX,
+            ..Limits::default()
+        };
+        assert_eq!(descriptors(&l), u64::MAX);
+    }
 }
