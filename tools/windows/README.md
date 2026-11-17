@@ -37,7 +37,7 @@
   next count, temporary-file sections are allowed), `daemonize`, `handles` (a handle the jailer inherited is not
   open in the jail), `pidns` (no process, thread or console of anyone else;
   needs a console: run with other stages, the script runs it alone in a
-  console of its own, `<WorkDir>-pidns`, as CI's step does), `handoff` (a handle and a socket held by a jailed process
+  console of its own, `<WorkDir>-pidns`, as CI's step does), `handoff` (a handle to a file of the jail and a socket held by a jailed process
   are pulled out by the operator and by a medium-integrity process of the
   user), `netns` (two jails with a network each, and a jail and a probe
   given the first's: each endpoint in its jail's own directory of the
@@ -50,11 +50,18 @@
   `isolation` (`jail-probe.rs`, run through the jailer as the jailed binary,
   may not read the user's files or SAM, write files outside its jail, reach another
   jail's files, API socket or process, or open the operator's; the operator
-  reaches the API socket), `boot` (a 2 vCPU guest in the jail), `bindlink`
+  reaches the API socket), `boot` (a 2 vCPU guest in the jail), `shared`
+  (a file hard-linked into three jails at once, a guest's read-write drive
+  and two jailed probes: one `0x12019f` entry of its own per jail and no
+  inherited jail entry while they run; the guest writes and reads it after
+  the others start; the probes are allowed to write it and refused
+  `WRITE_DAC`, `WRITE_OWNER` and `DELETE` through the operator's name;
+  after them no jail SID is left, and the inherited entries and label it
+  keeps are recorded), `bindlink`
   (upstream's `test_jailer_bind_mount_propagation` through bind links: a
   guest boots from a kernel and root drive bound into the jail's root before
-  the jailer starts, and the backing files' security descriptors are the same
-  before, during and after; elevated, Windows 11 24H2 or later, else it fails
+  the jailer starts; each backing file holds one entry of the jail's SID
+  while the jail runs and is otherwise unchanged, and is as before after it; elevated, Windows 11 24H2 or later, else it fails
   saying so; it has failed at that check, no `System32\bindlink.dll`, on
   each host it ran on, though Microsoft gives the Bindlink API as available
   from build 25314: Windows 11 build 26300 (a PC, elevated and not) and

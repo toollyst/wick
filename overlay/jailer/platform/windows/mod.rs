@@ -444,7 +444,6 @@ pub fn join_netns(path: &str) -> Result<(), JailerError> {
 
 /// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE` (winnt.h; in
 /// windows-sys under `SystemServices`, a feature the jailer does not take).
-#[cfg(test)]
 const ACCESS_ALLOWED_ACE_TYPE: u32 = 0;
 #[cfg(test)]
 const ACCESS_DENIED_ACE_TYPE: u32 = 1;
@@ -1152,12 +1151,18 @@ pub(crate) fn enter_jail(path: &Path) -> Result<(), JailerError> {
     let user = user_sid().map_err(|e| fail("the user's SID", e))?;
     let shared = {
         // Setting the directory's DACL rewrites the inherited entries of
-        // what is in it, files other jails hold included: under ACL_LOCK.
+        // what is in it, files other jails hold included: under ACL_LOCK,
+        // with the jail's own entry on those files narrowed before the lock
+        // is let go and before any process of the jail exists
+        // ([`share_with_jail`]). A file it could not narrow stops the start.
         let _one_at_a_time = SessionLock::take(ACL_LOCK);
         set_security(&root, &jail_dacl(&user), false)
             .map_err(|e| fail("grant the jail's SID", e))?;
         set_security(&root, JAIL_LABEL, true).map_err(|e| fail("set the jail's integrity label", e))?;
-        share_with_jail(&root)
+        share_with_jail(&root).map_err(|e| {
+            unshare_locked(Some(&root), &[]);
+            fail("give the jail its entry on the files it shares", e)
+        })?
     };
     let drive = std::fs::create_dir_all(root.join(JAIL_TMP))
         .map_err(|e| JailerError::from(fail("create tmp", e)))
@@ -1295,23 +1300,72 @@ impl SessionLock {
     }
 }
 
-/// The regular files under `dir` that have other names as well (hard links),
-/// which may be in other jails: what inheritance from `dir` grants them it
-/// grants to their other names too, and a jail that propagates its own
-/// directory's DACL to its name of the file replaces the inherited entries
-/// (a file holds one set of them). Reparse points are not followed.
-fn linked_files(dir: &Path) -> Vec<PathBuf> {
-    use std::os::windows::fs::OpenOptionsExt;
+/// The regular files under `dir` that are also files elsewhere, which the
+/// jail's directory does not hold alone, and which the jail's SID needs an
+/// entry of its own on ([`share_with_jail`]):
+/// - those that have other names as well (hard links), which may be in other
+///   jails: what inheritance from `dir` grants them it grants to their other
+///   names too, and a jail that propagates its own directory's DACL to its
+///   name of the file replaces the inherited entries (a file holds one set of
+///   them);
+/// - those whose name opens a file outside `dir` ([`opens_outside`]): a bind
+///   link (`CreateBindLink`, the counterpart of upstream's bind mount into
+///   the chroot), whose backing file's own security is what Windows checks,
+///   which the jail's directory does not give the jail's SID. These are
+///   returned by the backing file's name (`GetFinalPathNameByHandleW`).
+///
+/// Reparse points (symbolic links, junctions) are not followed: they are
+/// not the jail's to open (a chroot cannot name what is outside it).
+///
+/// What it could not look at (a directory it could not list, a file it
+/// could not open or ask) comes back beside the files, by name: a file it
+/// cannot tell is shared is not one to start a jail with
+/// ([`share_with_jail`]). A reparse point that does not open (an `AF_UNIX`
+/// socket's name) is passed over, as before.
+fn linked_files(dir: &Path) -> (Vec<PathBuf>, Vec<io::Error>) {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES, GetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        GetFileInformationByHandle,
     };
     let mut out = Vec::new();
+    let mut failed = Vec::new();
+    let named = |what: &str, path: &Path, e: io::Error| io::Error::new(e.kind(), format!("{what} {}: {e}", path.display()));
+    // Where `dir` is, as Windows names the files opened beneath it.
+    let base = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .and_then(|d| final_path(d.as_raw_handle()).ok_or_else(io::Error::last_os_error));
+    let base = match base {
+        Ok(base) => base,
+        Err(e) => return (out, vec![named("name", dir, e)]),
+    };
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else { continue };
-        for e in entries.flatten() {
-            let Ok(t) = e.file_type() else { continue };
+        let entries = match std::fs::read_dir(&d) {
+            Ok(entries) => entries,
+            Err(e) => {
+                failed.push(named("list", &d, e));
+                continue;
+            }
+        };
+        for e in entries {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => {
+                    failed.push(named("list", &d, err));
+                    continue;
+                }
+            };
+            let t = match e.file_type() {
+                Ok(t) => t,
+                Err(err) => {
+                    failed.push(named("look at", &e.path(), err));
+                    continue;
+                }
+            };
             if t.is_symlink() {
                 continue;
             }
@@ -1319,37 +1373,114 @@ fn linked_files(dir: &Path) -> Vec<PathBuf> {
                 stack.push(e.path());
                 continue;
             }
-            let Ok(f) = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).open(e.path()) else {
-                continue;
+            let f = match std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).open(e.path()) {
+                Ok(f) => f,
+                // A reparse point other than a link that does not open (an
+                // AF_UNIX socket's name, a stale one of a jail that was
+                // killed) is not a file to share, as before.
+                Err(_) if e.metadata().is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0) => continue,
+                Err(err) => {
+                    failed.push(named("open", &e.path(), err));
+                    continue;
+                }
             };
             // SAFETY: zeroed is a valid value of the plain structure.
             let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
             // SAFETY: an open handle and a structure to fill.
-            if unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) } != 0 && info.nNumberOfLinks > 1 {
+            if unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) } == 0 {
+                failed.push(named("ask", &e.path(), io::Error::last_os_error()));
+                continue;
+            }
+            let Some(at) = final_path(f.as_raw_handle()) else {
+                failed.push(named("name", &e.path(), io::Error::last_os_error()));
+                continue;
+            };
+            // A bound file is named by its backing file's own name, so that
+            // its entry comes off again ([`unshare`]) even when the link has
+            // gone first.
+            if opens_outside(&base, &at) {
+                out.push(PathBuf::from(at));
+            } else if info.nNumberOfLinks > 1 {
                 out.push(e.path());
             }
         }
     }
-    out
+    (out, failed)
 }
 
-/// Gives `sid` an entry of its own (not inherited) for full access to
-/// `path` (`grant`), or takes the ones it has away, keeping the rest of the
-/// DACL as it is: written through a handle, not by name, which would have
-/// Windows recompute the inherited entries from the directory of the name
-/// given (one jail's, for a file several jails hold).
+/// The name Windows gives the file `handle` is open on
+/// (`GetFinalPathNameByHandleW`, normalized, with its drive letter), or none.
+fn final_path(handle: HANDLE) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut buf = vec![0u16; 1024];
+    loop {
+        let len = u32::try_from(buf.len()).unwrap();
+        // SAFETY: an open handle; a buffer of `len` UTF-16 units.
+        // FILE_NAME_NORMALIZED | VOLUME_NAME_DOS (0).
+        let n = unsafe { GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), len, 0) } as usize;
+        if n == 0 {
+            return None;
+        }
+        if n < buf.len() {
+            return Some(String::from_utf16_lossy(&buf[..n]));
+        }
+        // Too small: `n` is the size it needs, with the NUL.
+        buf.resize(n + 1, 0);
+    }
+}
+
+/// Whether a file of the jail's directory, which Windows names `at` once
+/// open, is a file outside the directory Windows names `base`: `at` must be
+/// `base` (ASCII case aside: both names come from the same volume's
+/// normalized names) and more components.
+fn opens_outside(base: &str, at: &str) -> bool {
+    let base = base.trim_end_matches('\\');
+    let inside = at.len() > base.len()
+        && at.is_char_boundary(base.len())
+        && at.as_bytes()[base.len()] == b'\\'
+        && at[..base.len()].eq_ignore_ascii_case(base);
+    !inside
+}
+
+/// The jail's entry on a file it shares ([`share_with_jail`]): read and
+/// write the data, attributes and extended attributes, read the security
+/// descriptor, wait on the handle (`FILE_GENERIC_READ | FILE_GENERIC_WRITE`,
+/// 0x12019f), which is what Firecracker opens a kernel, a drive, a pmem
+/// backing file or a memory file for (Rust's `OpenOptions` read and write:
+/// `GENERIC_READ | GENERIC_WRITE`, which a file maps to these). Not
+/// `WRITE_DAC`, `WRITE_OWNER`, `DELETE` or `FILE_EXECUTE`: the entry was
+/// full access (`FA`) before, under which a jail's restricted token passed
+/// both of `AccessCheck`'s passes for `WRITE_DAC` on a file its user holds
+/// an entry on (the jail's directory gives the user full access) and could
+/// have rewritten the DACL of a file other jails and the operator hold
+/// (by the documented check; not exercised).
+const SHARED_FILE_ACCESS: u32 = windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
+    | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+
+/// Gives `sid` an entry of its own (not inherited) for
+/// [`SHARED_FILE_ACCESS`] to `path` (`grant`), or takes the ones it has
+/// away; either way the entries `sid` inherits on `path` go too, and the
+/// rest of the DACL stays as it is. Written through a handle, not by name,
+/// which would have Windows recompute the inherited entries from the
+/// directory of the name given (one jail's, for a file several jails hold).
+///
+/// The inherited entries: a jail's directory gives its SID full access,
+/// inherited, and setting that DACL by name ([`enter_jail`]) passes it down
+/// to every file in the directory, a hard-linked one too, whose one set of
+/// inherited entries all its names share. Left there, that inherited full
+/// access would make the narrower entry of its own pointless.
 fn explicit_access(path: &Path, sid: &str, grant: bool) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Security::Authorization::{
-        EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS,
+        EXPLICIT_ACCESS_W, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SET_ACCESS,
         SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
         InitializeSecurityDescriptor, NO_INHERITANCE, SECURITY_DESCRIPTOR, SetKernelObjectSecurity,
         SetSecurityDescriptorDacl,
     };
-    use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, READ_CONTROL, WRITE_DAC};
+    use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
     let file = std::fs::OpenOptions::new().access_mode(READ_CONTROL | WRITE_DAC).open(path)?;
     let handle = file.as_raw_handle();
     let sid = Sid::new(sid).map_err(|_| io::Error::last_os_error())?;
@@ -1372,8 +1503,10 @@ fn explicit_access(path: &Path, sid: &str, grant: bool) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(rc.cast_signed()));
     }
     let entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: FILE_ALL_ACCESS,
-        grfAccessMode: if grant { GRANT_ACCESS } else { REVOKE_ACCESS },
+        grfAccessPermissions: SHARED_FILE_ACCESS,
+        // SET_ACCESS: this entry and no other of the SID's own (GRANT_ACCESS
+        // would add the rights of one already there).
+        grfAccessMode: if grant { SET_ACCESS } else { REVOKE_ACCESS },
         grfInheritance: NO_INHERITANCE,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
@@ -1384,11 +1517,13 @@ fn explicit_access(path: &Path, sid: &str, grant: bool) -> io::Result<()> {
         },
     };
     let mut new: *mut ACL = std::ptr::null_mut();
-    // SAFETY: one entry, the DACL read above (in `sd`) and an out-pointer.
-    let rc = unsafe { SetEntriesInAclW(1, &entry, old, &mut new) };
-    let result = if rc != 0 {
-        Err(io::Error::from_raw_os_error(rc.cast_signed()))
-    } else {
+    // SAFETY: the DACL read above, in `sd`, which this owns.
+    let result = unsafe { drop_inherited(old, sid.0) }.and_then(|()| {
+        // SAFETY: one entry, the DACL read above (in `sd`) and an out-pointer.
+        let rc = unsafe { SetEntriesInAclW(1, &entry, old, &mut new) };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc.cast_signed()));
+        }
         // SAFETY: zeroed is a valid value of the plain structure, initialized next.
         let mut desc: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
         let p: PSECURITY_DESCRIPTOR = (&raw mut desc).cast();
@@ -1403,10 +1538,51 @@ fn explicit_access(path: &Path, sid: &str, grant: bool) -> io::Result<()> {
         // SAFETY: allocated by SetEntriesInAclW.
         unsafe { LocalFree(new.cast()) };
         result
-    };
-    // SAFETY: allocated by GetNamedSecurityInfoW.
+    });
+    // SAFETY: allocated by GetSecurityInfo.
     unsafe { LocalFree(sd) };
     result
+}
+
+/// Deletes from `acl` the allow entries `sid` inherits.
+///
+/// # Safety
+/// `acl` is null (no DACL) or a valid ACL the caller may write; `sid` a
+/// valid SID.
+unsafe fn drop_inherited(acl: *mut ACL, sid: PSID) -> io::Result<()> {
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation, DeleteAce, EqualSid, GetAce,
+        GetAclInformation, INHERITED_ACE,
+    };
+    if acl.is_null() {
+        return Ok(());
+    }
+    let mut info = ACL_SIZE_INFORMATION { AceCount: 0, AclBytesInUse: 0, AclBytesFree: 0 };
+    let size = u32::try_from(std::mem::size_of::<ACL_SIZE_INFORMATION>()).unwrap();
+    // SAFETY: a valid ACL (the caller's); a structure of the size passed.
+    if unsafe { GetAclInformation(acl, (&raw mut info).cast(), size, AclSizeInformation) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // From the last, so that a deletion moves no entry not yet looked at.
+    for i in (0..info.AceCount).rev() {
+        let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: an index below the count read above; an out-pointer.
+        if unsafe { GetAce(acl, i, &mut ace) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: GetAce gave an ACE, whose header comes first.
+        let header = unsafe { *ace.cast::<ACE_HEADER>() };
+        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE || u32::from(header.AceFlags) & INHERITED_ACE == 0 {
+            continue;
+        }
+        // SAFETY: an allow ACE has the mask and the SID after the header.
+        let at: PSID = unsafe { (&raw const (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast_mut().cast() };
+        // SAFETY: two valid SIDs; then an index of the ACL the caller may write.
+        if unsafe { EqualSid(at, sid) } != 0 && unsafe { DeleteAce(acl, i) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// What the jail directory gives the files already in it, kept for those it
@@ -1416,11 +1592,41 @@ fn explicit_access(path: &Path, sid: &str, grant: bool) -> io::Result<()> {
 /// are the same uid there). Without it, a jail started from a configuration
 /// file next to another one sharing its kernel and root file system had its
 /// Firecracker refused them (access denied, measured with six jails started
-/// at once). The entries go when Firecracker ends ([`unshare`]). Called under
-/// [`ACL_LOCK`], with the directory's own DACL set.
-fn share_with_jail(root: &Path) -> Vec<PathBuf> {
+/// at once). A file bound into the jail's root (a bind link, upstream's bind
+/// mount) is checked against its backing file's own security, outside the
+/// jail's directory: the entry goes on the backing file, by its own name,
+/// and comes off it again, as Linux's jailer, which leaves a bind-mounted
+/// file's owner alone, never needs to (`jailer-test.ps1 bindlink`). The
+/// entry is [`SHARED_FILE_ACCESS`], not full access, and the full access the
+/// jail's directory passes down to a hard-linked file goes
+/// ([`explicit_access`]); the jail's own files (copies) keep it, as Linux's
+/// jail owns its copies. The entries go when Firecracker ends ([`unshare`]).
+///
+/// Called by [`enter_jail`] under [`ACL_LOCK`], right after the directory's
+/// own DACL is set, and before any process of the jail exists: the jailer
+/// makes the jail's processes in [`exec_command`], after the chroot step
+/// (`--daemonize` and `--new-pid-ns` relaunch the jailer before it, a
+/// process of the user's, not of the jail). Between the directory's DACL and
+/// this, a hard-linked file holds this jail's inherited full access, which
+/// no process holds the SID for yet, and no other jail's inherited entry
+/// (one set of inherited entries per file); other jails' own entries stay.
+///
+/// A file it could not look at, or not give the entry to, is an error, and
+/// the start stops (`jailer-test.ps1 shared`); the caller then takes off
+/// what was given ([`unshare_locked`]). Before, a file whose entry failed was
+/// left out silently, and the jail started (its Firecracker then refused the
+/// file, or, for a hard-linked file, held its directory's inherited full
+/// access to it).
+fn share_with_jail(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mine = vm_sid();
-    linked_files(root).into_iter().filter(|f| explicit_access(f, mine, true).is_ok()).collect()
+    let (files, failed) = linked_files(root);
+    if let Some(e) = failed.into_iter().next() {
+        return Err(e);
+    }
+    for f in &files {
+        explicit_access(f, mine, true).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", f.display())))?;
+    }
+    Ok(files)
 }
 
 /// Takes the jail's own entries off the files [`share_with_jail`] gave them
@@ -1430,14 +1636,17 @@ fn share_with_jail(root: &Path) -> Vec<PathBuf> {
 /// entry for every jail that ever ran, until its ACL is full (an ACL holds
 /// 64 KiB; past it, Windows error 1340, measured).
 fn unshare(root: Option<&Path>, files: &[PathBuf]) {
+    let _one_at_a_time = SessionLock::take(ACL_LOCK);
+    unshare_locked(root, files);
+}
+
+/// [`unshare`], under [`ACL_LOCK`] already: as much as it can, a file it
+/// cannot change left as it is.
+fn unshare_locked(root: Option<&Path>, files: &[PathBuf]) {
     let mut all = files.to_vec();
     if let Some(root) = root {
-        all.extend(linked_files(root).into_iter().filter(|f| !files.contains(f)));
+        all.extend(linked_files(root).0.into_iter().filter(|f| !files.contains(f)));
     }
-    if all.is_empty() {
-        return;
-    }
-    let _one_at_a_time = SessionLock::take(ACL_LOCK);
     for f in &all {
         let _ = explicit_access(f, vm_sid(), false);
     }
@@ -3043,9 +3252,28 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    // A file of the jail's directory is outside it when Windows names it
+    // beneath another directory once open (a bind link's backing file),
+    // whatever the case of the names.
+    #[test]
+    fn test_opens_outside() {
+        let base = r"\\?\C:\jails\fc\a\root";
+        assert!(!opens_outside(base, r"\\?\C:\jails\fc\a\root\vmlinux.bin"));
+        assert!(!opens_outside(base, r"\\?\c:\JAILS\fc\a\root\run\x"));
+        assert!(!opens_outside(&format!("{base}\\"), r"\\?\C:\jails\fc\a\root\vmlinux.bin"));
+        assert!(opens_outside(base, r"\\?\C:\images\vmlinux"));
+        // A sibling whose name starts as the root's is outside.
+        assert!(opens_outside(base, r"\\?\C:\jails\fc\a\root2\vmlinux.bin"));
+        // The root itself is no file beneath it.
+        assert!(opens_outside(base, base));
+        assert!(opens_outside(base, r"\\?\D:\jails\fc\a\root\vmlinux.bin"));
+    }
+
     // A file linked into two jails keeps the first jail's access when the
     // second jail's directory passes its own down: inherited entries are one
-    // set per file, an entry of the jail's own is not replaced.
+    // set per file, an entry of the jail's own is not replaced. Each jail's
+    // entry is SHARED_FILE_ACCESS, and the full access its directory passes
+    // down to the file goes.
     #[test]
     fn test_a_file_shared_by_two_jails_keeps_both() {
         let base = std::env::temp_dir().join(format!("wick-jailer-share-{}", std::process::id()));
@@ -3059,30 +3287,50 @@ mod tests {
         std::fs::write(a.join("kernel"), b"k").unwrap();
         std::fs::hard_link(a.join("kernel"), b.join("kernel")).unwrap();
         std::fs::write(a.join("own"), b"o").unwrap();
-        assert_eq!(linked_files(&a), vec![a.join("kernel")]);
+        let (linked, failed) = linked_files(&a);
+        assert_eq!(linked, vec![a.join("kernel")]);
+        assert!(failed.is_empty(), "{failed:?}");
 
-        let grants = |sid: &str| -> (bool, bool) {
+        // The SID's own entries' masks, and whether it inherits one.
+        let grants = |sid: &str| -> (Vec<u32>, bool) {
             let e = dacl_entries(&a.join("kernel")).unwrap();
-            let has = |inherited: bool| {
-                e.iter().any(|(kind, flags, _, s)| {
-                    u32::from(*kind) == ACCESS_ALLOWED_ACE_TYPE
-                        && s == sid
-                        && (u32::from(*flags) & INHERITED_ACE != 0) == inherited
-                })
+            let allowed = |inherited: bool| {
+                e.iter()
+                    .filter(|(kind, flags, _, s)| {
+                        u32::from(*kind) == ACCESS_ALLOWED_ACE_TYPE
+                            && s == sid
+                            && (u32::from(*flags) & INHERITED_ACE != 0) == inherited
+                    })
+                    .map(|(_, _, mask, _)| *mask)
+                    .collect::<Vec<_>>()
             };
-            (has(false), has(true))
+            (allowed(false), !allowed(true).is_empty())
         };
         set_security(&a, &dacl(sid_a), false).unwrap();
+        assert_eq!(grants(sid_a), (vec![], true), "the directory passes its full access down");
         explicit_access(&a.join("kernel"), sid_a, true).unwrap();
-        // The second jail passes its directory's entries down to its name.
+        assert_eq!(grants(sid_a), (vec![SHARED_FILE_ACCESS], false));
+        assert_eq!(SHARED_FILE_ACCESS, 0x12_019f);
+        // The jail's own file keeps its directory's full access.
+        let own = dacl_entries(&a.join("own")).unwrap();
+        assert!(own.iter().any(|(_, f, m, s)| s == sid_a && u32::from(*f) & INHERITED_ACE != 0 && *m == FILE_ALL_ACCESS), "{own:?}");
+        // The second jail passes its directory's entries down to its name,
+        // then takes its own inherited one off as the first did.
         set_security(&b, &dacl(sid_b), false).unwrap();
-        assert_eq!(grants(sid_a), (true, false), "the first jail's own entry is kept");
-        assert_eq!(grants(sid_b), (false, true));
-        // Taken back, the first jail's entry is gone and the second jail's
-        // inherited one stays (not recomputed from the first's directory).
+        assert_eq!(grants(sid_a), (vec![SHARED_FILE_ACCESS], false), "the first jail's own entry is kept");
+        assert_eq!(grants(sid_b), (vec![], true));
+        explicit_access(&a.join("kernel"), sid_b, true).unwrap();
+        assert_eq!(grants(sid_b), (vec![SHARED_FILE_ACCESS], false));
+        // Given again, the entry is the same one entry.
+        explicit_access(&a.join("kernel"), sid_a, true).unwrap();
+        assert_eq!(grants(sid_a), (vec![SHARED_FILE_ACCESS], false));
+        // Taken back, each jail's entry is gone, the other's stays, and no
+        // inherited entry comes back (not recomputed from either directory).
         explicit_access(&a.join("kernel"), sid_a, false).unwrap();
-        assert_eq!(grants(sid_a), (false, false));
-        assert_eq!(grants(sid_b), (false, true));
+        assert_eq!(grants(sid_a), (vec![], false));
+        assert_eq!(grants(sid_b), (vec![SHARED_FILE_ACCESS], false));
+        explicit_access(&a.join("kernel"), sid_b, false).unwrap();
+        assert_eq!(grants(sid_b), (vec![], false));
         std::fs::remove_dir_all(&base).unwrap();
     }
 

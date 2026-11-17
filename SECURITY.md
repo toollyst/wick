@@ -1240,6 +1240,21 @@ upstream Firecracker and its jailer.
 
   The measurements, per device and per kind of object, the comparison with Linux and the fix's plan:
   [docs/windows-jail-reach.md](docs/windows-jail-reach.md).
+- **Windows jailer: a file a jail shares gets read and write, nothing more.**
+  - **What changed.** A file hard-linked into a jail's root, or a bind link's backing file, is one file for all its
+    names. Each jail's SID now gets one entry of its own on it: `FILE_GENERIC_READ | FILE_GENERIC_WRITE`
+    (`0x12019f`). The full access the jail directory passes down to a hard-linked file is removed. Both happen
+    before any process of the jail exists, and a file the jailer cannot narrow stops the start.
+  - **What it was before.** The entry was full access, and the directory's inherited full access also stayed on the
+    file. By the documented check of restricted tokens, a jail could then have rewritten the DACL of a file that
+    other jails and the operator hold, taken ownership of it or deleted it. Not exercised.
+  - **What stays after a jail.** A hard-linked file keeps the last jail directory's inherited entries (the system,
+    the administrators, the user) and the jail's label, integrity level `0x1800`, on every name of it, the
+    operator's included. On Linux, an inode's owner and mode are likewise one for all its names. Copy what must keep
+    its security; hard-link only what is the jails' to share.
+  - **Test:** `jailer-test.ps1 shared` (three jails on one file; not run yet) and
+    `test_a_file_shared_by_two_jails_keeps_both`.
+  - **Details:** [docs/windows-jail-reach.md](docs/windows-jail-reach.md), "Files a jail shares".
 - **Windows jailer: a parent cgroup's name is not the jail's to take.** A `--parent-cgroup` is a named Job Object
   that later jails join by its name. In the session's object namespace a process that may make an object there
   could make a job of that name first, for later jails to join a job of its own or be refused. So the jobs are

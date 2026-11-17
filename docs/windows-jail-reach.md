@@ -198,7 +198,100 @@ I/O control: it answered 0xC0000010, 0xC000000D or 0xC0000002, or completed it.
 - WHP must still work under the new token. Under the jail's SID alone it does not (below, "WHP under the jail's
   SID alone"): either the partition is made before the revert (option P) or the VMM runs in an AppContainer with
   WHP's capability (option Q).
-- Paths the operator gives Firecracker outside its jail would need to grant the jail's SID.
+- **How the operator gives a jail a file:** inside the jail's root, copied or hard-linked there, as upstream's jailer
+  is used on Linux, and named by its path in the root (`/vmlinux.bin`). Never by a path outside the root: the
+  enforcement is the token, and under the jail's SID alone Windows refuses the open (the handoff stage's hold of a
+  file in the operator's work directory: os error 5 under that token, step-1 experiment s2e), as a chroot cannot
+  name the path (Linux gives `ENOENT` there, no error of its own). No check on path strings is added: a second,
+  weaker rule could disagree with the token (relative paths, links, device paths). A hard-linked file gets an entry
+  of the jail's SID of its own while the jail runs (`share_with_jail`; what the entry is: "Files a jail shares",
+  below). A bind link's backing file, whose
+  own security is what Windows checks, is found as a file of the root that Windows names outside it once open
+  (`GetFinalPathNameByHandleW`) and gets the same entry by its own name while Firecracker runs, taken off when it
+  ends (overlay/jailer/platform/windows/mod.rs, `linked_files`, `test_opens_outside`). `jailer-test.ps1 bindlink`
+  checks that entry and that nothing else of the backing file's security changes, during or after: written, never
+  run, as no host with `bindlink.dll` is available (Windows 11 build 26300, Windows Server 2025 build 26100).
+
+**Files a jail shares.** A file hard-linked into a jail's root is one file with one security descriptor for all its
+names: the operator's, and other jails'. So is a bind link's backing file, which is outside the jail.
+- **The entry.** Each jail's SID gets one entry of its own on such a file while the jail runs:
+  `FILE_GENERIC_READ | FILE_GENERIC_WRITE` (`0x12019f`). That covers reading and writing data, attributes and
+  extended attributes, reading the security descriptor, and waiting on the handle. Firecracker opens a kernel, a
+  drive, a pmem backing file or a memory file with Rust's read and write options (`GENERIC_READ | GENERIC_WRITE`),
+  which a file maps to exactly these rights. The entry gives no `WRITE_DAC`, `WRITE_OWNER`, `DELETE` or
+  `FILE_EXECUTE` (overlay/jailer/platform/windows/mod.rs, `SHARED_FILE_ACCESS`, `explicit_access`,
+  `test_a_file_shared_by_two_jails_keeps_both`).
+- **The inherited entry goes too.** The jailer sets the jail directory's DACL by name, and Windows then passes the
+  directory's inherited entries down to every file in it, a hard-linked one included. That includes the jail SID's
+  full access. In the same write through the file's handle, the jailer removes the inherited entries of this jail's
+  SID from each shared file, and adds the jail's own entry. A jail's own files, copies included, keep the
+  directory's full access, as a Linux jail owns its copies.
+- **What the entry was before: full access (`FA`).** The jail directory's inherited full access also stayed on the
+  file. By the documented check, a jail's restricted token then passed both of its passes for `WRITE_DAC`,
+  `WRITE_OWNER` and `DELETE` on such a file:
+  - the normal pass, through the user's entry (the jail directory gives the user full access);
+  - the restricting SIDs' pass, through the jail SID's entry
+    ([Microsoft Learn, Restricted Tokens](https://learn.microsoft.com/windows/win32/secauthz/restricted-tokens)).
+  So a jail could have rewritten the DACL of a file that other jails and the operator hold, taken ownership of it
+  for a SID of its token, or deleted it. Not exercised: no build with the old entry was run against it.
+  - The owner of an object also has `READ_CONTROL` and `WRITE_DAC` implicitly ([Microsoft Learn, Security
+    identifiers](https://learn.microsoft.com/windows-server/identity/ad-ds/manage/understand-security-identifiers),
+    the OWNER RIGHTS SID: an entry of it makes "the system ignore the implicit READ_CONTROL and WRITE_DAC standard
+    access rights for the object owner").
+  - Whether Windows also grants those implicit rights in the restricting SIDs' pass is not sourced. The jail's SID
+    never owns a shared file, so the narrowed entry does not depend on the answer.
+- **When.** Both changes happen under the jailer's ACL lock, right after the directory's DACL is set and before any
+  process of the jail exists:
+  - The jailer makes the jail's processes, Firecracker and its API process, in `exec_command`, after the chroot
+    step.
+  - `--daemonize` and `--new-pid-ns` relaunch the jailer before that step, and the relaunched jailer is a process
+    of the user's, not of the jail.
+  - So there is a window, between setting the directory's DACL and removing the inherited entry. In it, the file
+    holds this jail's inherited full access, for a SID that no process holds yet. Other jails' processes hold other
+    SIDs: their own entries stay, and their inherited ones are already gone, since a file has one set of inherited
+    entries.
+- **Failures stop the start.** A file under the root that the jailer cannot look at, or a shared file it cannot
+  change, stops the start with an error naming the file, and what was given is taken off again. Before this, such
+  a file was left out silently and the jail started: Firecracker was then refused a bound file, or held the
+  directory's inherited full access to a hard-linked one.
+- **What stays after a jail, on every name of a hard-linked file.** This is a standing property, the operator's name
+  included:
+  - The last jail directory's inherited entries stay: the system, the administrators and the user. The jails'
+    entries of their own are gone, and the file's own entries are as before.
+  - The jail's label, integrity level `0x1800` with no write, read or execute up, stays as well.
+
+  On Linux, too, a hard-linked inode has one owner and one mode for all its names, so an operator's chown to a
+  jail's uid holds for every name. What differs is the label. Mandatory Integrity Control is checked before the DACL,
+  and a process of a lower integrity level cannot write to an object of a higher one, whatever the DACL allows
+  ([Microsoft Learn, Mandatory Integrity Control](https://learn.microsoft.com/windows/win32/secauthz/mandatory-integrity-control)).
+  With the label at `0x1800`:
+  - Processes of the user from `0x1800` up to medium (other jails) are held by the DACL alone. The DACL left after
+    the jails has no jail SID, which their restricting SIDs' pass needs.
+  - Low-integrity processes (`0x1000`) stay kept from writing it. Whether the label's no-read-up also keeps them from
+    reading it, where an unlabelled (medium) file allows reading up, is not measured.
+- **For operators.** Copy what must keep its security. Hard-link only what is the jails' to share. An operator can
+  still give a jail more on a file, as Linux's `chown` gives a jail's uid the owner's rights. The integration
+  harness does that for upstream's tests (tools/windows/integration/wick_windows.py, `give_to_jail`, full access).
+  The jailer takes the entry off again when Firecracker ends.
+- **A bind link's backing file** is outside the jail, so nothing passes down to it, and its security is as before
+  after the jail (`jailer-test.ps1 bindlink`, never run). A read-write drive through a bind link probably cannot
+  work: the backing file keeps its own label (none, so it is treated as medium), and the jail's token, below medium,
+  cannot write up to it. Not measured: the bindlink stage has never run, and its drives are read-only.
+- **Test: `jailer-test.ps1 shared`, in CI's windows-guest job.** Not run yet. One file is hard-linked into three
+  jails at once:
+  - V, a jailed guest's read-write drive;
+  - A and B, two jailed probes, started while V runs.
+
+  It checks:
+  - while all three run, the file holds exactly one `0x12019f` entry per jail SID and no inherited entry of any jail
+    SID;
+  - the guest writes the file before A and B start, and writes and reads it after;
+  - from inside A and B, writing is allowed, and opening the file for `WRITE_DAC`, for `WRITE_OWNER`, and for
+    `DELETE` through the operator's name are refused. The stage's line quotes the codes. `DELETE` through the jail's
+    own name is printed and not checked: Windows grants it through the root's `FILE_DELETE_CHILD`, and it removes the
+    jail's name only;
+  - after all three end, no jail SID is left and the file's own entries and owner are as before. The stage's line
+    records the inherited entries and the label as they are then.
 
 **WHP under the jail's SID alone.** `fs-probe whp-token` in CI's windows-guest job (Windows Server 2025 build 26100;
 the runs are in docs/COMPATIBILITY.md's `--chroot-base-dir` row, the first record and the variants record; the

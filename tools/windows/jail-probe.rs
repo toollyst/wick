@@ -27,6 +27,7 @@
 //!                               link:<new name>|<existing file> files:<n>
 //!                               private:<MiB> sections:<MiB> filesections:<MiB>
 //!                               namedjob:<object name> namespace:0
+//!                               dacl:<path> owner:<path> deleteopen:<path>
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
@@ -519,6 +520,30 @@ fn check(c: &str) -> String {
         }
         // Removes the file `arg` (a network endpoint, say).
         "delete" => io(std::fs::remove_file(arg)),
+        // Opens `arg` for one right and closes it again, changing nothing:
+        // WRITE_DAC (`dacl`: what changing its DACL needs, as
+        // SetSecurityInfo's handle must hold it), WRITE_OWNER (`owner`:
+        // taking ownership) or DELETE (`deleteopen`: what deleting or
+        // renaming it needs). Windows checks the right when the handle is
+        // made, so a refused open is a refused change.
+        "dacl" | "owner" | "deleteopen" => {
+            let right = match kind {
+                "dacl" => 0x0004_0000,
+                "owner" => 0x0008_0000,
+                _ => 0x0001_0000,
+            };
+            // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            // OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (a directory too).
+            // SAFETY: a NUL-terminated path; the handle is closed below.
+            let h = unsafe { CreateFileW(wide(arg).as_ptr(), right, 7, std::ptr::null(), 3, 0x0200_0000, std::ptr::null_mut()) };
+            if h == usize::MAX as HANDLE {
+                // SAFETY: plain call.
+                return format!("denied {}", std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
+            }
+            // SAFETY: the handle opened above.
+            unsafe { CloseHandle(h) };
+            "allowed".into()
+        }
         // Binds and listens at `arg`, as a network endpoint is made: whether
         // this process may make that name. A name it made is removed again.
         "bind" => {

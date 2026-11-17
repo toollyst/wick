@@ -6,7 +6,7 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user|x2storm] [-Bin <dir>] [-X2ApicFirecracker <exe>]
+#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,shared,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user|x2storm] [-Bin <dir>] [-X2ApicFirecracker <exe>]
 #
 # `refuse`, `freeze`, `cpuset`, `parent`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
@@ -31,7 +31,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'freeze', 'cpuset', 'parent', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'bindlink', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'freeze', 'cpuset', 'parent', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'shared', 'bindlink', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = '',
@@ -190,13 +190,16 @@ class JailedVm {
 # -Api keeps the API socket (/run/firecracker.socket in the jail) and sets
 # `Sock` and `Root` on the VM; -NoConfig starts Firecracker with nothing
 # configured (the API configures it); `drives` are added to the root drive;
-# `bootArgs` go at the end of the guest kernel's command line.
-function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(), [int]$memMib = 256, [switch]$Api, [switch]$NoConfig, [object[]]$drives = @(), [string]$hugePages = '', [int]$vcpus = 2, [string]$exec = '', [string]$bootArgs = '') {
+# `bootArgs` go at the end of the guest kernel's command line; `links` (a
+# name in the root -> a file outside it) are hard-linked into the root
+# before the jailer starts.
+function Start-JailedVm([string]$base, [string]$id, [string[]]$jailerArgs = @(), [int]$memMib = 256, [switch]$Api, [switch]$NoConfig, [object[]]$drives = @(), [string]$hugePages = '', [int]$vcpus = 2, [string]$exec = '', [string]$bootArgs = '', [hashtable]$links = @{}) {
     if (-not $exec) { $exec = $Fc }
     $root = Join-Path $base "firecracker.exe\$id\root"
     New-Item -ItemType Directory -Force -Path $root | Out-Null
     Copy-Item (Join-Path $Assets 'vmlinux-6.1.188') (Join-Path $root 'vmlinux')
     Copy-Item (Join-Path $Assets 'ubuntu-24.04.squashfs') (Join-Path $root 'rootfs')
+    foreach ($name in $links.Keys) { New-Item -ItemType HardLink -Path (Join-Path $root $name) -Target $links[$name] | Out-Null }
     $cfg = [ordered]@{
         'boot-source'    = [ordered]@{ kernel_image_path = '/vmlinux'; boot_args = ('console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd root=/dev/vda ro rootfstype=squashfs init=/bin/sh ' + $bootArgs).Trim() }
         'drives'         = @([ordered]@{ drive_id = 'rootfs'; path_on_host = '/rootfs'; is_root_device = $true; is_read_only = $true }) + $drives
@@ -1318,7 +1321,13 @@ function Stage-Handoff {
     $root = Join-Path $base 'jail-probe.exe\h\root'
     New-Item -ItemType Directory -Force -Path $root | Out-Null
     $secret = "HANDOFF-$([Guid]::NewGuid().ToString('N'))"
-    $file = Join-Path $WorkDir "handoff-secret-$PID.txt"
+    # The file the jailed process holds is the jail's own, in its root, as
+    # a file Firecracker opens is (a drive, a snapshot): the jail's SID,
+    # which the jail's directory grants, opens it with any token the jailer
+    # gives. A file of the operator's outside the jail is not the jail's
+    # to open (the jail's SID alone is denied it, measured; Linux's chroot
+    # cannot name it).
+    $file = Join-Path $root 'handoff-secret.txt'
     [IO.File]::WriteAllText($file, $secret)
     # The socket's receiver listens in the jail: a socket outside it is out
     # of the jail's reach, as a handler's socket is placed in the jail.
@@ -1330,7 +1339,7 @@ function Stage-Handoff {
         $listener = Start-Process $probe -ArgumentList "listenpull:$sock" -PassThru -NoNewWindow -RedirectStandardOutput $listenOut
         $t = [DateTime]::Now.AddSeconds(5); while (-not (Test-Path $sock) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
         Check (Test-Path $sock) 'the receiver did not listen'
-        $j = Start-Process $Jailer -ArgumentList "--id h --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- sockpull:$sock signal:$PID hold:${file}:20" -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+        $j = Start-Process $Jailer -ArgumentList "--id h --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- sockpull:$sock signal:$PID hold:/handoff-secret.txt:20" -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
         $t = [DateTime]::Now.AddSeconds(15); $held = $null
         while ([DateTime]::Now -lt $t -and -not $held -and -not $j.HasExited) {
             Start-Sleep -Milliseconds 200
@@ -1367,7 +1376,7 @@ function Stage-Handoff {
         $sig = Get-Content $out | Where-Object { $_.StartsWith("signal:$PID ") } | Select-Object -First 1
         Check ($sig -and $sig -notmatch ' allowed') "the jailed process can open the operator: $sig"
         Stop-Jailers @($j)
-        "a socket and a file handle held by the jailed process were pulled out by the operator$medium; the jailed process cannot open the operator ($sig)"
+        "a socket and a handle to a file of the jail held by the jailed process were pulled out by the operator$medium; the jailed process cannot open the operator ($sig)"
     } finally {
         if ($listener -and -not $listener.HasExited) { $listener.Kill() }
         Remove-Item $file -ErrorAction SilentlyContinue
@@ -1650,6 +1659,113 @@ function Stage-Boot {
     } finally { Stop-Jailed }
 }
 
+# A file hard-linked into three jails at once, read-write: a jailed
+# microVM's data drive (V) and two jailed probes (A and B, jail-probe as the
+# jailed binary, which a Firecracker jail cannot run), each jail started
+# while the ones before it run. Each jail's SID gets one entry of its own on
+# the file, FILE_GENERIC_READ | FILE_GENERIC_WRITE (0x12019f), and the full
+# access its directory passes down to the file goes before any process of
+# the jail exists (`share_with_jail`): while all three run, the file holds
+# exactly one such entry per jail and no inherited entry of any jail's SID;
+# the guest writes through its drive before A and B start and writes and
+# reads it again after; from inside A and B, writing the file is allowed and
+# opening it for WRITE_DAC (changing its DACL), WRITE_OWNER (taking
+# ownership) and DELETE through the operator's name of it are refused. DELETE
+# through the jail's own name, in its root, is printed and not checked:
+# Windows grants it through the root's FILE_DELETE_CHILD, which the jail's
+# directory gives the jail, and it removes the jail's name only, as unlink in
+# a chroot the jail owns. After all three end, no entry of any jail's SID is
+# left and the file's own entries are as before; its inherited entries and
+# its label are the last jail directory's, on every name of it (recorded in
+# the stage's line, docs/windows-jail-reach.md).
+function Stage-Shared {
+    $base = New-Base 'shared'
+    $probe = Get-Probe
+    $files = Join-Path $base 'files'
+    New-Item -ItemType Directory -Force -Path $files | Out-Null
+    $data = Join-Path $files 'data.img'
+    $f = [IO.File]::Create($data); $f.SetLength(16MB); $f.Close()
+    $own = { param($sddl) [regex]::Matches(($sddl -replace '^.*?D:[A-Z]*', ''), '\(([^)]*)\)') | ForEach-Object { $_.Groups[1].Value } | Where-Object { ($_ -split ';')[1] -notmatch 'ID' } }
+    $owner = { param($sddl) ($sddl -replace 'D:.*$', '') }
+    $jailSid = 'S-1-9-\d+-\d+-\d+-\d+'
+    $before = (Get-Acl $data).Sddl
+    # Reads `n` bytes of the file at `at` as text, beside the jails that hold it.
+    $peek = { param($at, $n)
+        $s = [IO.File]::Open($data, 'Open', 'Read', 'ReadWrite'); $b = New-Object byte[] $n
+        [void]$s.Seek($at, 'Begin'); [void]$s.Read($b, 0, $n); $s.Close(); [Text.Encoding]::ASCII.GetString($b) }
+    $jailers = @()
+    $vm = $null
+    try {
+        $drive = [ordered]@{ drive_id = 'data'; path_on_host = '/data.img'; is_root_device = $false; is_read_only = $false }
+        $vm = Start-JailedVm $base 'v' -drives @($drive) -links @{ 'data.img' = $data }
+        Wait-Shell $vm
+        $tag = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+        $w = $vm.Sh("echo V1-$tag | dd of=/dev/vdb conv=notrunc,fsync 2>/dev/null; echo `$?", 20)
+        Check ($w -eq '0') "the guest's first write to its hard-linked drive: '$w'"
+        Check ((& $peek 0 11) -eq "V1-$tag") "the guest's first write did not reach the file: '$(& $peek 0 11)'"
+        # A and B: jailed probes on the same file, started one after the other.
+        $results = [ordered]@{}
+        foreach ($id in 'a', 'b') {
+            $root = Join-Path $base "jail-probe.exe\$id\root"
+            New-Item -ItemType Directory -Force -Path $root | Out-Null
+            New-Item -ItemType HardLink -Path (Join-Path $root 'data.img') -Target $data | Out-Null
+            $out = Join-Path $WorkDir "shared-$id.txt"
+            $checks = "write:/data.img dacl:/data.img owner:/data.img `"deleteopen:$data`" deleteopen:/data.img wait:120"
+            $j = Start-Process $Jailer -ArgumentList "--id $id --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- $checks" -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+            $null = $j.Handle
+            $jailers += $j
+            $t = [DateTime]::Now.AddSeconds(20); $lines = @()
+            while ([DateTime]::Now -lt $t -and -not $j.HasExited) {
+                Start-Sleep -Milliseconds 200
+                $lines = @(Get-Content $out -ErrorAction SilentlyContinue)
+                if ($lines | Where-Object { $_.StartsWith('deleteopen:/data.img ') }) { break }
+            }
+            $got = { param($c) $lines | Where-Object { $_.StartsWith("$c ") } | ForEach-Object { $_.Substring($c.Length + 1) } | Select-Object -First 1 }
+            Check ($null -ne (& $got 'deleteopen:/data.img')) "jail $id's probe did not answer: $(Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue)"
+            Check ((& $got 'write:/data.img') -eq 'allowed') "jail ${id}: writing the shared file: $(& $got 'write:/data.img')"
+            foreach ($c in 'dacl:/data.img', 'owner:/data.img', "deleteopen:$data") {
+                $r = & $got $c
+                Check ($r -match '^denied ') "jail ${id}: $c is $r (refused expected)"
+            }
+            $results[$id] = "WRITE_DAC $(& $got 'dacl:/data.img'); WRITE_OWNER $(& $got 'owner:/data.img'); DELETE by the operator's name $(& $got "deleteopen:$data"); DELETE by the jail's own name (not checked) $(& $got 'deleteopen:/data.img')"
+        }
+        # All three run: one entry of its own per jail, 0x12019f, and no
+        # inherited entry of any jail's SID.
+        $during = (Get-Acl $data).Sddl
+        $mine = @(& $own $during | Where-Object { $_ -match ";;;$jailSid$" })
+        $sids = @($mine | ForEach-Object { ($_ -split ';')[5] } | Sort-Object -Unique)
+        Check ($mine.Count -eq 3 -and $sids.Count -eq 3) "while V, A and B run, the file holds $($mine.Count) entries of their own for $($sids.Count) jail SIDs, not one each for three: $during"
+        $bad = @($mine | Where-Object { ($_ -split ';')[2] -notmatch '^(0x12019f|FRFW|FWFR)$' })
+        Check ($bad.Count -eq 0) "a jail's entry is not FILE_GENERIC_READ | FILE_GENERIC_WRITE: $($bad -join ', ') in $during"
+        $inherited = [regex]::Matches($during, "\(A;[A-Z]*ID[A-Z]*;[^;]*;;;$jailSid\)").Count
+        Check ($inherited -eq 0) "the file holds $inherited inherited entries of a jail's SID while the jails run: $during"
+        # The guest still writes and reads its drive after A's and B's starts.
+        $w = $vm.Sh("echo V2-$tag | dd of=/dev/vdb bs=512 seek=8 conv=notrunc,fsync 2>/dev/null; echo `$?", 20)
+        Check ($w -eq '0') "the guest's write after the other jails started: '$w'"
+        Check ((& $peek 4096 11) -eq "V2-$tag") "the guest's second write did not reach the file: '$(& $peek 4096 11)'"
+        $r = $vm.Sh("dd if=/dev/vdb bs=512 skip=8 count=1 iflag=direct 2>/dev/null | tr -d '\000'", 20)
+        Check ($r -eq "V2-$tag") "the guest reading its drive after the other jails started: '$r'"
+        $vm.Send('reboot -ff')
+        Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after the guest rebooted'
+        Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
+        Stop-Jailers $jailers
+        $jailers = @()
+        $after = (Get-Acl $data).Sddl
+        Check ($after -notmatch $jailSid) "an entry of a jail's SID is left on the file after the jails: $after"
+        Check (((& $own $after) -join '') -eq ((& $own $before) -join '') -and (& $owner $after) -eq (& $owner $before)) "the file's own entries or owner changed: before [$before] after [$after]"
+        $label = ((icacls $data) | Where-Object { $_ -match 'Mandatory' }) -join ' '
+        if (-not $label) { $label = 'icacls printed no label line' }
+        "a file hard-linked into three jails at once (a guest's read-write drive, two probes): one entry of its own per jail SID, 0x12019f, no inherited jail entry while all run; the guest wrote it before and wrote and read it after the others started; A: $($results['a']); B: $($results['b']); after: no jail SID left, own entries as before; inherited entries and label now the last jail directory's on every name: $after label [$label] (before: $before)"
+    } finally {
+        Stop-Jailers $jailers
+        Stop-Jailed
+    }
+}
+
+# Written, never run: no host with bindlink.dll is available (Windows 11
+# build 26300 and Windows Server 2025 build 26100 have none), so neither the
+# boot through the links nor the security checks below have run anywhere.
+#
 # Upstream's test_jailer_bind_mount_propagation on Windows: files bound into
 # the jail's root before the jailer starts are what the jailed Firecracker
 # opens at /vmlinux.bin and /rootfs.img, and the guest boots from them.
@@ -1660,10 +1776,22 @@ function Stage-Boot {
 # backing files are copies under the stage's directory, so what the jailer
 # does to them through the links touches no guest asset. A bind link takes
 # the backing file's security for the virtual path (Microsoft, Bindlink API
-# overview), and the jailer sets the jail directory's DACL, which Windows
-# passes on to what the directory holds: the stage fails if a backing file's
-# security descriptor differs while the jail runs or after it, as Linux's
-# jailer leaves a bind-mounted file's owner and mode alone.
+# overview), which the jail's directory does not give the jail's SID. The
+# jailer gives each backing file one entry of the jail's SID's own,
+# FILE_GENERIC_READ | FILE_GENERIC_WRITE (0x12019f), while the jail runs and
+# takes it off when Firecracker ends, and nothing else: the
+# stage fails if a backing file's security descriptor, the jail's entry
+# aside, differs while the jail runs, if that entry is not there then, or if
+# the descriptor differs at all after it (the jail directory's DACL, which
+# Windows passes on to what the directory holds, must not reach the backing
+# files through the links). Linux's jailer leaves a bind-mounted file's owner
+# and mode alone; there the operator's mode decides, here the jail's SID is
+# the jailer's own random one, which the operator cannot name beforehand.
+# The drives here are read-only. A read-write drive through a bind link
+# probably cannot work: the backing file keeps its own label (none: medium
+# integrity), and the jail's token, below medium, cannot write up to it
+# (Microsoft Learn, Mandatory Integrity Control); not measured, as nothing
+# here has run.
 Add-Type -Namespace WickJailerTest -Name Bind -MemberDefinition @'
 [DllImport("bindlink.dll", CharSet = CharSet.Unicode)] public static extern int CreateBindLink(string virtualPath, string backingPath, uint flags, uint exceptionCount, System.IntPtr exceptionPaths);
 [DllImport("bindlink.dll", CharSet = CharSet.Unicode)] public static extern int RemoveBindLink(string virtualPath);
@@ -1716,12 +1844,17 @@ function Stage-Bindlink {
             Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
         } finally { Stop-Jailed }
         $after = & $sddl
-        # As on Linux, where the jailer leaves a bind-mounted file's owner and
-        # mode alone, the jail's setup must not change what the backing files
-        # allow (the jail's DACL, passed on through the links, would grant the
-        # jail access to files outside it).
-        Check ($during -eq $before -and $after -eq $before) "the guest booted, but the jail changed the backing files' security: before [$before] during [$during] after [$after]"
-        "the jailed guest booted from the kernel and root drive bound into its root before the jailer started (bind links); the backing files' security unchanged: $before"
+        # While the jail runs, each backing file holds one entry of the
+        # jail's SID (S-1-9-..., the jailer's own), 0x12019f, and is
+        # otherwise unchanged; after it, it is as it was (the jail's DACL,
+        # passed on through the links, would grant the jail access to files
+        # outside it, and for good).
+        $jailAce = '\(A;;(0x12019f|FRFW|FWFR);;;S-1-9-\d+-\d+-\d+-\d+\)'
+        $entries = [regex]::Matches($during, $jailAce).Count
+        Check ($entries -eq $links.Count) "the guest booted, but the backing files held $entries entries of the jail's SID while it ran, not one each: $during"
+        Check (($during -replace $jailAce, '') -eq $before) "the guest booted, but the jail changed the backing files' security beyond its own entry: before [$before] during [$during]"
+        Check ($after -eq $before) "the jail left the backing files' security changed: before [$before] after [$after]"
+        "the jailed guest booted from the kernel and root drive bound into its root before the jailer started (bind links); each backing file held one entry of the jail's SID while it ran, and its security is as before after it: $before"
     } finally {
         foreach ($v in $made) { [void][WickJailerTest.Bind]::RemoveBindLink($v) }
     }
