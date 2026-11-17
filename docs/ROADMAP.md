@@ -236,8 +236,8 @@ Through `wick-ext` (`PUT /extensions/{name}`): user-mode networking (no vmnet or
 capability query API.
 
 **virtio-fs: designed, being built** ([design-fs.md](design-fs.md)). Built so far: the frame format between the
-device and the server (`crates/fs/frame`, its unit tests and the `fs_frame` fuzz target); nothing a guest can use
-yet. The plan:
+device and the server (`crates/fs/frame`, its unit tests and the `fs_frame` fuzz target), and guest kernels with
+`CONFIG_VIRTIO_FS` built by CI's `guest-kernels` job (`tools/linux/guest-kernel.sh`); nothing a guest can use yet. The plan:
 
 - The device in Firecracker only copies bounded, unparsed requests between the virtqueues and one socket.
 - A separate server, `wick-fsd`, one per share, parses FUSE and does the file operations. It never sees guest

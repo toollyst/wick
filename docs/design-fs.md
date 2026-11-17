@@ -2,7 +2,9 @@
 
 **Status: design and plan, being built. Only the frame format exists** (`crates/fs/frame`: the frames of §4.1, the
 hello that checks the share id and protocol version, and the VMM's tracker of requests in flight; its unit tests and
-the `fs_frame` fuzz target). Nothing a guest can use exists yet, and nothing here describes what wick does today:
+the `fs_frame` fuzz target), and the guest kernels of row 21: CI's `guest-kernels` job builds upstream's CI kernel
+(6.1, 6.18) with `CONFIG_VIRTIO_FS=y` (`tools/linux/guest-kernel.sh`), though nothing boots them yet. Nothing a guest
+can use exists yet, and nothing here describes what wick does today:
 today `PUT /extensions/fs` is refused as an unknown extension (`crates/ext/src/lib.rs`,
 `test_unknown_extension_is_rejected`).
 The work is the virtio-fs item of [M7](ROADMAP.md#m7-desktop-devices). Every "is", "does" and "returns" below about
@@ -57,7 +59,7 @@ documented or measured; **measure** = the fix is designed, a measurement on the 
 | 18 | Feature off still adds attack surface | Cargo feature `fs`, default off; `wick-fsd` separate binary; no device/process/socket without config | Default build has no fs symbols; a planned boot-test stage `fs-off` shows no virtio device 26 | now |
 | 19 | Older macOS releases lack `O_RESOLVE_BENEATH` | Require the first macOS release that has the flag and refuse loudly on older ones (the same layers on every host, no reduced mode). **Which release that is is unconfirmed:** the flag is in the macOS 27.2 SDK's `sys/fcntl.h` (read 2026-11-13); this research read it in XNU's `bsd/sys/fcntl.h` from xnu-11417 on, which it took to be macOS 15.4; a third-party rsync patch says macOS 15 ([patch](https://sources.suse.com/SUSE:SLFO:1.1:Build/rsync/c0c245c4f613433f762b3dee895547b4/rsync-hardening-0021-syscall-also-use-O_RESOLVE_BENEATH-on-FreeBSD-and-Ma.patch)). 15.4 is used below as that working assumption, not as a settled floor | macOS 15 CI job: fs starts where the flag works and refuses below | measure on macOS 15 |
 | 20 | Linux host with unprivileged user namespaces disabled (Ubuntu AppArmor) | Start wick-fsd from root, which confines and drops to an unprivileged uid with no capabilities, as the jailer does; otherwise refuse loudly | Run with userns disabled: refuses without root, confined with root | now |
-| 21 | Guest kernel lacks the driver | Upstream CI configs have `CONFIG_FUSE_FS=y`, `# CONFIG_VIRTIO_FS is not set`; wick images add `CONFIG_VIRTIO_FS=y` | Guest boot with fs mounts the share | now |
+| 21 | Guest kernel lacks the driver | Upstream CI configs have `CONFIG_FUSE_FS=y`, `# CONFIG_VIRTIO_FS is not set`; wick's guest kernels add `CONFIG_VIRTIO_FS=y` (built: `tools/linux/guest-kernel.sh` with the fragment `tools/linux/guest-kernel-virtio-fs.config`, CI's `guest-kernels` job) | Guest boot with fs mounts the share | now |
 
 | 22 | Performance cost of the separate server | Measured 2026-11-13 on a MacBookPro18,3, macOS 27.2, **load average 53–79** (so upper bounds; re-measure idle with a concurrent control): AF_UNIX round trip 128 B ≈ 7.6–7.9 µs median; 1 MiB through the socket 267–409 µs (≈ 2.6–3.9 GB/s); host `fstatat` 0.8 µs, `openat`+`close` 7.2 µs, create+4 KiB write+close 64 µs; memcpy 41.7 GB/s (benchmark: a C program, not in the repository; AF_UNIX stream socketpair between two processes, medians of 20,000 round trips for 128 B and 4 KiB and of 2,000 for 128 KiB and 1 MiB, two runs; the busy machine also gave p99s from 0.4 to 5.4 ms). Small ops: the hop is about one host open; vhost-user on macOS/Windows also wakes the VMM (no in-kernel ioeventfd: wick's eventfds are pipes, docs/PORTING.md) [inf], so its round-trip cost is similar and the split's real extra is the data copy. Large I/O: replace the socket payload with a fixed-size shared ring between VMM and server (never guest memory; bounded and counted, since shared sections escape the Windows Job limit): one memcpy at ~40 GB/s ≈ 25 µs/MiB, socket only for notifications. Guest page cache and attr/entry timeouts keep repeated lookups in the guest | Benchmarks per host: fio seq 1 MiB read/write, untar of a kernel tree, `git status` on a large repo, `npm install`; split vs virtiofsd (Linux) and vs an in-VMM prototype; acceptance target set from the Linux virtiofsd number | measure |
 
@@ -546,8 +548,9 @@ it means layer 1 let the request through.
   - VMM: `fs_<id>` (requests, bytes, throttled, in-flight, device resets, server EOF);
   - server: its own metrics file in upstream's JSON format (errors by errno, limit hits, refusals by reason).
 - **Guest kernel:** upstream's CI configs have `CONFIG_FUSE_FS=y` but `# CONFIG_VIRTIO_FS is not set` and
-  `# CONFIG_NET_9P is not set` (all seven `microvm-kernel-ci-*.config`) [src]. wick's images (M6) would add
-  `CONFIG_VIRTIO_FS=y`. Option D works with upstream kernels as they are.
+  `# CONFIG_NET_9P is not set` (all seven `microvm-kernel-ci-*.config`) [src]. wick's CI builds upstream's 6.1 and
+  6.18 CI kernels with `CONFIG_VIRTIO_FS=y` added (`tools/linux/guest-kernel.sh`); wick's images (M6) would add it
+  too. Option D works with upstream kernels as they are.
 
 ---
 

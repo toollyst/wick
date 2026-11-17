@@ -1173,6 +1173,77 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # Guest kernels with virtio-fs (docs/design-fs.md, row 21): upstream's CI
+  # guest kernel, 6.1 and 6.18, from pinned Amazon Linux tags with upstream's
+  # configuration chain and wick's fragments (tools/linux/guest-kernel.sh),
+  # for the virtio-fs boot stages. Built when its inputs change and kept in
+  # the cache; every run checks the configuration of what it hands on and
+  # uploads the kernels as guest-kernels-<arch>. No guest boots here.
+  guest-kernels:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Architecture
+        id: arch
+        run: echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
+      # The key is every input of a build: the script, wick's fragments, and
+      # upstream's configurations and kernel patches at patches/base (the
+      # pinned tags are in the script).
+      - name: Kernels from an earlier run
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/guest-kernels
+          key: guest-kernels-${{ steps.arch.outputs.arch }}-${{ hashFiles('tools/linux/guest-kernel.sh', 'tools/linux/guest-kernel-*.config', 'lib/firecracker/resources/guest_configs/**', 'lib/firecracker/resources/patches/**') }}
+      - name: Build dependencies
+        if: steps.restore.outputs.cache-hit != 'true'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bc flex bison libelf-dev libssl-dev
+      - name: Build the kernels
+        if: steps.restore.outputs.cache-hit != 'true'
+        run: |
+          for v in 6.1 6.18; do
+            start=$SECONDS
+            tools/linux/guest-kernel.sh build "$v" build/guest-kernels
+            echo "GUESTKERNEL build $v ${{ steps.arch.outputs.arch }}: $((SECONDS - start)) s on $(nproc) CPUs"
+          done
+      # On a hit too: what is handed on has wick's fragments.
+      - name: The kernels have wick's fragments
+        run: |
+          shopt -s nullglob
+          configs=(build/guest-kernels/vmlinux-*-wick.config)
+          ((${#configs[@]} == 2)) || { echo "::error::expected 2 kernel configurations, found ${#configs[@]}"; exit 1; }
+          for c in "${configs[@]}"; do
+            tools/linux/guest-kernel.sh check "$c"
+            [[ -s "${c%.config}" ]] || { echo "::error::no kernel for $c"; exit 1; }
+          done
+          {
+            echo "### Guest kernels (${{ steps.arch.outputs.arch }}, cache hit: ${{ steps.restore.outputs.cache-hit == 'true' }})"
+            echo '```'
+            ls -l build/guest-kernels
+            du -sh build/guest-kernels
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Kernels for later runs
+        if: steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/guest-kernels
+          key: guest-kernels-${{ steps.arch.outputs.arch }}-${{ hashFiles('tools/linux/guest-kernel.sh', 'tools/linux/guest-kernel-*.config', 'lib/firecracker/resources/guest_configs/**', 'lib/firecracker/resources/patches/**') }}
+      - name: Upload the kernels
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: guest-kernels-${{ steps.arch.outputs.arch }}
+          path: build/guest-kernels
+          retention-days: 14
+
   # Host folder sharing's own workspace (crates/fs, docs/design-fs.md): the
   # frames the virtio-fs device and wick-fsd exchange, checked with
   # Firecracker's toolchain (crates/fs/rust-toolchain.toml, which rustup reads
