@@ -594,6 +594,10 @@ static UNLOCKED_CHANGES: AtomicUsize = AtomicUsize::new(0);
 static REGISTERING: AtomicUsize = AtomicUsize::new(0);
 /// Where a register waits for [`UNLOCKED_CHANGES`] to reach 0.
 static DRAINED: (Mutex<()>, std::sync::Condvar) = (Mutex::new(()), std::sync::Condvar::new());
+/// Where a remove event's waiter, woken by the readers' close, waits for
+/// [`destroy`] to have turned the userfaultfd's ranges back into ordinary
+/// memory ([`wait_teardown`]).
+static TORN_DOWN: (Mutex<()>, std::sync::Condvar) = (Mutex::new(()), std::sync::Condvar::new());
 
 /// A change of memory running without [`LOCK`]; ends when dropped.
 struct UnlockedChange;
@@ -1107,11 +1111,21 @@ fn wait_read(ctx: usize, generation: u64, bound: u64) {
         // The count of bytes written is read before the count unread: a
         // write between them only makes the bytes read look fewer.
         let written = c.written.load(Ordering::SeqCst);
-        // The reader's end closed: every user descriptor is, so the release
-        // is under way.
-        let Some(read) = unread(ctx).map(|u| written.saturating_sub(u)) else {
-            leave(ctx);
-            break;
+        let read = match unread(ctx) {
+            Some(u) => written.saturating_sub(u),
+            // The reader's end closed: every user descriptor is, so the
+            // release is under way. The wait ends once it is done, not
+            // before: Linux's release clears every vma's context under the
+            // mmap lock before it wakes this waiter (fs/userfaultfd.c,
+            // v6.12, `userfaultfd_release` :865 then :878), so the discard
+            // finds ordinary memory when it goes on.
+            None if reader_closed(ctx) => {
+                leave(ctx);
+                wait_teardown(ctx, generation);
+                break;
+            }
+            // The query failed: look again, as for a read still to come.
+            None => 0,
         };
         if read >= bound {
             leave(ctx);
@@ -1130,6 +1144,35 @@ fn wait_read(ctx: usize, generation: u64, bound: u64) {
         // above.
         unsafe { libc::kevent(c.wake_kq.load(Ordering::SeqCst), ptr::null(), 0, &mut ev, 1, &timeout) };
         leave(ctx);
+    }
+}
+
+/// Whether the reader's end of userfaultfd `ctx` is closed (`EV_EOF` on the
+/// kernel end): every user descriptor is, and [`serve`] is on its way to
+/// [`destroy`]. Called with the userfaultfd held ([`enter`]).
+fn reader_closed(ctx: usize) -> bool {
+    // SAFETY: a zeroed kevent to receive one event.
+    let mut ev: libc::kevent = unsafe { core::mem::zeroed() };
+    let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: reads at most one event of the userfaultfd's query kqueue,
+    // without waiting.
+    let n = unsafe { libc::kevent(CTXS[ctx].query_kq.load(Ordering::SeqCst), ptr::null(), 0, &mut ev, 1, &now) };
+    n == 1 && ev.flags & libc::EV_EOF != 0
+}
+
+/// Waits, holding nothing of userfaultfd `ctx` (so [`destroy`] does not wait
+/// on this thread), until its release is done: [`destroy`] took the mirror
+/// away, after its ranges became ordinary memory, or the slot is another
+/// userfaultfd's (`generation` gone by). A slot is taken again only after
+/// [`destroy`] ends, and [`create`] raises the generation before it gives
+/// the slot a mirror, so neither test misses the release.
+fn wait_teardown(ctx: usize, generation: u64) {
+    #[cfg(test)]
+    tests::teardown_wait_hook(ctx);
+    let c = &CTXS[ctx];
+    let mut torn = TORN_DOWN.0.lock().unwrap_or_else(|e| e.into_inner());
+    while !c.mirror.load(Ordering::SeqCst).is_null() && c.generation.load(Ordering::SeqCst) == generation {
+        torn = TORN_DOWN.1.wait(torn).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -2943,6 +2986,15 @@ fn destroy(ctx: usize) {
     // end closed meanwhile, or a descriptor that took its number.
     let c = &CTXS[ctx];
     let mirror = c.mirror.swap(ptr::null_mut(), Ordering::SeqCst);
+    // Its ranges are ordinary memory now: the remove events' waiters the
+    // readers' close woke may return ([`wait_teardown`]), as Linux wakes
+    // them only after `userfaultfd_release_all` (fs/userfaultfd.c, v6.12,
+    // :865 then :878). Under the condition's lock, after the swap, so a
+    // waiter that read the mirror there is waiting when this wakes it.
+    {
+        let _torn = TORN_DOWN.0.lock().unwrap_or_else(|e| e.into_inner());
+        TORN_DOWN.1.notify_all();
+    }
     while c.users.load(Ordering::SeqCst) != 0 {
         let ts = libc::timespec { tv_sec: 0, tv_nsec: 100_000 };
         // SAFETY: a plain sleep.
@@ -3257,6 +3309,8 @@ fn serve(ctx: usize, kernel: c_int) {
         // SAFETY: as above.
         unsafe { libc::close(fd) };
     }
+    #[cfg(test)]
+    tests::destroy_hook(ctx);
     destroy(ctx);
 }
 
@@ -3639,6 +3693,40 @@ mod tests {
     /// How many times a register waited for changes running without the
     /// lock ([`register`]).
     pub(super) static REGISTER_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A userfaultfd whose [`destroy`] [`serve`] holds back
+    /// ([`destroy_hook`]) until the test sets `None`.
+    static DESTROY_HELD: (Mutex<Option<usize>>, std::sync::Condvar) = (Mutex::new(None), std::sync::Condvar::new());
+
+    pub(super) fn destroy_hook(ctx: usize) {
+        let (held, released) = &DESTROY_HELD;
+        let mut g = held.lock().unwrap_or_else(|e| e.into_inner());
+        while *g == Some(ctx) {
+            g = released.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Where a remove event's waiter of the userfaultfd set here reports that
+    /// it saw the readers' close and waits for the teardown
+    /// ([`wait_teardown`]).
+    static TEARDOWN_WAIT: Mutex<Option<(usize, std::sync::mpsc::Sender<Step>)>> = Mutex::new(None);
+
+    /// What the release test hears, in order.
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        /// The discard's waiter saw the readers' close.
+        WaitsForTeardown,
+        /// The discard returned this, and whether the page was then missing.
+        Returned(c_int, bool),
+    }
+
+    pub(super) fn teardown_wait_hook(ctx: usize) {
+        if let Some((c, tx)) = &*TEARDOWN_WAIT.lock().unwrap_or_else(|e| e.into_inner()) {
+            if *c == ctx {
+                let _ = tx.send(Step::WaitsForTeardown);
+            }
+        }
+    }
 
     /// What a change running without the lock calls between its lock-free
     /// check and the change ([`unlocked_change`]): a race test's register.
@@ -7348,6 +7436,56 @@ mod tests {
         }
         assert_eq!(discard.join().unwrap(), 0);
         assert!(!is_missing(mem), "released memory is ordinary memory");
+    }
+
+    /// The interleaving CI run 44188936001 met by chance (macos job, this
+    /// test above failed once: the discard returned with the page still
+    /// missing), forced: the release's teardown is held back ([`serve`]
+    /// waits before [`destroy`]) while the discard's waiter sees the readers'
+    /// close. The discard must not return until the teardown is done, and
+    /// then finds the page ordinary memory, as on Linux, whose release clears
+    /// every vma's context (fs/userfaultfd.c, v6.12, `userfaultfd_release`
+    /// :865, `userfaultfd_release_all` in mm/userfaultfd.c :1916 to :1931)
+    /// before it wakes the remove event's waiter (:878), which only then
+    /// zaps the pages under the mmap lock again (mm/madvise.c
+    /// `madvise_dontneed_free` after `userfaultfd_remove`). No timing: each
+    /// step is one the other thread reports.
+    #[test]
+    fn test_a_discard_woken_by_the_release_returns_after_its_teardown() {
+        let (ctx, user) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let ps = test_page_size();
+        let mem = map(1);
+        register(ctx, mem, ps).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        *TEARDOWN_WAIT.lock().unwrap() = Some((ctx, tx.clone()));
+        *DESTROY_HELD.0.lock().unwrap() = Some(ctx);
+        let discard = std::thread::spawn(move || {
+            // SAFETY: registered memory of the test's.
+            let r = unsafe { crate::linux_items::madvise(mem as *mut _, ps as usize, libc::MADV_DONTNEED) };
+            let _ = tx.send(Step::Returned(r, is_missing(mem)));
+        });
+        assert!(readable(user), "no remove event");
+        // The last descriptor: the waiter sees the readers' close, and the
+        // teardown waits until the test lets it go.
+        close(&[user]);
+        let first = rx.recv_timeout(Duration::from_secs(10)).expect("neither step in 10 s");
+        let release = || {
+            *DESTROY_HELD.0.lock().unwrap() = None;
+            DESTROY_HELD.1.notify_all();
+        };
+        if first != Step::WaitsForTeardown {
+            release();
+            panic!("the discard returned before the release's teardown: {first:?}");
+        }
+        // Held back, the teardown has not run: the page is still missing.
+        assert!(is_missing(mem));
+        release();
+        let then = rx.recv_timeout(Duration::from_secs(10)).expect("the discard did not return in 10 s after the teardown");
+        assert_eq!(then, Step::Returned(0, false), "returned once the teardown was done, on ordinary memory");
+        discard.join().unwrap();
+        *TEARDOWN_WAIT.lock().unwrap() = None;
+        // SAFETY: the test's mapping.
+        unsafe { libc::munmap(mem as *mut _, ps as usize) };
     }
 
     /// `MADV_FREE` of shared memory whose two halves two userfaultfds have
