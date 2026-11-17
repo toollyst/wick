@@ -131,6 +131,11 @@ const API_IOCTLS: IoctlFlags = IoctlFlags::REGISTER
 const RANGE_IOCTLS: IoctlFlags = IoctlFlags::WAKE
     .union(IoctlFlags::COPY)
     .union(IoctlFlags::ZEROPAGE);
+// The kernel side answers a register with these bits (a range that holds
+// a `MAP_HUGETLB` mapping without `ZEROPAGE`, as Linux's).
+const _: () = assert!(RANGE_IOCTLS.bits() == proto::RANGE_IOCTLS);
+const _: () =
+    assert!(RANGE_IOCTLS.difference(IoctlFlags::ZEROPAGE).bits() == proto::RANGE_IOCTLS_HUGETLB);
 
 bitflags! {
     /// How a range is registered.
@@ -667,12 +672,11 @@ impl Uffd {
         }
         let (start, len) = (start as u64, len as u64);
         let reply = self.call(proto::OP_REGISTER, start, len, 0, |ctx| {
-            wick_uffd::register(ctx, start, len)
-                .map(|()| 0)
+            wick_uffd::register_ioctls(ctx, start, len)
                 .map_err(|e| (e.raw_os_error().unwrap_or(libc::EINVAL), 0))
         })?;
-        reply.map_err(|(e, _)| Error::SystemError(errno(e)))?;
-        Ok(RANGE_IOCTLS)
+        let ioctls = reply.map_err(|(e, _)| Error::SystemError(errno(e)))?;
+        Ok(IoctlFlags::from_bits_retain(ioctls))
     }
 
     /// Unregisters a range: its missing pages become ordinary memory.

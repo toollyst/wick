@@ -10,7 +10,16 @@
 //! Linux's `UFFDIO_*` would leave it in: a copy or zeropage fills exactly the
 //! missing pages it reports, with the data sent, and touches nothing else;
 //! a register makes the pages that were not resident missing; an unregister
-//! makes them ordinary zero pages. A mirror request (`OP_MIRROR`, with any
+//! makes them ordinary zero pages. Requests are checked as Linux v6.12
+//! checks the ioctls, in its order: a range off pages or below
+//! `mmap_min_addr` is `EINVAL`; a copy mode bit other than `DONTWAKE` and
+//! `WP`, or a zeropage mode bit other than `DONTWAKE`, is `EINVAL` whatever
+//! the range holds (fs/userfaultfd.c :1606 to :1608, :1658 to :1660); a
+//! copy with `WP` is `ENOENT` where a page is not registered and else
+//! `EINVAL`, no range being registered for write-protect faults
+//! (mm/userfaultfd.c :733, :762 to :763); a register answers the range's
+//! ioctls. A refused copy's data is read all the same, so each request
+//! after it is answered as itself. A mirror request (`OP_MIRROR`, with any
 //! words after the op, which no request reads) answers with the waiter
 //! mirror's size and exactly one descriptor: a read-only shared memory
 //! object of that size (opened read-only; its mapping cannot be made
@@ -61,6 +70,34 @@ mod imp {
         Raw(u64),
     }
 
+    /// A copy's or zeropage's mode word.
+    #[derive(Arbitrary, Debug)]
+    pub enum Mode {
+        Wake,
+        DontWake,
+        /// `MODE_WP`, with `DONTWAKE` or not.
+        Wp(bool),
+        Raw(u64),
+    }
+
+    impl Mode {
+        fn word(&self) -> u64 {
+            match self {
+                Mode::Wake => 0,
+                Mode::DontWake => proto::MODE_DONTWAKE,
+                Mode::Wp(d) => proto::MODE_WP | u64::from(*d),
+                Mode::Raw(v) => *v,
+            }
+        }
+    }
+
+    /// Linux's `mmap_min_addr` on arm64 and x86 hosts (security/Kconfig,
+    /// v6.12, `LSM_MMAP_MIN_ADDR` :145 to :149): a range below it is `EINVAL`.
+    const MMAP_MIN_ADDR: u64 = 0x1_0000;
+    /// One past the highest address a macOS process maps
+    /// (`MACH_VM_MAX_ADDRESS`), Linux's `TASK_SIZE` here.
+    const TASK_SIZE: u64 = 0x0000_7FFF_FE00_0000;
+
     #[derive(Arbitrary, Debug)]
     pub enum Op {
         Register {
@@ -76,13 +113,13 @@ mod imp {
         Copy {
             at: Addr,
             len: Len,
-            dontwake: bool,
+            mode: Mode,
             fill: u8,
         },
         Zeropage {
             at: Addr,
             len: Len,
-            dontwake: bool,
+            mode: Mode,
         },
         Wake {
             at: Addr,
@@ -454,6 +491,8 @@ mod imp {
         let mut sent = vec![theirs];
         // The mirror's size in this run's first mirror reply.
         let mut mirror_size: Option<u64> = None;
+        // Which arena pages are registered, from the replies.
+        let mut registered = [false; PAGES];
 
         for op in input.ops.iter().take(48) {
             let before = arena.snapshot();
@@ -480,17 +519,17 @@ mod imp {
                 Op::Copy {
                     at,
                     len,
-                    dontwake,
+                    mode,
                     fill: f,
                 } => {
                     let (a, l) = (arena.addr(at), arena.len(len));
                     fill = Some((a, l, *f));
-                    [proto::OP_COPY, a, l, u64::from(*dontwake)]
+                    [proto::OP_COPY, a, l, mode.word()]
                 }
-                Op::Zeropage { at, len, dontwake } => {
+                Op::Zeropage { at, len, mode } => {
                     let (a, l) = (arena.addr(at), arena.len(len));
                     fill = Some((a, l, 0));
-                    [proto::OP_ZEROPAGE, a, l, u64::from(*dontwake)]
+                    [proto::OP_ZEROPAGE, a, l, mode.word()]
                 }
                 Op::Wake { at, len } => [proto::OP_WAKE, arena.addr(at), arena.len(len), 0],
                 Op::Other { op, a, b, c } => {
@@ -554,7 +593,24 @@ mod imp {
                 // SAFETY: descriptors sent to the serving thread, which holds its copies.
                 unsafe { libc::close(fd) };
             }
-            check(arena, head, result, count, &before, &resident, fill);
+            check(
+                arena,
+                head,
+                result,
+                count,
+                &before,
+                &resident,
+                &registered,
+                fill,
+            );
+            if result >= 0 && matches!(head[0], proto::OP_REGISTER | proto::OP_UNREGISTER) {
+                for (i, r) in registered.iter_mut().enumerate() {
+                    let p = arena.page(i);
+                    if p >= head[1] && p < head[1].saturating_add(head[2]) {
+                        *r = head[0] == proto::OP_REGISTER;
+                    }
+                }
+            }
         }
 
         // The handler goes away: the userfaultfd is released and every
@@ -597,10 +653,11 @@ mod imp {
         count: u64,
         before: &[Option<Vec<u8>>],
         resident: &[bool],
+        registered: &[bool; PAGES],
         fill: Option<(u64, u64, u8)>,
     ) {
         let ps = arena.ps;
-        let [op, a, b, _] = head;
+        let [op, a, b, mode] = head;
         let after = arena.snapshot();
         let ok = result >= 0;
         if !ok {
@@ -610,11 +667,51 @@ mod imp {
         // The range requests (OP_MIRROR is answered by check_mirror, and
         // any other op must be refused, below).
         let aligned = a.is_multiple_of(ps) && b.is_multiple_of(ps) && b != 0;
+        let range_ok = aligned && a >= MMAP_MIN_ADDR && a < TASK_SIZE && b <= TASK_SIZE - a;
         if (proto::OP_COPY..=proto::OP_UNREGISTER).contains(&op) && (ok || result == -(libc::EAGAIN as i64)) {
             assert!(aligned, "{head:x?}: unaligned request accepted");
+            assert!(
+                a >= MMAP_MIN_ADDR,
+                "{head:x?}: a range below mmap_min_addr accepted"
+            );
         }
+        let einval = -(libc::EINVAL as i64);
         match op {
             proto::OP_COPY | proto::OP_ZEROPAGE => {
+                let known = match op {
+                    proto::OP_COPY => proto::MODE_DONTWAKE | proto::MODE_WP,
+                    _ => proto::MODE_DONTWAKE,
+                };
+                if mode & !known != 0 {
+                    assert_eq!(result, einval, "{head:x?}: an unknown mode bit");
+                } else if mode & proto::MODE_WP != 0 && range_ok {
+                    // Every page of the range registered (one range of
+                    // them, or two, which wick does not join): EINVAL or
+                    // ENOENT; any page not: ENOENT.
+                    let registered_at = |p: u64| {
+                        p >= arena.base
+                            && usize::try_from((p - arena.base) / ps)
+                                .is_ok_and(|i| i < PAGES && registered[i])
+                    };
+                    let all = (0..u64::MAX)
+                        .map(|i| a + i * ps)
+                        .take_while(|&p| p < a + b)
+                        .all(registered_at);
+                    let noent = -(libc::ENOENT as i64);
+                    if all {
+                        assert!(
+                            result == einval || result == noent,
+                            "{head:x?}: a write-protected copy, {result}"
+                        );
+                    } else {
+                        assert_eq!(
+                            result, noent,
+                            "{head:x?}: a write-protected copy into pages not registered"
+                        );
+                    }
+                } else if mode & proto::MODE_WP != 0 {
+                    assert_eq!(result, einval, "{head:x?}: a write-protected copy");
+                }
                 let (dst, len, byte) = fill.unwrap();
                 let filled = match result {
                     r if r >= 0 => {
@@ -656,6 +753,11 @@ mod imp {
                 }
             }
             proto::OP_REGISTER => {
+                if ok {
+                    // The range's ioctls: WAKE, COPY, ZEROPAGE (no hugetlb here).
+                    assert_eq!(result as u64, proto::RANGE_IOCTLS, "{head:x?}: ioctls");
+                    assert_eq!(count, proto::RANGE_IOCTLS, "{head:x?}: ioctls");
+                }
                 for i in 0..DATA_PAGES {
                     let p = arena.page(i);
                     if ok && p >= a && p < a.saturating_add(b) {
