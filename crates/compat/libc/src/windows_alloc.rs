@@ -147,7 +147,10 @@ pub fn installed() -> bool {
 /// is smaller"; a job memory limit (the jailer's `memory.max`) does not
 /// lower it (read 0x83fc5a000 in a job of 96 MiB at its limit, as out of a
 /// job, on Windows Server 2022 20348, the same as `GetPerformanceInfo`'s
-/// `CommitLimit` times `PageSize`). A system call into a buffer on the
+/// `CommitLimit` times `PageSize`), nor raise it: a job limit 2 GiB above
+/// it reads the same (`test_a_heap_allocation_above_the_hosts_commit_limit_is_refused_as_the_systems`),
+/// and a per-process limit of 768 MiB or 2 GiB above it neither (measured
+/// by hand on 20348 and Windows Server 2025 26100). A system call into a buffer on the
 /// stack, with no lock; `test_a_heap_allocation_refused_at_the_limit_ends_with_137_and_a_line`
 /// reads it with the job's limit reached, which proves it does not fail
 /// there, not that it never allocates. `GetPerformanceInfo` is not used:
@@ -240,11 +243,21 @@ fn refused(size: usize, kind: Kind, again: impl FnOnce() -> *mut u8) -> *mut u8 
         _ => 0,
     };
     // 1: more than the host can commit at all, as Linux's malloc is refused
-    // above RAM and swap. A commit limit at or under the job's is the
-    // process's own limit (`ullTotalPageFile` is the smaller of the two),
-    // not the host's: the size is left to 2.
+    // above RAM and swap, whatever memory.max is. The job's memory limit is
+    // not consulted: a size above the commit limit is null under a job's
+    // limit, over one (the host, not the job, cannot hold it; Linux's malloc
+    // is null there too), and out of a job. This is right both ways
+    // `ullTotalPageFile` can be read (Learn, `MEMORYSTATUSEX`: "the system
+    // or the current process, whichever is smaller"): as the system's, a
+    // size above it cannot be committed on the host; and were it ever the
+    // process's own commit limit below the host's, a size above it still
+    // cannot be committed, so null is right. Measured, neither a job memory
+    // limit (`memory.max`) nor a per-process one lowers it, on Windows
+    // Server 2022 20348 and 2025 26100, and `SetInformationJobObject`
+    // accepts a job limit above it, so a size above the host under such a
+    // job reaches here (`host_commit_limit`, the HEAPABOVE rows).
     let job = job_memory_limit();
-    if host_commit_limit().is_some_and(|total| size > total && job.is_none_or(|limit| total > limit)) {
+    if host_commit_limit().is_some_and(|total| size > total) {
         return core::ptr::null_mut();
     }
     // 2: more than the job's limit holds in all: no reclaim can make room.

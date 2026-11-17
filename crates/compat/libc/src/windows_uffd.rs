@@ -8305,31 +8305,44 @@ mod tests {
     /// job and in none; an infallible allocation ends with Rust's
     /// allocation error (0xC0000409, "memory allocation of N bytes
     /// failed"); neither says a line of wick's. On 6ef1c85e both ended with
-    /// 137 and a line that blamed the memory limit.
+    /// 137 and a line that blamed the memory limit. The same in a job whose
+    /// limit is above the host's commit limit (2 GiB above), where the host,
+    /// not the job, cannot hold the size.
     #[test]
     fn test_a_heap_allocation_above_the_hosts_commit_limit_is_refused_as_the_systems() {
         let mut failed = std::vec::Vec::new();
         let abort = Some(0xC000_0409u32.cast_signed());
+        let total = crate::wick_alloc::host_commit_limit().expect("the host's commit limit");
+        let above = total + (2 << 30);
         for (child, limit, want_code, want) in [
             ("heap_above_reserve_child", Some(96 << 20), Some(0), "HEAPABOVE try_reserve: Err"),
             ("heap_above_reserve_child", None, Some(0), "HEAPABOVE try_reserve: Err"),
             ("heap_above_alloc_child", Some(96 << 20), abort, "memory allocation of "),
+            ("heap_above_reserve_child", Some(above), Some(0), "HEAPABOVE try_reserve: Err"),
+            ("heap_above_alloc_child", Some(above), abort, "memory allocation of "),
         ] {
             let (code, text) = run_child(child, limit);
             for l in text.lines().filter(|l| l.starts_with("wick:") || l.starts_with("HEAP") || l.contains("memory allocation")) {
                 std::eprintln!("{child} (job {limit:?}): {l}");
             }
-            if code != want_code || !text.contains(want) || text.contains("wick: heap") {
-                failed.push(std::format!("{child} (job {limit:?}): exit {code:x?}, said {}", text.contains(want)));
+            // The child's size is above the host's commit limit as read out
+            // of a job: a job's limit, above or below it, does not change it.
+            let read = text.contains(&std::format!("HEAPABOVE the host's commit limit read in the job: {total}\n"));
+            if code != want_code || !text.contains(want) || text.contains("wick: heap") || !read {
+                failed.push(std::format!("{child} (job {limit:?}): exit {code:x?}, said {}, read {total} {read}", text.contains(want)));
             }
         }
         assert!(failed.is_empty(), "{failed:?}");
     }
 
     /// [`test_a_heap_allocation_above_the_hosts_commit_limit_is_refused_as_the_systems`]'s
-    /// size: the host's commit limit and 1 GiB.
+    /// size: the host's commit limit, as read in the job, and 1 GiB. The
+    /// read is said, for the parent to check it against its own, out of a
+    /// job.
     fn above_the_host() -> usize {
-        crate::wick_alloc::host_commit_limit().expect("the host's commit limit") + (1 << 30)
+        let total = crate::wick_alloc::host_commit_limit().expect("the host's commit limit");
+        crate::windows_mm::say_at_the_limit(format_args!("HEAPABOVE the host's commit limit read in the job: {total}"));
+        total + (1 << 30)
     }
 
     #[test]
