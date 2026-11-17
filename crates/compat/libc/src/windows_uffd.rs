@@ -90,18 +90,44 @@ pub mod proto {
     /// `WSAPROTOCOL_INFOW` of the sender's end of its request channel,
     /// duplicated for the userfaultfd's process.
     pub const HELLO: u64 = 0x10;
-    /// Request: `[OP_COPY, dst, len, mode]`, then `len` bytes.
+    /// Request: `[OP_COPY, dst, len, mode]`, then `len` bytes. `mode` is
+    /// Linux's `uffdio_copy.mode`: [`MODE_DONTWAKE`] and [`MODE_WP`], any
+    /// other bit `EINVAL` (the `len` bytes are read all the same).
     pub const OP_COPY: u64 = 1;
-    /// Request: `[OP_ZEROPAGE, start, len, mode]`.
+    /// Request: `[OP_ZEROPAGE, start, len, mode]`. `mode` is Linux's
+    /// `uffdio_zeropage.mode`: [`MODE_DONTWAKE`], any other bit `EINVAL`.
     pub const OP_ZEROPAGE: u64 = 2;
     /// Request: `[OP_WAKE, start, len, 0]`.
     pub const OP_WAKE: u64 = 3;
-    /// Request: `[OP_REGISTER, start, len, 0]`.
+    /// Request: `[OP_REGISTER, start, len, 0]`. Reply: the range's ioctls
+    /// (Linux's `uffdio_register.ioctls`, [`RANGE_IOCTLS`]) as the result
+    /// and the count.
     pub const OP_REGISTER: u64 = 4;
     /// Request: `[OP_UNREGISTER, start, len, 0]`.
     pub const OP_UNREGISTER: u64 = 5;
-    /// Copy and zeropage mode: do not wake the waiting threads.
+    /// Copy and zeropage mode: do not wake the waiting threads (Linux's
+    /// `UFFDIO_COPY_MODE_DONTWAKE` and `UFFDIO_ZEROPAGE_MODE_DONTWAKE`, both
+    /// bit 0, include/uapi/linux/userfaultfd.h).
     pub const MODE_DONTWAKE: u64 = 1;
+    /// Copy mode: map the pages write-protected (`UFFDIO_COPY_MODE_WP`, bit
+    /// 1), which Linux takes only into a range registered for write-protect
+    /// faults; no range is registered so here (a register asks for missing
+    /// faults only), so a copy with it is `EINVAL`, once its range is found,
+    /// as Linux's into a range not so registered.
+    pub const MODE_WP: u64 = 2;
+    /// A register's ioctls, Linux's bits (`1 << _UFFDIO_WAKE`, `_COPY`,
+    /// `_ZEROPAGE`, include/uapi/linux/userfaultfd.h): the ones a registered
+    /// range takes here. Linux's `UFFD_API_RANGE_IOCTLS` also has
+    /// `UFFDIO_MOVE` and `UFFDIO_POISON`, which are not here, and
+    /// `UFFDIO_WRITEPROTECT` and `UFFDIO_CONTINUE`, which it takes off for a
+    /// range registered for missing faults only.
+    pub const RANGE_IOCTLS: u64 = 1 << 0x02 | 1 << 0x03 | 1 << 0x04;
+    /// A register's ioctls for a range that holds a `MAP_HUGETLB` mapping:
+    /// no `UFFDIO_ZEROPAGE`, which Linux's hugetlb refuses
+    /// (`UFFD_API_RANGE_IOCTLS_BASIC`). The macOS twin's; never the reply
+    /// here, where a huge page mapping is not registered (`EINVAL`,
+    /// SECURITY.md, "Not at parity yet").
+    pub const RANGE_IOCTLS_HUGETLB: u64 = 1 << 0x02 | 1 << 0x03;
     // Reply: `[result, count, 0, 0]`: `result` is the byte count, or a
     // negative errno; for a partial copy `-EAGAIN` with the count copied.
 
@@ -1787,6 +1813,20 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
 /// ([`unregister_whole_at_a_failed_close`]). Linux's register changes no
 /// page's protection and has no such failure.
 pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
+    register_ioctls(ctx, start, len).map(|_| ())
+}
+
+/// [`register`], returning the ioctls the range takes, as Linux's
+/// `uffdio_register.ioctls` (fs/userfaultfd.c, v6.12, :1387 to :1388):
+/// [`proto::RANGE_IOCTLS`]. Linux's hugetlb set
+/// ([`proto::RANGE_IOCTLS_HUGETLB`], `basic_ioctls` :1371 to :1372) is never
+/// the answer here: a huge page mapping is not registered (`EINVAL`).
+pub fn register_ioctls(ctx: usize, start: u64, len: u64) -> io::Result<u64> {
+    register_range(ctx, start, len).map(|()| proto::RANGE_IOCTLS)
+}
+
+/// [`register`]'s work.
+fn register_range(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     // The range checked as Linux's register checks it (fs/userfaultfd.c,
     // v6.1, `validate_range` at :1309): page aligned, not empty, within the
     // process's addresses.
@@ -2085,17 +2125,22 @@ fn register_again(r: &'static Range, ctx: usize, start: u64, end: u64) -> io::Re
     Ok(())
 }
 
-/// The registered range holding all of `[start, start + len)`, which must be
-/// page aligned, every page of it registered with `ctx`: else `ENOENT`, as
-/// Linux's fill finds its destination in one vma of the context
-/// (mm/userfaultfd.c, v6.12, `validate_dst_vma` :34, `uffd_mfill_lock`
-/// :113). Pages `ctx` registered again after an unregister are one with
-/// the rest, as Linux merges the vma of a register with its neighbours
-/// (`userfaultfd_register_range`, its `vma_modify_flags_uffd` at :1860).
+/// The registered range holding all of `[start, start + len)`, which is
+/// checked as Linux's `validate_range` checks it (`EINVAL`), every page of
+/// it registered with `ctx`: a page in no registration (unregistered, or its
+/// memory unmapped or mapped over) is `ENOENT` for the whole call, as
+/// Linux's destination must lie in one registered vma (mm/userfaultfd.c,
+/// v6.12, `validate_dst_vma` :34, `uffd_mfill_lock` :113). Not Linux's:
+/// another userfaultfd's page is `ENOENT` too, where `validate_dst_vma` asks
+/// only that the vma has a userfaultfd, any (a fill through one into the
+/// other's memory would wake none of the other's waiters). Pages `ctx`
+/// registered again after an unregister are one with the rest, as Linux
+/// merges the vma of a register with its neighbours
+/// (`userfaultfd_register_range`, its `vma_modify_flags_uffd` at :1860);
+/// two ranges are not, where Linux's merged vma takes a fill across both
+/// (docs/ARCHITECTURE.md, "The ioctls' checks").
 fn range_of(ctx: usize, start: u64, len: u64) -> Result<&'static Range, c_int> {
-    if !start.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) || len == 0 {
-        return Err(crate::EINVAL);
-    }
+    validate_range(start, len)?;
     let (range, first) = find(start).ok_or(crate::ENOENT)?;
     if start + len > range.end.load(Ordering::Acquire) || (first..first + len / PAGE).any(|page| range.owner(page) != Some(ctx)) {
         return Err(crate::ENOENT);
@@ -2169,8 +2214,10 @@ pub fn unregister(_ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
     result
 }
 
-/// Fills missing pages from `dst` on with `fill(alias_dst, len)`: stops at
-/// the first page that is present. Returns the byte count; `EEXIST` if the
+/// Fills missing pages from `dst` on with `fill(alias_at, len, offset)`,
+/// `offset` the bytes from `dst` to the first page given (a fill whose
+/// commit was refused in part is given its pages in more than one call):
+/// stops at the first page that is present. Returns the byte count; `EEXIST` if the
 /// first page is present, `EAGAIN` with the count when only some were filled.
 ///
 /// A reserved section's pages are committed, and charged, first; the job's
@@ -2203,7 +2250,7 @@ fn fill(
     dst: u64,
     len: u64,
     wake_up: bool,
-    mut fill: impl FnMut(*mut u8, usize),
+    mut fill: impl FnMut(*mut u8, usize, usize),
 ) -> Result<u64, (c_int, u64)> {
     let mut guard = Some(lock());
     let range = range_of(ctx, dst, len).map_err(|e| (e, 0))?;
@@ -2241,10 +2288,10 @@ fn fill(
         let at = dst + done * PAGE;
         let mut bytes = n * PAGE;
         #[allow(clippy::cast_possible_truncation)]
-        if range.reserved.load(Ordering::Acquire) && !crate::windows_mm::uffd_commit(at as usize, bytes as usize) {
+        if range.reserved.load(Ordering::Acquire) && !uffd_commit(at, bytes) {
             // The pages that fit, a page at a time.
             let mut fits = 0;
-            while fits < bytes && crate::windows_mm::uffd_commit((at + fits) as usize, PAGE as usize) {
+            while fits < bytes && uffd_commit(at + fits, PAGE) {
                 fits += PAGE;
             }
             if fits == 0 {
@@ -2281,7 +2328,7 @@ fn fill(
             }
             bytes = fits;
         }
-        fill((alias + (at - base)) as *mut u8, bytes as usize);
+        fill((alias + (at - base)) as *mut u8, bytes as usize, (at - dst) as usize);
         // Each page with the protection `mprotect` gave it (one filled while
         // `PROT_NONE` stays closed, as Linux's copy fills a page of a
         // `PROT_NONE` vma).
@@ -2320,6 +2367,19 @@ fn fill(
         (e, 0) => Err((e, 0)),
         (_, n) => Err((crate::EAGAIN, n)),
     }
+}
+
+/// `windows_mm::uffd_commit` of `[at, at + len)`, a fill's commit of a
+/// reserved section's pages. In tests, a commit inside the span
+/// `tests::REFUSE_COMMITS` names follows its script first: refused, or
+/// made, one step a call.
+#[allow(clippy::cast_possible_truncation)]
+fn uffd_commit(at: u64, len: u64) -> bool {
+    #[cfg(test)]
+    if !tests::scripted_commit(at, len) {
+        return false;
+    }
+    crate::windows_mm::uffd_commit(at as usize, len as usize)
 }
 
 /// Linux's reclaims in a row that give nothing back before its memory
@@ -2391,15 +2451,16 @@ pub unsafe fn copy(
     len: u64,
     wake_up: bool,
 ) -> Result<u64, (c_int, u64)> {
-    fill(ctx, dst, len, wake_up, |to, n| {
-        // SAFETY: `to` is the alias of missing pages; `src` per the contract.
-        unsafe { ptr::copy_nonoverlapping(src, to, n) }
+    fill(ctx, dst, len, wake_up, |to, n, offset| {
+        // SAFETY: `to` is the alias of missing pages; `src` per the contract,
+        // `offset + n` at most `len`.
+        unsafe { ptr::copy_nonoverlapping(src.add(offset), to, n) }
     })
 }
 
 /// `UFFDIO_ZEROPAGE`: fills missing pages from `start` on with zeros.
 pub fn zeropage(ctx: usize, start: u64, len: u64, wake_up: bool) -> Result<u64, (c_int, u64)> {
-    fill(ctx, start, len, wake_up, |to, n| {
+    fill(ctx, start, len, wake_up, |to, n, _| {
         // SAFETY: `to` is the alias of missing pages.
         unsafe { ptr::write_bytes(to, 0, n) }
     })
@@ -2963,6 +3024,64 @@ fn serve_mirror_pull(ctx: usize) -> [u64; 2] {
     [mirror_bytes() as u64, pull as usize as u64]
 }
 
+/// Serves `[OP_COPY, dst, len, mode]`, whose `len` bytes of data follow on
+/// `fd`; `None` when the channel closed. The request is checked before the
+/// data is read, and the data is read and copied a piece at a time, so a
+/// length that names no registered memory costs no memory to refuse; a
+/// refused request's data is read and dropped all the same, so the next
+/// request is answered as itself. The checks are Linux's `userfaultfd_copy`
+/// and `mfill_atomic`'s, in their order (fs/userfaultfd.c and
+/// mm/userfaultfd.c, v6.12): the range (`EINVAL`, :1602 to :1604; Linux's
+/// check of `src` before it, :1598, has nothing to check here, where the
+/// data comes with the request), a mode bit other than
+/// [`proto::MODE_DONTWAKE`] and [`proto::MODE_WP`] (`EINVAL`, :1606 to
+/// :1608), the registered range (`ENOENT`, `uffd_mfill_lock` :733), then
+/// [`proto::MODE_WP`] into a range not registered for write-protect faults,
+/// which every range is here (`EINVAL`, :762 to :763). As Linux's
+/// `UFFDIO_COPY`, it stops at the first page that is not missing: `EEXIST`
+/// if that is the first, else `EAGAIN` with the count copied. The macOS
+/// twin's `serve_copy`.
+fn serve_copy(ctx: usize, fd: c_int, dst: u64, len: u64, mode: u64) -> Option<Result<u64, (c_int, u64)>> {
+    /// The data's pieces: a mebibyte.
+    const PIECE: u64 = 1 << 20;
+    let wake_up = mode & proto::MODE_DONTWAKE == 0;
+    let mut result = check_copy(ctx, dst, len, mode).map(|()| 0).map_err(|e| (e, 0));
+    let mut buf = Vec::new();
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(PIECE);
+        buf.resize(n as usize, 0);
+        if !recv_all(fd, &mut buf) {
+            return None;
+        }
+        // Once stopped, the rest of the data is read and dropped.
+        if let Ok(copied) = result {
+            // SAFETY: `buf` holds `n` bytes.
+            result = match unsafe { copy(ctx, buf.as_ptr(), dst + done, n, wake_up) } {
+                Ok(m) => Ok(copied + m),
+                Err((_, m)) if copied + m > 0 => Err((crate::EAGAIN, copied + m)),
+                Err(e) => Err(e),
+            };
+        }
+        done += n;
+    }
+    Some(result)
+}
+
+/// [`serve_copy`]'s checks of `[OP_COPY, dst, len, mode]`, in Linux's order.
+fn check_copy(ctx: usize, dst: u64, len: u64, mode: u64) -> Result<(), c_int> {
+    validate_range(dst, len)?;
+    if mode & !(proto::MODE_DONTWAKE | proto::MODE_WP) != 0 {
+        return Err(crate::EINVAL);
+    }
+    let _guard = lock();
+    range_of(ctx, dst, len)?;
+    if mode & proto::MODE_WP != 0 {
+        return Err(crate::EINVAL);
+    }
+    Ok(())
+}
+
 /// Serves one request from a client channel; false when the channel closed.
 fn serve_request(ctx: usize, fd: c_int) -> bool {
     let mut head = [0u8; proto::RECORD];
@@ -2970,29 +3089,25 @@ fn serve_request(ctx: usize, fd: c_int) -> bool {
         return false;
     }
     let [op, a, b, c] = words(&head);
-    let wake_up = c & proto::MODE_DONTWAKE == 0;
     let to_reply = |r: Result<u64, (c_int, u64)>| match r {
         Ok(n) => [n, n],
         Err((e, n)) => [(-i64::from(e)).cast_unsigned(), n],
     };
     let reply = match op {
-        proto::OP_COPY => {
-            let Ok(len) = usize::try_from(b) else {
-                return false;
-            };
-            let mut data = std::vec![0u8; len];
-            if !recv_all(fd, &mut data) {
-                return false;
-            }
-            // SAFETY: `data` holds `len` bytes.
-            to_reply(unsafe { copy(ctx, data.as_ptr(), a, b, wake_up) })
-        }
-        proto::OP_ZEROPAGE => to_reply(zeropage(ctx, a, b, wake_up)),
+        proto::OP_COPY => match serve_copy(ctx, fd, a, b, c) {
+            Some(r) => to_reply(r),
+            None => return false,
+        },
+        // Linux's `userfaultfd_zeropage`: the range, then a mode bit other
+        // than DONTWAKE, both `EINVAL` (fs/userfaultfd.c, v6.12, :1654 to
+        // :1660), then the fill's own checks.
+        proto::OP_ZEROPAGE => to_reply(match validate_range(a, b) {
+            Ok(()) if c & !proto::MODE_DONTWAKE != 0 => Err((crate::EINVAL, 0)),
+            _ => zeropage(ctx, a, b, c & proto::MODE_DONTWAKE == 0),
+        }),
         proto::OP_WAKE => to_reply(wake_range(ctx, a, b).map(|()| 0).map_err(|e| (e, 0))),
         proto::OP_REGISTER => to_reply(
-            register(ctx, a, b)
-                .map(|()| 0)
-                .map_err(|e| (e.raw_os_error().unwrap_or(crate::EINVAL), 0)),
+            register_ioctls(ctx, a, b).map_err(|e| (e.raw_os_error().unwrap_or(crate::EINVAL), 0)),
         ),
         proto::OP_UNREGISTER => to_reply(unregister(ctx, a, b).map(|()| 0).map_err(|e| (e, 0))),
         proto::OP_MIRROR => serve_mirror(ctx, fd),
@@ -3821,6 +3936,176 @@ mod tests {
         assert_eq!(proto::mirror_bytes(4096), 4096);
         // The mirror fits one page of this host.
         assert_eq!(mirror_bytes(), 4096);
+        // The modes and a register's ioctls: wick_uffd.rs `MODE_DONTWAKE` 1,
+        // `MODE_WP` 2, `RANGE_IOCTLS` and `RANGE_IOCTLS_HUGETLB` (Linux's
+        // `1 << _UFFDIO_WAKE | _COPY | _ZEROPAGE`, and without `_ZEROPAGE`).
+        assert_eq!((proto::MODE_DONTWAKE, proto::MODE_WP), (1, 2));
+        assert_eq!((proto::RANGE_IOCTLS, proto::RANGE_IOCTLS_HUGETLB), (0x1c, 0xc));
+    }
+
+    // ---- The ioctls' checks, as Linux v6.12's, in its order
+    // (docs/ARCHITECTURE.md, "The ioctls' checks"; the macOS backend's tests
+    // of the same names). The checks of a request's mode, made where it comes
+    // off a channel, are the `userfaultfd` crate's
+    // `test_fill_modes_and_ranges_are_checked_as_linux`. ----
+
+    /// Every range is checked as Linux's `validate_range` checks it: a start
+    /// below `mmap_min_addr` is `EINVAL`, which is 64 KiB on Linux's arm64 and
+    /// x86 hosts (security/Kconfig `LSM_MMAP_MIN_ADDR`, v6.12, :145 to :149)
+    /// and the lowest address a Windows process maps
+    /// (`lpMinimumApplicationAddress`); one at it is memory that is not mapped
+    /// (`ENOENT` for a fill, nothing to wake). A register answers the range's
+    /// ioctls. Before, a fill below 64 KiB was `ENOENT` (`range_of` checked
+    /// the alignment only).
+    #[test]
+    fn test_fill_modes_and_ranges_are_checked_as_linux() {
+        use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+        const MMAP_MIN_ADDR: u64 = 0x1_0000;
+        // SAFETY: an all-zero SYSTEM_INFO is valid; filled by the call.
+        let mut si: SYSTEM_INFO = unsafe { core::mem::zeroed() };
+        // SAFETY: as above.
+        unsafe { GetSystemInfo(&mut si) };
+        assert_eq!(si.lpMinimumApplicationAddress as u64, MMAP_MIN_ADDR, "Windows' lowest address is not Linux's mmap_min_addr");
+        let (ctx, user) = create(0, false, true).unwrap();
+        let mem = map(PAGE as usize);
+        assert_eq!(register_ioctls(ctx, mem, PAGE).unwrap(), proto::RANGE_IOCTLS);
+        let page = page_of(7);
+        for at in [PAGE, MMAP_MIN_ADDR - PAGE] {
+            assert_eq!(wake_range(ctx, at, PAGE), Err(crate::EINVAL), "{at:#x}");
+            assert_eq!(zeropage(ctx, at, PAGE, true), Err((crate::EINVAL, 0)), "{at:#x}");
+            // SAFETY: `page` holds a page.
+            assert_eq!(unsafe { copy(ctx, page.as_ptr(), at, PAGE, true) }, Err((crate::EINVAL, 0)), "{at:#x}");
+            assert_eq!(unregister(ctx, at, PAGE), Err(crate::EINVAL), "{at:#x}");
+            assert_eq!(register(ctx, at, PAGE).unwrap_err().raw_os_error(), Some(crate::EINVAL), "{at:#x}");
+        }
+        assert_eq!(wake_range(ctx, MMAP_MIN_ADDR, PAGE), Ok(()));
+        assert_eq!(zeropage(ctx, MMAP_MIN_ADDR, PAGE, true), Err((crate::ENOENT, 0)));
+        // SAFETY: `page` holds a page.
+        assert_eq!(unsafe { copy(ctx, page.as_ptr(), MMAP_MIN_ADDR, PAGE, true) }, Err((crate::ENOENT, 0)));
+        assert!(is_missing(mem));
+        assert_eq!(zeropage(ctx, mem, PAGE, true), Ok(PAGE));
+        release(ctx, user);
+    }
+
+    /// Not Linux's: two registers of adjacent memory are two ranges, and a
+    /// fill across both is `ENOENT`, where Linux merges the second vma with
+    /// the first (`userfaultfd_register_range`, `vma_modify_flags_uffd`,
+    /// fs/userfaultfd.c, v6.12) and fills across them. Each part fills on
+    /// its own. Two mappings here, as part of a mapping is not registered
+    /// on Windows (SECURITY.md, "Not at parity yet"); on Linux the two are
+    /// one vma.
+    #[test]
+    fn test_two_adjacent_registers_are_two_ranges() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        // Two mappings, one after the other: where one was unmapped, each
+        // placed there by its address hint (again if another test's mapping
+        // took the addresses meanwhile).
+        let at = |a: u64| {
+            // SAFETY: a new anonymous mapping, at free addresses of the test's.
+            (unsafe { crate::mmap(a as *mut c_void, CHUNK as usize, crate::PROT_READ | crate::PROT_WRITE, crate::MAP_PRIVATE | crate::MAP_ANONYMOUS, -1, 0) }) as u64
+        };
+        let mem = (0..10)
+            .find_map(|_| {
+                let mem = map(2 * CHUNK as usize);
+                assert_eq!(munmap_of(mem, 2 * CHUNK), 0);
+                let (a, b) = (at(mem), at(mem + CHUNK));
+                if (a, b) == (mem, mem + CHUNK) {
+                    return Some(mem);
+                }
+                for m in [a, b] {
+                    assert_eq!(munmap_of(m, CHUNK), 0);
+                }
+                None
+            })
+            .expect("the hints were not taken in 10 tries");
+        for at in [mem, mem + CHUNK] {
+            let r = register(ctx, at, CHUNK);
+            assert!(r.is_ok(), "the register at {at:#x}: {r:?}");
+        }
+        {
+            let _guard = lock();
+            let (a, b) = (find(mem).unwrap().0, find(mem + CHUNK).unwrap().0);
+            assert!(!ptr::eq(a, b), "one range");
+        }
+        let across = mem + CHUNK - PAGE;
+        assert_eq!(zeropage(ctx, across, 2 * PAGE, true), Err((crate::ENOENT, 0)));
+        assert!(is_missing(across) && is_missing(across + PAGE));
+        assert_eq!(zeropage(ctx, across, PAGE, true), Ok(PAGE));
+        assert_eq!(zeropage(ctx, across + PAGE, PAGE, true), Ok(PAGE));
+        assert_eq!(unregister(ctx, mem, 2 * CHUNK), Ok(()));
+        assert_eq!(munmap_of(mem, 2 * CHUNK), 0);
+        release(ctx, user);
+    }
+
+    /// Not Linux's, as on macOS: a fill while a remove event is unread is
+    /// not `EAGAIN`. `madvise(MADV_DONTNEED)` of registered pages queues
+    /// the event and returns ([`discarding`]), where Linux's waits for the
+    /// handler to read it (fs/userfaultfd.c, v6.12, `userfaultfd_remove`
+    /// :770, `userfaultfd_event_wait_completion` :793) and a fill meanwhile
+    /// sees `mmap_changing` (`EAGAIN`, :1588 to :1590). Here the fill fills,
+    /// and the event is read after.
+    #[test]
+    fn test_a_fill_while_a_remove_event_is_unread_fills() {
+        let (ctx, user) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
+        let mem = map(2 * PAGE as usize);
+        register(ctx, mem, 2 * PAGE).unwrap();
+        assert_eq!(zeropage(ctx, mem, 2 * PAGE, true), Ok(2 * PAGE));
+        // SAFETY: registered memory of the test's.
+        assert_eq!(unsafe { crate::madvise(mem as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
+        assert!(is_missing(mem));
+        // SAFETY: a page.
+        assert_eq!(unsafe { copy(ctx, page_of(3).as_ptr(), mem, PAGE, true) }, Ok(PAGE), "the fill before the remove event is read");
+        let mut rec = [0u8; proto::RECORD];
+        assert!(recv_all(user, &mut rec));
+        assert_eq!(words(&rec)[..3], [proto::EVENT_REMOVE, mem, mem + PAGE]);
+        // SAFETY: filled above.
+        assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 3);
+        assert_eq!(unregister(ctx, mem, 2 * PAGE), Ok(()));
+        release(ctx, user);
+    }
+
+    /// A reserved section's fill whose commit is refused in part fills the
+    /// pages that fit, then the rest once committed: each page from its own
+    /// bytes of the source. Before, each later part was filled from the
+    /// source's start (the fill's callback was given no offset), so a copy
+    /// that met the job's limit wrote the wrong bytes into the pages after
+    /// its first part. The commit's refusals are scripted
+    /// ([`REFUSE_COMMITS`]): the whole run refused, two pages made one at a
+    /// time, the third refused; the rest then committed whole.
+    #[test]
+    fn test_a_copy_whose_commit_is_refused_in_part_fills_each_page_from_its_own_bytes() {
+        let (ctx, user) = create(0, false, true).unwrap();
+        let mem = map_noreserve(4 * PAGE as usize);
+        register(ctx, mem, 4 * PAGE).unwrap();
+        assert!(find(mem).unwrap().0.reserved.load(Ordering::Acquire), "not a reserved section");
+        #[allow(clippy::cast_possible_truncation)]
+        let src: std::vec::Vec<u8> = (0..4 * PAGE).map(|i| (i / PAGE) as u8 + 1).collect();
+        *REFUSE_COMMITS.lock().unwrap() = Some((mem, mem + 4 * PAGE, [false, true, true, false].into_iter().collect()));
+        // SAFETY: `src` holds four pages.
+        let r = unsafe { copy(ctx, src.as_ptr(), mem, 4 * PAGE, true) };
+        let left = REFUSE_COMMITS.lock().unwrap().take().map(|(_, _, s)| s.len());
+        assert_eq!(left, Some(0), "the script was not followed");
+        assert_eq!(r, Ok(4 * PAGE));
+        for p in 0..4u8 {
+            // SAFETY: filled above.
+            let b = unsafe { ptr::read_volatile((mem + u64::from(p) * PAGE + 9) as *const u8) };
+            assert_eq!(b, p + 1, "page {p} holds page {}'s bytes", b.wrapping_sub(1));
+        }
+        assert_eq!(unregister(ctx, mem, 4 * PAGE), Ok(()));
+        release(ctx, user);
+    }
+
+    /// A fill's commits inside `[start, end)` follow the script first, a
+    /// step a call: `false` refused, `true` made; past the script, made
+    /// ([`uffd_commit`]).
+    pub(crate) static REFUSE_COMMITS: std::sync::Mutex<Option<(u64, u64, std::collections::VecDeque<bool>)>> = std::sync::Mutex::new(None);
+
+    /// [`REFUSE_COMMITS`]'s answer for a commit of `[at, at + len)`.
+    pub(crate) fn scripted_commit(at: u64, len: u64) -> bool {
+        match REFUSE_COMMITS.lock().unwrap().as_mut() {
+            Some((start, end, script)) if at >= *start && at + len <= *end => script.pop_front().unwrap_or(true),
+            _ => true,
+        }
     }
 
     /// Proof 1: the read-only handle a reader is given maps the mirror
@@ -11888,9 +12173,10 @@ mod tests {
     /// `userfaultfd_unregister` :1413, `userfaultfd_clear_vma` at :1522;
     /// `userfaultfd_register` refuses only a vma another context has, :1364
     /// to :1366): each part then faults to its own userfaultfd and is filled
-    /// only through it (a fill through the other is `ENOENT`,
-    /// mm/userfaultfd.c `validate_dst_vma` :23 to :37). The macOS backend's
-    /// test of the same name. For both kinds.
+    /// only through it (a fill through the other is `ENOENT`; not Linux's,
+    /// whose `validate_dst_vma`, mm/userfaultfd.c :23 to :37, asks only that
+    /// the vma has a userfaultfd: [`range_of`]). The macOS backend's test of
+    /// the same name. For both kinds.
     #[test]
     fn test_a_partial_unregister_frees_that_part_for_another_userfaultfd() {
         for kind in MEM_KINDS {

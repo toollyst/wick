@@ -203,6 +203,7 @@ has the per-control details and results.
 
 ## Fixed defects
 
+- **Windows: a userfaultfd copy whose commit the job's limit refused in part filled its later pages from the source's start** (from d0fbafae, which made a fill at the limit go on where it was; fixed in the commit that adds this entry). A fill of a reserved section commits its pages first; refused, it fills the pages that fit and goes on with the rest once a reclaim gave room back. The copy's callback was given each part's destination but not its offset into the source, so every part after the first was filled from the source's first bytes: the guest read another page's contents in those pages, with no error. Only a copy that met the job's memory limit in its middle was hit. Now each part is copied from its own offset (`test_a_copy_whose_commit_is_refused_in_part_fills_each_page_from_its_own_bytes`, which scripts the commit's refusals; it failed on the code before).
 - **macOS: stage 2 did not follow the host's protection of guest memory** (from the macOS backend's start; its tests
   and this entry, then under "Not at parity yet", in 2e942d5a; fixed in the commit that moved it here). On Linux each
   stage-2 page of a memslot is taken through the host's vma, so a guest access is allowed only as the host's

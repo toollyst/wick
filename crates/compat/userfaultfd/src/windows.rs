@@ -181,6 +181,12 @@ const API_IOCTLS: IoctlFlags = IoctlFlags::REGISTER
 const RANGE_IOCTLS: IoctlFlags = IoctlFlags::WAKE
     .union(IoctlFlags::COPY)
     .union(IoctlFlags::ZEROPAGE);
+// The kernel side answers a register with these bits (the macOS twin's
+// `MAP_HUGETLB` set without `ZEROPAGE` too, though a huge page mapping is
+// not registered here).
+const _: () = assert!(RANGE_IOCTLS.bits() == proto::RANGE_IOCTLS);
+const _: () =
+    assert!(RANGE_IOCTLS.difference(IoctlFlags::ZEROPAGE).bits() == proto::RANGE_IOCTLS_HUGETLB);
 
 bitflags! {
     /// How a range is registered.
@@ -660,12 +666,11 @@ impl Uffd {
         }
         let (start, len) = (start as u64, len as u64);
         let reply = self.call(proto::OP_REGISTER, start, len, 0, |ctx| {
-            wick_uffd::register(ctx, start, len)
-                .map(|()| 0)
+            wick_uffd::register_ioctls(ctx, start, len)
                 .map_err(|e| (e.raw_os_error().unwrap_or(libc::EINVAL), 0))
         })?;
-        reply.map_err(|(e, _)| Error::SystemError(errno(e)))?;
-        Ok(RANGE_IOCTLS)
+        let ioctls = reply.map_err(|(e, _)| Error::SystemError(errno(e)))?;
+        Ok(IoctlFlags::from_bits_retain(ioctls))
     }
 
     /// Unregisters a range: its missing pages become ordinary memory.
@@ -1292,6 +1297,116 @@ mod tests {
         assert_eq!(unsafe { ptr::read_volatile(mem.add(ps)) }, 2);
         // SAFETY: present, untouched by the madvise.
         assert_eq!(unsafe { ptr::read_volatile(mem) }, 1);
+    }
+
+    /// The modes and ranges of fills and wakes, as they come off a request
+    /// channel, are checked as Linux's `userfaultfd_copy`,
+    /// `userfaultfd_zeropage`, `mfill_atomic` and `validate_range` check them
+    /// (v6.12), in their order: a range off pages, or below `mmap_min_addr`
+    /// (64 KiB), then a mode bit Linux does not know (`EINVAL`, before the
+    /// range is looked up), then a range not registered (`ENOENT`), then a
+    /// write-protected copy (`EINVAL`: no range is registered for
+    /// write-protect faults). A refused copy's data is read all the same, so
+    /// the next request is answered as itself, a copy of more than the
+    /// kernel side's piece (a mebibyte) among them; a refused fill fills
+    /// nothing. A register through the channel answers the range's ioctls.
+    /// The macOS backend's test of the same name (`libc::wick_uffd`).
+    /// Before, every mode bit but `DONTWAKE` was ignored: a `WP` copy filled
+    /// the pages writable, and a zeropage with any mode filled.
+    #[test]
+    fn test_fill_modes_and_ranges_are_checked_as_linux() {
+        const MMAP_MIN_ADDR: u64 = 0x1_0000;
+        let ps = PAGE as u64;
+        let owner = UffdBuilder::new().non_blocking(true).create().unwrap();
+        // SAFETY: duplicates a descriptor this test owns.
+        let client = unsafe { Uffd::from_raw_fd(libc::dup(owner.as_raw_fd())) };
+        let mem = map(3 * PAGE) as u64;
+        let other = map(PAGE) as u64;
+        assert_eq!(client.register(mem as *mut c_void, 3 * PAGE).unwrap(), RANGE_IOCTLS, "the range's ioctls");
+        let request = |head: [u64; 4], data: &[u8]| client.request(head, data).unwrap();
+        let page = vec![7u8; PAGE];
+        let (inval, noent): (Reply, Reply) = (Err((libc::EINVAL, 0)), Err((libc::ENOENT, 0)));
+        let (wp, dontwake) = (proto::MODE_WP, proto::MODE_DONTWAKE);
+        let (copy, zero) = (proto::OP_COPY, proto::OP_ZEROPAGE);
+        for mode in [1 << 2, 1 << 2 | dontwake, 1 << 2 | wp, 1 << 31, 1 << 63, u64::MAX] {
+            // Unknown bits: EINVAL, into registered memory and not.
+            assert_eq!(request([copy, mem, ps, mode], &page), inval, "copy {mode:#x}");
+            assert_eq!(request([copy, other, ps, mode], &page), inval, "copy {mode:#x}");
+            assert_eq!(request([zero, mem, ps, mode], &[]), inval, "zeropage {mode:#x}");
+            assert_eq!(request([zero, other, ps, mode], &[]), inval, "zeropage {mode:#x}");
+        }
+        // Zeropage has no write-protect mode.
+        for mode in [wp, wp | dontwake] {
+            assert_eq!(request([zero, mem, ps, mode], &[]), inval, "zeropage {mode:#x}");
+            assert_eq!(request([zero, other, ps, mode], &[]), inval, "zeropage {mode:#x}");
+        }
+        // A write-protected copy: the range first (EINVAL off pages, ENOENT
+        // not registered), then EINVAL.
+        for mode in [wp, wp | dontwake] {
+            assert_eq!(request([copy, mem, ps, mode], &page), inval, "copy {mode:#x}");
+            assert_eq!(request([copy, other, ps, mode], &page), noent, "copy {mode:#x}");
+            assert_eq!(request([copy, mem + 8, ps, mode], &page), inval, "copy {mode:#x}");
+        }
+        assert!((0..3).all(|i| wick_uffd::is_missing(mem + i * ps)), "a refused fill filled a page");
+        // A refused copy of more than a piece: its data is read whole.
+        let big = vec![9u8; (3 << 20) + PAGE];
+        assert_eq!(request([copy, other, big.len() as u64, 0], &big), noent);
+        assert_eq!(request([copy, other, big.len() as u64, 1 << 2], &big), inval);
+        // The modes Linux knows fill.
+        assert_eq!(request([copy, mem, ps, dontwake], &page), Ok(ps));
+        assert_eq!(request([zero, mem + ps, ps, dontwake], &[]), Ok(ps));
+        assert_eq!(request([copy, mem + 2 * ps, ps, 0], &page), Ok(ps));
+        // SAFETY: filled pages.
+        let read = |at: u64| unsafe { ptr::read_volatile(at as *const u8) };
+        assert_eq!([read(mem), read(mem + ps), read(mem + 2 * ps)], [7, 0, 7]);
+        // `mmap_min_addr`: a range below it is EINVAL, one at it is memory
+        // that is not mapped.
+        for at in [ps, MMAP_MIN_ADDR - ps] {
+            assert_eq!(request([proto::OP_WAKE, at, ps, 0], &[]), inval, "{at:#x}");
+            assert_eq!(request([copy, at, ps, 0], &page), inval, "{at:#x}");
+            assert_eq!(request([zero, at, ps, 0], &[]), inval, "{at:#x}");
+            assert_eq!(request([proto::OP_REGISTER, at, ps, 0], &[]), inval, "{at:#x}");
+            assert_eq!(request([proto::OP_UNREGISTER, at, ps, 0], &[]), inval, "{at:#x}");
+        }
+        assert_eq!(request([proto::OP_WAKE, MMAP_MIN_ADDR, ps, 0], &[]), Ok(0));
+        assert_eq!(request([copy, MMAP_MIN_ADDR, ps, 0], &page), noent);
+        client.unregister(mem as *mut c_void, 3 * PAGE).unwrap();
+    }
+
+    /// A copy through the channel of more than the kernel side's piece (a
+    /// mebibyte), read and copied a piece at a time: each page holds its own
+    /// bytes, and the count is the whole; stopped at a present page in a
+    /// later piece, `EAGAIN` with the count copied, and the rest of the data
+    /// read, so the next request is answered as itself.
+    #[test]
+    fn test_a_copy_of_many_pieces_fills_each_page_from_its_own_bytes() {
+        let len = (2 << 20) + 2 * PAGE;
+        let owner = UffdBuilder::new().non_blocking(true).create().unwrap();
+        // SAFETY: duplicates a descriptor this test owns.
+        let client = unsafe { Uffd::from_raw_fd(libc::dup(owner.as_raw_fd())) };
+        let mem = map(len);
+        client.register(mem.cast(), len).unwrap();
+        #[allow(clippy::cast_possible_truncation)]
+        let src: Vec<u8> = (0..len).map(|i| (i / PAGE) as u8 ^ 0x5a).collect();
+        // Page 300 (in the second piece) present first.
+        let at300 = 300 * PAGE;
+        // SAFETY: `src` holds the page; a registered page.
+        assert_eq!(unsafe { client.copy(src[at300..].as_ptr().cast(), mem.add(at300).cast(), PAGE, true) }.unwrap(), PAGE);
+        // SAFETY: `src` holds `len` bytes; registered pages.
+        let e = unsafe { client.copy(src.as_ptr().cast(), mem.cast(), len, true) };
+        assert!(matches!(e, Err(Error::PartiallyCopied(n)) if n == at300), "{e:?}");
+        // The next request is answered as itself.
+        // SAFETY: as above, from page 301 on.
+        let n = unsafe { client.copy(src[at300 + PAGE..].as_ptr().cast(), mem.add(at300 + PAGE).cast(), len - at300 - PAGE, true) };
+        assert_eq!(n.unwrap(), len - at300 - PAGE);
+        for p in (0..len / PAGE).step_by(37).chain([255, 256, 257, 511, 512, 513, len / PAGE - 1]) {
+            // SAFETY: filled pages.
+            let b = unsafe { ptr::read_volatile(mem.add(p * PAGE + 11)) };
+            #[allow(clippy::cast_possible_truncation)]
+            let want = p as u8 ^ 0x5a;
+            assert_eq!(b, want, "page {p}");
+        }
+        client.unregister(mem.cast(), len).unwrap();
     }
 
     #[test]
