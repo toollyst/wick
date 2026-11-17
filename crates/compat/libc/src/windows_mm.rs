@@ -3971,7 +3971,30 @@ fn spans_outside(s: usize, e: usize, done: &[(u64, u64)]) -> Vec<(usize, usize)>
 /// Before, the whole section was committed here and charged to no job. A
 /// resident page is charged before the private page it is copied from is
 /// freed, so it counts twice for that moment.
-pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(usize, bool), c_int> {
+///
+/// The mapping is closed to writes for the move ([`close_for_the_move`]):
+/// its read-write committed runs are made read-only before the copy, so
+/// that no write lands in a private page after it is copied (it would be
+/// lost with the allocation). The caller (`wick_uffd`'s register) has the
+/// mapping marked moving meanwhile, so a thread whose write faults on it,
+/// or whose access faults in the gap while the mapping is a placeholder,
+/// waits and runs again on the views, and has claimed it against system
+/// calls' copies ([`claim_move`]), which no exception reaches. A failure
+/// before the private allocation is given back gives its runs their
+/// protection back ([`reopen_after_the_move`], which ends the process if
+/// it cannot); one after it leaves a placeholder, which holds no memory to
+/// reopen.
+///
+/// `pages` holds a byte a page, whose bits 1 and 2 the caller set
+/// (`uffd_protections`); bit 0 is set here for each page in the working
+/// set, the pages copied, and read only once the mapping is closed: from
+/// then on a write to a committed page faults and waits, and a lazy page's
+/// first touch faults and waits, so no page takes data after its residency
+/// is read. Read before (as it was), a write in between to a committed page
+/// not in the working set, or a first touch of a lazy page, made a page
+/// that was taken as missing and not copied, and the write was lost
+/// (`test_a_write_made_as_a_register_starts_its_move_is_kept`).
+pub(crate) fn uffd_alias(start: usize, len: usize, pages: &mut [u8]) -> Result<(usize, bool), c_int> {
     let mut t = table().lock().unwrap();
     match t.get(&start) {
         Some(r)
@@ -3982,11 +4005,142 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(u
         _ => return Err(crate::EINVAL),
     }
     #[cfg(test)]
+    run_hook(&NARROW_HOOK);
+    let narrowed = close_for_the_move(start, len).ok_or(crate::ENOMEM)?;
+    if !working_set_bits(start, pages) {
+        reopen_after_the_move(&narrowed);
+        return Err(crate::ENOMEM);
+    }
+    let moved = uffd_alias_closed(&mut t, start, len, pages);
+    // The private allocation is still there if the move failed before it
+    // was given back; after, the table holds placeholders there.
+    if moved.is_err() && t.get(&start).is_some_and(|r| matches!(r.kind, Kind::Private { .. })) {
+        reopen_after_the_move(&narrowed);
+    }
+    moved
+}
+
+/// Tests: the private allocation's release in [`uffd_alias`]'s move taken
+/// as refused, once (the move fails with its memory still there), and the
+/// protection [`reopen_after_the_move`] gives back taken as refused, once.
+#[cfg(test)]
+pub(crate) static MOVE_RELEASE_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static REOPEN_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`uffd_alias`]'s release of the private allocation as a placeholder:
+/// whether it was made.
+fn release_for_the_move(start: usize, len: usize) -> bool {
+    #[cfg(test)]
+    if MOVE_RELEASE_REFUSED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    // SAFETY: gives the private allocation back as a placeholder.
+    unsafe { VirtualFree(start as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0 }
+}
+
+/// Tests: a function run inside [`uffd_alias`] once the resident pages are
+/// copied and before the private allocation is given back (a write landing
+/// in a private page there would be lost with it), as an `fn()` in a
+/// `usize`, 0 for none; taken as it runs.
+#[cfg(test)]
+pub(crate) static ALIAS_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Tests: as [`ALIAS_HOOK`], run inside [`uffd_alias`] right before the
+/// mapping is closed for the move (and its residency read).
+#[cfg(test)]
+pub(crate) static NARROW_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn alias_hook() {
+    run_hook(&ALIAS_HOOK);
+}
+
+/// Runs the `fn()` in `hook`, if any, and takes it.
+#[cfg(test)]
+fn run_hook(hook: &std::sync::atomic::AtomicUsize) {
+    let hook = hook.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if hook != 0 {
+        // SAFETY: only `fn()` values are stored.
+        unsafe { core::mem::transmute::<usize, fn()>(hook)() };
+    }
+}
+
+/// Makes the committed read-write runs of `[start, start + len)` read-only
+/// (an executable one executable and read-only), keeping every other
+/// protection, `PROT_NONE` and read-only ones included, as it is: a
+/// [`uffd_alias`] copy reads the pages it copies and opens none. The runs
+/// changed, with their protection before, or `None` with nothing changed
+/// if a query or a change was refused: the runs narrowed until then get
+/// their protection back ([`reopen_after_the_move`]), and a refusal of that
+/// ends the process, named.
+fn close_for_the_move(start: usize, len: usize) -> Option<Vec<(usize, usize, PAGE_PROTECTION_FLAGS)>> {
+    let mut narrowed = Vec::new();
+    let end = start + len;
+    let mut at = start;
+    while at < end {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0 {
+            reopen_after_the_move(&narrowed);
+            return None;
+        }
+        let run = (mbi.BaseAddress as usize + mbi.RegionSize).min(end) - at;
+        let read_only = match mbi.Protect & 0xff {
+            PAGE_READWRITE => Some(PAGE_READONLY),
+            PAGE_EXECUTE_READWRITE => Some(PAGE_EXECUTE_READ),
+            _ => None,
+        };
+        if let (MEM_COMMIT, Some(base)) = (mbi.State, read_only) {
+            let mut old = 0;
+            // SAFETY: narrows the protection of committed pages of ours.
+            if unsafe { VirtualProtect(at as *mut c_void, run, (mbi.Protect & !0xff) | base, &mut old) } == 0 {
+                reopen_after_the_move(&narrowed);
+                return None;
+            }
+            narrowed.push((at, run, mbi.Protect));
+        }
+        at += run;
+    }
+    Some(narrowed)
+}
+
+/// Gives the runs [`close_for_the_move`] narrowed their protection back,
+/// the private allocation still there. A refusal ends the process at once,
+/// naming the run, as macOS's reclaim does when a chunk cannot get its
+/// protection back (`wick_owned::restore`): the run would stay read-only
+/// while the process holds it read-write, so a later write would fault
+/// outside any move and end the process far from the cause, and a system
+/// call's copy into it would fail or come back short.
+fn reopen_after_the_move(narrowed: &[(usize, usize, PAGE_PROTECTION_FLAGS)]) {
+    for &(at, run, prot) in narrowed {
+        #[cfg(test)]
+        let refused = REOPEN_REFUSED.swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let refused = false;
+        let mut old = 0;
+        // SAFETY: committed pages of our private allocation, which the move
+        // narrowed.
+        if refused || unsafe { VirtualProtect(at as *mut c_void, run, prot, &mut old) } == 0 {
+            // SAFETY: plain call.
+            let err = if refused { 0 } else { unsafe { GetLastError() } };
+            std::eprintln!(
+                "wick: userfaultfd: a register's move could not give its pages {at:#x}+{run:#x} back their protection {prot:#x} \
+                 (error {err}): they would stay read-only while the process holds them writable, so the process ends"
+            );
+            std::process::abort();
+        }
+    }
+}
+
+/// [`uffd_alias`]'s move, the mapping closed to writes.
+fn uffd_alias_closed(t: &mut Table, start: usize, len: usize, resident: &[u8]) -> Result<(usize, bool), c_int> {
+    #[cfg(test)]
     let unreserved = UFFD_UNRESERVED.load(std::sync::atomic::Ordering::SeqCst);
     #[cfg(not(test))]
     let unreserved = false;
     if exception_handler() && !unreserved {
-        return uffd_alias_chunked(&mut t, start, len, resident).map(|alias| (alias, true));
+        return uffd_alias_chunked(t, start, len, resident).map(|alias| (alias, true));
     }
     let hi = u32::try_from((len as u64) >> 32).unwrap();
     #[allow(clippy::cast_possible_truncation)]
@@ -4056,8 +4210,9 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(u
         // SAFETY: resident pages of the mapping, into the alias.
         unsafe { std::ptr::copy_nonoverlapping((start + off) as *const u8, (alias + off) as *mut u8, n) };
     }
-    // SAFETY: gives the private allocation back as a placeholder.
-    if unsafe { VirtualFree(start as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+    #[cfg(test)]
+    alias_hook();
+    if !release_for_the_move(start, len) {
         if reserved {
             charge_remove(start);
         }
@@ -4450,8 +4605,9 @@ fn uffd_alias_chunked(t: &mut Table, start: usize, len: usize, resident: &[u8]) 
         // SAFETY: resident pages of the mapping, into the alias.
         unsafe { std::ptr::copy_nonoverlapping((start + off) as *const u8, (alias + off) as *mut u8, n) };
     }
-    // SAFETY: gives the private allocation back as a placeholder.
-    if unsafe { VirtualFree(start as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+    #[cfg(test)]
+    alias_hook();
+    if !release_for_the_move(start, len) {
         undo(mapped, charges.len());
         return Err(crate::EINVAL);
     }
@@ -6264,6 +6420,11 @@ impl Copying {
     }
 }
 
+/// The claims that waited for a call in its copy
+/// ([`Moving::wait_for_copies`]), for the tests.
+#[cfg(test)]
+pub(crate) static CLAIMS_THAT_WAITED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// The turns to a copy that waited for a move ([`Copying::copy_now`]), for
 /// the tests.
 #[cfg(test)]
@@ -6307,6 +6468,10 @@ impl Moving {
     /// the userfaultfd's locks.
     pub(crate) fn wait_for_copies(&self) {
         let mut f = IN_FLIGHT.lock().unwrap();
+        #[cfg(test)]
+        if any_copy_overlaps(&f.calls, self.0, self.1) {
+            CLAIMS_THAT_WAITED.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
         while any_copy_overlaps(&f.calls, self.0, self.1) {
             f = f.wait_on(&IN_FLIGHT_CHANGED).unwrap();
         }
@@ -6668,7 +6833,23 @@ pub unsafe fn mincore(addr: *mut c_void, len: size_t, vec: *mut c_uchar) -> c_in
             return fail(crate::ENOMEM, -1);
         }
     }
+    // SAFETY: the caller's contract: one byte per page.
+    let out = unsafe { std::slice::from_raw_parts_mut(vec, pages) };
+    out.fill(0);
+    if !working_set_bits(start, out) {
+        return crate::windows_fd::raw_failed();
+    }
+    0
+}
+
+/// Sets bit 0 of `out[i]` if page `i` from `start` is in the working set
+/// (`QueryWorkingSetEx`'s `Valid`), leaving it clear otherwise and the
+/// other bits as they are; `false`, with the error in `GetLastError`, if
+/// the query fails. Takes no lock ([`mincore`] takes the region table's to
+/// check the range; [`uffd_alias`] holds it).
+fn working_set_bits(start: usize, out: &mut [u8]) -> bool {
     const BATCH: usize = 512;
+    let pages = out.len();
     let mut info: std::vec::Vec<PSAPI_WORKING_SET_EX_INFORMATION> = std::vec::Vec::new();
     let mut i = 0;
     while i < pages {
@@ -6684,17 +6865,16 @@ pub unsafe fn mincore(addr: *mut c_void, len: size_t, vec: *mut c_uchar) -> c_in
             u32::try_from(n * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()).unwrap();
         // SAFETY: the buffer holds `n` entries.
         if unsafe { QueryWorkingSetEx(proc(), info.as_mut_ptr().cast(), bytes) } == 0 {
-            return crate::windows_fd::raw_failed();
+            return false;
         }
         for (k, e) in info.iter().enumerate() {
             // SAFETY: reads the flags of the union.
             let valid = unsafe { e.VirtualAttributes.Flags } & 1;
-            // SAFETY: the caller's contract.
-            unsafe { *vec.add(i + k) = u8::from(valid != 0) };
+            out[i + k] = (out[i + k] & !1) | u8::from(valid != 0);
         }
         i += n;
     }
-    0
+    true
 }
 
 /// `msync`.

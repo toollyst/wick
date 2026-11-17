@@ -686,10 +686,56 @@ fn touches(start: u64, end: u64) -> bool {
     })
 }
 
-/// The chunk a reclaim is moving (`[start, end)`, start 0 when none,
-/// [`move_chunk`]): an access to it waits for the move ([`fault`]).
+/// The memory being moved (`[start, end)`, start 0 when none): a chunk the
+/// reclaim moves ([`move_chunk`]) or a register's memory ([`register`]),
+/// one at a time ([`MovingWindow`]). An access to it waits for the move
+/// ([`fault`]).
 static MOVING_START: AtomicU64 = AtomicU64::new(0);
 static MOVING_END: AtomicU64 = AtomicU64::new(0);
+
+/// The moving mark ([`MOVING_START`]) over `[start, end)` until dropped:
+/// a register's memory while it is moved and its range made ([`register`]),
+/// or a chunk the reclaim moves ([`move_chunk`]). The mark is one, so two
+/// windows open at once would leave the first's faulting threads waiting on
+/// the second's bounds; [`LOCK`] keeps them apart for every window's whole
+/// life: a register opens its window after it takes the lock and drops it
+/// before the lock's guard (declared after it); the reclaim's thread opens
+/// one only in an answer to an ask ([`reclaimer`]), and every asker holds
+/// the lock until the answer ([`ask_the_reclaimer`]: a fill's reclaim under
+/// the fill's guard, [`reclaim_at_touch`]'s and [`wait_and_move`]'s under
+/// their own). Debug builds assert the mark empty at the open and still
+/// this window's at the drop.
+struct MovingWindow {
+    start: u64,
+    end: u64,
+}
+
+impl MovingWindow {
+    fn open(start: u64, end: u64) -> MovingWindow {
+        // The reclaimer holds it for its asker (`HOLDS_LOCK` set for good).
+        debug_assert!(HOLDS_LOCK.get(), "a moving window opened over [{start:#x}, {end:#x}) without LOCK");
+        let was_end = MOVING_END.swap(end, Ordering::SeqCst);
+        let was = MOVING_START.swap(start, Ordering::SeqCst);
+        debug_assert!(
+            was == 0 && was_end == 0,
+            "a moving window opened over [{start:#x}, {end:#x}) while [{was:#x}, {was_end:#x}) was open"
+        );
+        MovingWindow { start, end }
+    }
+}
+
+impl Drop for MovingWindow {
+    fn drop(&mut self) {
+        let start = MOVING_START.swap(0, Ordering::SeqCst);
+        let end = MOVING_END.swap(0, Ordering::SeqCst);
+        debug_assert!(
+            start == self.start && end == self.end,
+            "the moving window over [{:#x}, {:#x}) closed holding [{start:#x}, {end:#x})",
+            self.start,
+            self.end
+        );
+    }
+}
 
 /// Whether `addr` is in the chunk being moved.
 pub fn is_moving(addr: u64) -> bool {
@@ -865,6 +911,8 @@ pub fn fault(addr: u64, write: bool) -> bool {
     // again.
     if is_moving(addr) {
         let t = std::time::Instant::now();
+        #[cfg(test)]
+        tests::MOVE_WAITING.fetch_add(1, Ordering::SeqCst);
         while is_moving(addr) {
             std::thread::yield_now();
         }
@@ -1861,6 +1909,23 @@ fn register_range(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         // again above).
         unsafe { WaitOnAddress((&raw const UNLOCKED_CHANGES).cast(), (&raw const n).cast(), core::mem::size_of::<usize>(), INFINITE) };
     }
+    // The memory is moved into its sections below (`windows_mm::uffd_alias`),
+    // a placeholder for a moment: claimed against system calls' copies
+    // first, as the reclaim's move of a chunk is (`windows_mm::claim_move`):
+    // a call already in its copy into or out of it (a block device's read
+    // into guest memory, a snapshot's write of it) is waited for, without
+    // [`LOCK`], as a fill waits for one ([`wait_and_move`]); one that turns
+    // to its copy meanwhile waits for the register. The kernel's copy takes
+    // no exception this process could resolve, so a call copying while the
+    // pages were read-only or gone would fail or lose its bytes.
+    if !crate::windows_mm::reserve_discards() {
+        return Err(errno_err(crate::ENOMEM));
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let Some(claim) = crate::windows_mm::claim_move(start as usize, len as usize) else {
+        return Err(errno_err(crate::ENOMEM));
+    };
+    claim.wait_for_copies();
     let _guard = lock();
     // No mapping in the range: `ENOMEM` if none lies at or above its start,
     // `EINVAL` if the first lies at or past its end, as Linux's
@@ -1903,17 +1968,22 @@ fn register_range(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     // reserved now, so that a reclaim at the limit allocates nothing.
     let chunks = usize::try_from(len.div_ceil(crate::windows_mm::UFFD_CHUNK as u64)).unwrap_or(usize::MAX);
     reserve_reclaim(registered_chunks().saturating_add(chunks)).map_err(undo)?;
-    // Residency decides what is missing.
-    let mut resident = std::vec![0u8; pages as usize];
-    // SAFETY: `resident` has one byte per page of the range.
-    if unsafe { crate::mincore(start as *mut _, len as usize, resident.as_mut_ptr()) } != 0 {
-        return Err(undo(io::Error::last_os_error()));
-    }
     // Each page's protection, in bits 1 (no read) and 2 (no write) of its
-    // byte: the alias's view below is mapped read-write.
+    // byte: the alias's view below is mapped read-write. Read under the
+    // lock, which an `mprotect` takes while a register runs. Residency, in
+    // bit 0, decides what is missing: the move reads it once the memory is
+    // closed to writes (`windows_mm::uffd_alias`).
+    let mut resident = std::vec![0u8; pages as usize];
     #[allow(clippy::cast_possible_truncation)]
     crate::windows_mm::uffd_protections(start as usize, len as usize, &mut resident);
-    let (alias, reserved) = crate::windows_mm::uffd_alias(start as usize, len as usize, &resident).map_err(|e| undo(errno_err(e)))?;
+    // Marked moving from the move to the end of the register: an access
+    // that faults on the memory meanwhile (a write to a page the move made
+    // read-only, any access while it is a placeholder, a missing page's
+    // before its range is published) waits in [`fault`] and runs again once
+    // the register is done, as an access to a chunk the reclaim moves does
+    // ([`move_chunk`]); a vCPU's waits on [`LOCK`] (`with_registrations_still`).
+    let _moving = MovingWindow::open(start, end);
+    let (alias, reserved) = crate::windows_mm::uffd_alias(start as usize, len as usize, &mut resident).map_err(|e| undo(errno_err(e)))?;
     if reserved {
         crate::windows_mm::released_alias(record, alias);
     } else {
@@ -3698,15 +3768,13 @@ fn move_chunk(d: &Candidate) -> Reclaimed {
     let Some((range, s)) = range_of_view(d.view) else {
         return Reclaimed::default();
     };
-    MOVING_END.store((d.view + d.len) as u64, Ordering::SeqCst);
-    MOVING_START.store(d.view as u64, Ordering::SeqCst);
+    let moving = MovingWindow::open(d.view as u64, (d.view + d.len) as u64);
     let t = std::time::Instant::now();
     #[allow(clippy::cast_possible_truncation)]
     let span = (s as usize, range.end.load(Ordering::Acquire) as usize);
     let moved = crate::windows_mm::uffd_move_chunk(d.view, d.len, d.alias, span, &|at| missing_at(range, s, at));
     let us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
-    MOVING_START.store(0, Ordering::SeqCst);
-    MOVING_END.store(0, Ordering::SeqCst);
+    drop(moving);
     reclaim_progress(true);
     let Some((copied, freed)) = moved else {
         return Reclaimed::default();
@@ -13012,6 +13080,257 @@ mod tests {
             std::eprintln!("{l}");
         }
         assert_eq!(code, Some(0), "{text}");
+    }
+
+    /// The page a write during a register's move goes to
+    /// ([`write_during_the_move`]), and the writer's thread with whether it
+    /// was still waiting when the hook went on.
+    static MOVE_WRITE_AT: AtomicU64 = AtomicU64::new(0);
+    static MOVE_WRITER: Mutex<Option<(std::thread::JoinHandle<()>, bool)>> = Mutex::new(None);
+    /// The accesses that began waiting in [`fault`] for a moving mark.
+    pub(super) static MOVE_WAITING: AtomicU64 = AtomicU64::new(0);
+
+    /// [`crate::windows_mm::ALIAS_HOOK`]: a thread writes 2 to the page at
+    /// [`MOVE_WRITE_AT`] once the register's copy of its pages is made and
+    /// before the private allocation is given back; the hook goes on once
+    /// the write waits for the move, or is done.
+    fn write_during_the_move() {
+        let at = MOVE_WRITE_AT.load(Ordering::SeqCst);
+        let before = MOVE_WAITING.load(Ordering::SeqCst);
+        // SAFETY: a page of the test's own mapping.
+        let writer = std::thread::spawn(move || unsafe { ptr::write_volatile(at as *mut u8, 2) });
+        until(|| MOVE_WAITING.load(Ordering::SeqCst) > before || writer.is_finished());
+        let waiting = !writer.is_finished();
+        *MOVE_WRITER.lock().unwrap() = Some((writer, waiting));
+    }
+
+    /// A write to registered memory made while the register moves it into
+    /// its sections (after its pages are copied, before the private
+    /// allocation is given back) lands in the registered memory: the move
+    /// makes the mapping read-only first and marks it moving, so the write
+    /// faults, waits for the register, and runs again on the views. Linux's
+    /// register moves nothing, so the write simply lands. For both kinds of
+    /// mapping, through the chunked sections (the exception handler's) and
+    /// through one section (`WICK_UFFD_ALIAS=unreserved`). Before, the
+    /// write landed in the private page after its copy, and the page read
+    /// back the value from before it (1, not 2): the check "the write made
+    /// during the move was lost" fails there.
+    #[test]
+    fn test_a_write_during_a_registers_move_lands_in_the_registered_memory() {
+        for alias in ["reserved", "unreserved"] {
+            let (code, text, _) = run_child_in_jobs("write_during_the_move_child", &[("WICK_UFFD_ALIAS", alias)], &[]);
+            for l in text.lines().filter(|l| l.starts_with("UNMAPCHECK") || l.starts_with("WATCHDOG") || l.starts_with("wick:")) {
+                std::eprintln!("{alias}: {l}");
+            }
+            assert_eq!(code, Some(0), "{alias}: {text}");
+        }
+    }
+
+    #[test]
+    #[ignore = "run by test_a_write_during_a_registers_move_lands_in_the_registered_memory in processes of its own"]
+    fn write_during_the_move_child() {
+        watchdog(60);
+        if std::env::var("WICK_UFFD_ALIAS").as_deref() == Ok("unreserved") {
+            crate::windows_mm::UFFD_UNRESERVED.store(true, Ordering::SeqCst);
+        }
+        let mut c = Checks::new();
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let mem = map_pages(kind, 4);
+            // SAFETY: a page of the test's own mapping: resident, so copied.
+            unsafe { ptr::write_volatile(mem as *mut u8, 1) };
+            MOVE_WRITE_AT.store(mem, Ordering::SeqCst);
+            crate::windows_mm::ALIAS_HOOK.store(write_during_the_move as fn() as usize, Ordering::SeqCst);
+            let r = register(a, mem, 4 * PAGE);
+            let Some((writer, waiting)) = MOVE_WRITER.lock().unwrap().take() else {
+                c.check(false, std::format!("{kind}: the hook did not run ({r:?})"));
+                release(a, ua);
+                continue;
+            };
+            writer.join().unwrap();
+            c.check(r.is_ok(), std::format!("{kind}: the register: {r:?}"));
+            c.check(waiting, std::format!("{kind}: the write went through while the register moved the memory"));
+            // SAFETY: page 0, resident, registered and not missing.
+            let value = unsafe { ptr::read_volatile(mem as *const u8) };
+            c.check(value == 2, std::format!("{kind}: the write made during the move was lost: the page reads {value}"));
+            c.check(!is_missing(mem), std::format!("{kind}: the written page is missing"));
+            release(a, ua);
+            munmap_of(mem, 4 * PAGE);
+        }
+        c.done();
+    }
+
+    /// A write made as a register starts its move (a hook right before the
+    /// mapping is closed for it, `windows_mm::NARROW_HOOK`) to a page never
+    /// touched is kept: the register reads the pages' residency only once
+    /// the mapping is closed, so a write before that makes the page resident
+    /// and copied (an ordinary mapping's committed page: the write ends at
+    /// once), and a first touch after it waits for the register and then
+    /// faults as missing (a lazy page: the test fills it with zeros, which
+    /// wakes the writer, whose write then lands). Linux's register takes the
+    /// page as it is when the register holds the mm's lock: present, or
+    /// missing and faulted. For both kinds. Before, residency was read
+    /// before the hook's point, so the written page was taken as missing and
+    /// not copied: it read 0 after the fill, and the check "the write made
+    /// as the move started was lost" fails there.
+    #[test]
+    fn test_a_write_made_as_a_register_starts_its_move_is_kept() {
+        in_a_child("write_as_the_move_starts_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_write_made_as_a_register_starts_its_move_is_kept in a process of its own"]
+    fn write_as_the_move_starts_child() {
+        watchdog(60);
+        let mut c = Checks::new();
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let mem = map_pages(kind, 4);
+            // Page 3 is never touched before the hook's write.
+            MOVE_WRITE_AT.store(mem + 3 * PAGE, Ordering::SeqCst);
+            crate::windows_mm::NARROW_HOOK.store(write_during_the_move as fn() as usize, Ordering::SeqCst);
+            let r = register(a, mem, 4 * PAGE);
+            c.check(r.is_ok(), std::format!("{kind}: the register: {r:?}"));
+            let Some((writer, waiting)) = MOVE_WRITER.lock().unwrap().take() else {
+                c.check(false, std::format!("{kind}: the hook did not run ({r:?})"));
+                release(a, ua);
+                continue;
+            };
+            std::println!("RACE {kind}: the write waited for the register: {waiting}; the page is missing after it: {}", is_missing(mem + 3 * PAGE));
+            if is_missing(mem + 3 * PAGE) {
+                c.check(zeropage(a, mem + 3 * PAGE, PAGE, true) == Ok(PAGE), std::format!("{kind}: the fill of the missing page"));
+            }
+            writer.join().unwrap();
+            // SAFETY: page 3, filled or holding memory.
+            let value = unsafe { ptr::read_volatile((mem + 3 * PAGE) as *const u8) };
+            c.check(value == 2, std::format!("{kind}: the write made as the move started was lost: the page reads {value}"));
+            release(a, ua);
+            munmap_of(mem, 4 * PAGE);
+        }
+        c.done();
+    }
+
+    /// A register waits for a system call that is in its copy into or out
+    /// of the memory (counted in flight: `windows_mm::copying`, as a block
+    /// device's read into guest memory is, `windows_fd::read`), and only
+    /// then moves it: the kernel's copy takes no exception this process
+    /// could resolve, so a copy into the memory while it was read-only or a
+    /// placeholder would fail, or land in the private pages after their
+    /// copy and be lost. Linux's register moves nothing and does not wait.
+    /// Before, the register did not wait: the check "the register moved the
+    /// memory while a system call copied into it" fails there.
+    #[test]
+    fn test_a_register_waits_for_a_call_copying_into_its_memory() {
+        in_a_child("register_waits_for_a_copy_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_register_waits_for_a_call_copying_into_its_memory in a process of its own"]
+    fn register_waits_for_a_copy_child() {
+        watchdog(60);
+        let mut c = Checks::new();
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let mem = map_pages(kind, 4);
+            // A call into page 1, in its copy.
+            let call = crate::windows_mm::copying((mem + PAGE) as usize, PAGE as usize);
+            call.copy_now();
+            let waited = crate::windows_mm::CLAIMS_THAT_WAITED.load(Ordering::SeqCst);
+            let reg = std::thread::spawn(move || register(a, mem, 4 * PAGE));
+            until(|| crate::windows_mm::CLAIMS_THAT_WAITED.load(Ordering::SeqCst) > waited || reg.is_finished());
+            c.check(!reg.is_finished(), std::format!("{kind}: the register moved the memory while a system call copied into it"));
+            drop(call);
+            let r = reg.join().unwrap();
+            c.check(r.is_ok(), std::format!("{kind}: the register after the call: {r:?}"));
+            release(a, ua);
+            munmap_of(mem, 4 * PAGE);
+        }
+        c.done();
+    }
+
+    /// A register whose move fails before the private allocation is given
+    /// back (its release refused, `windows_mm::MOVE_RELEASE_REFUSED`) gives
+    /// the runs it made read-only for the move their protection back: the
+    /// register fails (`EINVAL`), nothing is registered, and the memory
+    /// holds what it held and takes writes. For both kinds of mapping,
+    /// through the chunked sections and through one section. A guard of the
+    /// restore that [`test_a_refused_reopen_after_a_failed_move_ends_the_process`]
+    /// makes fatal: the parent commit, which gave the protection back too,
+    /// passes it.
+    #[test]
+    fn test_a_failed_registers_move_gives_the_memory_back_writable() {
+        for alias in ["reserved", "unreserved"] {
+            let (code, text, _) = run_child_in_jobs("failed_move_child", &[("WICK_UFFD_ALIAS", alias)], &[]);
+            for l in text.lines().filter(|l| l.starts_with("WATCHDOG") || l.starts_with("wick:")) {
+                std::eprintln!("{alias}: {l}");
+            }
+            assert_eq!(code, Some(0), "{alias}: {text}");
+        }
+    }
+
+    #[test]
+    #[ignore = "run by test_a_failed_registers_move_gives_the_memory_back_writable in processes of its own"]
+    fn failed_move_child() {
+        watchdog(60);
+        if std::env::var("WICK_UFFD_ALIAS").as_deref() == Ok("unreserved") {
+            crate::windows_mm::UFFD_UNRESERVED.store(true, Ordering::SeqCst);
+        }
+        let mut c = Checks::new();
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let mem = map_pages(kind, 4);
+            // SAFETY: a page of the test's own mapping: resident, so narrowed.
+            unsafe { ptr::write_volatile(mem as *mut u8, 1) };
+            crate::windows_mm::MOVE_RELEASE_REFUSED.store(true, Ordering::SeqCst);
+            let r = register(a, mem, 4 * PAGE);
+            c.check(
+                r.as_ref().map_err(io::Error::raw_os_error) == Err(Some(crate::EINVAL)),
+                std::format!("{kind}: the register whose move failed: {r:?}"),
+            );
+            c.check(find(mem).is_none(), std::format!("{kind}: registered after a failed move"));
+            // SAFETY: page 0 of the test's mapping, which the failed move
+            // left as it was.
+            let value = unsafe { ptr::read_volatile(mem as *const u8) };
+            c.check(value == 1, std::format!("{kind}: the page reads {value} after the failed move"));
+            // SAFETY: as above; a write the narrowed run would refuse.
+            unsafe { ptr::write_volatile(mem as *mut u8, 3) };
+            // SAFETY: as above.
+            let value = unsafe { ptr::read_volatile(mem as *const u8) };
+            c.check(value == 3, std::format!("{kind}: the write after the failed move reads back {value}"));
+            release(a, ua);
+            munmap_of(mem, 4 * PAGE);
+        }
+        c.done();
+    }
+
+    /// A register whose move fails before the private allocation is given
+    /// back, and whose restore of the runs the move made read-only is then
+    /// refused (`windows_mm::REOPEN_REFUSED`), ends the process there with a
+    /// line naming the run: the run would stay read-only while the process
+    /// holds it writable, so a later write would fault outside any move and
+    /// end the process far from the cause, or a system call's copy into it
+    /// would fail. Before, the refusal was ignored and the register failed
+    /// with `EINVAL`: the child returned, and the check "not aborted" fails
+    /// there (with the two refusals at the same points).
+    #[test]
+    fn test_a_refused_reopen_after_a_failed_move_ends_the_process() {
+        let (code, text) = run_child("refused_reopen_child", None);
+        assert!(text.contains("wick: userfaultfd: a register's move could not give its pages"), "{text}");
+        assert_eq!(code, Some(0xC000_0409_u32.cast_signed()), "not aborted: {text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_refused_reopen_after_a_failed_move_ends_the_process in a process of its own"]
+    fn refused_reopen_child() {
+        watchdog(60);
+        let (a, _ua) = create(0, false, true).unwrap();
+        let mem = map_pages("ordinary", 4);
+        // SAFETY: a page of the test's own mapping: resident, so narrowed.
+        unsafe { ptr::write_volatile(mem as *mut u8, 1) };
+        crate::windows_mm::MOVE_RELEASE_REFUSED.store(true, Ordering::SeqCst);
+        crate::windows_mm::REOPEN_REFUSED.store(true, Ordering::SeqCst);
+        let r = register(a, mem, 4 * PAGE);
+        std::println!("the register returned: {r:?}");
     }
 
     /// A register that starts while an `munmap` of the memory runs without

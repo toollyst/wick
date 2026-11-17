@@ -203,6 +203,31 @@ has the per-control details and results.
 
 ## Fixed defects
 
+- **Windows: a write into memory that a userfaultfd register was moving could be lost, and an access to it at the
+  wrong moment could end the process** (since the register moves the memory into sections,
+  `windows_mm::uffd_alias`; fixed in the commit that adds this entry). The register copies the mapping's resident
+  pages into the new sections, gives the private allocation back and maps the sections in its place. In the copy, a
+  write from another thread could land in a private page that was already copied, and be lost with the allocation.
+  In the gap before the sections were mapped, an access to the address faulted on nothing and ended the process.
+  A system call copying into or out of the memory (counted in flight, `windows_mm::copying`) failed, since the
+  kernel's copy takes no exception this process can resolve. Firecracker was not hit: it registers guest memory it
+  has just mapped, before any vCPU or device uses it (src/vmm/src/persist.rs `guest_memory_from_uffd`). Now:
+  - the register claims the memory against system calls' copies first and waits for those already in their copy,
+    as the reclaim's move of a chunk does (`windows_mm::claim_move`);
+  - it makes the mapping read-only for the copy, and reads which pages hold memory (the working set) only after
+    that, so a write or a first touch just before the move is copied or waits
+    (`test_a_write_made_as_a_register_starts_its_move_is_kept`; before, such a page was taken as missing and its
+    write lost); a move that fails before the allocation is given back gives
+    the runs their protection back (`test_a_failed_registers_move_gives_the_memory_back_writable`); a refusal of
+    that ends the process there, named, as a run left read-only would fail a later write or a system call's copy
+    far from the cause (`test_a_refused_reopen_after_a_failed_move_ends_the_process`);
+  - it marks the memory moving until the register is done, so a faulting access waits and runs again on the
+    sections (`test_a_write_during_a_registers_move_lands_in_the_registered_memory`,
+    `test_a_register_waits_for_a_call_copying_into_its_memory`; each fails on the code before at the check its doc
+    names). The moving mark is one for the process, and `LOCK` keeps a register's mark and the reclaim's apart for
+    each one's whole time (`wick_uffd::MovingWindow`, which debug builds check).
+
+  First run: CI.
 - **macOS: wick-fsd's exchange (`RENAME_EXCHANGE`) on a volume without one could replace the target with the source and
   report success** (from 4f7f4673, which added the host directory, to ff3174a1, which fixed it; never reachable from a
   guest). The backend learned whether a volume exchanges from the error `renameatx_np(RENAME_SWAP)` gave, and macOS
