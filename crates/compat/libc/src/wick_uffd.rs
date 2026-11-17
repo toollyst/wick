@@ -6330,6 +6330,59 @@ mod tests {
         kr == 0 && at <= addr && addr < at + size
     }
 
+    /// The process's VM map entries (task_info TASK_VM_INFO's region_count,
+    /// mach/task_info.h: the 32-bit word 2).
+    fn region_count() -> u64 {
+        const TASK_VM_INFO: c_int = 22;
+        unsafe extern "C" {
+            fn task_info(task: libc::mach_port_t, flavor: c_int, info: *mut c_int, count: *mut u32) -> c_int;
+        }
+        let mut info = [0 as c_int; 128];
+        let mut count = 128u32;
+        // SAFETY: a buffer of `count` words for this flavour, of this task.
+        assert_eq!(unsafe { task_info(mach_task_self_, TASK_VM_INFO, info.as_mut_ptr(), &mut count) }, 0);
+        info[2] as u64
+    }
+
+    /// 64 MiB of registered memory filled a page at a time, in a random
+    /// order, leaves the map as it found it: the range one entry or a few
+    /// (its pages all read and write again, which XNU merges), and the
+    /// process's entries where they were, give or take a few made by other
+    /// tests' threads, since each fill's view is gone. A fill that left its
+    /// view (the alias's way) adds an entry a fill, 4096 here; a range whose
+    /// entries stayed split adds one a page. Measured on an M1 Pro, macOS
+    /// 27.2, before this test: 32588 entries in a 1 GiB range halfway through
+    /// such fills, 8 after. In a process of its own, so that no other test
+    /// maps memory meanwhile.
+    #[test]
+    fn test_fills_in_a_random_order_leave_the_map_as_they_found_it() {
+        if !in_own_process("wick_uffd::tests::test_fills_in_a_random_order_leave_the_map_as_they_found_it") {
+            return;
+        }
+        let (ctx, user) = create(0, false, true).unwrap();
+        let ps = test_page_size();
+        let pages = (64 << 20) / ps;
+        let mem = map(pages);
+        register(ctx, mem, pages * ps).unwrap();
+        let before = region_count();
+        let data = std::vec![0x5au8; ps as usize];
+        // Every page once, in the order of a full-period LCG (a = 5, c = 1
+        // modulo a power of two).
+        let mut i = 0u64;
+        for _ in 0..pages {
+            i = (5 * i + 1) % pages;
+            // SAFETY: `data` holds a page.
+            assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem + i * ps, ps, false) }, Ok(ps));
+        }
+        let entries = mapped_entries(mem, mem + pages * ps).len();
+        let after = region_count();
+        std::println!("ENTRIES: the range {entries}, the process {before} -> {after}");
+        assert!((0..pages).all(|p| !is_missing(mem + p * ps)), "a page left missing");
+        assert!(entries <= 8, "the range is {entries} entries after its fills");
+        assert!(after <= before + 16, "the process went from {before} to {after} entries");
+        close(&[user]);
+    }
+
     /// A fill writes through a view of the pages of its own, read-write and
     /// outside the range, while the pages stay missing and `PROT_NONE` in
     /// the range, so a thread that reads them meanwhile waits and never

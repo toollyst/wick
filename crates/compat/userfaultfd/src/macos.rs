@@ -1565,6 +1565,68 @@ mod tests {
         }
     }
 
+    /// A timed measurement, run alone, on a prebuilt binary (the cost of a
+    /// userfaultfd fill on a host fault's path, docs/COMPATIBILITY.md,
+    /// `mem_backend: Uffd`): faults/s with THREADS threads each
+    /// reading PAGES registered pages, served through a second object (the
+    /// request channel, as a handler process) that reads each event and
+    /// fills its page with a wake. Prints "THROUGHPUT <faults/s> <secs>".
+    #[test]
+    #[ignore = "a timed measurement, run alone"]
+    fn timed_fault_throughput() {
+        const THREADS: usize = 8;
+        const PAGES: usize = 512;
+        let ps = page();
+        let total = THREADS * PAGES;
+        let owner = UffdBuilder::new().non_blocking(true).create().unwrap();
+        // SAFETY: duplicates a descriptor this test owns.
+        let handler = unsafe { Uffd::from_raw_fd(libc::dup(owner.as_raw_fd())) };
+        let mem = map(total * ps) as usize;
+        owner.register(mem as *mut c_void, total * ps).unwrap();
+        let fd = owner.as_raw_fd();
+        let start = std::time::Instant::now();
+        let server = thread::spawn(move || {
+            let src = vec![1u8; ps];
+            let mut served = 0;
+            while served < total {
+                let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                // SAFETY: one pollfd.
+                unsafe { libc::poll(&mut p, 1, 1000) };
+                while let Some(e) = handler.read_event().unwrap() {
+                    let Event::Pagefault { addr, .. } = e else { panic!("{e:?}") };
+                    let at = (addr as usize) & !(ps - 1);
+                    // SAFETY: a page; a registered page.
+                    match unsafe { handler.copy(src.as_ptr().cast(), at as *mut c_void, ps, true) } {
+                        Ok(_) => served += 1,
+                        Err(Error::CopyFailed(Errno::EEXIST)) => {}
+                        Err(e) => panic!("{e:?}"),
+                    }
+                }
+            }
+            handler
+        });
+        let workers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                thread::spawn(move || {
+                    let mut sum = 0u64;
+                    for i in 0..PAGES {
+                        // SAFETY: registered memory: each read waits for its page.
+                        sum += u64::from(unsafe { ptr::read_volatile((mem + (t * PAGES + i) * ps) as *const u8) });
+                    }
+                    sum
+                })
+            })
+            .collect();
+        let sum: u64 = workers.into_iter().map(|w| w.join().unwrap()).sum();
+        let secs = start.elapsed().as_secs_f64();
+        let _handler = server.join().unwrap();
+        assert_eq!(sum, total as u64);
+        println!("THROUGHPUT {:.0} {:.4}", total as f64 / secs, secs);
+        owner.unregister(mem as *mut c_void, total * ps).unwrap();
+        // SAFETY: the test's mapping.
+        unsafe { libc::munmap(mem as *mut c_void, total * ps) };
+    }
+
     #[test]
     fn test_inflight_socket_is_flushed() {
         const ROUNDS: usize = 10;

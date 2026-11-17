@@ -3337,6 +3337,62 @@ mod tests {
     /// event): `KVM_RUN` ends with `EFAULT` and the userfaultfd has nothing
     /// to read. Bounded: an event posted is answered by a fill after the
     /// mprotect back, which lets the guest go on.
+    /// A timed measurement, run alone, on a prebuilt binary, signed (the
+    /// cost of a userfaultfd fill on the vCPU's fault path, docs/COMPATIBILITY.md,
+    /// `mem_backend: Uffd`): a vCPU reads every page of 64 MiB
+    /// of slot memory a userfaultfd registered (a stage-2 fault a page); a
+    /// handler thread reads each fault and copies its page with a wake.
+    /// Prints "VCPU-THROUGHPUT <faults/s> <secs>".
+    #[test]
+    #[ignore = "a timed measurement, run alone"]
+    fn timed_vcpu_fault_throughput() {
+        const MIB: u64 = 64;
+        let (vm, mut vcpu, _code, _) = vm_with_memory(1, &READ);
+        let page = host_page_size();
+        let len = MIB << 20;
+        // SAFETY: a fresh anonymous mapping, kept for the test.
+        let mem = unsafe {
+            libc::mmap(std::ptr::null_mut(), len as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+        };
+        assert_ne!(mem, libc::MAP_FAILED);
+        let mem = mem as u64;
+        let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+        libc::wick_uffd::register(ctx, mem, len).unwrap();
+        let ipa = GUEST_BASE + (1 << 30);
+        let region = kvm_userspace_memory_region { slot: 1, guest_phys_addr: ipa, memory_size: len, userspace_addr: mem, flags: 0 };
+        // SAFETY: the mapping stays for the test.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+        let total = len / page;
+        let server = std::thread::spawn(move || {
+            let src = vec![1u8; page as usize];
+            let mut served = 0;
+            let mut rec = [0u8; 32];
+            while served < total {
+                // SAFETY: a buffer of a record's size.
+                assert_eq!(unsafe { libc::read(user, rec.as_mut_ptr().cast(), 32) }, 32);
+                let w = |i: usize| u64::from_le_bytes(rec[i * 8..i * 8 + 8].try_into().unwrap());
+                assert_eq!(w(0), libc::wick_uffd::proto::EVENT_PAGEFAULT);
+                let at = w(1) & !(page - 1);
+                // SAFETY: `src` holds a page.
+                match unsafe { libc::wick_uffd::copy(ctx, src.as_ptr(), at, page, true) } {
+                    Ok(_) => served += 1,
+                    Err((libc::EEXIST, _)) => {}
+                    Err(e) => panic!("{e:?}"),
+                }
+            }
+        });
+        let start = std::time::Instant::now();
+        guest_pass(&mut vcpu, ipa, ipa + len);
+        let secs = start.elapsed().as_secs_f64();
+        server.join().unwrap();
+        println!("VCPU-THROUGHPUT {:.0} {:.4}", total as f64 / secs, secs);
+        // SAFETY: the test's descriptor and mapping.
+        unsafe {
+            libc::close(user);
+            libc::munmap(mem as *mut _, len as usize);
+        }
+    }
+
     #[test]
     fn test_a_refused_access_to_a_missing_page_posts_no_event() {
         let (vm, mut vcpu, _mem, _len) = vm_with_memory(1, &STORE_THEN_LOAD);
