@@ -1352,6 +1352,9 @@ function Find-Tool([string]$name) {
 # jail with its memory served by upstream's uffd_on_demand_handler, a process
 # of the operator: the jailed Firecracker hands it the userfaultfd (a
 # socket) and the memory file, which the handler pulls out of the jail.
+# Needs a guest (WHP). The userfaultfd's waiter mirror is pulled too: the
+# jailed VMM may not open the handler to push it (its OP_MIRROR answers
+# -EPERM), so the handler opens the VMM and copies the read-only handle out.
 function Stage-Uffd {
     $handler = Find-Tool 'uffd_on_demand_handler.exe'
     $base = New-Base 'uffd'

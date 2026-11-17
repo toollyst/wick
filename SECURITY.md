@@ -617,28 +617,59 @@ has the per-control details and results.
   - It is an **unnamed** pagefile-backed section of one page (256 words, one per waiter slot, `MIRROR_WORDS`), which
     the VMM maps read-write and each reader maps read-only. Its direction is VMM to handler only: the VMM never reads
     what a reader could write, and a reader cannot write it. A reader's handle comes from a **distinct**
-    reduced-access `DuplicateHandle` that asks for `FILE_MAP_READ` (`SECTION_MAP_READ`) alone, never
-    `DUPLICATE_SAME_ACCESS` (`dup_mirror_read_only`, not the crate's default handle send), and the section's DACL
-    grants Everyone (`WD`) only `SECTION_QUERY | SECTION_MAP_READ` and no write, so a reader's handle cannot be
-    re-duplicated up to `SECTION_MAP_WRITE` — the access check reads the DACL with the caller's token and finds no
-    write ACE — and its read-only view cannot be made writable (`ERROR_ACCESS_DENIED`)
-    (`test_a_mirror_handle_a_reader_gets_maps_read_only`, `test_a_read_only_mirror_view_cannot_be_made_writable`,
-    `test_a_mirror_handle_a_reader_gets_cannot_be_re_duplicated_to_writable`). The section has no name at any point, so
-    no `OpenFileMappingW` can reach it; a reader reaches it only through the handle the VMM duplicates
-    (`test_the_mirror_section_has_no_name`). The DACL grants Everyone, not the creator's SID, because a reader's token
-    is not known when the section is made (a jailed reader is in another token); it is never narrowed to the creator,
-    and it grants read, never write.
-  - The transport is a push, not a pull: the VMM, which is privileged and unjailed, opens the reader with
-    `PROCESS_DUP_HANDLE` and duplicates the read-only handle into it, the `OP_MIRROR` reply carrying the handle value
-    (`serve_mirror`), where the macOS twin passes a descriptor over the socket (`SCM_RIGHTS`). This is the one
-    direction a jail allows: a jailed process cannot `OpenProcess(PROCESS_DUP_HANDLE)` its unjailed peer, but the
-    privileged side can open and push into the jailed child (the windows-sandbox probe measured both on fc-win,
-    2026-11-10). The reader checks the handle's section is the table's size before it maps (`EPROTO` otherwise,
-    `map_mirror_handle`) and fails the read if the mirror cannot be set up, never reading without the check
-    (`test_a_kernel_side_without_the_mirror_fails_the_read`: a serving thread that predates the mirror answers
-    `OP_MIRROR` with `-EINVAL`). A reader that predates the mirror fails on the first page fault, whose event type is
-    now `EVENT_PAGEFAULT2` (`test_a_page_fault_record_is_no_type_a_reader_before_the_mirror_decodes`); the two backends'
-    `proto` constants are kept in step by a cross-import test (`test_the_mirror_proto_matches_the_macos_twin`).
+    reduced-access `DuplicateHandle` that asks for `FILE_MAP_READ` (`SECTION_MAP_READ`) and `SECTION_QUERY` (which the
+    reader's check below needs) alone, never `DUPLICATE_SAME_ACCESS` (`dup_mirror_read_only`, `pull_mirror`, not the
+    crate's default handle send), and the section's DACL grants Everyone (`WD`) only `SECTION_QUERY |
+    SECTION_MAP_READ` and no write, so a reader's handle cannot be re-duplicated up to `SECTION_MAP_WRITE` — the
+    access check reads the DACL with the caller's token and finds no write ACE — and its read-only view cannot be made
+    writable (`ERROR_ACCESS_DENIED`) (`test_a_mirror_handle_a_reader_gets_maps_read_only`,
+    `test_a_read_only_mirror_view_cannot_be_made_writable`,
+    `test_a_mirror_handle_a_reader_gets_cannot_be_re_duplicated_to_writable`). The section has no name at any point,
+    so no `OpenFileMappingW` can reach it; a reader reaches it only through a read-only handle duplicated out of the
+    VMM's (`test_the_mirror_section_has_no_name`). The DACL grants Everyone, not the creator's SID, because a reader's
+    token is not known when the section is made (a jailed reader is in another token); it is never narrowed to the
+    creator, and it grants read, never write.
+  - The transport goes whichever way the two processes' tokens allow, and only that way:
+
+    | VMM | handler | how the handler gets its copy | who opens whom |
+    |---|---|---|---|
+    | not jailed | not jailed, or jailed | push (`OP_MIRROR`) | the VMM opens the handler (`PROCESS_DUP_HANDLE`) and duplicates the read-only handle into it |
+    | jailed | the operator's (not jailed) | pull (`OP_MIRROR_PULL`) | the handler opens the VMM and copies out the VMM's read-only handle |
+    | jailed | jailed, apart (an LPAC handler) | none: the read fails, `EACCES` | neither may open the other; not supported, it needs a third process that may open both |
+
+    The push is tried first; a VMM that may not open the handler answers it `-EPERM` (a jail's token opens no
+    process outside the jail: `jailer-test.ps1 handoff`), and the handler then pulls: the reply names the VMM's own
+    read-only handle of the mirror (made with it, closed at its release), never the read-write one it was made with
+    (`test_no_mirror_reply_names_the_read_write_handle`), and the handler takes a copy asking for
+    `SECTION_QUERY | SECTION_MAP_READ` alone, not inheritable, without `DUPLICATE_SAME_ACCESS` or
+    `DUPLICATE_CLOSE_SOURCE` (`pull_mirror`), out of the process the userfaultfd's socket names as its peer
+    (`SIO_AF_UNIX_GETPEERPID`), never a pid of the reply (`test_a_pulled_mirror_comes_from_the_sockets_peer`).
+    This is the access the operator already uses to take the userfaultfd itself out of the jail (vmm-sys-util's
+    `sock_ctrl_msg`, `FLAG_PULL`); the jailed VMM gains no right, and a handler that may open the VMM for
+    `PROCESS_DUP_HANDLE` could take any handle of it already (Learn, "Process Security and Access Rights").
+    The push was the only transport from piece 1 (bc9c1f60) to this fix, and a jailed VMM's handler failed its
+    first read with `EPERM`: upstream's handler panicked, its panic hook killed Firecracker, and `/snapshot/load`
+    got no answer (CI's windows-guest `jailer-test.ps1 uffd`, from 48e2838a; the push had been reviewed for a
+    jailed handler only; `test_a_reader_its_userfaultfds_process_cannot_open_pulls_the_mirror` failed before
+    the pull, `EPERM`, and serves the fault after it). With neither direction open the read fails with the pull's
+    `EACCES`, never reads without the mirror
+    (`test_a_reader_and_a_userfaultfd_that_cannot_open_each_other_fail_the_read`).
+  - The handler does not trust the VMM: whichever way its copy came, it checks the object before it maps it
+    (`check_mirror_section`, `NtQuerySection`): a section (`ENODEV` otherwise), of committed pagefile memory, not a
+    file's or an image's and not only reserved (`EOPNOTSUPP` otherwise: a file's page whose read fails would stop or
+    end the handler), of exactly the mirror's size (`EPROTO` otherwise), and closes the handle whatever the answer
+    (`test_a_mirror_handle_is_checked_before_it_is_mapped`, `test_a_pulled_handle_that_is_no_mirror_fails_the_read`).
+    What the VMM writes in the mirror is not trusted either: the view is the table's size, a tag naming a slot past
+    it is `EBADMSG` (`test_waits_reads_the_mirror_word`), and a wrong word only makes the reader drop or keep that
+    VMM's own faults, which its records could misstate anyway. The reader checks the reply's size before it maps
+    (`EPROTO` otherwise, `map_mirror_handle`) and fails the read if the mirror cannot be set up, never reading
+    without the check (`test_a_kernel_side_without_the_mirror_fails_the_read`: a serving thread that predates the
+    mirror answers `OP_MIRROR` with `-EINVAL`; `test_a_kernel_side_without_the_pull_fails_the_read`: one that
+    predates the pull answers `OP_MIRROR_PULL` with `-EINVAL`; a handler that predates the pull is refused
+    `-EPERM` by a jailed VMM, as before). A reader that predates the mirror fails on the first page fault, whose
+    event type is now `EVENT_PAGEFAULT2` (`test_a_page_fault_record_is_no_type_a_reader_before_the_mirror_decodes`);
+    the two backends' `proto` constants are kept in step by a cross-import test
+    (`test_the_mirror_proto_matches_the_macos_twin`).
   - The section is not charged to the jail's `memory.max`: a pagefile-backed shared section is not charged to the
     job's commit (the windows-sandbox probe measured 640 MiB of shared section as a 2–6 MiB job peak, fc-win,
     2026-11-10), so the one page a userfaultfd needs no carve-out — 256 mirrors added well under a page of private
@@ -649,12 +680,15 @@ has the per-control details and results.
     a single extra user-mode PID read, against 77 µs with 30000 of them a serve (the control that shows the
     measurement resolves a per-serve cost), so the mirror's handful of uncontended atomics do not show
     (`test_the_mirror_cost_on_record`, MIRRORCOST).
-  - One mirror a userfaultfd (at most 16, `MAX_CTX`), given back at its release on both sides: the VMM unmaps the
-    view and closes the section once no thread uses it (an enter/leave count the release drains before it frees,
-    `destroy`), and a reader unmaps its view when it is dropped. The drain closes the same write-after-close race the
-    macOS side had: a waiter's write of its record, or an `OP_MIRROR` in flight, cannot reach a section the release
-    freed meanwhile. The Windows sandbox blocks child-process creation and does not name objects (it is not Seatbelt),
-    so the unnamed section needs no path rule.
+  - One mirror a userfaultfd (at most 16, `MAX_CTX`), given back at its release on both sides: the VMM unmaps the view
+    and closes the section and its own read-only handle (the pull's) once no thread uses it (an enter/leave count the
+    release drains before it frees, `destroy`), and a reader unmaps its view when it is dropped. A pull's value read
+    after that release names no mirror, or, the value reused, another handle of that VMM: the check above refuses all
+    but a section of the mirror's size and backing, and another userfaultfd's mirror of the same VMM would only
+    misstate that VMM's own faults. The drain closes the same write-after-close race the macOS side had: a waiter's
+    write of its record, or an `OP_MIRROR` or `OP_MIRROR_PULL` in flight, cannot reach a section the release freed
+    meanwhile. The Windows sandbox blocks child-process creation and does not name objects (it is not Seatbelt), so
+    the unnamed section needs no path rule.
 - **macOS: a memfd and a waiter mirror had a name anyone could guess while they were made** (the memfd from
   9fc77c46, the compatibility memfd's start; the mirror from bdf94c63; under "Not at parity yet" in a554ef2c; fixed in
   the commit that moved it here). On Linux a memfd has no name: its file is made unlinked (v6.12 mm/memfd.c :393,

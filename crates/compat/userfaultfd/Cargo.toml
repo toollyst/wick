@@ -40,3 +40,13 @@ libc = { version = "0.2.186", features = ["extra_traits"] }
 [target.'cfg(windows)'.dependencies]
 wick-os = { path = "../os" }
 windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The mirror pull tests: processes locked against opening, sections and
+# semaphores that are no mirror.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }

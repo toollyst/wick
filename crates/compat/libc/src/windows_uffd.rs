@@ -66,8 +66,8 @@ use windows_sys::Win32::Networking::WinSock::{
 use windows_sys::Win32::Storage::FileSystem::DeleteFileW;
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, DiscardVirtualMemory, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS,
-    MapViewOfFile, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT,
-    UnmapViewOfFile, VirtualProtect,
+    MapViewOfFile, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, SECTION_QUERY,
+    SEC_COMMIT, SEC_FILE, SEC_IMAGE, SEC_RESERVE, UnmapViewOfFile, VirtualProtect,
 };
 use windows_sys::Win32::System::Threading::{
     CreateSemaphoreW, GetCurrentProcess, INFINITE, OpenProcess, PROCESS_DUP_HANDLE, ReleaseSemaphore, Sleep,
@@ -119,13 +119,31 @@ pub mod proto {
     /// Its value matches the macOS twin's `EVENT_PAGEFAULT` (3,
     /// wick_uffd.rs:140), where that side renamed the type in place.
     pub const EVENT_PAGEFAULT2: u64 = 3;
-    /// Request: `[OP_MIRROR, 0, 0, 0]`. Reply: `[size, 0, 0, 0]` with the
-    /// waiter mirror's section handle duplicated into the reader's process
-    /// read-only (`SECTION_MAP_READ`, never `DUPLICATE_SAME_ACCESS`;
-    /// [`super::dup_mirror_read_only`]), of `size` bytes ([`mirror_bytes`]); a
-    /// negative errno and no handle if it fails. A serving thread that
-    /// predates the mirror answers `-EINVAL` (an unknown request).
+    /// Request: `[OP_MIRROR, 0, 0, 0]`: the push. Reply: `[size, handle, 0,
+    /// 0]`, the waiter mirror's section duplicated into the reader's process
+    /// read-only (`SECTION_QUERY | SECTION_MAP_READ`, never
+    /// `DUPLICATE_SAME_ACCESS`; [`super::dup_mirror_read_only`]) and its value
+    /// there, of `size` bytes ([`mirror_bytes`]); a negative errno and no
+    /// handle if it fails: `-EPERM` when this process may not open the reader
+    /// (a jailed VMM and a handler of the operator: the jail's token opens no
+    /// process outside the jail), after which the reader pulls
+    /// ([`OP_MIRROR_PULL`]). A serving thread that predates the mirror answers
+    /// `-EINVAL` (an unknown request).
     pub const OP_MIRROR: u64 = 6;
+    /// Request: `[OP_MIRROR_PULL, 0, 0, 0]`: the pull, for a reader this
+    /// process may not open. Reply: `[size, handle, 0, 0]`, `handle` the value,
+    /// in **this** (the VMM's) process, of the userfaultfd's read-only handle
+    /// of the mirror (made at its creation with [`super::dup_mirror_read_only`],
+    /// closed at its release); never the read-write handle the mirror was made
+    /// with. The reader takes its own copy out of this process
+    /// ([`super::pull_mirror`]: `PROCESS_DUP_HANDLE` on the process the
+    /// userfaultfd's socket names as its peer, never a pid from a reply), as
+    /// it took the userfaultfd itself out of a jail (vmm-sys-util's
+    /// `sock_ctrl_msg`, `FLAG_PULL`). `-EINVAL` when there is no mirror; a
+    /// serving thread that predates the pull answers `-EINVAL` (an unknown
+    /// request). Windows only: the macOS twin passes a descriptor over the
+    /// socket (`SCM_RIGHTS`), which a sandbox does not stop.
+    pub const OP_MIRROR_PULL: u64 = 7;
     /// The waiter mirror's words: one per waiter slot.
     pub const MIRROR_WORDS: usize = 256;
     /// A tag's bit 0: its waiter waits.
@@ -478,7 +496,13 @@ struct Ctx {
     mirror: AtomicPtr<AtomicU64>,
     /// The mirror's section handle, duplicated read-only to each reader
     /// ([`dup_mirror_read_only`]) and closed at [`destroy`]; null for none.
+    /// Read-write: never named in a reply.
     section: AtomicPtr<c_void>,
+    /// A read-only handle of the mirror in this process
+    /// ([`dup_mirror_read_only`]), whose value `OP_MIRROR_PULL` replies with
+    /// for a reader to take its own copy of ([`serve_mirror_pull`]); made
+    /// with the mirror, closed at [`destroy`]; null for none.
+    pull: AtomicPtr<c_void>,
     /// Threads using the mirror or the kernel end ([`enter`]): [`destroy`]
     /// unmaps the mirror and closes the section once none is left.
     users: AtomicUsize,
@@ -509,6 +533,7 @@ static CTXS: [Ctx; MAX_CTX] = [const {
         features: AtomicU64::new(0),
         mirror: AtomicPtr::new(ptr::null_mut()),
         section: AtomicPtr::new(ptr::null_mut()),
+        pull: AtomicPtr::new(ptr::null_mut()),
         users: AtomicUsize::new(0),
     }
 }; MAX_CTX];
@@ -986,10 +1011,12 @@ pub fn new_mirror() -> io::Result<(HANDLE, *mut AtomicU64)> {
     // token is not known when the section is made (a reader is any process the
     // descriptor later reaches), so the DACL cannot name it. A future editor
     // must NOT "tighten" this to the creator's SID — that would refuse a
-    // read handle to a reader in another security context (a jailed or LPAC
-    // reader, piece 3), the opposite of what the mirror needs. The ACE grants
-    // read, never write, so Everyone-read costs nothing a reader does not
-    // already get from this side's read-only duplicate.
+    // read handle to a reader in another security context (the operator's
+    // handler of a jailed VMM, which pulls its copy, `OP_MIRROR_PULL`; a
+    // jailed handler of an unjailed VMM, which is pushed one), the opposite
+    // of what the mirror needs. The ACE grants query and read, never write,
+    // so Everyone-read costs nothing a reader does not already get from this
+    // side's read-only handle.
     let sddl: Vec<u16> = "D:(A;;0x5;;;WD)".encode_utf16().chain([0]).collect();
     let mut psd: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: a NUL-terminated SDDL string and an out-pointer for the SD.
@@ -1036,13 +1063,20 @@ pub fn new_mirror() -> io::Result<(HANDLE, *mut AtomicU64)> {
     Ok((section, view.cast()))
 }
 
+/// The access a reader's handle of the mirror has: `SECTION_MAP_READ`
+/// (`FILE_MAP_READ`'s value, 0x4) to map it read-only, and `SECTION_QUERY`
+/// (0x1), which [`check_mirror_section`] needs to read what the object is
+/// before the reader maps it. No write; the section's DACL grants Everyone
+/// exactly these two (0x5, [`new_mirror`]).
+const MIRROR_READER_ACCESS: u32 = FILE_MAP_READ | SECTION_QUERY;
+
 /// Duplicates the mirror `section` into `target` (a process handle) with
-/// **`SECTION_MAP_READ` only** (`FILE_MAP_READ`'s value, 0x4), never
-/// `DUPLICATE_SAME_ACCESS`. This is a **distinct** path from the crate's
-/// other handle sends, which pass `DUPLICATE_SAME_ACCESS` (windows_fd.rs),
-/// so no caller gets the read-write handle by mistake: the reduced access is
-/// not a flag on a shared send, it is this function. The duplicate can map
-/// the mirror read-only and nothing more
+/// **[`MIRROR_READER_ACCESS`] only** (`SECTION_QUERY | SECTION_MAP_READ`),
+/// never `DUPLICATE_SAME_ACCESS`. This is a **distinct** path from the
+/// crate's other handle sends, which pass `DUPLICATE_SAME_ACCESS`
+/// (windows_fd.rs), so no caller gets the read-write handle by mistake: the
+/// reduced access is not a flag on a shared send, it is this function. The
+/// duplicate can map the mirror read-only and query it, nothing more
 /// (`test_a_mirror_handle_a_reader_gets_cannot_be_re_duplicated_to_writable`).
 ///
 /// # Safety
@@ -1051,10 +1085,10 @@ pub fn new_mirror() -> io::Result<(HANDLE, *mut AtomicU64)> {
 pub unsafe fn dup_mirror_read_only(section: HANDLE, target: HANDLE) -> io::Result<HANDLE> {
     let mut out: HANDLE = ptr::null_mut();
     // SAFETY: the caller's live section and target process handles; the
-    // access is `FILE_MAP_READ` (== `SECTION_MAP_READ`), no
-    // `DUPLICATE_SAME_ACCESS`, and `bInheritHandle` (the 6th argument) is 0,
-    // so the reader's duplicate is not inheritable either.
-    let ok = unsafe { DuplicateHandle(GetCurrentProcess(), section, target, &mut out, FILE_MAP_READ, 0, 0) };
+    // access is `MIRROR_READER_ACCESS`, no `DUPLICATE_SAME_ACCESS`, and
+    // `bInheritHandle` (the 6th argument) is 0, so the reader's duplicate is
+    // not inheritable either.
+    let ok = unsafe { DuplicateHandle(GetCurrentProcess(), section, target, &mut out, MIRROR_READER_ACCESS, 0, 0) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1088,27 +1122,142 @@ pub unsafe fn unmap_mirror(view: *const AtomicU64) {
     unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut c_void }) };
 }
 
-/// Maps a reader's duplicate of a mirror section and closes the handle, which
+/// Takes the reader's own copy of a mirror out of the VMM, for a reader the
+/// VMM cannot open (`OP_MIRROR_PULL`, [`serve_mirror_pull`]): opens process
+/// `vmm` with `PROCESS_DUP_HANDLE` and duplicates its handle `value` into
+/// this process asking [`MIRROR_READER_ACCESS`] alone, not inheritable,
+/// without `DUPLICATE_SAME_ACCESS` (a value naming a writable handle still
+/// gives a read-only copy) and without `DUPLICATE_CLOSE_SOURCE` (the VMM's
+/// handle stays its own, for other readers, and nothing of the VMM's is
+/// closed by a value it gave). `vmm` must come from the userfaultfd socket's
+/// peer (`SIO_AF_UNIX_GETPEERPID`, which the system gives), never from a
+/// reply. The VMM is not trusted: the copy is checked before it is mapped
+/// ([`map_mirror_handle`]). Fails with the error that stopped it: the
+/// process not opened (`EACCES`, `ERROR_ACCESS_DENIED`: neither side may
+/// open the other, a combination that needs a third process that may), or
+/// the value naming no handle there.
+pub fn pull_mirror(vmm: u32, value: u64) -> io::Result<HANDLE> {
+    // SAFETY: a pid; a process handle with the one right the dup needs.
+    let proc = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, vmm) };
+    if proc.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut out: HANDLE = ptr::null_mut();
+    // SAFETY: the VMM's process handle; a handle value of its table, which
+    // the call checks; the copy has the reader's access and nothing more.
+    let ok = unsafe {
+        DuplicateHandle(proc, value as usize as HANDLE, GetCurrentProcess(), &mut out, MIRROR_READER_ACCESS, 0, 0)
+    };
+    let e = io::Error::last_os_error();
+    // SAFETY: the process handle opened above.
+    unsafe { CloseHandle(proc) };
+    if ok == 0 {
+        return Err(e);
+    }
+    Ok(out)
+}
+
+/// Why a handle a reader got is no mirror ([`check_mirror_section`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotAMirror {
+    /// Not a section, or one that cannot be queried (`NtQuerySection`'s
+    /// status): `ENODEV`, as Linux's `mmap` of a file that cannot be mapped.
+    NotASection(i32),
+    /// A section of another size (bytes): `EPROTO`.
+    Size(u64),
+    /// A section backed by a file or an image, or only reserved
+    /// (`SECTION_BASIC_INFORMATION.AllocationAttributes`): `EOPNOTSUPP`. A
+    /// file's pages are read in at the access and a failed read is an
+    /// in-page error in the reader; a reserved page faults; the mirror is
+    /// committed pagefile memory.
+    Backing(u32),
+}
+
+impl NotAMirror {
+    /// The errno the read fails with.
+    pub fn errno(self) -> c_int {
+        match self {
+            NotAMirror::NotASection(_) => crate::ENODEV,
+            NotAMirror::Size(_) => crate::EPROTO,
+            NotAMirror::Backing(_) => crate::EOPNOTSUPP,
+        }
+    }
+}
+
+/// What a section's `AllocationAttributes` and size make of it: a mirror
+/// only if committed pagefile memory (`SEC_COMMIT`, no `SEC_FILE`,
+/// `SEC_IMAGE` or `SEC_RESERVE`) of exactly [`mirror_bytes`].
+pub fn mirror_section_kind(attributes: u32, size: u64) -> Result<(), NotAMirror> {
+    if attributes & (SEC_FILE | SEC_IMAGE | SEC_RESERVE) != 0 || attributes & SEC_COMMIT == 0 {
+        return Err(NotAMirror::Backing(attributes));
+    }
+    if size != mirror_bytes() as u64 {
+        return Err(NotAMirror::Size(size));
+    }
+    Ok(())
+}
+
+/// `SECTION_BASIC_INFORMATION` (`NtQuerySection`'s class 0).
+#[repr(C)]
+#[derive(Default)]
+struct SectionBasicInformation {
+    base: usize,
+    attributes: u32,
+    size: i64,
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQuerySection(section: HANDLE, class: u32, info: *mut c_void, len: usize, returned: *mut usize) -> i32;
+}
+
+/// Whether `section`, a handle a reader got (pushed or pulled), is a mirror:
+/// a section ([`NotAMirror::NotASection`] otherwise), of committed pagefile
+/// memory and of exactly the mirror's size ([`mirror_section_kind`]). Read
+/// with `NtQuerySection` (`SectionBasicInformation`, which needs
+/// `SECTION_QUERY`) before the reader maps anything: the VMM is the
+/// untrusted side and the handler the more privileged one, so the object
+/// the handler maps is never one the VMM chose freely (a file's section
+/// whose read fails would stop or end the handler; another object's 0x4 is
+/// another right).
+fn check_mirror_section(section: HANDLE) -> Result<(), NotAMirror> {
+    let mut info = SectionBasicInformation::default();
+    let mut got = 0usize;
+    // SAFETY: a handle of this process and a structure of the size given.
+    let status = unsafe {
+        NtQuerySection(section, 0, (&raw mut info).cast(), core::mem::size_of::<SectionBasicInformation>(), &mut got)
+    };
+    if status < 0 {
+        return Err(NotAMirror::NotASection(status));
+    }
+    mirror_section_kind(info.attributes, u64::try_from(info.size).unwrap_or(u64::MAX))
+}
+
+/// Maps a reader's copy of a mirror section and closes the handle, which
 /// the view keeps alive. The `userfaultfd` crate's reader calls this on the
-/// handle value `OP_MIRROR` ([`serve_mirror`]) duplicated into its process;
-/// `size` is the size that reply reported, refused with `EPROTO` (and the
-/// handle closed) unless it is the table's size, so an object of another size
-/// is no mirror (the macOS twin checks the descriptor's `st_size` the same
-/// way). The handle is consumed either way; [`unmap_mirror`] releases the
-/// view the call returns.
+/// handle value `OP_MIRROR` ([`serve_mirror`]) duplicated into its process,
+/// or on the copy it pulled ([`pull_mirror`]); `size` is the size the reply
+/// reported, refused with `EPROTO` (and the handle closed) unless it is the
+/// table's size (the macOS twin checks the descriptor's `st_size` the same
+/// way). Then the object itself is checked before it is mapped
+/// ([`check_mirror_section`]: a section, committed pagefile memory, the
+/// mirror's size), refused with [`NotAMirror::errno`] and closed otherwise.
+/// The handle is consumed either way; [`unmap_mirror`] releases the view
+/// the call returns.
 ///
 /// # Safety
-/// `value` must be a section handle this process holds, as `serve_mirror`
-/// duplicates into the reader read-only; it is consumed (closed).
+/// `value` must be a handle this process holds (as `serve_mirror`
+/// duplicates into the reader, or [`pull_mirror`] returns); it is consumed
+/// (closed).
 pub unsafe fn map_mirror_handle(value: u64, size: u64) -> io::Result<*const AtomicU64> {
     let section = value as usize as HANDLE;
-    if size != mirror_bytes() as u64 {
-        // SAFETY: the handle value the reply carried, closed unused.
-        unsafe { CloseHandle(section) };
-        return Err(io::Error::from_raw_os_error(crate::EPROTO));
-    }
-    // SAFETY: a section handle of this process with `SECTION_MAP_READ`.
-    let view = unsafe { map_mirror_read_only(section) };
+    let checked = if size == mirror_bytes() as u64 {
+        check_mirror_section(section).map_err(|e| io::Error::from_raw_os_error(e.errno()))
+    } else {
+        Err(io::Error::from_raw_os_error(crate::EPROTO))
+    };
+    // SAFETY: a mirror section of this process with `SECTION_MAP_READ`.
+    let view = checked.and_then(|()| unsafe { map_mirror_read_only(section) });
     // SAFETY: the handle; on success the view keeps the section mapped.
     unsafe { CloseHandle(section) };
     view
@@ -1545,7 +1694,23 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
     // negligibly (the module's "The waiter mirror section" doc). Set before
     // the serving thread starts (it answers `OP_MIRROR` from the section) and
     // before the caller registers memory (a fault then reads the mirror).
-    let (section, view) = match new_mirror() {
+    // The mirror and its read-only handle for a reader's pull
+    // (`OP_MIRROR_PULL`).
+    let made = new_mirror().and_then(|(section, view)| {
+        // SAFETY: the section just made; this process's pseudo handle.
+        match unsafe { dup_mirror_read_only(section, GetCurrentProcess()) } {
+            Ok(pull) => Ok((section, view, pull)),
+            Err(e) => {
+                // SAFETY: the mirror just made, not in use.
+                unsafe {
+                    unmap_mirror(view);
+                    CloseHandle(section);
+                }
+                Err(e)
+            }
+        }
+    });
+    let (section, view, pull) = match made {
         Ok(m) => m,
         Err(e) => {
             CTXS[index].fd.store(-1, Ordering::Release);
@@ -1558,14 +1723,17 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
         }
     };
     CTXS[index].section.store(section, Ordering::Release);
+    CTXS[index].pull.store(pull, Ordering::Release);
     CTXS[index].mirror.store(view, Ordering::Release);
     if let Err(e) = std::thread::Builder::new().name("userfaultfd".into()).spawn(move || serve(index, kernel)) {
         CTXS[index].mirror.store(ptr::null_mut(), Ordering::Release);
+        CTXS[index].pull.store(ptr::null_mut(), Ordering::Release);
         CTXS[index].section.store(ptr::null_mut(), Ordering::Release);
         CTXS[index].fd.store(-1, Ordering::Release);
         // SAFETY: the mirror just made and the sockets above, none in use yet.
         unsafe {
             unmap_mirror(view);
+            CloseHandle(pull);
             CloseHandle(section);
             ws::closesocket(sock(kernel));
             ws::closesocket(sock(user));
@@ -2531,6 +2699,7 @@ fn destroy(ctx: usize) {
     // too: the view is unmapped and the section closed after the last reader
     // of them (no write-after-close).
     let section = CTXS[ctx].section.swap(ptr::null_mut(), Ordering::AcqRel);
+    let pull = CTXS[ctx].pull.swap(ptr::null_mut(), Ordering::AcqRel);
     let view = CTXS[ctx].mirror.swap(ptr::null_mut(), Ordering::AcqRel);
     while CTXS[ctx].users.load(Ordering::SeqCst) != 0 {
         std::thread::yield_now();
@@ -2538,6 +2707,11 @@ fn destroy(ctx: usize) {
     if !view.is_null() {
         // SAFETY: the mirror view, no longer used.
         unsafe { unmap_mirror(view) };
+    }
+    if !pull.is_null() {
+        // SAFETY: the read-only handle, no longer used. A reader that pulled
+        // holds a copy of its own.
+        unsafe { CloseHandle(pull) };
     }
     if !section.is_null() {
         // SAFETY: the section handle, no longer used.
@@ -2732,12 +2906,15 @@ fn peer_pid(fd: c_int) -> Option<u32> {
     (asked == 0).then_some(pid)
 }
 
-/// Serves `OP_MIRROR`: duplicates the ctx's mirror section into the reader's
-/// process read-only ([`dup_mirror_read_only`]) and replies with the mirror's
-/// size and the duplicate's handle value (valid in the reader). `users` is held
-/// across the duplicate, so [`destroy`] does not close the section under it.
-/// `-EINVAL` when there is no mirror (its ctx is being torn down), as a serving
-/// thread that predates the mirror answers an unknown request `-EINVAL`.
+/// Serves `OP_MIRROR`, the push: duplicates the ctx's mirror section into the
+/// reader's process read-only ([`dup_mirror_read_only`]) and replies with the
+/// mirror's size and the duplicate's handle value (valid in the reader).
+/// `users` is held across the duplicate, so [`destroy`] does not close the
+/// section under it. `-EPERM` when the reader cannot be opened for the
+/// duplicate (this VMM is jailed and the reader is not: the reader then
+/// pulls, [`serve_mirror_pull`]); `-EINVAL` when there is no mirror (its ctx
+/// is being torn down), as a serving thread that predates the mirror answers
+/// an unknown request `-EINVAL`.
 fn serve_mirror(ctx: usize, fd: c_int) -> [u64; 2] {
     let err = |e: c_int| [(-i64::from(e)).cast_unsigned(), 0];
     let Some(c) = CTXS.get(ctx) else {
@@ -2767,6 +2944,23 @@ fn serve_mirror(ctx: usize, fd: c_int) -> [u64; 2] {
     };
     c.users.fetch_sub(1, Ordering::SeqCst);
     reply
+}
+
+/// Serves `OP_MIRROR_PULL`: replies with the mirror's size and the value, in
+/// this process, of the ctx's read-only handle of it (`Ctx::pull`), for a
+/// reader this process cannot open to take its own copy of
+/// ([`pull_mirror`]). The read-write handle is never named. `-EINVAL` when
+/// there is no mirror.
+fn serve_mirror_pull(ctx: usize) -> [u64; 2] {
+    let err = |e: c_int| [(-i64::from(e)).cast_unsigned(), 0];
+    let Some(c) = CTXS.get(ctx) else {
+        return err(crate::EINVAL);
+    };
+    let pull = c.pull.load(Ordering::SeqCst);
+    if pull.is_null() {
+        return err(crate::EINVAL);
+    }
+    [mirror_bytes() as u64, pull as usize as u64]
 }
 
 /// Serves one request from a client channel; false when the channel closed.
@@ -2802,6 +2996,7 @@ fn serve_request(ctx: usize, fd: c_int) -> bool {
         ),
         proto::OP_UNREGISTER => to_reply(unregister(ctx, a, b).map(|()| 0).map_err(|e| (e, 0))),
         proto::OP_MIRROR => serve_mirror(ctx, fd),
+        proto::OP_MIRROR_PULL => serve_mirror_pull(ctx),
         _ => to_reply(Err((crate::EINVAL, 0))),
     };
     let mut out = [0u8; proto::RECORD];
@@ -3809,6 +4004,7 @@ mod tests {
             let (ctx, user) = create(0, false, true).unwrap();
             assert!(!CTXS[ctx].mirror.load(Ordering::SeqCst).is_null(), "a mirror at create");
             assert!(!CTXS[ctx].section.load(Ordering::SeqCst).is_null(), "a section at create");
+            assert!(!CTXS[ctx].pull.load(Ordering::SeqCst).is_null(), "a read-only handle for a pull at create");
             // Close the user end through the libc (detaching its descriptor
             // state, as a caller's `close` does): the serve thread then releases
             // the userfaultfd and ends.
@@ -3825,7 +4021,142 @@ mod tests {
             // unmapped and its pointer null.
             assert!(CTXS[ctx].section.load(Ordering::SeqCst).is_null(), "the section is freed at release");
             assert!(CTXS[ctx].mirror.load(Ordering::SeqCst).is_null(), "the mirror is freed at release");
+            assert!(CTXS[ctx].pull.load(Ordering::SeqCst).is_null(), "the read-only handle is closed at release");
         }
+    }
+
+    /// `ObjectBasicInformation` of a handle (`NtQueryObject` class 0): its
+    /// granted access and the object's handle count.
+    fn object_basics(h: HANDLE) -> (u32, u32) {
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryObject(handle: HANDLE, class: u32, info: *mut c_void, len: u32, returned: *mut u32) -> i32;
+        }
+        // Attributes, GrantedAccess, HandleCount, PointerCount, then reserved
+        // words: 56 bytes in all.
+        let mut info = [0u32; 14];
+        let mut got = 0u32;
+        // SAFETY: a handle of this process and a buffer of the size given.
+        let status = unsafe { NtQueryObject(h, 0, info.as_mut_ptr().cast(), 56, &mut got) };
+        assert!(status >= 0, "NtQueryObject: {status:#x}");
+        (info[1], info[2])
+    }
+
+    /// No reply names the mirror's read-write handle: `OP_MIRROR`'s push
+    /// gives the reader a handle of `SECTION_QUERY | SECTION_MAP_READ` alone,
+    /// and `OP_MIRROR_PULL` names the VMM's own read-only handle of the
+    /// mirror, of the same access, never the section handle the mirror was
+    /// made with (which keeps write). Each names the mirror's object
+    /// (`CompareObjectHandles`), and neither can be duplicated up to write.
+    /// The reader here is this process (the user end's peer).
+    #[test]
+    fn test_no_mirror_reply_names_the_read_write_handle() {
+        use windows_sys::Win32::Foundation::CompareObjectHandles;
+        let (ctx, user) = create(0, false, true).unwrap();
+        let section = CTXS[ctx].section.load(Ordering::SeqCst);
+        let (rw_access, _) = object_basics(section);
+        assert_ne!(rw_access & FILE_MAP_WRITE, 0, "the mirror's own handle keeps write");
+        let pushed = serve_mirror(ctx, user);
+        let pulled = serve_mirror_pull(ctx);
+        // SAFETY: plain call.
+        let me = unsafe { GetCurrentProcess() };
+        for (op, [size, value]) in [("OP_MIRROR", pushed), ("OP_MIRROR_PULL", pulled)] {
+            assert_eq!(size, mirror_bytes() as u64, "{op}: {size:#x}");
+            let h = value as usize as HANDLE;
+            assert_ne!(h, section, "{op} named the read-write handle");
+            // SAFETY: two handles of this process.
+            assert_ne!(unsafe { CompareObjectHandles(h, section) }, 0, "{op}: not the mirror");
+            let (access, _) = object_basics(h);
+            assert_eq!(access, MIRROR_READER_ACCESS, "{op}: access {access:#x}");
+            let mut wide: HANDLE = ptr::null_mut();
+            // SAFETY: a handle of this process; a duplicate asking for write.
+            let ok = unsafe { DuplicateHandle(me, h, me, &mut wide, FILE_MAP_WRITE, 0, 0) };
+            assert_eq!(ok, 0, "{op}: duplicated up to write");
+        }
+        // The push's duplicate is the reader's; the pull's handle is the VMM's.
+        // SAFETY: the handle the push made for this process.
+        unsafe { CloseHandle(pushed[1] as usize as HANDLE) };
+        release(ctx, user);
+    }
+
+    /// What a mirror's object must be: a section of committed pagefile
+    /// memory of exactly the mirror's size. The VMM is the untrusted side, so
+    /// the reader checks the object a handle names before it maps it, pushed
+    /// or pulled (`map_mirror_handle`), and the handle is closed whatever the
+    /// answer: a handle of another type (`ENODEV`), a section of another size
+    /// (`EPROTO`) and a section of a file (`EOPNOTSUPP`) are refused; the
+    /// mirror maps. MIRRORKIND prints the attributes a real mirror reads with.
+    #[test]
+    fn test_a_mirror_handle_is_checked_before_it_is_mapped() {
+        use std::io::Write as _;
+        use std::os::windows::io::AsRawHandle;
+        // The rule, on the attributes and sizes.
+        let page = mirror_bytes() as u64;
+        assert_eq!(mirror_section_kind(SEC_COMMIT, page), Ok(()));
+        for attrs in [SEC_COMMIT | SEC_FILE, SEC_COMMIT | SEC_IMAGE, SEC_IMAGE, SEC_FILE, SEC_RESERVE, 0] {
+            assert_eq!(mirror_section_kind(attrs, page), Err(NotAMirror::Backing(attrs)), "{attrs:#x}");
+        }
+        assert_eq!(mirror_section_kind(SEC_COMMIT, 2 * page), Err(NotAMirror::Size(2 * page)));
+        // SAFETY: plain call.
+        let me = unsafe { GetCurrentProcess() };
+        // Hands `map_mirror_handle` a duplicate of `h` and checks it was
+        // consumed: the object's handles are as many as before the duplicate.
+        let map = |h: HANDLE| -> io::Result<*const AtomicU64> {
+            let before = object_basics(h).1;
+            let mut dup: HANDLE = ptr::null_mut();
+            // SAFETY: a handle of this process; a duplicate of the same access.
+            assert_ne!(unsafe { DuplicateHandle(me, h, me, &mut dup, 0, 0, windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS) }, 0);
+            assert_eq!(object_basics(h).1, before + 1);
+            // SAFETY: a handle of this process, consumed.
+            let r = unsafe { map_mirror_handle(dup as usize as u64, page) };
+            assert_eq!(object_basics(h).1, before, "the handle given was not closed");
+            r
+        };
+        let errno = |r: io::Result<*const AtomicU64>| r.err().and_then(|e| e.raw_os_error());
+        // Not a section: a semaphore.
+        // SAFETY: an unnamed semaphore.
+        let sem = unsafe { CreateSemaphoreW(ptr::null(), 0, 1, ptr::null()) };
+        assert!(!sem.is_null());
+        assert_eq!(errno(map(sem)), Some(crate::ENODEV), "a semaphore");
+        // A pagefile section of another size.
+        // SAFETY: an unnamed pagefile-backed section of two pages.
+        let big = unsafe {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, 2 * page as u32, ptr::null())
+        };
+        assert!(!big.is_null());
+        assert_eq!(errno(map(big)), Some(crate::EPROTO), "a section of two pages");
+        // A section of a file, of the mirror's size.
+        let path = std::env::temp_dir().join(std::format!("wick-mirror-file-{}.bin", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&std::vec![0u8; page as usize]).unwrap();
+        drop(file);
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: a read-only section of the file just written.
+        let filed = unsafe {
+            CreateFileMappingW(file.as_raw_handle() as HANDLE, ptr::null(), PAGE_READONLY, 0, 0, ptr::null())
+        };
+        assert!(!filed.is_null(), "{}", io::Error::last_os_error());
+        assert_eq!(errno(map(filed)), Some(crate::EOPNOTSUPP), "a section of a file");
+        // The mirror, read-only, as a reader gets it.
+        let (section, rw) = new_mirror().unwrap();
+        // SAFETY: the section just made; this process.
+        let ro = unsafe { dup_mirror_read_only(section, me) }.unwrap();
+        let mut info = SectionBasicInformation::default();
+        let mut got = 0usize;
+        // SAFETY: as in `check_mirror_section`.
+        let status = unsafe { NtQuerySection(ro, 0, (&raw mut info).cast(), core::mem::size_of_val(&info), &mut got) };
+        std::println!("MIRRORKIND status {status:#x} attributes {:#x} size {}", info.attributes, info.size);
+        let view = map(ro).unwrap();
+        // SAFETY: views and handles this test made.
+        unsafe {
+            unmap_mirror(view);
+            unmap_mirror(rw);
+            for h in [ro, section, filed, big, sem] {
+                CloseHandle(h);
+            }
+        }
+        drop(file);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// MIRRORHANDLES: attributes the process handle growth seen while

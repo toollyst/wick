@@ -556,15 +556,17 @@ impl Uffd {
         }
     }
 
-    /// `OP_MIRROR`: the reply words. Word 0 is the mirror's size or `-errno`;
-    /// word 1, on success, the section handle [`serve_mirror`](wick_uffd)
-    /// duplicated into this process read-only. Where the macOS twin receives a
-    /// descriptor over the socket (`SCM_RIGHTS`), the Windows kernel side has
-    /// already placed the handle in the reader's table, so the value stands
-    /// alone and no control message is read.
-    fn request_mirror(&self) -> SysResult<[u64; 4]> {
+    /// `OP_MIRROR` or `OP_MIRROR_PULL` (`op`): the reply words. Word 0 is the
+    /// mirror's size or `-errno`; word 1, on success, a handle value: for
+    /// `OP_MIRROR` (the push) the section the kernel side duplicated into this
+    /// process read-only, for `OP_MIRROR_PULL` the kernel side's own read-only
+    /// handle, valid in its process, which this reader takes a copy of
+    /// ([`wick_uffd::pull_mirror`]). Where the macOS twin receives a descriptor
+    /// over the socket (`SCM_RIGHTS`), here the value stands alone and no
+    /// control message is read.
+    fn request_mirror(&self, op: u64) -> SysResult<[u64; 4]> {
         let mut channel = self.channel()?.lock().unwrap();
-        write_all(channel.fd, &record([proto::OP_MIRROR, 0, 0, 0]))?;
+        write_all(channel.fd, &record([op, 0, 0, 0]))?;
         let mut reply = [0u8; proto::RECORD];
         read_all(channel.fd, &mut reply)?;
         if let Some(fd) = channel.sent.take() {
@@ -575,10 +577,21 @@ impl Uffd {
     }
 
     /// The waiter mirror, set up at the first call: the kernel side's own
-    /// mapping for the object that made the userfaultfd, else the section
-    /// `OP_MIRROR` answers with, mapped read-only. Every failure is an error
-    /// (a kernel side that predates the mirror answers `EINVAL`; a reply of
-    /// another size is `EPROTO`), never a read without the check.
+    /// mapping for the object that made the userfaultfd, else a read-only
+    /// copy of its section, checked and mapped read-only. The copy is pushed
+    /// (`OP_MIRROR`: the kernel side duplicates it into this process), or,
+    /// when the kernel side cannot open this process (`EPERM`: a jailed VMM
+    /// and a handler of the operator), pulled (`OP_MIRROR_PULL`: this reader
+    /// opens the kernel side's process, the one the userfaultfd's socket
+    /// names as its peer, and copies the handle the reply names). Either copy
+    /// is checked before it is mapped (`map_mirror_handle`: a section of
+    /// committed pagefile memory of the mirror's size), as the kernel side is
+    /// not trusted. Every failure is an error, never a read without the
+    /// check: a kernel side that predates the mirror, or the pull, answers
+    /// `EINVAL`; a reply of another size is `EPROTO`, an object that is no
+    /// section `ENODEV`, a section of a file `EOPNOTSUPP`; neither side may
+    /// open the other: `EACCES` (that combination needs a third process that
+    /// may, as a jailed VMM and its API process have the jailer).
     fn mirror(&self) -> Result<&Mirror> {
         if let Some(m) = self.mirror.get() {
             return Ok(m);
@@ -590,15 +603,31 @@ impl Uffd {
                 view: ptr::null(),
             },
             None => {
-                let [result, handle, _, _] = self.request_mirror()?;
+                let [mut result, mut handle, _, _] = self.request_mirror(proto::OP_MIRROR)?;
+                if result.cast_signed() == -i64::from(libc::EPERM) {
+                    // The kernel side may not open this process: take a copy
+                    // out of it. Its pid is the socket's peer, which the
+                    // system gives (`SIO_AF_UNIX_GETPEERPID`), never a word
+                    // of a reply.
+                    let [r, value, _, _] = self.request_mirror(proto::OP_MIRROR_PULL)?;
+                    result = r;
+                    if r.cast_signed() >= 0 {
+                        let pid = wick_os::windows::peer_pid(self.fd)
+                            .map_err(|e| Error::SystemError(errno(e.raw_os_error().unwrap_or(libc::EIO))))?;
+                        let copy = wick_uffd::pull_mirror(pid, value)
+                            .map_err(|e| Error::SystemError(errno(e.raw_os_error().unwrap_or(libc::EIO))))?;
+                        handle = copy as usize as u64;
+                    }
+                }
                 let result = result.cast_signed();
                 #[allow(clippy::cast_possible_truncation)]
                 if result < 0 {
                     return Err(Error::SystemError(errno((-result) as i32)));
                 }
-                // SAFETY: `handle` is the section `serve_mirror` duplicated
-                // into this process read-only; `map_mirror_handle` checks its
-                // size against the table's and consumes it either way.
+                // SAFETY: `handle` is a handle of this process: the section
+                // `serve_mirror` duplicated into it, or the copy pulled above;
+                // `map_mirror_handle` checks the reply's size and the object
+                // itself before it maps, and consumes it either way.
                 let view =
                     unsafe { wick_uffd::map_mirror_handle(handle, result.cast_unsigned()) }
                         .map_err(|e| {
@@ -1299,5 +1328,437 @@ mod tests {
         // Part of the range too.
         let e = other.register(mem.wrapping_add(PAGE).cast(), PAGE);
         assert!(matches!(e, Err(Error::SystemError(Errno::EBUSY))), "{e:?}");
+    }
+
+    // ---- The mirror for a reader the userfaultfd's process cannot open: a
+    // jailed VMM and a page fault handler of the operator (jailer-test.ps1
+    // `uffd`), whose token opens no process outside its jail. The push
+    // (`OP_MIRROR`) is refused there, `-EPERM`; the reader pulls a read-only
+    // copy out of the VMM (`OP_MIRROR_PULL`), as it pulled the userfaultfd
+    // itself. Locking a process's DACL stands in for the jail: no process may
+    // open it from then on. ----
+
+    use std::io::{Read as _, Write as _};
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
+
+    /// The role of a child of these tests, and the socket it reports on.
+    const ROLE: &str = "WICK_TEST_UFFD_ROLE";
+    const SOCK: &str = "WICK_TEST_UFFD_SOCK";
+
+    /// Drops `SeDebugPrivilege` from this process's token, if it is there: an
+    /// administrator's debug privilege, enabled on some CI machines, opens any
+    /// process; a jailed process has no privilege (vmm-sys-util's
+    /// `sock_ctrl_msg` tests do the same).
+    fn disable_debug_privilege() {
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, TOKEN_ADJUST_PRIVILEGES,
+            TOKEN_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::OpenProcessToken;
+        let name: Vec<u16> = "SeDebugPrivilege".encode_utf16().chain(Some(0)).collect();
+        let mut token: HANDLE = ptr::null_mut();
+        // SAFETY: plain data.
+        let mut privileges: TOKEN_PRIVILEGES = unsafe { mem::zeroed() };
+        privileges.PrivilegeCount = 1;
+        // SAFETY: this process's token, a privilege name, and its structure;
+        // each call checked.
+        unsafe {
+            assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token), 0);
+            assert_ne!(LookupPrivilegeValueW(ptr::null(), name.as_ptr(), &mut privileges.Privileges[0].Luid), 0);
+            privileges.Privileges[0] = LUID_AND_ATTRIBUTES { Luid: privileges.Privileges[0].Luid, Attributes: 0 };
+            assert_ne!(AdjustTokenPrivileges(token, 0, &privileges, 0, ptr::null_mut(), ptr::null_mut()), 0);
+            CloseHandle(token);
+        }
+    }
+
+    /// Gives this process an empty DACL: no process may open it from now on.
+    fn lock_process() {
+        use windows_sys::Win32::Security::{
+            ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl, InitializeSecurityDescriptor,
+            SECURITY_DESCRIPTOR, SetKernelObjectSecurity, SetSecurityDescriptorDacl,
+        };
+        let mut acl = [0u64; 1];
+        // SAFETY: plain data.
+        let mut sd: SECURITY_DESCRIPTOR = unsafe { mem::zeroed() };
+        let sd_ptr = (&raw mut sd).cast::<c_void>();
+        // SAFETY: an ACL and a descriptor of their sizes; each call checked.
+        unsafe {
+            assert_ne!(InitializeAcl(acl.as_mut_ptr().cast::<ACL>(), 8, ACL_REVISION), 0);
+            assert_ne!(InitializeSecurityDescriptor(sd_ptr, 1), 0);
+            assert_ne!(SetSecurityDescriptorDacl(sd_ptr, 1, acl.as_ptr().cast::<ACL>(), 0), 0);
+            assert_ne!(SetKernelObjectSecurity(GetCurrentProcess(), DACL_SECURITY_INFORMATION, sd_ptr), 0);
+        }
+    }
+
+    /// Whether this process may open process `pid` for handle duplication.
+    fn can_open(pid: u32) -> bool {
+        // SAFETY: plain call; the handle is closed.
+        let h = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
+        if h.is_null() {
+            return false;
+        }
+        // SAFETY: the handle just opened.
+        unsafe { CloseHandle(h) };
+        true
+    }
+
+    /// A private, non-inheritable copy of `fd`'s handle in this process, for
+    /// a process that may open this one to take out, as vmm-sys-util's
+    /// `sock_ctrl_msg` leaves one for a receiver to pull (`FLAG_PULL`).
+    fn copy_to_pull(fd: RawFd) -> u64 {
+        let mut out: HANDLE = ptr::null_mut();
+        // SAFETY: plain calls on this process's handles; checked.
+        unsafe {
+            let me = GetCurrentProcess();
+            assert_ne!(DuplicateHandle(me, wick_os::fd::handle(fd), me, &mut out, 0, 0, DUPLICATE_SAME_ACCESS), 0);
+        }
+        out as usize as u64
+    }
+
+    /// The userfaultfd whose handle `value` process `pid` left to be taken,
+    /// taken out of it (`DUPLICATE_CLOSE_SOURCE`), as a handler takes it out
+    /// of a jailed Firecracker.
+    fn take_uffd(pid: u32, value: u64) -> Uffd {
+        // SAFETY: plain calls; checked.
+        unsafe {
+            let p = OpenProcess(PROCESS_DUP_HANDLE, 0, pid);
+            assert!(!p.is_null(), "the owner cannot be opened: {}", io::Error::last_os_error());
+            let mut h: HANDLE = ptr::null_mut();
+            let ok = DuplicateHandle(
+                p,
+                value as usize as HANDLE,
+                GetCurrentProcess(),
+                &mut h,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE,
+            );
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            CloseHandle(p);
+            Uffd::from_raw_fd(wick_os::fd::from_handle(h.cast()))
+        }
+    }
+
+    /// One line from `s`, without its end; `None` at the end of the stream.
+    fn line(s: &mut wick_os::unix::net::UnixStream) -> Option<String> {
+        let mut out = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            match s.read(&mut b) {
+                Ok(0) | Err(_) => return (!out.is_empty()).then(|| String::from_utf8_lossy(&out).into_owned()),
+                Ok(_) if b[0] == b'\n' => return Some(String::from_utf8_lossy(&out).into_owned()),
+                Ok(_) => out.push(b[0]),
+            }
+        }
+    }
+
+    /// A child of this test binary in `role`, reporting on a socket it
+    /// connects to; the parent's end once it connected.
+    fn child(role: &str) -> (std::process::Child, wick_os::unix::net::UnixStream) {
+        use std::process::{Command, Stdio};
+        let path = std::env::temp_dir().join(format!("wick-uffd-{role}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = wick_os::unix::net::UnixListener::bind(&path).unwrap();
+        let c = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "windows::tests::uffd_role_child", "--ignored", "--nocapture"])
+            .env(ROLE, role)
+            .env(SOCK, &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (s, _) = listener.accept().unwrap();
+        let _ = std::fs::remove_file(&path);
+        (c, s)
+    }
+
+    fn output(c: std::process::Child) -> (bool, String) {
+        let out = c.wait_with_output().unwrap();
+        (
+            out.status.success(),
+            format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
+        )
+    }
+
+    /// `NtQueryObject`'s `ObjectBasicInformation`: a handle's granted access.
+    fn granted_access(h: HANDLE) -> u32 {
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryObject(handle: HANDLE, class: u32, info: *mut c_void, len: u32, returned: *mut u32) -> i32;
+        }
+        let mut info = [0u32; 14];
+        let mut got = 0u32;
+        // SAFETY: a handle of this process and a buffer of the size given.
+        let status = unsafe { NtQueryObject(h, 0, info.as_mut_ptr().cast(), 56, &mut got) };
+        assert!(status >= 0, "NtQueryObject: {status:#x}");
+        info[1]
+    }
+
+    /// The children of the tests below, by `ROLE`:
+    /// - `reader`: locks itself, takes the parent's userfaultfd, asks the
+    ///   mirror as a reader from before the pull does (`OP_MIRROR` alone:
+    ///   `-EPERM`), pulls a copy and reports its access, then serves the
+    ///   parent's fault with `0x5a`;
+    /// - `owner`: makes a userfaultfd and leaves it to be taken, then locks
+    ///   itself when told, and lives until its stream ends;
+    /// - `reader-locked-out`: locks itself, takes the owner's userfaultfd, and
+    ///   once the owner is locked too reports what its read gives.
+    #[test]
+    #[ignore = "a child of the mirror pull tests"]
+    fn uffd_role_child() {
+        let Ok(role) = std::env::var(ROLE) else {
+            return;
+        };
+        let mut s = wick_os::unix::net::UnixStream::connect(std::env::var(SOCK).unwrap()).unwrap();
+        disable_debug_privilege();
+        match role.as_str() {
+            "reader" | "reader-locked-out" => {
+                lock_process();
+                writeln!(s, "locked").unwrap();
+                let got = line(&mut s).unwrap();
+                let (pid, value) = got.split_once(' ').unwrap();
+                let uffd = take_uffd(pid.parse().unwrap(), value.parse().unwrap());
+                if role == "reader-locked-out" {
+                    // The request channel is set up while the owner may still
+                    // be reached (`WSADuplicateSocketW` opens it); its push is
+                    // refused already, this process being locked.
+                    let [push, ..] = uffd.request_mirror(proto::OP_MIRROR).unwrap();
+                    assert_eq!(push.cast_signed(), -i64::from(libc::EPERM));
+                    writeln!(s, "taken").unwrap();
+                    assert_eq!(line(&mut s).as_deref(), Some("go"));
+                    writeln!(s, "read: {:?}", uffd.read_event()).unwrap();
+                    return;
+                }
+                // A reader from before the pull asks the push only.
+                let [old, ..] = uffd.request_mirror(proto::OP_MIRROR).unwrap();
+                writeln!(s, "old OP_MIRROR: {}", old.cast_signed()).unwrap();
+                // The pull's copy has the reader's access, no write.
+                let [size, value, ..] = uffd.request_mirror(proto::OP_MIRROR_PULL).unwrap();
+                let vmm = wick_os::windows::peer_pid(uffd.as_raw_fd()).unwrap();
+                let copy = wick_uffd::pull_mirror(vmm, value).unwrap();
+                writeln!(s, "pulled {size} access {:#x}", granted_access(copy)).unwrap();
+                // SAFETY: the copy just pulled.
+                unsafe { CloseHandle(copy) };
+                let addr = loop {
+                    match uffd.read_event() {
+                        Ok(Some(Event::Pagefault { addr, .. })) => break addr as usize,
+                        Ok(_) => thread::sleep(std::time::Duration::from_millis(1)),
+                        Err(e) => {
+                            writeln!(s, "read: {e:?}").unwrap();
+                            panic!("read: {e:?}");
+                        }
+                    }
+                };
+                let src = vec![0x5au8; PAGE];
+                let page = addr - addr % PAGE;
+                // SAFETY: a page; the faulting page.
+                let n = unsafe { uffd.copy(src.as_ptr().cast(), page as *mut c_void, PAGE, true) }.unwrap();
+                writeln!(s, "served {n}").unwrap();
+            }
+            "owner" => {
+                let owner = UffdBuilder::new().non_blocking(true).create().unwrap();
+                let mem = map(PAGE);
+                owner.register(mem.cast(), PAGE).unwrap();
+                writeln!(s, "{} {}", std::process::id(), copy_to_pull(owner.as_raw_fd())).unwrap();
+                assert_eq!(line(&mut s).as_deref(), Some("lock"));
+                lock_process();
+                writeln!(s, "locked").unwrap();
+                // Until the parent is done; the userfaultfd lives meanwhile.
+                let _ = line(&mut s);
+                std::process::exit(0);
+            }
+            other => panic!("role {other}"),
+        }
+    }
+
+    /// The failing-first case of the jailed restore (CI run 44024090570 and
+    /// on, `jailer-test.ps1 uffd`: uffd_on_demand_handler's first read failed
+    /// with `EPERM`, its panic hook killed Firecracker, and `/snapshot/load`
+    /// got no answer): a reader its userfaultfd's process cannot open reads
+    /// the fault and serves it, through the pulled mirror. A reader from
+    /// before the pull, which asks the push alone, is still refused `-EPERM`
+    /// (the version skew, loudly); the copy it pulls has `SECTION_QUERY |
+    /// SECTION_MAP_READ` (0x5) alone.
+    #[test]
+    fn test_a_reader_its_userfaultfds_process_cannot_open_pulls_the_mirror() {
+        disable_debug_privilege();
+        let (c, mut s) = child("reader");
+        assert_eq!(line(&mut s).as_deref(), Some("locked"));
+        assert!(!can_open(c.id()), "the reader can be opened, so the test proves nothing");
+        let owner = UffdBuilder::new().non_blocking(true).create().unwrap();
+        let mem = map(PAGE);
+        owner.register(mem.cast(), PAGE).unwrap();
+        writeln!(s, "{} {}", std::process::id(), copy_to_pull(owner.as_raw_fd())).unwrap();
+        let fault = reader_of(mem as usize);
+        let mut said = Vec::new();
+        while let Some(l) = line(&mut s) {
+            let done = l.starts_with("served") || l.starts_with("read:");
+            said.push(l);
+            if done {
+                break;
+            }
+        }
+        if !said.iter().any(|l| l.starts_with("served")) {
+            // The fault was not served: free the faulting thread.
+            owner.unregister(mem.cast(), PAGE).unwrap();
+            let _ = fault.join();
+            let (_, text) = output(c);
+            panic!("the reader did not serve the fault: {said:?}\n{text}");
+        }
+        assert_eq!(fault.join().unwrap(), 0x5a);
+        let (ok, text) = output(c);
+        assert!(ok, "{said:?}\n{text}");
+        let eperm = -i64::from(libc::EPERM);
+        assert!(said.contains(&format!("old OP_MIRROR: {eperm}")), "{said:?}");
+        assert!(said.contains(&format!("pulled {} access 0x5", proto::mirror_bytes(PAGE))), "{said:?}");
+        owner.unregister(mem.cast(), PAGE).unwrap();
+    }
+
+    /// Neither side may open the other (both jailed apart, as a jailed VMM
+    /// and an LPAC handler would be): no push, no pull, and the read fails
+    /// with the pull's `EACCES`, never reads without the mirror. That
+    /// combination is not supported: it needs a third process that may open
+    /// both (SECURITY.md, docs/PORTING.md).
+    #[test]
+    fn test_a_reader_and_a_userfaultfd_that_cannot_open_each_other_fail_the_read() {
+        disable_debug_privilege();
+        let (o, mut so) = child("owner");
+        let (r, mut sr) = child("reader-locked-out");
+        assert_eq!(line(&mut sr).as_deref(), Some("locked"));
+        let handoff = line(&mut so).unwrap();
+        writeln!(sr, "{handoff}").unwrap();
+        assert_eq!(line(&mut sr).as_deref(), Some("taken"));
+        writeln!(so, "lock").unwrap();
+        assert_eq!(line(&mut so).as_deref(), Some("locked"));
+        assert!(!can_open(o.id()) && !can_open(r.id()), "a child can be opened, so the test proves nothing");
+        writeln!(sr, "go").unwrap();
+        let read = line(&mut sr).unwrap_or_default();
+        drop(so);
+        let (rok, rtext) = output(r);
+        let (ook, otext) = output(o);
+        assert!(rok && ook, "{read}\n{rtext}\n{otext}");
+        assert_eq!(read, format!("read: Err(SystemError(Errno({})))", libc::EACCES), "{rtext}");
+    }
+
+    /// The pull against a stand-in kernel side (this process, the socket's
+    /// peer): `OP_MIRROR` refused `-EPERM`, then `OP_MIRROR_PULL` answered
+    /// with `value`, a handle of this process, and the further words `extra`.
+    fn pulled_from(value: u64, extra: u64, records: Vec<[u64; 4]>) -> (Uffd, RawFd) {
+        stand_in(
+            move |c| {
+                answer_with(c, -i64::from(libc::EPERM), 0);
+                let mut head = [0u8; proto::RECORD];
+                read_all(c, &mut head).unwrap();
+                assert_eq!(words(&head)[0], proto::OP_MIRROR_PULL);
+                write_all(c, &record([proto::mirror_bytes(PAGE) as u64, value, extra, extra])).unwrap();
+            },
+            records,
+        )
+    }
+
+    /// A pulled mirror is the kernel side's read-only copy, taken out of the
+    /// process the socket names as its peer, whatever else the reply says:
+    /// words past the handle naming another process (4, the System process)
+    /// are not read. Here the copy maps and a record whose tag is not in the
+    /// stand-in's (zero) mirror is dropped: the read returns the remove event
+    /// written after it (the stand-in's end blocks, so an empty read would
+    /// wait).
+    #[test]
+    fn test_a_pulled_mirror_comes_from_the_sockets_peer() {
+        let (section, rw) = wick_uffd::new_mirror().unwrap();
+        // SAFETY: the section just made; this process.
+        let ro = unsafe { wick_uffd::dup_mirror_read_only(section, GetCurrentProcess()) }.unwrap();
+        let (uffd, kernel) = pulled_from(
+            ro as usize as u64,
+            4,
+            vec![[proto::EVENT_PAGEFAULT2, 0x1000, 0, proto::tag(1, 3)], [proto::EVENT_REMOVE, 0x2000, 0x3000, 0]],
+        );
+        let e = uffd.read_event();
+        assert!(
+            matches!(e, Ok(Some(Event::Remove { start, end })) if start as usize == 0x2000 && end as usize == 0x3000),
+            "{e:?}"
+        );
+        drop(uffd);
+        // SAFETY: the stand-in's end, the mirror and handles this test made.
+        unsafe {
+            libc::close(kernel);
+            wick_uffd::unmap_mirror(rw);
+            CloseHandle(ro);
+            CloseHandle(section);
+        }
+    }
+
+    /// A kernel side that is not trusted: the handle a pull names is checked
+    /// before it is mapped, and refused, the record left unread: an object
+    /// that is no section (`ENODEV`), a section of another size (`EPROTO`), a
+    /// section of a file (`EOPNOTSUPP`).
+    #[test]
+    fn test_a_pulled_handle_that_is_no_mirror_fails_the_read() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT};
+        use windows_sys::Win32::System::Threading::CreateSemaphoreW;
+        // SAFETY: an unnamed semaphore.
+        let sem = unsafe { CreateSemaphoreW(ptr::null(), 0, 1, ptr::null()) };
+        // SAFETY: an unnamed pagefile-backed section of two pages.
+        let big = unsafe {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, 2 * PAGE as u32, ptr::null())
+        };
+        let path = std::env::temp_dir().join(format!("wick-uffd-filed-{}.bin", std::process::id()));
+        std::fs::write(&path, vec![0u8; PAGE]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: a read-only section of the file just written.
+        let filed = unsafe {
+            CreateFileMappingW(file.as_raw_handle() as HANDLE, ptr::null(), PAGE_READONLY, 0, 0, ptr::null())
+        };
+        assert!(!sem.is_null() && !big.is_null() && !filed.is_null());
+        for (h, want, what) in [
+            (sem, libc::ENODEV, "a semaphore"),
+            (big, libc::EPROTO, "a section of two pages"),
+            (filed, libc::EOPNOTSUPP, "a section of a file"),
+        ] {
+            let (uffd, kernel) =
+                pulled_from(h as usize as u64, 0, vec![[proto::EVENT_PAGEFAULT2, 0x1000, 0, proto::tag(1, 3)]]);
+            let e = uffd.read_event();
+            assert!(matches!(e, Err(Error::SystemError(Errno(n))) if n == want), "{what}: {e:?}");
+            assert_eq!(pending(uffd.as_raw_fd()), 1, "{what}: the record was read");
+            drop(uffd);
+            // SAFETY: the stand-in's end.
+            unsafe { libc::close(kernel) };
+        }
+        // SAFETY: handles this test made.
+        unsafe {
+            for h in [sem, big, filed] {
+                CloseHandle(h);
+            }
+        }
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Version skew, this reader with a kernel side that predates the pull:
+    /// it answers `OP_MIRROR_PULL` as any unknown request, `-EINVAL`, and the
+    /// read fails with that error, the record left unread.
+    #[test]
+    fn test_a_kernel_side_without_the_pull_fails_the_read() {
+        let (uffd, kernel) = stand_in(
+            |c| {
+                answer_with(c, -i64::from(libc::EPERM), 0);
+                let mut head = [0u8; proto::RECORD];
+                read_all(c, &mut head).unwrap();
+                assert_eq!(words(&head)[0], proto::OP_MIRROR_PULL);
+                answer_with(c, -i64::from(libc::EINVAL), 0);
+            },
+            vec![[proto::EVENT_PAGEFAULT2, 0x1000, 0, proto::tag(1, 3)]],
+        );
+        let e = uffd.read_event();
+        assert!(matches!(e, Err(Error::SystemError(Errno::EINVAL))), "{e:?}");
+        assert_eq!(pending(uffd.as_raw_fd()), 1, "the record was read");
+        // SAFETY: the stand-in's end.
+        unsafe { libc::close(kernel) };
     }
 }
