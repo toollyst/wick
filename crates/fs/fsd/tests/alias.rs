@@ -39,6 +39,12 @@ fn create(s: &mut Session<HostDir>, n: &[u8]) -> Result<(), Errno> {
     if e < 0 { Err(errno(e)) } else { Ok(()) }
 }
 
+fn rename(s: &mut Session<HostDir>, from: (u64, &[u8]), to: (u64, &[u8]), flags: u32) -> Result<(), Errno> {
+    let args = [&le64(to.0)[..], &le32(flags), &le32(0)].concat();
+    let (e, _) = call(s, Opcode::Rename2, from.0, &[&args, &name(from.1), &name(to.1)]);
+    if e < 0 { Err(errno(e)) } else { Ok(()) }
+}
+
 fn names(dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -48,12 +54,16 @@ fn names(dir: &Path) -> Vec<String> {
     v
 }
 
-/// On a volume that folds case: one stored name, the other forms refused.
+/// On a volume that folds case: one stored name, the other forms refused;
+/// an object renamed to its own other case is stored under the new one
+/// (docs/design-fs.md §4.3, Rename), with or without `RENAME_NOREPLACE`,
+/// and keeps its node and its other links; a name that folds onto another
+/// link of the same object is EEXIST, as onto another object.
 fn case_collisions(dir: &Path) {
-    std::fs::write(dir.join("Foo"), b"").unwrap();
+    std::fs::write(dir.join("Foo"), b"f").unwrap();
     std::fs::write(dir.join("x"), b"").unwrap();
     let mut s = session_over(dir, Options { case_insensitive_ok: true }, Config::default()).unwrap();
-    lookup(&mut s, b"Foo").unwrap();
+    let node = lookup(&mut s, b"Foo").unwrap();
     assert_eq!(lookup(&mut s, b"foo"), Err(Errno::ENOENT));
     assert_eq!(lookup(&mut s, b"FOO"), Err(Errno::ENOENT));
     assert_eq!(create(&mut s, b"foo"), Err(Errno::EEXIST));
@@ -63,10 +73,44 @@ fn case_collisions(dir: &Path) {
     assert_eq!(errno(e), Errno::EEXIST, "a rename onto another object's case variant");
     let (e, _) = call(&mut s, Opcode::Unlink, ROOT, &[&name(b"foo")]);
     assert_eq!(errno(e), Errno::ENOENT);
-    // An object renamed to its own other case: the host stores the new one.
+    // An object renamed to its own other case: the host stores the new one,
+    // and the object keeps its node.
     let (e, _) = call(&mut s, Opcode::Rename, ROOT, &[&le64(ROOT), &name(b"Foo"), &name(b"foo")]);
     assert_eq!(e, 0);
     assert_eq!(names(dir), ["foo", "x"]);
+    assert_eq!(lookup(&mut s, b"foo"), Ok(node));
+    assert_eq!(lookup(&mut s, b"Foo"), Err(Errno::ENOENT));
+    // RENAME_NOREPLACE: the new case is no name the guest has.
+    rename(&mut s, (ROOT, b"foo"), (ROOT, b"FOO"), 1).unwrap();
+    assert_eq!(names(dir), ["FOO", "x"]);
+    // RENAME_EXCHANGE: the other case is not there to exchange with.
+    assert_eq!(rename(&mut s, (ROOT, b"FOO"), (ROOT, b"Foo"), 2), Err(Errno::ENOENT));
+    assert_eq!(names(dir), ["FOO", "x"]);
+    // Another link of the object, in another directory: untouched by a
+    // rename to another case, and a name there that folds onto it is EEXIST.
+    std::fs::create_dir(dir.join("d2")).unwrap();
+    std::fs::hard_link(dir.join("FOO"), dir.join("d2/other")).unwrap();
+    let d2 = lookup(&mut s, b"d2").unwrap();
+    rename(&mut s, (ROOT, b"FOO"), (ROOT, b"fOO"), 0).unwrap();
+    assert_eq!(names(dir), ["d2", "fOO", "x"]);
+    assert_eq!(names(&dir.join("d2")), ["other"]);
+    assert_eq!(std::fs::read(dir.join("d2/other")).unwrap(), b"f");
+    assert_eq!(rename(&mut s, (d2, b"other"), (ROOT, b"foo"), 0), Err(Errno::EEXIST), "onto another link's case");
+    // Another link in the same directory: a name that folds onto it is
+    // EEXIST, and both names stay.
+    std::fs::hard_link(dir.join("fOO"), dir.join("Zed")).unwrap();
+    assert_eq!(rename(&mut s, (ROOT, b"Zed"), (ROOT, b"foo"), 0), Err(Errno::EEXIST), "onto another link's case");
+    assert_eq!(names(dir), ["Zed", "d2", "fOO", "x"]);
+    // A link stored exactly: two names of one object, nothing done (POSIX).
+    rename(&mut s, (ROOT, b"Zed"), (ROOT, b"fOO"), 0).unwrap();
+    assert_eq!(names(dir), ["Zed", "d2", "fOO", "x"]);
+    // A directory to its own other case.
+    rename(&mut s, (ROOT, b"d2"), (ROOT, b"D2"), 0).unwrap();
+    assert_eq!(names(dir), ["D2", "Zed", "fOO", "x"]);
+    assert_eq!(names(&dir.join("D2")), ["other"]);
+    // Another object's name, as before, and the unrelated object untouched.
+    assert_eq!(rename(&mut s, (ROOT, b"x"), (ROOT, b"zed"), 0), Err(Errno::EEXIST));
+    assert_eq!(names(dir), ["D2", "Zed", "fOO", "x"]);
     assert_eq!(s.counters().layer_refusals, 0);
 }
 

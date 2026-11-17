@@ -382,5 +382,18 @@ fn test_stage0_and_renames_on_other_volumes() {
     assert_eq!(e, 0);
     let (e, _) = call(&mut s, Opcode::Rename2, ROOT, &[&rn2(ROOT, 2), &name(b"A"), &name(b"B")]);
     eprintln!("exchange on {}: {}", dir.display(), exchange_outcome(&dir, e));
+    // A rename to the object's own other case stores the new one (Linux's
+    // vfs_rename does nothing for two names of one inode: the backend goes
+    // through a middle name, design-fs §4.3), and keeps the node.
+    let (e, out) = call(&mut s, Opcode::Lookup, ROOT, &[&name(b"A")]);
+    assert_eq!(e, 0);
+    let a = u64_at(&out, 0);
+    let (e, _) = call(&mut s, Opcode::Rename2, ROOT, &[&rn2(ROOT, 0), &name(b"A"), &name(b"a")]);
+    assert_eq!(e, 0);
+    let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    names.sort();
+    assert_eq!(names, ["B", "a"], "the new case stored, nothing else left");
+    let (e, out) = call(&mut s, Opcode::Lookup, ROOT, &[&name(b"a")]);
+    assert_eq!((e, u64_at(&out, 0)), (0, a), "the same node");
     remove(&dir);
 }

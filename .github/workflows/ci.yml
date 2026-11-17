@@ -1290,9 +1290,21 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "$t/cf/d"
           sudo mount -o "loop,uid=$(id -u),gid=$(id -g)" "$t/fat.img" "$t/fat"
           WICK_FS_TEST_CASEFOLD_DIR="$t/cf/d" WICK_FS_TEST_NOXATTR_DIR="$t/fat" cargo test --locked -- --ignored
+          # On record (libtest keeps a passing test's output): what an exchange
+          # on vfat did here, for design-fs §4.3.
+          WICK_FS_TEST_NOXATTR_DIR="$t/fat" cargo test --locked -p wick-fsd --test host -- --ignored --exact \
+            test_stage0_and_renames_on_other_volumes --nocapture 2>&1 | grep -E "^exchange on|test result"
           bin="$(cargo test --locked --test special --no-run 2>&1 | grep -o 'target/debug/deps/special-[0-9a-f]*' | head -1)"
           sudo "$bin" --exact test_host_device_node_never_opened --nocapture
           sudo umount "$t/cf" "$t/fat"
+      # On record (libtest keeps a passing test's output): what this macOS's
+      # msdos does with renameatx_np(RENAME_SWAP), and the backend's
+      # exchange there, for design-fs §4.3.
+      - name: Host behaviour on record (macOS msdos exchange)
+        if: runner.os == 'macOS'
+        run: >-
+          cargo test --locked -p wick-fsd --test host -- --exact test_stage0_and_renames_on_other_volumes --nocapture 2>&1
+          | grep -E "^msdos on|^exchange on|test result"
       # Every test's result in one format (tools/ci-results.py, results.tsv),
       # for the docs' run claims; a step that did not run gives no rows.
       - name: Results in one format

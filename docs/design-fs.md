@@ -528,8 +528,24 @@ server's only unsafe code, `wick-fsd` itself forbids it):
   always (APFS and HFS+ fold Unicode normalization on every volume, and case on most), by `getattrlistat(...,
   ATTR_CMN_NAME, FSOPT_NOFOLLOW)`; Linux in a casefold directory and on vfat and exfat, by listing the directory.
   Another stored form is ENOENT to a lookup or unlink, EEXIST to a create, mkdir or rename onto it
-  (`test_alias_names_refused`, `test_case_collision_is_eexist`). An object renamed to its own other case is
-  renamed.
+  (`test_alias_names_refused`, `test_case_collision_is_eexist`). An object renamed to its own other case is stored under
+  the new one, as the guest asked, with or without `RENAME_NOREPLACE` (the new case is no name the guest has), keeping
+  its node and its other links; `RENAME_EXCHANGE` with it is ENOENT; a name that folds onto another link of the object,
+  in the same directory or another, is EEXIST, as onto another object; two links stored as given are two names of one
+  object, and the rename does nothing (Linux's 0; EEXIST with `RENAME_NOREPLACE`). macOS: one `renameatx_np`, which
+  stores the new case, when `getattrlistat` says the name folds onto the source's own entry (xnu hands a rename between
+  two names of one vnode to a case-insensitive file system, `renameat_internal`) [src]. Linux will not: a casefold
+  directory's dentries hash and compare folded (fs/libfs.c, v6.12, `generic_ci_d_hash` :1846, `generic_ci_d_compare`
+  :1794, set for the superblock by ext4 at fs/ext4/super.c :5472), so the lookup of the new case finds the source's
+  dentry and `vfs_rename` returns 0 with nothing done when both are one inode (fs/namei.c :4908; with
+  `RENAME_NOREPLACE`, EEXIST first, `do_renameat2` :5125 to :5126; unchanged in Linux's master) [src]. virtiofsd passes
+  the guest's `renameat2` through unchanged (`passthrough/mod.rs` `rename`) [src], so its guest gets that 0. Here the
+  source goes to a name the server makes (`.wick-recase-` and 16 hex digits) and then to the new case, each
+  `RENAME_NOREPLACE` in the one held directory (`HostDir::recase`); if the new case still names something once the
+  source is gone, it was another link, and the source goes back (EEXIST). Requests are served one at a time, so no guest
+  request sees the middle name; a host process may, between the two renames, see neither name and the middle one, and a
+  crash there leaves the object under it. A step that fails puts the source back; if a host process took the source's
+  name meanwhile, EIO, with the object at the middle name, where its node still finds it.
 - **Host names that are not guest names** (not UTF-8, an escape image of §6.3) are skipped by a listing and counted
   (`names_skipped`); no guest name reaches them (`test_host_names_that_are_not_guest_names_are_skipped`).
 - **Extended attributes.** The record is `user.wick.stat` (Linux) or `wick.stat` (macOS); a guest attribute `n` is
@@ -768,7 +784,7 @@ it means layer 1 let the request through.
 | Hard links | supported within the share; `st_nlink` from the host | yes | yes (APFS) | yes (NTFS) |
 | Inode numbers | server-chosen, stable for the session; `st_ino` = a hash of the host identity, not guaranteed stable across server restarts | | | 128-bit FileId hashed |
 | Rename over an open file / unlink while open | POSIX semantics | native | native | POSIX rename/disposition flags [inf: minimum build] |
-| Case | require a case-sensitive root by default; with an explicit operator flag, run on a case-insensitive root with exact-name lookups and EEXIST on case collisions (loud, documented) | ext4/f2fs casefold dirs handled the same way | APFS default is insensitive; use a case-sensitive APFS volume or sparse image (`hdiutil` needs no admin [inf]) | per directory; needs admin |
+| Case | require a case-sensitive root by default; with an explicit operator flag, run on a case-insensitive root with exact-name lookups and EEXIST on case collisions (loud, documented) | ext4/f2fs casefold dirs handled the same way; a rename to an object's own other case, which Linux returns 0 for and does not do, goes through a middle name (§4.3) | APFS default is insensitive; use a case-sensitive APFS volume or sparse image (`hdiutil` needs no admin [inf]) | per directory; needs admin |
 | Names | UTF-8 only, ≤255 bytes; `EILSEQ`/`ENAMETOOLONG` otherwise | non-UTF-8 host names: open question | APFS requires UTF-8 | escaped (§6.3); total NT path length ~32K characters |
 | Locks (`fcntl`, `flock`) | not negotiated, so guest-local only; not visible to host processes | | | |
 | mmap coherence | guest page cache (no DAX): coherent inside the guest; host writers show up after cache timeouts; `cache=never` option for shares edited on both sides | | | |

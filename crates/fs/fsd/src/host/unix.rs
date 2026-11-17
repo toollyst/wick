@@ -125,6 +125,16 @@ fn host_stat(st: &sys::Stat) -> HostStat {
     }
 }
 
+/// A name for [`HostDir::recase`]'s middle step: unlikely to be taken
+/// (each is tried with `RENAME_NOREPLACE`), and a guest name.
+#[cfg(target_os = "linux")]
+fn temporary_name() -> Vec<u8> {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    format!(".wick-recase-{:016x}", h.finish()).into_bytes()
+}
+
 /// A held directory.
 #[derive(Debug)]
 pub struct DirFd {
@@ -596,6 +606,68 @@ impl HostDir {
         }
     }
 
+    /// Renames `from` beneath `dir` to `to`, a name the directory folds
+    /// onto an entry of the same object (the caller's check), so that the
+    /// directory stores `to`.
+    ///
+    /// macOS: one `renameatx_np`, which stores the new case (xnu passes a
+    /// rename between two names of one vnode to a case-insensitive file
+    /// system, `renameat_internal`), when `to` folds onto `from` itself
+    /// (`stored_name`); onto another link of it, EEXIST.
+    ///
+    /// Linux: `vfs_rename` returns 0 with nothing done when both names are
+    /// one inode (fs/namei.c, v6.12, :4908), as a casefold directory's
+    /// lookup of `to` finds `from`'s dentry; with `RENAME_NOREPLACE` it is
+    /// EEXIST (`do_renameat2`, :5126). So `from` goes to a name the server
+    /// makes, then that name to `to`, each with `RENAME_NOREPLACE` in this
+    /// held directory: if `to` still names something once `from` has gone,
+    /// it was another link of the object, and the rename is undone (EEXIST).
+    /// Requests are served one at a time, so no guest request sees the
+    /// temporary name; a host process may, between the two renames, see
+    /// neither name and the temporary one. A step that fails puts `from`
+    /// back; if even that fails (a host process took `from` in between),
+    /// EIO, the object at the temporary name.
+    fn recase(&self, dir: &Arc<DirFd>, from: &[u8], to: &[u8], noreplace: bool) -> Result<(), DirError> {
+        let d = dir.fd.as_fd();
+        #[cfg(target_os = "macos")]
+        {
+            let stored = sys::stored_name(d, to).map_err(err)?;
+            if stored != from {
+                return Err(DirError::Errno(Errno::EEXIST));
+            }
+            sys::rename(d, from, d, to, noreplace, false).map_err(err)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = noreplace;
+            let mut tmp = None;
+            for _ in 0..4 {
+                let name = temporary_name();
+                match sys::rename(d, from, d, &name, true, false) {
+                    Ok(()) => {
+                        tmp = Some(name);
+                        break;
+                    }
+                    Err(e) if e.0 == sys::errno::EEXIST => {}
+                    Err(e) => return Err(err(e)),
+                }
+            }
+            let Some(tmp) = tmp else {
+                return Err(DirError::Errno(Errno::EIO));
+            };
+            let undo = |why: DirError| match sys::rename(d, &tmp, d, from, true, false) {
+                Ok(()) => why,
+                Err(_) => DirError::Errno(Errno::EIO),
+            };
+            match sys::fstatat(d, to) {
+                Err(e) if e.0 == sys::errno::ENOENT => {}
+                Ok(_) => return Err(undo(DirError::Errno(Errno::EEXIST))),
+                Err(e) => return Err(undo(err(e))),
+            }
+            sys::rename(d, &tmp, d, to, true, false).map_err(|e| undo(err(e)))
+        }
+    }
+
     fn node_id(node: &HostNode) -> HostId {
         match node {
             HostNode::Dir(d) => d.id,
@@ -777,6 +849,36 @@ impl ConfinedDir for HostDir {
             Err(e) if e.0 == sys::errno::ENOENT => None,
             Err(e) => return Err(err(e)),
         };
+        // `to` names the source object but is not stored as these bytes: on
+        // a folding volume, the source's own entry under another case (the
+        // guest's rename of a file to its other case), or another link of
+        // it. The guest sees exact names, so `to` does not exist for it: an
+        // exchange is ENOENT, and the rename must store `to` (§4.3).
+        if let Some(st) = &target
+            && (src.dev, src.ino) == (st.dev, st.ino)
+            && self.exact(td, to.1.as_bytes()).is_err()
+        {
+            if flags.exchange {
+                return Err(enoent());
+            }
+            if fd.id != td.id {
+                // Another directory's entry for it: a collision.
+                return Err(DirError::Errno(Errno::EEXIST));
+            }
+            self.recase(fd, from.1.as_bytes(), to.1.as_bytes(), flags.noreplace)?;
+            if let Some(s) = self.known(id_of(&src)) {
+                s.remove_name(fd.id, from.1.as_bytes());
+                s.add_name(td, to.1.as_bytes());
+            }
+            return Ok(());
+        }
+        // Two names of one object, each stored as given: nothing to do, as
+        // Linux's `vfs_rename` (0, fs/namei.c, v6.12, :4908; EEXIST first
+        // with `RENAME_NOREPLACE`, `do_renameat2` :5126), never asked of the
+        // host (macOS hands it to a case-insensitive file system).
+        if target.as_ref().is_some_and(|st| (src.dev, src.ino) == (st.dev, st.ino)) {
+            return if flags.noreplace { Err(DirError::Errno(Errno::EEXIST)) } else { Ok(()) };
+        }
         // A volume that does not report an exchange is never asked for one
         // (macOS: one may answer 0 without it, `sys::rename_swap`); a
         // missing target is ENOENT first, as Linux finds both names before
