@@ -3028,6 +3028,463 @@ fn devices(base: &str) {
     println!("cleanup {parent_dir} security {}", if parent_after == parent_before { "unchanged".to_string() } else { format!("CHANGED {parent_before} -> {parent_after}") });
 }
 
+// ----------------------------------------------------------------------------
+// `fs-probe devjail`: run by the jailer as the jailed binary (it carries the
+// jailer's handover mark), what the jailed VMM's token reaches: every named
+// kernel object, named pipe and device, and for each device what a handle
+// to it allows (data read and write, a driver's I/O controls). Also IP, the
+// randomness device, network configuration, and names made in global
+// namespaces. `fs-probe list-objects` writes the list it reads, readable by
+// every jail; `fs-probe jail-variants` runs the same checks under tokens the
+// jailer could make instead (fix option (i)).
+
+/// `vmm::ext::jail::HANDOVER_MARK`: the jailer starts only binaries that
+/// carry it, those that take the jail over (tools/windows/jail-probe.rs).
+#[used]
+static HANDOVER_MARK: [u8; 22] = *b"wick-jail-handover:v1\0";
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtDeviceIoControlFile(h: HANDLE, event: HANDLE, apc: *const c_void, ctx: *const c_void, io: *mut IO_STATUS_BLOCK, code: u32, inb: *const c_void, inl: u32, outb: *mut c_void, outl: u32) -> i32;
+    fn NtQueryVolumeInformationFile(h: HANDLE, io: *mut IO_STATUS_BLOCK, buf: *mut c_void, len: u32, class: u32) -> i32;
+    fn NtWriteFile(h: HANDLE, event: HANDLE, apc: *const c_void, ctx: *const c_void, io: *mut IO_STATUS_BLOCK, buf: *const c_void, len: u32, offset: *const i64, key: *const u32) -> i32;
+}
+#[link(name = "bcrypt")]
+extern "system" {
+    fn BCryptGenRandom(alg: HANDLE, buf: *mut u8, len: u32, flags: u32) -> i32;
+}
+#[link(name = "iphlpapi")]
+extern "system" {
+    fn GetAdaptersAddresses(family: u32, flags: u32, reserved: *const c_void, buf: *mut u8, size: *mut u32) -> u32;
+}
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateMailslotW(name: *const u16, max: u32, timeout: u32, sa: *const c_void) -> HANDLE;
+}
+
+const STATUS_PENDING: i32 = 0x103;
+
+/// `\Device\...` opened asynchronously (no `FILE_SYNCHRONOUS_IO_*`), so
+/// that a read or an I/O control the driver keeps can be cancelled.
+fn open_async(path: &str, access: u32) -> Result<H, i32> {
+    let name: Vec<u16> = path.encode_utf16().collect();
+    let bytes = u16::try_from(name.len() * 2).unwrap();
+    let us = UNICODE_STRING { len: bytes, max: bytes, buf: name.as_ptr() };
+    let oa = OBJECT_ATTRIBUTES { len: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32, root: null_mut(), name: &us, attrs: OBJ_CASE_INSENSITIVE, sd: null_mut(), qos: null_mut() };
+    let mut h = null_mut();
+    let mut io = IO_STATUS_BLOCK { status: 0, info: 0 };
+    // SAFETY: valid structures for the call's duration.
+    let st = unsafe { NtCreateFile(&mut h, access, &oa, &mut io, null(), 0x80, SHARE_ALL, FILE_OPEN, 0, null(), 0) };
+    if st < 0 { Err(st) } else { Ok(H(h)) }
+}
+
+/// Waits up to `ms` for an operation that returned `st` on an asynchronous
+/// handle, cancelling it then: (final status, bytes).
+fn settle(h: HANDLE, ev: HANDLE, st: i32, io: &IO_STATUS_BLOCK, ms: u32) -> (String, usize) {
+    if st != STATUS_PENDING {
+        return (format!("{:#010x}", st as u32), io.info);
+    }
+    // SAFETY: our event and handle.
+    unsafe {
+        if WaitForSingleObject(ev, ms) == 0 {
+            return (format!("{:#010x} after pending", io.status as u32), io.info);
+        }
+        CancelIoEx(h, null());
+        WaitForSingleObject(ev, 5000);
+    }
+    (format!("pending {ms} ms, cancelled {:#010x}", io.status as u32), 0)
+}
+
+/// An I/O control on `h`: (status, bytes returned).
+fn ioctl(h: HANDLE, code: u32, inb: &[u8], out: &mut [u8]) -> (String, usize) {
+    let mut io = IO_STATUS_BLOCK { status: 0, info: 0 };
+    // SAFETY: an unnamed manual-reset event; buffers of their lengths.
+    unsafe {
+        let ev = H(CreateEventW(null(), 1, 0, null()));
+        let st = NtDeviceIoControlFile(h, ev.0, null(), null(), &mut io, code, inb.as_ptr().cast(), inb.len() as u32, out.as_mut_ptr().cast(), out.len() as u32);
+        settle(h, ev.0, st, &io, 2000)
+    }
+}
+
+/// What a handle to the device `path` allows the caller: its granted
+/// access, the device's type and characteristics, whether its driver
+/// dispatches an I/O control (one no driver defines, so it is refused after
+/// dispatch), and a read and a zero-length write where granted.
+fn device_reach(path: &str) -> Option<String> {
+    // The device by its name; refused that, a name beneath it, which only a
+    // device with FILE_DEVICE_SECURE_OPEN checks against its security.
+    let (h, how) = match open_async(path, MAXIMUM_ALLOWED) {
+        Ok(h) => (h, "by-name"),
+        Err(st) if st == STATUS_ACCESS_DENIED => (open_async(&format!("{path}\\wick-probe"), MAXIMUM_ALLOWED).ok()?, "beneath-its-name"),
+        Err(_) => return None,
+    };
+    let g = granted(h.0);
+    let mut io = IO_STATUS_BLOCK { status: 0, info: 0 };
+    let mut info = [0u32; 2];
+    // SAFETY: FILE_FS_DEVICE_INFORMATION (class 4) is two ULONGs.
+    let st = unsafe { NtQueryVolumeInformationFile(h.0, &mut io, info.as_mut_ptr().cast(), 8, 4) };
+    let (dtype, chars) = if st >= 0 { (info[0], info[1]) } else { (0, 0) };
+    // CTL_CODE(device type, 0xFFF, METHOD_BUFFERED, FILE_ANY_ACCESS): needs
+    // no access right, so any handle may send it.
+    let (ioc, _) = ioctl(h.0, (dtype.max(1) << 16) | (0xFFF << 2), &[], &mut []);
+    let mut line = format!("{how} granted {g:#x} type {dtype:#x} chars {chars:#x} secure-open {} unknown-ioctl {ioc}", chars & 0x100 != 0);
+    if g & FILE_READ_DATA != 0 {
+        let mut buf = vec![0u8; 512];
+        let mut io = IO_STATUS_BLOCK { status: 0, info: 0 };
+        let off = 0i64;
+        // SAFETY: an unnamed event; a buffer of 512 bytes.
+        let r = unsafe {
+            let ev = H(CreateEventW(null(), 1, 0, null()));
+            let st = NtReadFile(h.0, ev.0, null(), null(), &mut io, buf.as_mut_ptr().cast(), 512, &off, null());
+            settle(h.0, ev.0, st, &io, 1000)
+        };
+        line += &format!(" read {} ({} bytes)", r.0, r.1);
+    }
+    if g & FILE_WRITE_DATA != 0 {
+        let mut io = IO_STATUS_BLOCK { status: 0, info: 0 };
+        let off = 0i64;
+        // SAFETY: an unnamed event; zero bytes.
+        let r = unsafe {
+            let ev = H(CreateEventW(null(), 1, 0, null()));
+            let st = NtWriteFile(h.0, ev.0, null(), null(), &mut io, null(), 0, &off, null());
+            settle(h.0, ev.0, st, &io, 1000)
+        };
+        line += &format!(" zero-length-write {}", r.0);
+    }
+    Some(line)
+}
+
+/// I/O controls that read what a device knows, named by the device; the
+/// data itself is not printed.
+fn device_info(c: &Child) {
+    let mut out = vec![0u8; 16384];
+    let probe = |path: &str, name: &str, code: u32, inb: &[u8], out: &mut [u8]| match open_async(path, MAXIMUM_ALLOWED) {
+        Ok(h) => {
+            let (st, n) = ioctl(h.0, code, inb, out);
+            c.out("device-info", format!("{path} {name} {st} {n} bytes"));
+            n
+        }
+        Err(st) => {
+            c.out("device-info", format!("{path} {name} open {:#010x}", st as u32));
+            0
+        }
+    };
+    // IOCTL_STORAGE_QUERY_PROPERTY, StorageDeviceProperty, standard query.
+    let q = [0u8; 12];
+    let n = probe(r"\Device\Harddisk0\DR0", "storage-query-property", 0x002D_1400, &q, &mut out);
+    if n >= 40 {
+        let serial_off = u32::from_le_bytes(out[24..28].try_into().unwrap()) as usize;
+        let serial = if serial_off != 0 && serial_off < n { out[serial_off..n].iter().take_while(|b| **b != 0).count() } else { 0 };
+        c.out("device-info", format!(r"\Device\Harddisk0\DR0 serial-number-returned {} characters", serial));
+    }
+    // IOCTL_DISK_GET_DRIVE_LAYOUT_EX: the partition table.
+    let n = probe(r"\Device\Harddisk0\DR0", "disk-get-drive-layout-ex", 0x0007_0050, &[], &mut out);
+    if n >= 8 {
+        c.out("device-info", format!(r"\Device\Harddisk0\DR0 partitions {}", u32::from_le_bytes(out[4..8].try_into().unwrap())));
+    }
+    // IOCTL_MOUNTMGR_QUERY_POINTS with an empty MOUNTMGR_MOUNT_POINT: every
+    // volume, letter and volume GUID.
+    let mp = [0u8; 24];
+    let n = probe(r"\Device\MountPointManager", "mountmgr-query-points", 0x006D_0008, &mp, &mut out);
+    if n >= 8 {
+        c.out("device-info", format!(r"\Device\MountPointManager mount-points {}", u32::from_le_bytes(out[4..8].try_into().unwrap())));
+    }
+    // IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS on each volume.
+    for v in 1..=4 {
+        probe(&format!(r"\Device\HarddiskVolume{v}"), "volume-get-disk-extents", 0x0056_0000, &[], &mut out);
+    }
+    // IOCTL_SERIAL_GET_BAUD_RATE.
+    for s in 0..=2 {
+        probe(&format!(r"\Device\Serial{s}"), "serial-get-baud-rate", 0x001B_0050, &[], &mut out);
+    }
+    // Raw reads ask FILE_READ_DATA explicitly.
+    for p in [r"\Device\Harddisk0\DR0", r"\Device\HarddiskVolume1", r"\Device\HarddiskVolume2", r"\Device\HarddiskVolume3", r"\Device\PhysicalMemory"] {
+        let r = match open_async(p, FILE_READ_DATA | SYNCHRONIZE) {
+            Ok(_) => "allowed".to_string(),
+            Err(st) => format!("{:#010x}", st as u32),
+        };
+        c.out("raw-open-for-read", format!("{p} {r}"));
+    }
+}
+
+/// What the jailed side reaches; `list` is `-` for standard input.
+fn jail_checks(c: &Child, revert: bool, list: &str, port: u16, ext: ([u8; 4], u16), sockdir: &str) {
+    // What the checks load, loaded while the initial token is on the
+    // thread, as Firecracker loads what it uses before `RevertToSelf`.
+    wsa();
+    // SAFETY: plain Winsock calls, size queries and a buffer of 16 bytes.
+    unsafe {
+        for af in [2, 1] {
+            let s = socket(af, 1, 0);
+            if s != usize::MAX {
+                closesocket(s);
+            }
+        }
+        let mut size = 0u32;
+        GetAdaptersAddresses(0, 0, null(), null_mut(), &mut size);
+        let mut b = [0u8; 16];
+        BCryptGenRandom(null_mut(), b.as_mut_ptr(), 16, 2);
+    }
+    if revert {
+        // SAFETY: plain call.
+        let ok = unsafe { RevertToSelf() };
+        c.out("revert-to-lockdown-token", if ok != 0 { "allowed".into() } else { last() });
+    }
+    c.token();
+    c.mitigate();
+    // What the jail's session groups give a process after RevertToSelf: a
+    // System32 DLL loaded late, and HKLM read.
+    for dll in ["version.dll", "dbghelp.dll"] {
+        // SAFETY: NUL-terminated name.
+        let h = unsafe { LoadLibraryW(wide(dll).as_ptr()) };
+        c.out("load-library-after-revert", format!("{dll} {}", if h.is_null() { last() } else { "allowed".into() }));
+    }
+    let mut k = 0usize;
+    // SAFETY: NUL-terminated subkey; KEY_READ; an out-pointer.
+    let e = unsafe { RegOpenKeyExW(HKLM, wide(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion").as_ptr(), 0, 0x20019, &mut k) };
+    c.out("hklm-read", if e == 0 { "allowed".into() } else { format!("error {e}") });
+    // IP: loopback, the cloud metadata server, an external address
+    // (connects only; nothing is sent).
+    c.out("tcp-loopback", tcp_connect([127, 0, 0, 1], port));
+    c.out("tcp-link-local-metadata", tcp_connect([169, 254, 169, 254], 80));
+    c.out("tcp-external", format!("{}.{}.{}.{}:{} {}", ext.0[0], ext.0[1], ext.0[2], ext.0[3], ext.1, tcp_connect(ext.0, ext.1)));
+    // AF_UNIX: a socket bound where the jail may make files.
+    // SAFETY: plain Winsock calls.
+    unsafe {
+        let s = socket(1, 1, 0);
+        if s == usize::MAX {
+            c.out("unix-socket", format!("denied wsa {}", WSAGetLastError()));
+        } else {
+            let addr = unix_addr(&format!("{sockdir}\\p{}.sock", std::process::id()));
+            let r = bind(s, addr.as_ptr(), addr.len() as i32);
+            c.out("unix-socket-bind", if r == 0 { "allowed".into() } else { format!("denied wsa {}", WSAGetLastError()) });
+            closesocket(s);
+            let _ = std::fs::remove_file(format!("{sockdir}\\p{}.sock", std::process::id()));
+        }
+    }
+    // Randomness (the counterpart of /dev/urandom).
+    let mut b = [0u8; 16];
+    // SAFETY: a buffer of 16 bytes; BCRYPT_USE_SYSTEM_PREFERRED_RNG.
+    let st = unsafe { BCryptGenRandom(null_mut(), b.as_mut_ptr(), 16, 2) };
+    c.out("bcrypt-gen-random", format!("{:#010x}", st as u32));
+    // The host's network configuration (\Device\Nsi).
+    let mut size = 0u32;
+    // SAFETY: a size query, then a buffer of that size.
+    let r = unsafe {
+        GetAdaptersAddresses(0, 0, null(), null_mut(), &mut size);
+        let mut buf = vec![0u8; size as usize + 1];
+        let e = GetAdaptersAddresses(0, 0, null(), buf.as_mut_ptr(), &mut size);
+        if e == 0 {
+            let mut n = 0;
+            let mut p = buf.as_ptr();
+            while !p.is_null() {
+                n += 1;
+                // IP_ADAPTER_ADDRESSES: Length (4), IfIndex (4), Next (8).
+                p = std::ptr::read_unaligned(p.add(8).cast::<*const u8>());
+            }
+            format!("allowed {n} adapters")
+        } else {
+            format!("error {e}")
+        }
+    };
+    c.out("network-configuration", r);
+    // Names in the global namespaces: a named pipe and a mailslot.
+    let pipe = format!(r"\\.\pipe\wick-probe-squat-{}", std::process::id());
+    // SAFETY: NUL-terminated name; PIPE_ACCESS_DUPLEX, byte mode, one instance.
+    let h = H(unsafe { CreateNamedPipeW(wide(&pipe).as_ptr(), 3, 0, 1, 512, 512, 0, null()) });
+    c.out("named-pipe-create", if h.0 != INVALID { "allowed".into() } else { last() });
+    let slot = format!(r"\\.\mailslot\wick-probe-{}", std::process::id());
+    // SAFETY: NUL-terminated name.
+    let h = H(unsafe { CreateMailslotW(wide(&slot).as_ptr(), 0, 0, null()) });
+    c.out("mailslot-create", if h.0 != INVALID { "allowed".into() } else { last() });
+    c.out("named-pipe-list", match std::fs::read_dir(r"\\.\pipe\") {
+        Ok(rd) => format!("allowed {} names", rd.count()),
+        Err(e) => format!("denied {e}"),
+    });
+    device_info(c);
+    // Every name.
+    let text = if list == "-" {
+        let mut s = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut s);
+        s
+    } else {
+        std::fs::read_to_string(list).unwrap_or_else(|e| {
+            c.out("list", format!("unreadable {e}"));
+            String::new()
+        })
+    };
+    let mut by_type = std::collections::BTreeMap::<String, (usize, usize)>::new();
+    for l in text.lines() {
+        let Some((ty, path)) = l.split_once('\t') else { continue };
+        let e = by_type.entry(ty.to_string()).or_default();
+        e.0 += 1;
+        let reached = match ty {
+            "Pipe" => {
+                let n: Vec<u16> = format!("\\Device\\NamedPipe\\{path}").encode_utf16().collect();
+                nt_open_raw(null_mut(), &n, MAXIMUM_ALLOWED, FILE_OPEN, FILE_NON_DIRECTORY_FILE, 0).ok().map(|h| format!("granted {:#x}", granted(h.0)))
+            }
+            "ALPC Port" => {
+                let st = with_oa(null_mut(), path, 0, |_, us| {
+                    let mut h = null_mut();
+                    let timeout: i64 = -10_000_000;
+                    // SAFETY: a port name; no message; one second.
+                    let st = unsafe { NtAlpcConnectPort(&mut h, us, null(), null(), 0, null_mut(), null_mut(), null_mut(), null_mut(), null_mut(), &timeout) };
+                    if st >= 0 {
+                        // SAFETY: the port handle.
+                        unsafe { NtClose(h) };
+                    }
+                    st
+                });
+                (st >= 0 || st as u32 == 0xC000_0041).then(|| format!("connect {:#010x}", st as u32))
+            }
+            "Device" => device_reach(path),
+            _ => open_object(ty, path, MAXIMUM_ALLOWED).ok().map(|h| format!("granted {:#x}", granted(h.0))),
+        };
+        if let Some(r) = reached {
+            e.1 += 1;
+            c.out("reached", format!("{ty}\t{path}\t{r}"));
+        }
+    }
+    for (ty, (tried, reached)) in &by_type {
+        c.out("summary", format!("{ty} tried {tried} reached {reached}"));
+    }
+    c.out("done", "");
+}
+
+fn devjail(args: &[String]) {
+    let c = Child { scn: "jail".into(), base: String::new(), root: null_mut(), secret_id: 0, share_id: 0, parent: 0, dummy: 0, tcp_port: 0, pid_tag: String::new() };
+    let ip: Vec<u8> = args[2].split('.').map(|p| p.parse().unwrap()).collect();
+    let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    c.out("cwd", &cwd);
+    jail_checks(&c, true, &args[0], args[1].parse().unwrap(), ([ip[0], ip[1], ip[2], ip[3]], args[3].parse().unwrap()), &cwd);
+}
+
+/// The list `devjail` reads: every named kernel object and named pipe, in
+/// a file every jail may read (Everyone is among a jail's restricting SIDs).
+fn list_objects(path: &str) {
+    let mut objs = Vec::new();
+    walk_objects("\\", &mut objs);
+    let pipes: Vec<String> = std::fs::read_dir(r"\\.\pipe\").map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    let n = write_list(path, objs.iter().map(|(t, p)| format!("{t}\t{p}")).chain(pipes.iter().map(|p| format!("Pipe\t{p}"))));
+    assert_eq!(set_dacl(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;WD)"), 0);
+    println!("host list-objects {n} ({} objects, {} pipes)", objs.len(), pipes.len());
+}
+
+/// `jail_checks` under tokens the jailer could make instead of its own
+/// (fix option (i)): the jail's integrity level and a jail SID of its own,
+/// with fewer restricting SIDs. Each child gets the list on standard input
+/// and a socket directory its SID may write, labelled as a jail's.
+fn jail_variants(base: &str, ext: &str) {
+    assert!(std::fs::metadata(base).is_err(), "{base} exists");
+    let parent_dir = std::path::Path::new(base).parent().unwrap().to_string_lossy().into_owned();
+    let parent_before = file_sddl(&parent_dir);
+    std::fs::create_dir(base).unwrap();
+    wsa();
+    let own = own_token();
+    let user = token_sid(own, 1);
+    let r = std::collections::hash_map::RandomState::new();
+    let rnd = |i: u64| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = r.build_hasher();
+        h.write_u64(i);
+        h.finish() as u32
+    };
+    let jail_sid = format!("S-1-9-{}-{}-{}-{}", rnd(1), rnd(2), rnd(3), rnd(4));
+    let bin = format!("{base}\\bin");
+    let sock = format!("{base}\\sock");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(&sock).unwrap();
+    let exe = format!("{bin}\\fs-probe.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    assert_eq!(set_dacl(&bin, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;0x1200a9;;;{jail_sid})")), 0);
+    assert_eq!(set_dacl(&sock, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{jail_sid})")), 0);
+    assert_eq!(set_label(&sock, Some("S:(ML;OICI;NWNRNX;;;S-1-16-6144)")), 0);
+    let list = format!("{base}\\all.txt");
+    let mut objs = Vec::new();
+    walk_objects("\\", &mut objs);
+    let pipes: Vec<String> = std::fs::read_dir(r"\\.\pipe\").map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    write_list(&list, objs.iter().map(|(t, p)| format!("{t}\t{p}")).chain(pipes.iter().map(|p| format!("Pipe\t{p}"))));
+    // SAFETY: plain Winsock calls.
+    let port = unsafe {
+        let t = socket(2, 1, 6);
+        let mut a = [0u8; 16];
+        a[0] = 2;
+        a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        assert_eq!(bind(t, a.as_ptr(), 16), 0);
+        listen(t, 8);
+        let mut len = 16;
+        getsockname(t, a.as_mut_ptr(), &mut len);
+        sink(t);
+        u16::from_be_bytes([a[2], a[3]])
+    };
+    let logon = logon_sid(own);
+    let session = ["S-1-1-0", "S-1-5-32-545", "S-1-5-11", "S-1-5-4"];
+    // ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION PACKAGES in
+    // place of the four groups: what Windows grants AppContainers, which
+    // SECURITY names as the planned replacement.
+    let variants: [(&str, Vec<&str>); 4] = [
+        ("jail-as-now", session.to_vec()),
+        ("jail-own-sid-only", Vec::new()),
+        ("jail-all-app-packages", vec!["S-1-15-2-1"]),
+        ("jail-all-restricted-app-packages", vec!["S-1-15-2-2"]),
+    ];
+    for (name, groups) in &variants {
+        let mut restricting = vec![jail_sid.as_str()];
+        restricting.extend(groups.iter().copied());
+        // Whether Windows takes these as restricting SIDs at all.
+        let sids: Vec<SID_AND_ATTRIBUTES> = restricting.iter().map(|s| SID_AND_ATTRIBUTES { sid: sid(s), attributes: 0 }).collect();
+        let mut t = null_mut();
+        // SAFETY: valid SID array; LUA_TOKEN | DISABLE_MAX_PRIVILEGE.
+        if unsafe { CreateRestrictedToken(own, 0x4 | 0x1, 0, null(), 0, null(), sids.len() as u32, sids.as_ptr(), &mut t) } == 0 {
+            println!("host {name} restricted-token refused {}", last());
+            continue;
+        }
+        // SAFETY: the token just made.
+        unsafe { CloseHandle(t) };
+        let primary = restricted_token(own, &user, &restricting, &[&user, &jail_sid]);
+        set_integrity(primary, "S-1-16-6144");
+        // The jailer's initial token: the four groups, the logon SID and
+        // the user's, for the loader.
+        let mut all = vec![jail_sid.as_str()];
+        all.extend(session);
+        all.extend([logon.as_str(), user.as_str()]);
+        let initial = restricted_token(own, &user, &all, &[&user, &jail_sid]);
+        set_integrity(initial, "S-1-16-6144");
+        let who = Who::Restricted { primary, initial: impersonation(initial) };
+        // SAFETY: NUL-terminated path.
+        let input = inheritable(H(unsafe { CreateFileW(wide(&list).as_ptr(), GENERIC_READ, SHARE_ALL, null(), OPEN_EXISTING, 0, null_mut()) }).0);
+        let out = inheritable(GetStd(-11));
+        let cmd = format!("\"{exe}\" jail-variant-child {name} {port} {ext} {sock}");
+        match start(&cmd, &bin, &who, null_mut(), null_mut(), &[input, out], [input, out, out], true) {
+            // SAFETY: the suspended child.
+            Ok(child) => unsafe {
+                ResumeThread(child.thread.0);
+                let w = WaitForSingleObject(child.process.0, 900_000);
+                let mut code = 0;
+                GetExitCodeProcess(child.process.0, &mut code);
+                if w != 0 {
+                    TerminateProcess(child.process.0, 1);
+                }
+                println!("host {name} child-exit {code:#x}{}", if w != 0 { " (timed out)" } else { "" });
+            },
+            Err(e) => println!("host {name} start {e}"),
+        }
+        // SAFETY: our copy.
+        unsafe { CloseHandle(input) };
+    }
+    let removed = std::fs::remove_dir_all(base);
+    println!("cleanup base removed {:?} exists-after {}", removed.map_err(|e| e.to_string()), std::fs::metadata(base).is_ok());
+    let parent_after = file_sddl(&parent_dir);
+    println!("cleanup {parent_dir} security {}", if parent_after == parent_before { "unchanged".to_string() } else { format!("CHANGED {parent_before} -> {parent_after}") });
+}
+
+fn jail_variant_child(args: &[String]) {
+    let c = Child { scn: args[0].clone(), base: String::new(), root: null_mut(), secret_id: 0, share_id: 0, parent: 0, dummy: 0, tcp_port: 0, pid_tag: String::new() };
+    let (ip, port) = args[2].split_once(':').unwrap();
+    let ip: Vec<u8> = ip.split('.').map(|p| p.parse().unwrap()).collect();
+    jail_checks(&c, true, "-", args[1].parse().unwrap(), ([ip[0], ip[1], ip[2], ip[3]], port.parse().unwrap()), &args[3]);
+}
+
 #[allow(non_snake_case)]
 fn GetStd(which: i32) -> HANDLE {
     // SAFETY: plain call.
@@ -3068,8 +3525,24 @@ fn dummy(tag: &str) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // The jailer makes a second process of its binary for Firecracker's API
+    // server (vmm::ext::api_process); this binary serves nothing.
+    if std::env::var_os("WICK_API_LINK").is_some() {
+        eprintln!("fs-probe: started as the jail's API process; nothing to serve");
+        return;
+    }
+    // Under the jailer, upstream's four arguments with their values come
+    // first (env.rs `exec_command`: --id, then the three times).
+    if args.first().map(String::as_str) == Some("--id") {
+        args.drain(..8.min(args.len()));
+    }
+    std::hint::black_box(&HANDOVER_MARK);
     match args.first().map(String::as_str) {
+        Some("devjail") => devjail(&args[1..]),
+        Some("list-objects") => list_objects(&args[1]),
+        Some("jail-variants") => jail_variants(&args[1], &args[2]),
+        Some("jail-variant-child") => jail_variant_child(&args[1..]),
         Some("child") => child(&args[1..]),
         Some("dummy") => dummy(&args[1]),
         Some("ea") => ea_limits(&args[1]),
@@ -3088,7 +3561,7 @@ fn main() {
             run(&base);
         }
         _ => {
-            eprintln!("usage: fs-probe run [<base>] | fs-probe reach [<base>] | fs-probe devices [<base>] | fs-probe ea <dir>");
+            eprintln!("usage: fs-probe run [<base>] | reach [<base>] | devices [<base>] | list-objects <file> | devjail <list> <port> <ip> <port> (under the jailer) | jail-variants <base> <ip:port> | ea <dir>");
             std::process::exit(2);
         }
     }
