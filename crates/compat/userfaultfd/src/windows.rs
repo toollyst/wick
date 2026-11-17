@@ -18,6 +18,8 @@ use std::fmt;
 use std::io;
 use std::mem;
 use std::os::raw::c_void;
+use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use bitflags::bitflags;
@@ -45,6 +47,11 @@ impl Errno {
     pub const ENOENT: Errno = Errno(libc::ENOENT);
     /// Busy (pages another userfaultfd has registered).
     pub const EBUSY: Errno = Errno(libc::EBUSY);
+    /// A record the kernel side never writes (a waiter-mirror tag whose slot
+    /// is past the table), as the macOS twin's `Errno::EBADMSG`.
+    pub const EBADMSG: Errno = Errno(libc::EBADMSG);
+    /// A reply that is no mirror: another size, or no handle.
+    pub const EPROTO: Errno = Errno(libc::EPROTO);
 
     /// The value of the last error of this thread.
     pub fn last() -> Errno {
@@ -245,7 +252,12 @@ pub enum Event {
 impl Event {
     fn from_record(w: [u64; 4]) -> Result<Event> {
         match w[0] {
-            proto::EVENT_PAGEFAULT => Ok(Event::Pagefault {
+            // The mirror era's page fault (`[EVENT_PAGEFAULT2, addr, flags,
+            // tag]`): a reader from before the mirror knew only
+            // `EVENT_PAGEFAULT` (1) and fails on this type loudly, and this
+            // reader fails on that older type the same way (version skew is an
+            // error, never a silent misread): the loud-fail test below.
+            proto::EVENT_PAGEFAULT2 => Ok(Event::Pagefault {
                 kind: FaultKind::Missing,
                 rw: if w[2] & proto::FLAG_WRITE != 0 {
                     ReadWrite::Write
@@ -283,6 +295,46 @@ pub struct Uffd {
     owner: Option<usize>,
     /// The request channel of an object made with `from_raw_fd`.
     channel: OnceLock<Mutex<Channel>>,
+    /// The waiter mirror as this object reads it, set up at the first read.
+    mirror: OnceLock<Mirror>,
+}
+
+/// The waiter mirror as this object reads it (the macOS twin's `Mirror`): the
+/// read-only words a reader checks a page fault record's waiter against.
+#[derive(Debug)]
+struct Mirror {
+    words: *const AtomicU64,
+    /// The read-only view this object mapped (`OP_MIRROR`), to unmap on drop;
+    /// null for the mapping of this process's own userfaultfd (`wick_uffd`
+    /// owns and frees that one).
+    view: *const AtomicU64,
+}
+
+// SAFETY: read-only shared memory, read with atomic loads only.
+unsafe impl Send for Mirror {}
+// SAFETY: as above.
+unsafe impl Sync for Mirror {}
+
+impl Mirror {
+    /// Whether a page fault record's waiter still waits: its tag is the slot's
+    /// word, waiting, at one load of it. A slot past the table is a record the
+    /// kernel side never writes: an error, never a read past the table.
+    fn waits(&self, tag: u64) -> Result<bool> {
+        let slot = proto::tag_slot(tag);
+        if slot >= proto::MIRROR_WORDS {
+            return Err(Error::SystemError(Errno::EBADMSG));
+        }
+        // SAFETY: `slot` is within the mapping's `MIRROR_WORDS` words.
+        let word = unsafe { &*self.words.add(slot) }.load(Ordering::Acquire);
+        Ok(tag & proto::TAG_WAITING != 0 && word == tag)
+    }
+
+    fn unmap(&self) {
+        if !self.view.is_null() {
+            // SAFETY: the read-only view this object mapped (`OP_MIRROR`).
+            unsafe { wick_uffd::unmap_mirror(self.view) };
+        }
+    }
 }
 
 /// A request channel to the serving thread.
@@ -315,6 +367,9 @@ impl Drop for Uffd {
         if let Some(channel) = self.channel.get() {
             channel.lock().unwrap().close();
         }
+        if let Some(mirror) = self.mirror.get() {
+            mirror.unmap();
+        }
     }
 }
 
@@ -337,6 +392,9 @@ impl IntoRawFd for Uffd {
         if let Some(channel) = self.channel.get() {
             channel.lock().unwrap().close();
         }
+        if let Some(mirror) = self.mirror.get() {
+            mirror.unmap();
+        }
         mem::forget(self);
         fd
     }
@@ -348,6 +406,7 @@ impl FromRawFd for Uffd {
             fd,
             owner: None,
             channel: OnceLock::new(),
+            mirror: OnceLock::new(),
         }
     }
 }
@@ -497,6 +556,64 @@ impl Uffd {
         }
     }
 
+    /// `OP_MIRROR`: the reply words. Word 0 is the mirror's size or `-errno`;
+    /// word 1, on success, the section handle [`serve_mirror`](wick_uffd)
+    /// duplicated into this process read-only. Where the macOS twin receives a
+    /// descriptor over the socket (`SCM_RIGHTS`), the Windows kernel side has
+    /// already placed the handle in the reader's table, so the value stands
+    /// alone and no control message is read.
+    fn request_mirror(&self) -> SysResult<[u64; 4]> {
+        let mut channel = self.channel()?.lock().unwrap();
+        write_all(channel.fd, &record([proto::OP_MIRROR, 0, 0, 0]))?;
+        let mut reply = [0u8; proto::RECORD];
+        read_all(channel.fd, &mut reply)?;
+        if let Some(fd) = channel.sent.take() {
+            // SAFETY: the serving thread holds its own socket now.
+            unsafe { libc::close(fd) };
+        }
+        Ok(words(&reply))
+    }
+
+    /// The waiter mirror, set up at the first call: the kernel side's own
+    /// mapping for the object that made the userfaultfd, else the section
+    /// `OP_MIRROR` answers with, mapped read-only. Every failure is an error
+    /// (a kernel side that predates the mirror answers `EINVAL`; a reply of
+    /// another size is `EPROTO`), never a read without the check.
+    fn mirror(&self) -> Result<&Mirror> {
+        if let Some(m) = self.mirror.get() {
+            return Ok(m);
+        }
+        let mirror = match self.owner {
+            Some(ctx) => Mirror {
+                words: wick_uffd::mirror(ctx)
+                    .ok_or(Error::SystemError(Errno::from_i32(libc::EBADF)))?,
+                view: ptr::null(),
+            },
+            None => {
+                let [result, handle, _, _] = self.request_mirror()?;
+                let result = result.cast_signed();
+                #[allow(clippy::cast_possible_truncation)]
+                if result < 0 {
+                    return Err(Error::SystemError(errno((-result) as i32)));
+                }
+                // SAFETY: `handle` is the section `serve_mirror` duplicated
+                // into this process read-only; `map_mirror_handle` checks its
+                // size against the table's and consumes it either way.
+                let view =
+                    unsafe { wick_uffd::map_mirror_handle(handle, result.cast_unsigned()) }
+                        .map_err(|e| {
+                            Error::SystemError(errno(e.raw_os_error().unwrap_or(libc::EIO)))
+                        })?;
+                Mirror { words: view, view }
+            }
+        };
+        if let Err(other) = self.mirror.set(mirror) {
+            // Another thread set it up first.
+            other.unmap();
+        }
+        Ok(self.mirror.get().unwrap())
+    }
+
     /// Registers a range for missing page faults; returns the range's ioctls.
     pub fn register(&self, start: *mut c_void, len: usize) -> Result<IoctlFlags> {
         self.register_with_mode(start, len, RegisterMode::MISSING)
@@ -601,36 +718,57 @@ impl Uffd {
         events.next().transpose()
     }
 
-    /// Reads up to `buf`'s size of events.
+    /// Reads up to `buf`'s size of events. A page fault whose waiter was woken
+    /// before this read checked it is dropped (Linux's wake takes the record
+    /// off the queue unread, v6.12 fs/userfaultfd.c `userfaultfd_wake_function`
+    /// :141); with only such records read, it reads again: a blocking
+    /// descriptor waits for an event, a non-blocking one returns none once the
+    /// socket is empty.
     pub fn read_events<'a>(
         &self,
         buf: &'a mut EventBuffer,
     ) -> Result<impl Iterator<Item = Result<Event>> + 'a> {
+        let mirror = self.mirror()?;
         let bytes = buf.0.len() * proto::RECORD;
-        // SAFETY: the buffer is `bytes` long.
-        let n = unsafe { libc::read(self.fd, buf.0.as_mut_ptr().cast(), bytes) };
-        let count = if n < 0 {
-            let e = Errno::last();
-            if e != Errno::EAGAIN {
-                return Err(Error::SystemError(e));
-            }
-            0
-        } else if n == 0 {
-            return Err(Error::ReadEof);
-        } else {
-            let n = n.unsigned_abs();
-            let rest = n % proto::RECORD;
-            if rest != 0 {
-                // Records are written whole; finish the last one.
-                let last = n / proto::RECORD;
-                let slice = &mut buf.0[last][rest..];
-                read_all(self.fd, slice).map_err(|_| Error::IncompleteMsg {
-                    read: rest,
-                    expected: proto::RECORD,
-                })?;
-                last + 1
+        let count = loop {
+            // SAFETY: the buffer is `bytes` long.
+            let n = unsafe { libc::read(self.fd, buf.0.as_mut_ptr().cast(), bytes) };
+            let count = if n < 0 {
+                let e = Errno::last();
+                if e != Errno::EAGAIN {
+                    return Err(Error::SystemError(e));
+                }
+                break 0;
+            } else if n == 0 {
+                return Err(Error::ReadEof);
             } else {
-                n / proto::RECORD
+                let n = n.unsigned_abs();
+                let rest = n % proto::RECORD;
+                if rest != 0 {
+                    // Records are written whole; finish the last one.
+                    let last = n / proto::RECORD;
+                    let slice = &mut buf.0[last][rest..];
+                    read_all(self.fd, slice).map_err(|_| Error::IncompleteMsg {
+                        read: rest,
+                        expected: proto::RECORD,
+                    })?;
+                    last + 1
+                } else {
+                    n / proto::RECORD
+                }
+            };
+            // Drop the records of woken waiters, compacting the live ones down.
+            let mut live = 0;
+            for i in 0..count {
+                let w = words(&buf.0[i]);
+                if w[0] == proto::EVENT_PAGEFAULT2 && !mirror.waits(w[3])? {
+                    continue;
+                }
+                buf.0[live] = buf.0[i];
+                live += 1;
+            }
+            if live > 0 {
+                break live;
             }
         };
         Ok(buf
@@ -701,6 +839,7 @@ impl UffdBuilder {
             fd,
             owner: Some(ctx),
             channel: OnceLock::new(),
+            mirror: OnceLock::new(),
         };
         if let Some(ioctls) = self.req_ioctls {
             if !API_IOCTLS.contains(ioctls) {
@@ -734,6 +873,289 @@ mod tests {
         };
         assert_ne!(p, libc::MAP_FAILED);
         p.cast()
+    }
+
+    /// Records queued on the reader socket, counted without consuming them
+    /// (`FIONREAD`), as macOS's `pending` does with its `ioctl`. The crate's
+    /// `RawFd` on Windows is the socket value itself (`WSADuplicateSocketW`
+    /// above casts it so), so the winsock query takes it directly.
+    fn pending(fd: RawFd) -> usize {
+        use windows_sys::Win32::Networking::WinSock::{FIONREAD, ioctlsocket};
+        let mut n: u32 = 0;
+        #[allow(clippy::cast_sign_loss)]
+        let sock = fd as u32 as usize;
+        // SAFETY: `FIONREAD` writes a `u32`; the socket is ours.
+        assert_eq!(unsafe { ioctlsocket(sock, FIONREAD, &mut n) }, 0);
+        n as usize / proto::RECORD
+    }
+
+    /// Waits until at least `records` events are queued on `fd`, as macOS's
+    /// `until_pending`.
+    fn until_pending(fd: RawFd, records: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pending(fd) < records {
+            assert!(std::time::Instant::now() < deadline, "{} of {records} records after 10 s", pending(fd));
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A thread whose read of `addr` faults and blocks until the page is
+    /// served or its waiter woken; returns the byte read, as macOS's
+    /// `reader_of`.
+    fn reader_of(addr: usize) -> thread::JoinHandle<u8> {
+        // SAFETY: registered memory; the read waits for its page.
+        thread::spawn(move || unsafe { ptr::read_volatile(addr as *const u8) })
+    }
+
+    fn fault_addr(event: Option<Event>) -> usize {
+        match event {
+            Some(Event::Pagefault { addr, .. }) => addr as usize,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// How a test ends the wait of the second of two unread faults
+    /// (`Ioctl`: `UFFDIO_WAKE`).
+    #[derive(Clone, Copy, Debug)]
+    enum Wake {
+        Unregister,
+        Fill,
+        Ioctl,
+    }
+
+    /// Two faults posted and not read, as a handler finds them in its socket;
+    /// the first returned; then the second's waiter woken without its event
+    /// read: an unregister of its page, a fill with a wake, or `UFFDIO_WAKE`.
+    /// Linux's wake took that event off the queue unread (v6.12
+    /// fs/userfaultfd.c `userfaultfd_wake_function` :141), so the next read has
+    /// nothing of it: `None` here (non-blocking), where before the mirror it
+    /// returned the event and a `UFFDIO_COPY` to its now-unregistered page
+    /// failed with `ENOENT` (`Wake::Unregister`). After `UFFDIO_WAKE` the
+    /// thread runs its access again on a page still missing and faults again:
+    /// one new event, and no other.
+    fn second_unread_fault_woken(how: Wake) {
+        let ps = PAGE;
+        let owner = UffdBuilder::new().non_blocking(true).create().unwrap();
+        // SAFETY: duplicates a descriptor this test owns.
+        let handler = unsafe { Uffd::from_raw_fd(libc::dup(owner.as_raw_fd())) };
+        let mem = map(2 * ps) as usize;
+        owner.register(mem as *mut c_void, 2 * ps).unwrap();
+        let first = reader_of(mem);
+        until_pending(owner.as_raw_fd(), 1);
+        let second = reader_of(mem + ps);
+        until_pending(owner.as_raw_fd(), 2);
+        assert_eq!(fault_addr(handler.read_event().unwrap()), mem, "{how:?}: the first fault");
+        let page2 = (mem + ps) as *mut c_void;
+        let src = vec![0x77u8; ps];
+        match how {
+            Wake::Unregister => handler.unregister(page2, ps).unwrap(),
+            // SAFETY: `src` is a page; the second, registered page.
+            Wake::Fill => assert_eq!(unsafe { handler.copy(src.as_ptr().cast(), page2, ps, true) }.unwrap(), ps),
+            Wake::Ioctl => {
+                handler.wake(page2, ps).unwrap();
+                // The stale record and the new fault's.
+                until_pending(owner.as_raw_fd(), 2);
+                assert_eq!(fault_addr(handler.read_event().unwrap()), mem + ps, "{how:?}: the new fault");
+                // SAFETY: as above.
+                assert_eq!(unsafe { handler.copy(src.as_ptr().cast(), page2, ps, true) }.unwrap(), ps);
+            }
+        }
+        let next = handler.read_event().unwrap();
+        assert!(next.is_none(), "{how:?}: an event whose waiter was woken before it was read: {next:?}");
+        let byte = second.join().unwrap();
+        assert_eq!(byte, if matches!(how, Wake::Unregister) { 0 } else { 0x77 }, "{how:?}");
+        let ones = vec![1u8; ps];
+        // SAFETY: a page; the first, registered page.
+        assert_eq!(unsafe { handler.copy(ones.as_ptr().cast(), mem as *mut c_void, ps, true) }.unwrap(), ps);
+        assert_eq!(first.join().unwrap(), 1);
+        let registered = if matches!(how, Wake::Unregister) { ps } else { 2 * ps };
+        owner.unregister(mem as *mut c_void, registered).unwrap();
+    }
+
+    /// The failing-first case (the mirror turns it green): the unread fault's
+    /// page is unregistered, so acting on its stale record would be an
+    /// `ENOENT` copy.
+    #[test]
+    fn test_an_unread_fault_unregistered_is_not_read() {
+        second_unread_fault_woken(Wake::Unregister);
+    }
+
+    #[test]
+    fn test_an_unread_fault_filled_with_a_wake_is_not_read() {
+        second_unread_fault_woken(Wake::Fill);
+    }
+
+    #[test]
+    fn test_an_unread_fault_woken_is_read_once_as_its_new_fault() {
+        second_unread_fault_woken(Wake::Ioctl);
+    }
+
+    /// The control: a fill with `DONTWAKE` wakes nothing (the wake is skipped,
+    /// as Linux's, fs/userfaultfd.c v6.12 :1626 to :1627), so the unread fault
+    /// is still read.
+    #[test]
+    fn test_an_unread_fault_filled_without_a_wake_is_still_read() {
+        let ps = PAGE;
+        let owner = UffdBuilder::new().non_blocking(true).create().unwrap();
+        // SAFETY: duplicates a descriptor this test owns.
+        let handler = unsafe { Uffd::from_raw_fd(libc::dup(owner.as_raw_fd())) };
+        let mem = map(ps) as usize;
+        owner.register(mem as *mut c_void, ps).unwrap();
+        let reader = reader_of(mem);
+        until_pending(owner.as_raw_fd(), 1);
+        let src = vec![0x33u8; ps];
+        // SAFETY: a page; the registered page.
+        assert_eq!(unsafe { handler.copy(src.as_ptr().cast(), mem as *mut c_void, ps, false) }.unwrap(), ps);
+        assert_eq!(fault_addr(handler.read_event().unwrap()), mem);
+        handler.wake(mem as *mut c_void, ps).unwrap();
+        assert_eq!(reader.join().unwrap(), 0x33);
+        assert!(handler.read_event().unwrap().is_none());
+        owner.unregister(mem as *mut c_void, ps).unwrap();
+    }
+
+    /// A blocking read with only a woken waiter's record in the socket waits
+    /// on for an event, as Linux's blocking read waits while no fault is
+    /// pending (fs/userfaultfd.c v6.12 :1064 to :1076), and returns the next
+    /// fault.
+    #[test]
+    fn test_a_blocking_read_waits_past_a_woken_waiters_record() {
+        let ps = PAGE;
+        let owner = UffdBuilder::new().non_blocking(false).create().unwrap();
+        // SAFETY: duplicates a descriptor this test owns.
+        let handler = std::sync::Arc::new(unsafe { Uffd::from_raw_fd(libc::dup(owner.as_raw_fd())) });
+        let mem = map(2 * ps) as usize;
+        owner.register(mem as *mut c_void, 2 * ps).unwrap();
+        let stale = reader_of(mem);
+        until_pending(owner.as_raw_fd(), 1);
+        handler.unregister(mem as *mut c_void, ps).unwrap();
+        assert_eq!(stale.join().unwrap(), 0);
+        let h = handler.clone();
+        let read = thread::spawn(move || fault_addr(h.read_event().unwrap()));
+        thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!read.is_finished(), "the blocking read returned with only a woken waiter's record");
+        let live = reader_of(mem + ps);
+        assert_eq!(read.join().unwrap(), mem + ps);
+        let src = vec![5u8; ps];
+        // SAFETY: a page; the second, registered page.
+        assert_eq!(unsafe { handler.copy(src.as_ptr().cast(), (mem + ps) as *mut c_void, ps, true) }.unwrap(), ps);
+        assert_eq!(live.join().unwrap(), 5);
+        owner.unregister((mem + ps) as *mut c_void, ps).unwrap();
+    }
+
+    /// `Mirror::waits` reads the slot's word: a tag that is the word, waiting,
+    /// still waits; a word with the waiting bit cleared (woken) or a slot
+    /// holding another tag does not; a tag naming a slot past the table is an
+    /// error (`EBADMSG`), never a read past the table, as the macOS twin's
+    /// `test_a_tag_past_the_mirror_is_an_error`.
+    #[test]
+    fn test_waits_reads_the_mirror_word() {
+        let table: Box<[AtomicU64]> = (0..proto::MIRROR_WORDS).map(|_| AtomicU64::new(0)).collect();
+        let m = Mirror { words: table.as_ptr(), view: ptr::null() };
+        // A tag past the table: an error.
+        let e = m.waits(proto::tag(1, proto::MIRROR_WORDS + 44));
+        assert!(matches!(e, Err(Error::SystemError(Errno::EBADMSG))), "{e:?}");
+        // A waiting tag stored in its slot: still waits.
+        let tag = proto::tag(2, 3);
+        table[3].store(tag, Ordering::Release);
+        assert!(m.waits(tag).unwrap(), "a waiting tag in its slot");
+        // Its waiting bit cleared (woken): no longer waits.
+        table[3].store(tag & !proto::TAG_WAITING, Ordering::Release);
+        assert!(!m.waits(tag).unwrap(), "a woken tag");
+        // The slot holds a later waiter's tag: this one does not wait.
+        table[3].store(proto::tag(5, 3), Ordering::Release);
+        assert!(!m.waits(tag).unwrap(), "the slot taken by a later waiter");
+        // A zero slot (no waiter): does not wait.
+        assert!(!m.waits(proto::tag(1, 7)).unwrap(), "an empty slot");
+    }
+
+    /// Version skew the other way, a reader that predates the mirror with this
+    /// kernel side: its crate decoded types 1 (page fault) and 2 (remove) and
+    /// failed on any other (`Error::UnrecognizedEvent`), and a page fault is
+    /// now type 3 (`EVENT_PAGEFAULT2`), so it fails on the first one; this
+    /// crate fails on a type 1 record the same way.
+    #[test]
+    fn test_a_page_fault_record_is_no_type_a_reader_before_the_mirror_decodes() {
+        assert!(![1, 2].contains(&proto::EVENT_PAGEFAULT2));
+        assert!(matches!(Event::from_record([1, 0x1000, 0, 0]), Err(Error::UnrecognizedEvent(1))));
+    }
+
+    /// A stand-in for the kernel side: an AF_UNIX socket pair whose user end a
+    /// `Uffd` reads, the other end receiving the reader's `HELLO` (with the
+    /// `WSAPROTOCOL_INFOW` of its channel, as the real serving thread does,
+    /// `windows_uffd::recv_hello`), reconstructing the channel socket and
+    /// answering its `OP_MIRROR` with `answer(channel)`; `records` are queued
+    /// on the user end first, as faults a handler would find.
+    fn stand_in(answer: impl FnOnce(RawFd) + Send + 'static, records: Vec<[u64; 4]>) -> (Uffd, RawFd) {
+        use windows_sys::Win32::Networking::WinSock::{
+            FROM_PROTOCOL_INFO, INVALID_SOCKET, WSAPROTOCOL_INFOW, WSASocketW, WSA_FLAG_NO_HANDLE_INHERIT,
+            WSA_FLAG_OVERLAPPED,
+        };
+        let (user, kernel) = wick_os::unix::net::UnixStream::pair().unwrap();
+        let user = user.into_raw_fd();
+        let kernel = kernel.into_raw_fd();
+        for r in records {
+            write_all(kernel, &record(r)).unwrap();
+        }
+        thread::spawn(move || {
+            // The HELLO and the channel's protocol information.
+            let mut hello = [0u8; proto::RECORD];
+            read_all(kernel, &mut hello).unwrap();
+            assert_eq!(words(&hello)[0], proto::HELLO);
+            // SAFETY: plain data, filled by the read below.
+            let mut info: WSAPROTOCOL_INFOW = unsafe { mem::zeroed() };
+            // SAFETY: the structure's bytes.
+            let raw = unsafe {
+                std::slice::from_raw_parts_mut((&raw mut info).cast::<u8>(), mem::size_of::<WSAPROTOCOL_INFOW>())
+            };
+            read_all(kernel, raw).unwrap();
+            // SAFETY: a socket from the peer's protocol information.
+            let s = unsafe {
+                WSASocketW(
+                    FROM_PROTOCOL_INFO,
+                    FROM_PROTOCOL_INFO,
+                    FROM_PROTOCOL_INFO,
+                    &info,
+                    0,
+                    WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+                )
+            };
+            assert_ne!(s, INVALID_SOCKET, "WSASocketW: {}", Errno::last());
+            let channel = wick_os::windows::fd::from_socket(s);
+            let mut head = [0u8; proto::RECORD];
+            read_all(channel, &mut head).unwrap();
+            assert_eq!(words(&head)[0], proto::OP_MIRROR);
+            answer(channel);
+            // Held until the reader has its answer.
+            thread::sleep(std::time::Duration::from_millis(500));
+            // SAFETY: the channel's end reconstructed above.
+            unsafe { libc::close(channel) };
+        });
+        // SAFETY: the user end, owned by the object.
+        (unsafe { Uffd::from_raw_fd(user) }, kernel)
+    }
+
+    /// The reply to `OP_MIRROR`: `[result, handle, 0, 0]`.
+    fn answer_with(channel: RawFd, result: i64, handle: u64) {
+        #[allow(clippy::cast_sign_loss)]
+        write_all(channel, &record([result as u64, handle, 0, 0])).unwrap();
+    }
+
+    /// Version skew, this crate with a kernel side that predates the mirror:
+    /// it answers `OP_MIRROR` as any unknown request, `-EINVAL`
+    /// (`windows_uffd::serve_request`), and the read fails with that error,
+    /// the record left unread, where reading without the check would return a
+    /// woken waiter's record.
+    #[test]
+    fn test_a_kernel_side_without_the_mirror_fails_the_read() {
+        let (uffd, kernel) = stand_in(
+            |c| answer_with(c, -i64::from(libc::EINVAL), 0),
+            vec![[proto::EVENT_PAGEFAULT2, 0x1000, 0, proto::tag(1, 3)]],
+        );
+        let e = uffd.read_event();
+        assert!(matches!(e, Err(Error::SystemError(Errno::EINVAL))), "{e:?}");
+        assert_eq!(pending(uffd.as_raw_fd()), 1, "the record was read");
+        // SAFETY: the stand-in's end.
+        unsafe { libc::close(kernel) };
     }
 
     /// A thread reading registered memory blocks until the page is copied in.

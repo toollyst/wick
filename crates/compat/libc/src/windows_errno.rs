@@ -103,6 +103,9 @@ errnos! {
     ENOTSUP = 50;
     /// `ERROR_INVALID_DATA`.
     EPROTO = 13;
+    /// `ERROR_INVALID_MESSAGE`: a message/record the layer never writes (a
+    /// waiter-mirror tag naming a slot past the table), distinct from `EPROTO`.
+    EBADMSG = 1002;
     /// `WSAETIMEDOUT`.
     ETIMEDOUT = 10060;
     /// `WSAEADDRINUSE`.
