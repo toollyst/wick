@@ -54,7 +54,10 @@ In short:
   - `jail-as-now`: the jailer's construction. Its counts equal the real jail's for every kind of object, which is
     what lets the other variants stand for jailer changes;
   - `jail-own-sid-only`: the jail's own SID as the only restricting SID (the fix below);
-  - two variants with AppContainer group SIDs, which Windows refuses.
+  - two variants with AppContainer group SIDs, which Windows refuses;
+  - since the WHP records, in CI's windows-guest job: the jail's SID with Authenticated Users, with Authenticated
+    Users and Everyone, and with the `hypervisorPlatform` capability SID (refused); an AppContainer and two LPACs
+    with that capability (option Q), each followed by option Q's own checks (`q_checks`). Not yet run.
 
 ## What the jail reaches
 
@@ -188,17 +191,20 @@ I/O control: it answered 0xC0000010, 0xC000000D or 0xC0000002, or completed it.
 - Firecracker reverts to the lockdown token first thing in `main` and loads what it needs later. Every DLL and
   registry key it uses after that must move before the revert, under the initial token, as Chromium's sandbox warms
   up before it locks down. That includes WHP's, Winsock's and anything else loaded lazily.
-- WHP's own device must still open under the new token. **It does not** (below, "WHP under the jail's SID alone").
+- WHP must still work under the new token. Under the jail's SID alone it does not (below, "WHP under the jail's
+  SID alone"): either the partition is made before the revert (option P) or the VMM runs in an AppContainer with
+  WHP's capability (option Q).
 - Paths the operator gives Firecracker outside its jail would need to grant the jail's SID.
 
 **WHP under the jail's SID alone.** `fs-probe whp-token` in CI's windows-guest job (Windows Server 2025 build 26100;
-the run is in docs/COMPATIBILITY.md's `--chroot-base-dir` row; the runner's built-in administrator, not elevated):
+the runs are in docs/COMPATIBILITY.md's `--chroot-base-dir` row, the first record and the variants record; the
+runner's built-in administrator, not elevated):
 - In the probe itself and under the lockdown token as now, every step returned `S_OK` (capability, partition,
   processor count, setup, two memory maps, a vCPU) and the vCPU's one run exited at the guest's HLT. The partition
   opens one device, `\Device\VidExo`, at `WHvSetupPartition`, granted `0x00120089` (read).
 - Under the jail's SID alone (the WHP DLLs loaded before the revert), `WHvGetCapability(HypervisorPresent)` returned
-  `S_OK` with the answer 0: WHP reports no hypervisor. Without the DLLs loaded before the revert, `WinHvPlatform.dll`
-  does not load (126).
+  `S_OK` with the answer 0: WHP reports no hypervisor, and `WHvCreatePartition` fails with `0xC0351000`
+  (`STATUS_HV_NOT_PRESENT`). Without the DLLs loaded before the revert, `WinHvPlatform.dll` does not load (126).
 - `\Device\VidExo`'s security: `O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1201bf;;;AU)(A;;0x1201bf;;;S-1-15-3-1024-1350733694-1533467442-3402045280-1710179238-1008639688-2282869650-3611451526-669908847)S:AI(ML;;NW;;;LW)`.
   Read, write and execute go to Authenticated Users and to one capability, which a lockdown token restricted to the
   jail's SID cannot pass: the restricting SIDs' check finds no entry for them ([Microsoft Learn, Restricted
@@ -209,27 +215,105 @@ the run is in docs/COMPATIBILITY.md's `--chroot-base-dir` row; the runner's buil
   `HvSocketSystem`, `VMBus` and `RootVMBus` refuse the probe's open of the device object itself (`0xC000000D`,
   `0xC000000E`).
 
-So the token cannot be the jail's SID alone for the VMM. The probe's next record measures the candidates: the jail's
-SID with Authenticated Users, with each other group alone, and with the `hypervisorPlatform` capability SID (if
-`CreateRestrictedToken` takes it as a restricting SID); the partition made and set up before the revert; an
-AppContainer with and without that capability; and in each, `\Device\VidExo` and `\Device\HvService` opened
-directly. `fs-probe jail-variants` measures the reach of the first and third tokens as above. The API process, which
-needs no WHP, keeps the jail's SID alone whichever wins.
+**The variants record** (`whp-token`'s second record, each child opening `\Device\VidExo` and `\Device\HvService`
+itself after its revert):
+
+| Token after the revert | VidExo | HvService | HypervisorPresent | Partition |
+| --- | --- | --- | --- | --- |
+| Jail's SID with the four groups (as now) | granted | granted | 1 | every step, HLT |
+| Jail's SID alone | denied | denied | 0 | `0xC0351000` |
+| With Authenticated Users | granted | denied | 0 | `0xC0351000` |
+| With Everyone | denied | granted | 0 | `0xC0351000` |
+| With Users | denied | denied | `E_ACCESSDENIED` | `E_ACCESSDENIED` |
+| With Interactive | denied | denied | 0 | `0xC0351000` |
+| With the `hypervisorPlatform` capability SID | `CreateRestrictedToken` refuses the SID as a restricting SID (87): not run | | | |
+| Jail's SID alone, partition made and set up before the revert | denied | denied | (1 before) | maps, vCPU, run to HLT after the revert |
+| As now, partition made before the revert | granted | granted | (1 before) | the same |
+| AppContainer, no capability | denied | denied | `E_ACCESSDENIED` | `E_ACCESSDENIED` |
+| AppContainer with `hypervisorPlatform` | granted (`0x120089`; most allowed `0x1201bf`) | denied | 1 | every step, HLT |
+
+What it shows:
+- **A capability SID cannot be a restricting SID.** `CreateRestrictedToken` refuses it with 87, as it refuses ALL
+  APPLICATION PACKAGES and ALL RESTRICTED APPLICATION PACKAGES (below). Microsoft's page documents no such limit.
+- **A restricted token needs both devices.** Each group that opens one of them alone leaves WHP reporting no
+  hypervisor: Authenticated Users opens VidExo, Everyone HvService, and neither variant made a partition. Whether the
+  two together suffice is the next record's `jail-au-everyone` (and `jail-au-users`).
+- **An AppContainer with `hypervisorPlatform` runs WHP fully with VidExo alone**: HvService was denied it, and WHP
+  still reported a hypervisor and ran the vCPU to its HLT. Without the capability WHP refuses the AppContainer
+  (`E_ACCESSDENIED`), which is what "WHP is refused inside an AppContainer" measured before.
+- **A partition made before the revert works with the jail's SID alone.** WHP keeps the handle to VidExo it opened at
+  set-up; after the revert the memory maps, the vCPU and its run need no new open, though both devices are denied.
+
+**Option P: the jail's SID alone, the partition made and set up before the revert.** What it takes, from
+kvm-ioctls' WHP backend (crates/compat/kvm-ioctls/src/whp/vm.rs, `configure`, `VmFd::create`):
+- Every property the backend sets before `WHvSetupPartition` comes from the host, never from the API's
+  configuration: `ProcessorCount` (`MAX_VCPUS`), `ProcessorFeaturesBanks` (the partition's own plus the host's
+  speculation controls, less WHP's TSC-deadline timer), `ProcessorXsaveFeatures` (every component offered),
+  `LocalApicEmulationMode` (by the host's vendor), `ExtendedVmExits` (CPUID, MSR, hypercall; exceptions with gdb)
+  and `CpuidExitList` (every basic and extended leaf, and KVM's two). So the partition can be made before
+  Firecracker knows its VM.
+- Set after set-up already: `ExceptionExitBitmap` (the x2APIC's #GP and the gdb stub's exits, `write_exits`) and
+  `X64MsrExitBitmap` (`tsc_write_exit`). Microsoft Learn,
+  [WHvSetupPartition](https://learn.microsoft.com/virtualization/api/hypervisor-platform/funcs/whvsetuppartition):
+  `ExtendedVmExits`, `ExceptionExitBitmap`, `X64MsrExitBitmap` and `CpuidExitList` "can be modified after" set-up;
+  [Partition Property Data Types](https://learn.microsoft.com/virtualization/api/hypervisor-platform/funcs/whvpartitionpropertydatatypes):
+  the processor-related properties "can only be configured" before it. Silent on `ProcessorCount` and
+  `LocalApicEmulationMode`: the next record sets each again after set-up.
+- The guest sees the vCPUs Firecracker makes, not `ProcessorCount`: the backend sets the maximum and makes the
+  configured number on every boot today (the ACPI tables and the CPUID topology are Firecracker's, and every CPUID
+  leaf exits to it). The next record makes two of four and runs one.
+- A second partition after the revert fails (the jail's SID alone: no hypervisor). The backend makes two per
+  process: its register probe (`regs::probe`, a partition made, given a vCPU and deleted, before the VM's) and the
+  VM's; both would move before the revert. Snapshot restore makes its VM as a boot does, in a process that has made
+  none, so it takes the same partition. Upstream lets an `InstanceStart` that failed be tried again in the same
+  process; under P that needs the partition used again (its memory unmapped and vCPUs deleted), which the next
+  record measures, or a named error.
+- Each capability read after the revert must work, or be read before it: `pvclock::tsc_hz` reads the clock
+  frequency at first use and answers 0 on a failure. The next record reads every capability code before and after.
+- Every call a running VM makes (registers, XSAVE and interrupt-controller state, interrupts, partition time,
+  cancel, address translation, dirty bitmap, advice, unmap): the next record makes each after the revert.
+- The API process needs none of it: it makes no partition.
+
+**Option Q: the VMM in an AppContainer (or an LPAC) with `hypervisorPlatform`.** WHP works natively, with no change
+to when the partition is made. What it brings, and what the next record (`jail-variants`' `appcontainer-cap`,
+`lpac-cap`, `lpac-cap-registry-com`, and `q_checks` after every variant) measures:
+- Reach: an AppContainer is granted what ALL APPLICATION PACKAGES (an LPAC: ALL RESTRICTED APPLICATION PACKAGES) is
+  granted, besides its own SID and capabilities, and the I/O manager's traverse check closes names beneath devices
+  without `FILE_DEVICE_ALLOW_APPCONTAINER_TRAVERSAL`
+  ([Microsoft Learn, `DEVICE_OBJECT`](https://learn.microsoft.com/windows-hardware/drivers/ddi/wdm/ns-wdm-_device_object)).
+  Measured by the same object, pipe and device lists as above.
+- Integrity: an AppContainer runs at low integrity, below the jail's label (0x1800, no write up), so the jail's
+  directory would be labelled low, which a low-integrity process of the user also passes. Measured
+  (`jail-labelled-dir-create`).
+- Sockets: the link to the API process (the API process listens, Firecracker connects) and sockets Firecracker binds
+  for clients outside. On Windows Server 2022 an AppContainer bound a Unix socket an outside process reached, and an
+  LPAC needs `registryRead` and `lpacCom` for Winsock at all (a probe of the Windows sandbox mechanisms, build 20348,
+  2026-11-10; not in the repository). Measured again both ways.
+- Processes and handles: who may open the VMM (the uffd mirror's reader pulls its handle, the jailer's count reads
+  its memory: `process-sddl`, `open-child`); the VMM opening another process (`open-parent-dup-handle`); a section
+  the jailer duplicates into it mapped, as large pages are given (a large-page one only where the measuring process
+  holds Lock pages in memory). An AppContainer has no privilege to enable, as the jail now.
+- A Job and `SECURITY_CAPABILITIES` together: the AppContainer variants of both probes run in a Job, assigned after
+  `CreateProcessAsUserW` as the jailer assigns Firecracker (the variants record: it ran); its memory limit is
+  checked by `job-commit-300-mib`.
+- DLLs: an AppContainer loads System32's; an LPAC only what ALL RESTRICTED APPLICATION PACKAGES may read
+  (`load-library-after-revert`). The mitigation profile is applied inside each (`mitigation-*`).
+- A profile per jail or none: `appcontainer-cap-bare-sid` runs WHP on a SID from
+  `DeriveAppContainerSidFromAppContainerName` with no profile made.
 
 **What does not work.**
-- `CreateRestrictedToken` refuses ALL APPLICATION PACKAGES (`S-1-15-2-1`) and ALL RESTRICTED APPLICATION PACKAGES
-  (`S-1-15-2-2`) as restricting SIDs with `ERROR_INVALID_PARAMETER` (87) (`fs-probe jail-variants`). Microsoft's page
-  does not document that limit; it is measured.
-- An AppContainer token, which would carry those groups and would also apply the I/O manager's traverse check to
-  device namespaces
-  ([Microsoft Learn, `DEVICE_OBJECT`](https://learn.microsoft.com/windows-hardware/drivers/ddi/wdm/ns-wdm-_device_object),
-  `FILE_DEVICE_ALLOW_APPCONTAINER_TRAVERSAL`), is refused by WHP (SECURITY.md).
+- `CreateRestrictedToken` refuses ALL APPLICATION PACKAGES (`S-1-15-2-1`), ALL RESTRICTED APPLICATION PACKAGES
+  (`S-1-15-2-2`) and the `hypervisorPlatform` capability SID as restricting SIDs with `ERROR_INVALID_PARAMETER` (87)
+  (`fs-probe jail-variants`, `fs-probe whp-token`). Microsoft's page does not document that limit; it is measured.
+- An AppContainer without the `hypervisorPlatform` capability: WHP refuses it (`E_ACCESSDENIED`).
 - A Job Object, the mitigation policies and WFP have no control over devices, I/O controls or RPC. The system's
   device security descriptors are the host's, not wick's to change.
 
 **What stays after the fix.**
 - The 13 device namespaces above, with `\Device\Afd` carrying IP when `--netns` is not given.
-- WHP's device or devices, the counterpart of `/dev/kvm`.
+- WHP, the counterpart of `/dev/kvm`: under option P the partition's handle to `\Device\VidExo` only (neither
+  device opens after the revert); under option Q `\Device\VidExo` through the capability, with what an
+  AppContainer is granted besides.
 - Objects that have no DACL at all.
 - No list of allowed I/O-control numbers. Windows offers none to a user-mode process.
 

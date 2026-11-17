@@ -20,7 +20,8 @@
 //!   restricting SIDs, so the user's files are denied, and the jail's
 //!   integrity level ([`JAIL_INTEGRITY_SID`], between low and medium), so
 //!   nothing at medium integrity can be written. WHP works for such a process
-//!   (it is refused inside an AppContainer). The process starts with an
+//!   (inside an AppContainer only with the `hypervisorPlatform` capability:
+//!   docs/windows-jail-reach.md). The process starts with an
 //!   initial impersonation token on its main thread, the same restricted
 //!   token with the user's SID, for the loader to initialise; Firecracker
 //!   reverts to the lockdown token first thing (`vmm::ext::jail`), the

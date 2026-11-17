@@ -124,7 +124,8 @@ dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `
   vhost-user-blk test backend, and huge pages (`MEM_LARGE_PAGES`).
 - Measured on that machine: WHP honours the host protection of guest RAM (a guest access to a `PAGE_NOACCESS` page
   exits at the instruction and re-runs once the page is accessible), which the Uffd backend relies on; WHP is
-  refused inside an AppContainer (`E_ACCESSDENIED`) but works for a process on a restricted token below medium integrity
+  refused inside an AppContainer without the `hypervisorPlatform` capability (`E_ACCESSDENIED`; with the capability it
+  runs: `fs-probe whp-token`, docs/windows-jail-reach.md) and works for a process on a restricted token below medium integrity
   that has no access to the user's files ([M5](#m5-security-parity-the-jailer-on-every-host)).
 - What the hardware runs found, each fixed and covered by its stage: the guest's CPUID (KVM's supported set, no
   MWAIT or nested virtualisation; no x2APIC while the partition's local APIC is an xAPIC, where KVM offers it on any host (option E's x2APIC partition for AMD hosts is in the code and off in the product: WHP's register refuses the TSC-deadline mode, and the APIC page's get and set lose an interrupt requested between them, PC step 15a at 305a806, so the backend makes that write with the VM's vCPUs, time and interrupt requests held (E-ii), whose tests have passed in CI on AMD runners, with a Linux guest booted on it by a record build (`boot-test.ps1 x2apic`, 5 of 5 in CI runs 43627299415 to 43688550565; docs/COMPATIBILITY.md, Guest CPUID); the switch is not made yet); OSXSAVE, OSPKE and the XSAVE sizes from the vCPU's state at each CPUID exit; the TSC

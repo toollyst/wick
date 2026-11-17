@@ -1485,7 +1485,8 @@ jobs:
           rustc --edition 2021 --test -o "$RUNNER_TEMP/jail-parent-test.exe" tools/windows/jail-parent.rs
           "$RUNNER_TEMP/jail-parent-test.exe"
           rustc --edition 2021 -O -o tools/windows/memory-partition-probe.exe tools/windows/memory-partition-probe.rs
-          # Run by hand (docs/design-fs.md §6.3); built here so that it keeps building.
+          # Run by hand (docs/design-fs.md §6.3) and by the windows-guest job's
+          # records (whp-token, jail-variants: docs/windows-jail-reach.md).
           rustc --edition 2021 -O -C target-feature=+crt-static -o tools/windows/fs-probe.exe tools/windows/fs-probe.rs
       # The x2APIC record build, for boot-test.ps1 x2apic (the windows-guest
       # job and a PC): a release Firecracker with kvm-ioctls'
@@ -2425,15 +2426,33 @@ jobs:
       # elevated process, then in a child whose lockdown token restricts to
       # the jail's SID with the four session groups (as now), alone (with
       # and without the WHP DLLs loaded before the revert, and with the
-      # partition made before it), with each group alone and with the
-      # hypervisorPlatform capability SID; and in an AppContainer with and
-      # without that capability. Each child opens WHP's devices itself; the
+      # partition made before it, and option P's whole VM made so), with each
+      # group alone, with two of them and with the hypervisorPlatform
+      # capability SID; in an AppContainer with and without that capability;
+      # and in an LPAC with it. Each child opens WHP's devices itself; the
       # SDDL of the devices the partition opens. A record for now, never
       # failing the job.
       - name: fs-probe whp-token (a record)
         if: (success() || failure()) && steps.kit.outcome == 'success'
         continue-on-error: true
         run: .\tools\windows\fs-probe.exe whp-token "$env:RUNNER_TEMP\whp-token"
+      # What each token the jailer could give Firecracker reaches
+      # (docs/windows-jail-reach.md): every named kernel object, named pipe
+      # and device, IP, randomness and the jail's socket directory, under
+      # the jail's token as now, its SID alone or with Authenticated Users,
+      # and in an AppContainer and an LPAC with WHP's capability (option Q);
+      # then option Q's questions (a file in a jail-labelled directory, Unix
+      # sockets each way, the parent opened, sections given, the Job's
+      # memory limit) and each child's process security. The external
+      # address is github.com's, which the runner reaches anyway: a connect
+      # only. A record, never failing the job.
+      - name: fs-probe jail-variants (a record)
+        if: (success() || failure()) && steps.kit.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          $ip = ([System.Net.Dns]::GetHostAddresses('github.com') | Where-Object AddressFamily -eq 'InterNetwork' | Select-Object -First 1).IPAddressToString
+          .\tools\windows\fs-probe.exe jail-variants "$env:RUNNER_TEMP\jail-variants" "${ip}:443"
       # Every stage of `all`, as a PC's default run has them, but hugepages
       # (its own step below), and diff-nospace, which needs the elevation
       # this runner has. Not in `all`: foreign-snapshot (it wants a state of

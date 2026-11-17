@@ -1214,11 +1214,17 @@ upstream Firecracker and its jailer.
     behind a list of allowed I/O-control numbers.
   - **Not done yet: the jail's own SID as the only restricting SID.** Measured under that token: 13 device namespaces
     (those without `FILE_DEVICE_SECURE_OPEN`) and no RPC endpoint, service pipe, section or name of its own making.
-    It needs every DLL and registry key Firecracker uses to be loaded before `RevertToSelf`, and WHP's device to
-    open under it (not yet measured; the host had no Hyper-V).
+    It needs every DLL and registry key Firecracker uses to be loaded before `RevertToSelf`, and WHP to work under
+    it. WHP does not, measured: it reports no hypervisor, as `\Device\VidExo` grants Authenticated Users and the
+    `hypervisorPlatform` capability, not the jail. A restricted token needed both WHP devices in the records (each
+    group that opens one alone failed). Two ways work: a partition made and set up before `RevertToSelf` runs after
+    it under the jail's SID alone (option P), and an AppContainer with the `hypervisorPlatform` capability runs WHP
+    fully (option Q). Which one, and what each leaves reachable, is measured next (`fs-probe whp-token`,
+    `fs-probe jail-variants`; docs/windows-jail-reach.md).
   - **The plan this replaces cannot be done.** ALL APPLICATION PACKAGES in place of the four groups:
-    `CreateRestrictedToken` refuses it and ALL RESTRICTED APPLICATION PACKAGES as restricting SIDs with error 87
-    (`fs-probe jail-variants`), and WHP refuses an AppContainer token.
+    `CreateRestrictedToken` refuses it, ALL RESTRICTED APPLICATION PACKAGES and the `hypervisorPlatform`
+    capability SID as restricting SIDs with error 87 (`fs-probe jail-variants`, `fs-probe whp-token`). WHP refuses
+    an AppContainer token only without the `hypervisorPlatform` capability (`E_ACCESSDENIED`); with it, WHP runs.
   - Then a less-privileged token for the API process, which needs no WHP.
 
   The measurements, per device and per kind of object, the comparison with Linux and the fix's plan:

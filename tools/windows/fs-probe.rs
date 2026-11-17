@@ -25,10 +25,19 @@
 //!                         lockdown token the jailer could make: the jail's
 //!                         SID with the four groups as now, alone, alone
 //!                         without the WHP DLLs preloaded, with each group
-//!                         alone, with the hypervisorPlatform capability SID,
-//!                         and alone or as now with the partition made and
-//!                         set up before the revert; and in an AppContainer
-//!                         with and without that capability. Each child with
+//!                         alone, with Authenticated Users and Everyone, with
+//!                         Authenticated Users and Users, with the
+//!                         hypervisorPlatform capability SID, and alone or as
+//!                         now with the partition made and set up before the
+//!                         revert; alone with option P's whole VM (the
+//!                         partition made as kvm-ioctls makes one, before the
+//!                         revert; after it, every capability read again,
+//!                         each property set again, two of four vCPUs, each
+//!                         call a running VM makes, a second partition); in
+//!                         an AppContainer with and without that capability,
+//!                         and with it on a SID with no profile; and in an
+//!                         LPAC with it, alone and with registryRead and
+//!                         lpacCom. Each child with
 //!                         the jail's initial token until it reverts, then
 //!                         opening `\Device\VidExo` and `\Device\HvService`
 //!                         itself; every step goes on past a refusal. And the
@@ -3389,8 +3398,10 @@ fn list_objects(path: &str) {
 
 /// `jail_checks` under tokens the jailer could make instead of its own
 /// (fix option (i)): the jail's integrity level and a jail SID of its own,
-/// with fewer restricting SIDs. Each child gets the list on standard input
-/// and a socket directory its SID may write, labelled as a jail's.
+/// with fewer restricting SIDs; and option Q's AppContainer and LPAC with
+/// WHP's capability. Each child gets the list on standard input and a
+/// socket directory its SID may write, labelled as a jail's (an
+/// AppContainer's labelled low), then `q_checks`.
 fn jail_variants(base: &str, ext: &str, only: &[String]) {
     assert!(std::fs::metadata(base).is_err(), "{base} exists");
     let parent_dir = std::path::Path::new(base).parent().unwrap().to_string_lossy().into_owned();
@@ -3444,18 +3455,88 @@ fn jail_variants(base: &str, ext: &str, only: &[String]) {
     // `\Device\VidExo` grants, or the hypervisorPlatform capability it
     // grants too.
     let cap = sid_string(capability_sid("hypervisorPlatform"));
-    let variants: Vec<(&str, Vec<&str>)> = vec![
-        ("jail-as-now", session.to_vec()),
-        ("jail-own-sid-only", Vec::new()),
-        ("jail-all-app-packages", vec!["S-1-15-2-1"]),
-        ("jail-all-restricted-app-packages", vec!["S-1-15-2-2"]),
-        ("jail-sid-au", vec!["S-1-5-11"]),
-        ("jail-sid-hypervisor-platform", vec![cap.as_str()]),
+    // (name, the lockdown token's restricting SIDs besides the jail's, or
+    // None for an AppContainer with the capabilities given; LPAC).
+    let hv = vec!["hypervisorPlatform"];
+    let variants: Vec<(&str, Option<Vec<&str>>, Vec<&str>, bool)> = vec![
+        ("jail-as-now", Some(session.to_vec()), Vec::new(), false),
+        ("jail-own-sid-only", Some(Vec::new()), Vec::new(), false),
+        ("jail-all-app-packages", Some(vec!["S-1-15-2-1"]), Vec::new(), false),
+        ("jail-all-restricted-app-packages", Some(vec!["S-1-15-2-2"]), Vec::new(), false),
+        ("jail-sid-au", Some(vec!["S-1-5-11"]), Vec::new(), false),
+        // WHP's two devices' groups (`whp-token`'s jail-au-everyone).
+        ("jail-sid-au-everyone", Some(vec!["S-1-5-11", "S-1-1-0"]), Vec::new(), false),
+        ("jail-sid-hypervisor-platform", Some(vec![cap.as_str()]), Vec::new(), false),
+        // Option Q's tokens (docs/windows-jail-reach.md): an AppContainer
+        // with WHP's capability, and an LPAC with it, alone and with the two
+        // capabilities Winsock needs in an LPAC.
+        ("appcontainer-cap", None, hv.clone(), false),
+        ("lpac-cap", None, hv.clone(), true),
+        ("lpac-cap-registry-com", None, vec!["hypervisorPlatform", "registryRead", "lpacCom"], true),
     ];
-    for (name, groups) in &variants {
+    // The AppContainer's profile, its SID's ACEs on the binary's directory
+    // and on a socket directory of its own: an AppContainer runs at low
+    // integrity, which a jail's label (0x1800, no write up) keeps out of
+    // `sock`, so `sock-low` is labelled low.
+    let profile = format!("wick.jail-variants.{}", std::process::id());
+    let ac = variants.iter().any(|v| v.1.is_none() && (only.is_empty() || only.iter().any(|o| o == v.0)));
+    let (ac_psid, ac_made) = if ac { appcontainer_profile(&profile) } else { (null_mut(), false) };
+    let sock_low = format!("{base}\\sock-low");
+    if ac {
+        let ac_sid = sid_string(ac_psid);
+        assert_eq!(set_dacl(&bin, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;0x1200a9;;;{jail_sid})(A;OICI;0x1200a9;;;{ac_sid})")), 0);
+        std::fs::create_dir(&sock_low).unwrap();
+        assert_eq!(set_dacl(&sock_low, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{ac_sid})")), 0);
+        assert_eq!(set_label(&sock_low, Some("S:(ML;OICI;NWNRNX;;;LW)")), 0);
+        // The jail's directory as the jailer labels it grants the
+        // AppContainer too: whether its label alone keeps it out.
+        assert_eq!(set_dacl(&sock, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;FA;;;{jail_sid})(A;OICI;FA;;;{ac_sid})")), 0);
+        assert_eq!(set_label(&sock, Some("S:(ML;OICI;NWNRNX;;;S-1-16-6144)")), 0);
+    }
+    // A Unix socket listening in each socket directory, as the API process
+    // listens for Firecracker (`vmm::ext::api_process`): the jailed side
+    // connects to it.
+    for dir in [sock.as_str(), sock_low.as_str()] {
+        if std::fs::metadata(dir).is_err() {
+            continue;
+        }
+        // SAFETY: plain Winsock calls.
+        unsafe {
+            let l = socket(1, 1, 0);
+            let a = unix_addr(&format!("{dir}\\link.sock"));
+            assert_eq!(bind(l, a.as_ptr(), a.len() as i32), 0, "bind link.sock wsa {}", WSAGetLastError());
+            listen(l, 8);
+            sink(l);
+        }
+    }
+    // A section the jailed side is given, as the jailer gives Firecracker a
+    // large-page one (overlay/jailer/platform/windows/large_pages.rs), and a
+    // large-page one where this process may make it.
+    // SAFETY: a pagefile-backed section of 64 KiB, PAGE_READWRITE; a view of it.
+    let plain = unsafe {
+        let s = H(CreateFileMappingW(INVALID, null(), 0x04, 0, 0x1_0000, null()));
+        let v = MapViewOfFile(s.0, 0x2, 0, 0, 0);
+        std::ptr::copy_nonoverlapping(b"wick".as_ptr(), v.cast::<u8>(), 4);
+        s
+    };
+    let large = if enable_privilege("SeLockMemoryPrivilege") {
+        // SAFETY: PAGE_READWRITE | SEC_COMMIT | SEC_LARGE_PAGES, 2 MiB.
+        let s = H(unsafe { CreateFileMappingW(INVALID, null(), 0x04 | 0x0800_0000 | 0x8000_0000, 0, 0x20_0000, null()) });
+        println!("host large-page-section {}", if s.0.is_null() { last() } else { "made".into() });
+        (!s.0.is_null()).then_some(s)
+    } else {
+        println!("host large-page-section not made: this process does not hold SeLockMemoryPrivilege");
+        None
+    };
+    for (name, groups, caps, lpac) in &variants {
         if !only.is_empty() && !only.iter().any(|o| o == name) {
             continue;
         }
+        let Some(groups) = groups else {
+            let who = Who::AppContainer { sid: ac_psid, caps: caps.iter().map(|c| capability_sid(c)).collect(), lpac: *lpac };
+            jail_variant_run(name, &exe, &bin, &who, &list, port, ext, &sock_low, &sock, &plain, large.as_ref());
+            continue;
+        };
         let mut restricting = vec![jail_sid.as_str()];
         restricting.extend(groups.iter().copied());
         // Whether Windows takes these as restricting SIDs at all.
@@ -3478,26 +3559,10 @@ fn jail_variants(base: &str, ext: &str, only: &[String]) {
         let initial = restricted_token(own, &user, &all, &[&user, &jail_sid]);
         set_integrity(initial, "S-1-16-6144");
         let who = Who::Restricted { primary, initial: impersonation(initial) };
-        // SAFETY: NUL-terminated path.
-        let input = inheritable(H(unsafe { CreateFileW(wide(&list).as_ptr(), GENERIC_READ, SHARE_ALL, null(), OPEN_EXISTING, 0, null_mut()) }).0);
-        let out = inheritable(GetStd(-11));
-        let cmd = format!("\"{exe}\" jail-variant-child {name} {port} {ext} {sock}");
-        match start(&cmd, &bin, &who, null_mut(), null_mut(), &[input, out], [input, out, out], true) {
-            // SAFETY: the suspended child.
-            Ok(child) => unsafe {
-                ResumeThread(child.thread.0);
-                let w = WaitForSingleObject(child.process.0, 900_000);
-                let mut code = 0;
-                GetExitCodeProcess(child.process.0, &mut code);
-                if w != 0 {
-                    TerminateProcess(child.process.0, 1);
-                }
-                println!("host {name} child-exit {code:#x}{}", if w != 0 { " (timed out)" } else { "" });
-            },
-            Err(e) => println!("host {name} start {e}"),
-        }
-        // SAFETY: our copy.
-        unsafe { CloseHandle(input) };
+        jail_variant_run(name, &exe, &bin, &who, &list, port, ext, &sock, &sock, &plain, large.as_ref());
+    }
+    if ac_made {
+        delete_appcontainer_profile(&profile);
     }
     let removed = std::fs::remove_dir_all(base);
     println!("cleanup base removed {:?} exists-after {}", removed.map_err(|e| e.to_string()), std::fs::metadata(base).is_ok());
@@ -3505,11 +3570,196 @@ fn jail_variants(base: &str, ext: &str, only: &[String]) {
     println!("cleanup {parent_dir} security {}", if parent_after == parent_before { "unchanged".to_string() } else { format!("CHANGED {parent_before} -> {parent_after}") });
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateFileMappingW(file: HANDLE, sa: *const SECURITY_ATTRIBUTES, protect: u32, high: u32, low: u32, name: *const u16) -> HANDLE;
+    fn MapViewOfFile(section: HANDLE, access: u32, high: u32, low: u32, size: usize) -> *mut c_void;
+    fn VirtualFree(addr: *mut c_void, size: usize, ty: u32) -> i32;
+    fn GetCurrentProcessId() -> u32;
+}
+#[link(name = "ws2_32")]
+extern "system" {
+    fn select(nfds: i32, read: *mut FdSet, write: *mut FdSet, except: *mut FdSet, timeout: *const [i32; 2]) -> i32;
+}
+
+/// Winsock's `fd_set`.
+#[repr(C)]
+struct FdSet {
+    count: u32,
+    sockets: [usize; 64],
+}
+
+/// One `jail-variants` child under `who`, its sockets in `sockdir` and
+/// `labelled` the jail's directory as the jailer labels it. Before it runs:
+/// its process's security printed and the process opened from here (as the
+/// uffd mirror's reader and the jailer's count of its memory open it); the
+/// plain section, and the large-page one where made, duplicated into it, as
+/// the jailer gives Firecracker a large-page section; then a connection made
+/// to the socket it listens on.
+#[allow(clippy::too_many_arguments)]
+fn jail_variant_run(name: &str, exe: &str, bin: &str, who: &Who, list: &str, port: u16, ext: &str, sockdir: &str, labelled: &str, plain: &H, large: Option<&H>) {
+    // SAFETY: NUL-terminated path.
+    let input = inheritable(H(unsafe { CreateFileW(wide(list).as_ptr(), GENERIC_READ, SHARE_ALL, null(), OPEN_EXISTING, 0, null_mut()) }).0);
+    let out = inheritable(GetStd(-11));
+    let handoff = format!("{sockdir}\\handoff-{name}.txt");
+    // SAFETY: plain call.
+    let me = unsafe { GetCurrentProcessId() };
+    let cmd = format!("\"{exe}\" jail-variant-child {name} {port} {ext} {sockdir} {labelled} {me} {handoff}");
+    match start(&cmd, bin, who, null_mut(), null_mut(), &[input, out], [input, out, out], true) {
+        Ok(child) => {
+            println!("host {name} process-sddl {}", handle_sddl(child.process.0));
+            for (what, access) in [("dup-handle", 0x40u32), ("query-information", 0x400), ("vm-read", 0x10)] {
+                // SAFETY: a pid.
+                let h = H(unsafe { OpenProcess(access, 0, child.pid) });
+                println!("host {name} open-child {what} {}", if h.0.is_null() { last() } else { "allowed".into() });
+            }
+            let give = |s: &H| -> String {
+                let mut v = null_mut();
+                // SAFETY: our section; the child's process handle; FILE_MAP_READ.
+                if unsafe { DuplicateHandle(GetCurrentProcess(), s.0, child.process.0, &mut v, 0x4, 0, 0) } == 0 {
+                    format!("refused:{}", last().replace(' ', "_"))
+                } else {
+                    format!("{}", v as usize)
+                }
+            };
+            std::fs::write(&handoff, format!("{} {}", give(plain), large.map_or_else(|| "none".to_string(), give))).unwrap();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let connector = {
+                let (path, tag, stop) = (format!("{sockdir}\\c-{name}.sock"), name.to_string(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        if std::fs::metadata(&path).is_ok() {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            // SAFETY: plain Winsock calls on a socket made here.
+                            let r = unsafe {
+                                let s = socket(1, 1, 0);
+                                let a = unix_addr(&path);
+                                let r = if connect(s, a.as_ptr(), a.len() as i32) == 0 { "allowed".to_string() } else { format!("denied wsa {}", WSAGetLastError()) };
+                                closesocket(s);
+                                r
+                            };
+                            println!("host {tag} unix-connect-to-jailed-listener {r}");
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    println!("host {tag} unix-connect-to-jailed-listener no socket file while the child ran");
+                })
+            };
+            // SAFETY: the suspended child.
+            unsafe {
+                ResumeThread(child.thread.0);
+                let w = WaitForSingleObject(child.process.0, 900_000);
+                let mut code = 0;
+                GetExitCodeProcess(child.process.0, &mut code);
+                if w != 0 {
+                    TerminateProcess(child.process.0, 1);
+                }
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = connector.join();
+                println!("host {name} child-exit {code:#x}{}", if w != 0 { " (timed out)" } else { "" });
+            }
+        }
+        Err(e) => println!("host {name} start {e}"),
+    }
+    // SAFETY: our copy.
+    unsafe { CloseHandle(input) };
+}
+
 fn jail_variant_child(args: &[String]) {
     let c = Child { scn: args[0].clone(), base: String::new(), root: null_mut(), secret_id: 0, share_id: 0, parent: 0, dummy: 0, tcp_port: 0, pid_tag: String::new() };
     let (ip, port) = args[2].split_once(':').unwrap();
     let ip: Vec<u8> = ip.split('.').map(|p| p.parse().unwrap()).collect();
     jail_checks(&c, true, "-", args[1].parse().unwrap(), ([ip[0], ip[1], ip[2], ip[3]], port.parse().unwrap()), &args[3]);
+    if args.len() >= 7 {
+        q_checks(&c, &args[3], &args[4], args[5].parse().unwrap(), &args[6]);
+    }
+}
+
+/// Option Q's questions (docs/windows-jail-reach.md), asked by every
+/// variant after its revert: a file made in the jail's directory as the
+/// jailer labels it (0x1800); a connection to a socket a process outside
+/// listens on; a socket listening for one from outside; the parent opened
+/// to duplicate a handle into it; the sections given (`handoff`) mapped;
+/// memory committed past the Job's limit.
+fn q_checks(c: &Child, sockdir: &str, labelled: &str, parent: u32, handoff: &str) {
+    let name = format!("{labelled}\\q-{}.txt", std::process::id());
+    // SAFETY: NUL-terminated path.
+    let h = H(unsafe { CreateFileW(wide(&name).as_ptr(), GENERIC_WRITE, 0, null(), CREATE_NEW, 0, null_mut()) });
+    let made = h.0 != INVALID;
+    c.out("jail-labelled-dir-create", if made { "allowed".into() } else { last() });
+    drop(h);
+    if made {
+        let _ = std::fs::remove_file(&name);
+    }
+    // SAFETY: plain Winsock calls on sockets made here.
+    unsafe {
+        let s = socket(1, 1, 0);
+        let a = unix_addr(&format!("{sockdir}\\link.sock"));
+        c.out("unix-connect-outside-listener", if s == usize::MAX { format!("socket denied wsa {}", WSAGetLastError()) } else if connect(s, a.as_ptr(), a.len() as i32) == 0 { "allowed".into() } else { format!("denied wsa {}", WSAGetLastError()) });
+        if s != usize::MAX {
+            closesocket(s);
+        }
+        let l = socket(1, 1, 0);
+        let path = format!("{sockdir}\\c-{}.sock", c.scn);
+        let a = unix_addr(&path);
+        let r = if l == usize::MAX {
+            format!("socket denied wsa {}", WSAGetLastError())
+        } else if bind(l, a.as_ptr(), a.len() as i32) != 0 || listen(l, 1) != 0 {
+            format!("bind or listen denied wsa {}", WSAGetLastError())
+        } else {
+            let mut set = FdSet { count: 1, sockets: [0; 64] };
+            set.sockets[0] = l;
+            let timeout = [15i32, 0];
+            match select(0, &mut set, null_mut(), null_mut(), &timeout) {
+                1 => {
+                    let s = accept(l, null_mut(), null_mut());
+                    if s == usize::MAX { format!("accept failed wsa {}", WSAGetLastError()) } else { closesocket(s); "accepted".into() }
+                }
+                0 => "no connection in 15 s".into(),
+                _ => format!("select failed wsa {}", WSAGetLastError()),
+            }
+        };
+        c.out("unix-listen-for-outside", r);
+        if l != usize::MAX {
+            closesocket(l);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    // SAFETY: a pid.
+    let p = H(unsafe { OpenProcess(0x40, 0, parent) });
+    c.out("open-parent-dup-handle", if p.0.is_null() { last() } else { "allowed".into() });
+    match std::fs::read_to_string(handoff) {
+        Ok(text) => {
+            for (what, v) in ["plain-section", "large-page-section"].iter().zip(text.split(' ')) {
+                let r = match v.parse::<usize>() {
+                    Ok(v) => {
+                        // SAFETY: a handle value the parent duplicated into this process; FILE_MAP_READ.
+                        let view = unsafe { MapViewOfFile(v as HANDLE, 0x4, 0, 0, 0) };
+                        if view.is_null() {
+                            format!("given, map {}", last())
+                        } else {
+                            // SAFETY: a view of at least 64 KiB.
+                            let head = unsafe { std::slice::from_raw_parts(view.cast::<u8>(), 4) };
+                            format!("given, mapped, reads {:?}", String::from_utf8_lossy(head))
+                        }
+                    }
+                    Err(_) => format!("not given ({v})"),
+                };
+                c.out(what, r);
+            }
+        }
+        Err(e) => c.out("handoff-read", format!("denied {e}")),
+    }
+    // The Job's process memory limit is 256 MiB (`start`).
+    // SAFETY: MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE; released below.
+    let m = unsafe { VirtualAlloc(null_mut(), 300 << 20, 0x3000, 0x04) };
+    c.out("job-commit-300-mib", if m.is_null() { format!("refused {}", last()) } else { "allowed".into() });
+    if !m.is_null() {
+        // SAFETY: the allocation above; MEM_RELEASE.
+        unsafe { VirtualFree(m, 0, 0x8000) };
+    }
+    c.out("q-done", "");
 }
 
 #[allow(non_snake_case)]
@@ -3683,7 +3933,60 @@ struct Whp {
     run: unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32) -> i32,
     delete_vp: unsafe extern "system" fn(HANDLE, u32) -> i32,
     delete: unsafe extern "system" fn(HANDLE) -> i32,
+    /// The other exports the backend calls once a VM runs (`p_steps`), each
+    /// by name; one missing is printed and its step left out.
+    more: Vec<(&'static str, usize)>,
 }
+
+/// The exports of WinHvPlatform.dll that kvm-ioctls' WHP backend calls on a
+/// partition set up (crates/compat/kvm-ioctls/src/whp/whv.rs), besides
+/// [`Whp`]'s own.
+const WHP_MORE: &[&str] = &[
+    "WHvGetPartitionProperty",
+    "WHvUnmapGpaRange",
+    "WHvGetVirtualProcessorRegisters",
+    "WHvSetVirtualProcessorRegisters",
+    "WHvGetVirtualProcessorXsaveState",
+    "WHvGetVirtualProcessorInterruptControllerState",
+    "WHvRequestInterrupt",
+    "WHvSuspendPartitionTime",
+    "WHvResumePartitionTime",
+    "WHvCancelRunVirtualProcessor",
+    "WHvTranslateGva",
+    "WHvQueryGpaRangeDirtyBitmap",
+    "WHvAdviseGpaRange",
+];
+
+/// Every capability code of `WHV_CAPABILITY_CODE` (WinHvPlatformDefs.h;
+/// windows-sys' Win32::System::Hypervisor), the backend's among them.
+const WHP_CAPS: &[(u32, &str)] = &[
+    (0, "HypervisorPresent"),
+    (1, "Features"),
+    (2, "ExtendedVmExits"),
+    (3, "ExceptionExitBitmap"),
+    (4, "X64MsrExitBitmap"),
+    (5, "GpaRangePopulateFlags"),
+    (6, "SchedulerFeatures"),
+    (0x1000, "ProcessorVendor"),
+    (0x1001, "ProcessorFeatures"),
+    (0x1002, "ProcessorClFlushSize"),
+    (0x1003, "ProcessorXsaveFeatures"),
+    (0x1004, "ProcessorClockFrequency"),
+    (0x1005, "InterruptClockFrequency"),
+    (0x1006, "ProcessorFeaturesBanks"),
+    (0x1007, "ProcessorFrequencyCap"),
+    (0x1008, "SyntheticProcessorFeaturesBanks"),
+    (0x1009, "ProcessorPerfmonFeatures"),
+];
+
+/// `WHV_PARTITION_PROPERTY_CODE`s (windows-sys' Win32::System::Hypervisor).
+const WHV_PROP_EXTENDED_VM_EXITS: u32 = 1;
+const WHV_PROP_EXCEPTION_EXIT_BITMAP: u32 = 2;
+const WHV_PROP_X64_MSR_EXIT_BITMAP: u32 = 5;
+const WHV_PROP_CPUID_EXIT_LIST: u32 = 0x1003;
+const WHV_PROP_LOCAL_APIC_EMULATION_MODE: u32 = 0x1005;
+const WHV_PROP_PROCESSOR_XSAVE_FEATURES: u32 = 0x1006;
+const WHV_PROP_PROCESSOR_FEATURES_BANKS: u32 = 0x100A;
 
 fn show_hr(tag: &str, step: &str, hr: i32) {
     println!("{tag} {step} {:#010x}{}", hr as u32, if hr < 0 { " FAILED" } else { "" });
@@ -3707,9 +4010,23 @@ impl Whp {
         if p.iter().any(|x| x.is_null()) {
             return None;
         }
+        let more = WHP_MORE
+            .iter()
+            .filter_map(|&name| {
+                // SAFETY: a module handle and a NUL-terminated name.
+                let p = unsafe { GetProcAddress(m, format!("{name}\0").as_ptr()) };
+                if p.is_null() {
+                    println!("{tag} {name} missing");
+                    None
+                } else {
+                    Some((name, p as usize))
+                }
+            })
+            .collect();
         // SAFETY: the exports of WinHvPlatform.dll, with their documented signatures.
         unsafe {
             Some(Whp {
+                more,
                 get_cap: std::mem::transmute::<*const c_void, _>(p[0]),
                 create: std::mem::transmute::<*const c_void, _>(p[1]),
                 set_prop: std::mem::transmute::<*const c_void, _>(p[2]),
@@ -3807,6 +4124,289 @@ impl Whp {
         }
         // SAFETY: the partition made above.
         show_hr(tag, "WHvDeletePartition", unsafe { (self.delete)(part) });
+    }
+
+    /// The export `name` of [`WHP_MORE`], or none (printed missing at load).
+    fn more(&self, name: &str) -> Option<usize> {
+        self.more.iter().find(|(n, _)| *n == name).map(|&(_, p)| p)
+    }
+
+    /// Every capability code, one line each (HRESULT, bytes written, the
+    /// bytes); the lines, to compare a later read with.
+    fn caps(&self, tag: &str) -> Vec<String> {
+        WHP_CAPS
+            .iter()
+            .map(|&(code, name)| {
+                let mut buf = [0u8; 64];
+                let mut written = 0u32;
+                // SAFETY: a buffer of its size.
+                let hr = unsafe { (self.get_cap)(code, buf.as_mut_ptr().cast(), 64, &mut written) };
+                let hex: String = buf[..(written as usize).min(64)].iter().map(|b| format!("{b:02x}")).collect();
+                let line = format!("{name} {:#010x} {written} bytes {hex}", hr as u32);
+                println!("{tag} capability {line}");
+                line
+            })
+            .collect()
+    }
+
+    /// `WHvGetPartitionProperty` of `size` bytes, printed: the bytes, or none.
+    fn get_prop(&self, tag: &str, part: HANDLE, code: u32, name: &str, size: usize) -> Option<Vec<u8>> {
+        type F = unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32, *mut u32) -> i32;
+        let f = self.more("WHvGetPartitionProperty")?;
+        let mut buf = vec![0u8; size];
+        let mut written = 0u32;
+        // SAFETY: the export, of type F; a buffer of its size.
+        let hr = unsafe { std::mem::transmute::<usize, F>(f)(part, code, buf.as_mut_ptr().cast(), size as u32, &mut written) };
+        let hex: String = buf.iter().take(written as usize).map(|b| format!("{b:02x}")).collect();
+        println!("{tag} WHvGetPartitionProperty({name}) {:#010x}{} {written} bytes {hex}", hr as u32, if hr < 0 { " FAILED" } else { "" });
+        (hr >= 0).then_some(buf)
+    }
+
+    /// `WHvSetPartitionProperty` of `bytes`, printed.
+    fn set_prop_bytes(&self, tag: &str, part: HANDLE, code: u32, name: &str, bytes: &[u8]) -> i32 {
+        // SAFETY: the partition; a buffer of its size.
+        let hr = unsafe { (self.set_prop)(part, code, bytes.as_ptr().cast(), bytes.len() as u32) };
+        show_hr(tag, &format!("WHvSetPartitionProperty({name})"), hr);
+        hr
+    }
+
+    /// Option P's partition, made and set up before the revert as the
+    /// backend's `configure` makes a VM's (crates/compat/kvm-ioctls/src/whp/
+    /// vm.rs): more processors than the vCPUs made later, the exits, the
+    /// CPUID exit list, an xAPIC, the XSAVE components and processor
+    /// features WHP offers. Also the backend's second partition (its
+    /// register probe, `probe_registers`), made, set up, given a vCPU and
+    /// deleted. Returns the partition and the capabilities read, or none.
+    fn p_before(&self, tag: &str) -> Option<(HANDLE, Vec<String>)> {
+        let caps = self.caps(tag);
+        let mut devices = Vec::new();
+        if let Some((probe, set_up)) = self.make(&format!("{tag} register-probe-partition"), &mut devices) {
+            if set_up {
+                // SAFETY: the partition; vCPU 0, no flags.
+                show_hr(&format!("{tag} register-probe-partition"), "WHvCreateVirtualProcessor", unsafe { (self.create_vp)(probe, 0, 0) });
+            }
+            // SAFETY: the partition made above, with its vCPU.
+            show_hr(&format!("{tag} register-probe-partition"), "WHvDeletePartition", unsafe { (self.delete)(probe) });
+        }
+        let mut part = null_mut();
+        // SAFETY: an out-pointer.
+        let hr = unsafe { (self.create)(&mut part) };
+        show_hr(tag, "WHvCreatePartition", hr);
+        if hr < 0 {
+            return None;
+        }
+        self.set_prop_bytes(tag, part, WHV_PROCESSOR_COUNT, "ProcessorCount=4", &4u32.to_le_bytes());
+        let mut offered = 0u64;
+        let mut n = 0u32;
+        // SAFETY: a u64 of its size.
+        unsafe { (self.get_cap)(2, (&raw mut offered).cast(), 8, &mut n) };
+        // X64CpuidExit | X64MsrExit | HypercallExit where offered (debug::extended_vm_exits).
+        let exits = 0x3 | (offered & (1 << 5));
+        self.set_prop_bytes(tag, part, WHV_PROP_EXTENDED_VM_EXITS, &format!("ExtendedVmExits={exits:#x}"), &exits.to_le_bytes());
+        let leaves: Vec<u8> = (0x0u32..=0x24).chain([0x4000_0000, 0x4000_0001]).chain(0x8000_0000..=0x8000_0028).flat_map(u32::to_le_bytes).collect();
+        self.set_prop_bytes(tag, part, WHV_PROP_CPUID_EXIT_LIST, "CpuidExitList", &leaves);
+        // WHvX64LocalApicEmulationModeXApic.
+        self.set_prop_bytes(tag, part, WHV_PROP_LOCAL_APIC_EMULATION_MODE, "LocalApicEmulationMode=XApic", &1u32.to_le_bytes());
+        let mut xsave = 0u64;
+        // SAFETY: a u64 of its size.
+        if unsafe { (self.get_cap)(0x1003, (&raw mut xsave).cast(), 8, &mut n) } >= 0 && xsave != 0 {
+            self.set_prop_bytes(tag, part, WHV_PROP_PROCESSOR_XSAVE_FEATURES, "ProcessorXsaveFeatures", &xsave.to_le_bytes());
+        }
+        if let Some(banks) = self.get_prop(tag, part, WHV_PROP_PROCESSOR_FEATURES_BANKS, "ProcessorFeaturesBanks", 24) {
+            self.set_prop_bytes(tag, part, WHV_PROP_PROCESSOR_FEATURES_BANKS, "ProcessorFeaturesBanks", &banks);
+        }
+        // SAFETY: the partition.
+        let hr = unsafe { (self.setup)(part) };
+        show_hr(tag, "WHvSetupPartition", hr);
+        if hr < 0 {
+            // SAFETY: the partition made above.
+            unsafe { (self.delete)(part) };
+            return None;
+        }
+        Some((part, caps))
+    }
+
+    /// The rest of a VM's life on `p_before`'s partition, after the revert:
+    /// the capabilities read again (`before`: the lines read before the
+    /// revert); each property read; the properties the backend sets before
+    /// set-up, set again now; the two it sets later (exception exits, MSR
+    /// exits); memory with dirty tracking; two of the four vCPUs made and
+    /// one run to its HLT; each call the backend makes on a running VM; a
+    /// second partition; then the deletes.
+    fn p_after(&self, tag: &str, part: HANDLE, before: &[String]) {
+        let after = self.caps(tag);
+        let differ: Vec<&str> = WHP_CAPS.iter().zip(before.iter().zip(&after)).filter(|(_, (b, a))| b != a).map(|(&(_, n), _)| n).collect();
+        println!("{tag} capabilities-as-before-revert {}", if differ.is_empty() { "same".to_string() } else { format!("DIFFER {}", differ.join(",")) });
+        let props: [(u32, &str, usize); 7] = [
+            (WHV_PROCESSOR_COUNT, "ProcessorCount", 4),
+            (WHV_PROP_EXTENDED_VM_EXITS, "ExtendedVmExits", 8),
+            (WHV_PROP_EXCEPTION_EXIT_BITMAP, "ExceptionExitBitmap", 8),
+            (WHV_PROP_X64_MSR_EXIT_BITMAP, "X64MsrExitBitmap", 8),
+            (WHV_PROP_LOCAL_APIC_EMULATION_MODE, "LocalApicEmulationMode", 4),
+            (WHV_PROP_PROCESSOR_XSAVE_FEATURES, "ProcessorXsaveFeatures", 8),
+            (WHV_PROP_PROCESSOR_FEATURES_BANKS, "ProcessorFeaturesBanks", 24),
+        ];
+        let mut values = std::collections::HashMap::new();
+        for (code, name, size) in props {
+            if let Some(v) = self.get_prop(tag, part, code, name, size) {
+                values.insert(code, v);
+            }
+        }
+        // Set before set-up by the backend; each set again with the value it
+        // has (ProcessorCount with another), after set-up.
+        let late = format!("{tag} after-setup");
+        self.set_prop_bytes(&late, part, WHV_PROCESSOR_COUNT, "ProcessorCount=8", &8u32.to_le_bytes());
+        for (code, name) in [
+            (WHV_PROP_EXTENDED_VM_EXITS, "ExtendedVmExits"),
+            (WHV_PROP_LOCAL_APIC_EMULATION_MODE, "LocalApicEmulationMode"),
+            (WHV_PROP_PROCESSOR_XSAVE_FEATURES, "ProcessorXsaveFeatures"),
+            (WHV_PROP_PROCESSOR_FEATURES_BANKS, "ProcessorFeaturesBanks"),
+        ] {
+            if let Some(v) = values.get(&code) {
+                self.set_prop_bytes(&late, part, code, name, v);
+            }
+        }
+        let leaves: Vec<u8> = (0x0u32..=0x24).flat_map(u32::to_le_bytes).collect();
+        self.set_prop_bytes(&late, part, WHV_PROP_CPUID_EXIT_LIST, "CpuidExitList", &leaves);
+        // Set after set-up by the backend: the #GP exit (vm.rs `write_exits`,
+        // the gdb stub's and the x2APIC's) and TscMsrWrite (`tsc_write_exit`).
+        self.set_prop_bytes(&late, part, WHV_PROP_EXCEPTION_EXIT_BITMAP, "ExceptionExitBitmap=#GP", &(1u64 << 13).to_le_bytes());
+        self.set_prop_bytes(&late, part, WHV_PROP_EXCEPTION_EXIT_BITMAP, "ExceptionExitBitmap=0", &0u64.to_le_bytes());
+        if let Some(v) = values.get(&WHV_PROP_X64_MSR_EXIT_BITMAP) {
+            let with = u64::from_le_bytes(v[..8].try_into().unwrap()) | (1 << 1);
+            self.set_prop_bytes(&late, part, WHV_PROP_X64_MSR_EXIT_BITMAP, &format!("X64MsrExitBitmap={with:#x}"), &with.to_le_bytes());
+        }
+        // SAFETY: three committed read-write pages of our own.
+        let mem = unsafe { VirtualAlloc(null_mut(), 0x3000, 0x3000, 0x04) };
+        assert!(!mem.is_null(), "VirtualAlloc {}", last());
+        for (page, gpa, flags) in [(0usize, 0xFFFF_F000u64, 0x7u32), (0x1000, 0xF_F000, 0x7), (0x2000, 0x1000, 0xB)] {
+            if flags == 0x7 {
+                // SAFETY: within the pages.
+                unsafe { *mem.cast::<u8>().add(page + 0xFF0) = 0xF4 };
+            }
+            // SAFETY: the partition, our page; Read | Write | Execute, or Read | Write | TrackDirtyPages.
+            show_hr(tag, &format!("WHvMapGpaRange({gpa:#x},{flags:#x})"), unsafe { (self.map)(part, mem.cast::<u8>().add(page).cast(), gpa, 0x1000, flags) });
+        }
+        // Two of the four processors, as the backend makes the guest's vCPUs
+        // (fewer than ProcessorCount, its MAX_VCPUS).
+        let mut made = Vec::new();
+        for vp in [0u32, 1] {
+            // SAFETY: the partition; vCPU `vp`, no flags.
+            let hr = unsafe { (self.create_vp)(part, vp, 0) };
+            show_hr(tag, &format!("WHvCreateVirtualProcessor({vp} of 4)"), hr);
+            if hr >= 0 {
+                made.push(vp);
+            }
+        }
+        if made.contains(&0) {
+            let mut ctx = [0u64; WHV_EXIT_CONTEXT_SIZE as usize / 8];
+            // SAFETY: the partition, vCPU 0, an exit context of its size.
+            let hr = unsafe { (self.run)(part, 0, ctx.as_mut_ptr().cast(), WHV_EXIT_CONTEXT_SIZE) };
+            show_hr(tag, "WHvRunVirtualProcessor(0)", hr);
+            if hr >= 0 {
+                let reason = ctx[0] as u32;
+                println!("{tag} exit-reason {reason:#x}{}", if reason == WHV_EXIT_HALT { " (X64Halt: the guest's HLT)" } else { " (not the HLT)" });
+            }
+            self.p_running_calls(tag, part);
+        }
+        // A partition made now, as a retried InstanceStart or a second
+        // `Kvm`'s register probe would: option P has none after the revert.
+        let mut devices = Vec::new();
+        if let Some((second, set_up)) = self.make(&format!("{tag} second-partition"), &mut devices) {
+            println!("{tag} second-partition made, set-up {set_up}");
+            // SAFETY: the partition made above.
+            unsafe { (self.delete)(second) };
+        }
+        for vp in made.iter().rev() {
+            // SAFETY: a vCPU made above.
+            show_hr(tag, &format!("WHvDeleteVirtualProcessor({vp})"), unsafe { (self.delete_vp)(part, *vp) });
+        }
+        // The partition used again, as a retried InstanceStart would need
+        // under option P: its memory unmapped and its vCPUs gone, then
+        // mapped, a vCPU made and run again.
+        let again = format!("{tag} reuse");
+        if let Some(unmap) = self.more("WHvUnmapGpaRange") {
+            // SAFETY: the export, of this type (WinHvPlatform.h).
+            let unmap = unsafe { std::mem::transmute::<usize, unsafe extern "system" fn(HANDLE, u64, u64) -> i32>(unmap) };
+            for gpa in [0xFFFF_F000u64, 0xF_F000] {
+                // SAFETY: the partition; a range mapped above.
+                show_hr(&again, &format!("WHvUnmapGpaRange({gpa:#x})"), unsafe { unmap(part, gpa, 0x1000) });
+            }
+            for (page, gpa) in [(0usize, 0xFFFF_F000u64), (0x1000, 0xF_F000)] {
+                // SAFETY: the partition, our page; Read | Write | Execute.
+                show_hr(&again, &format!("WHvMapGpaRange({gpa:#x})"), unsafe { (self.map)(part, mem.cast::<u8>().add(page).cast(), gpa, 0x1000, 0x7) });
+            }
+            // SAFETY: the partition; vCPU 0, no flags.
+            let hr = unsafe { (self.create_vp)(part, 0, 0) };
+            show_hr(&again, "WHvCreateVirtualProcessor(0)", hr);
+            if hr >= 0 {
+                let mut ctx = [0u64; WHV_EXIT_CONTEXT_SIZE as usize / 8];
+                // SAFETY: the partition, vCPU 0, an exit context of its size.
+                let hr = unsafe { (self.run)(part, 0, ctx.as_mut_ptr().cast(), WHV_EXIT_CONTEXT_SIZE) };
+                show_hr(&again, "WHvRunVirtualProcessor(0)", hr);
+                if hr >= 0 {
+                    let reason = ctx[0] as u32;
+                    println!("{again} exit-reason {reason:#x}{}", if reason == WHV_EXIT_HALT { " (X64Halt: the guest's HLT)" } else { " (not the HLT)" });
+                }
+                // SAFETY: the vCPU just made.
+                show_hr(&again, "WHvDeleteVirtualProcessor(0)", unsafe { (self.delete_vp)(part, 0) });
+            }
+        }
+        // SAFETY: the partition made before the revert.
+        show_hr(tag, "WHvDeletePartition", unsafe { (self.delete)(part) });
+    }
+
+    /// The calls kvm-ioctls' WHP backend makes on a running VM, each once on
+    /// vCPU 0 and the pages `p_after` mapped, printed.
+    fn p_running_calls(&self, tag: &str, part: HANDLE) {
+        macro_rules! call {
+            ($name:literal, $ty:ty, |$f:ident| $body:expr) => {
+                if let Some(p) = self.more($name) {
+                    // SAFETY: the export, of the type given (WinHvPlatform.h).
+                    let $f = unsafe { std::mem::transmute::<usize, $ty>(p) };
+                    let hr: i32 = $body;
+                    show_hr(tag, $name, hr);
+                }
+            };
+        }
+        let rip = [16u32];
+        let mut value = [0u128; 1];
+        call!("WHvGetVirtualProcessorRegisters", unsafe extern "system" fn(HANDLE, u32, *const u32, u32, *mut u128) -> i32, |f| unsafe {
+            f(part, 0, rip.as_ptr(), 1, value.as_mut_ptr())
+        });
+        call!("WHvSetVirtualProcessorRegisters", unsafe extern "system" fn(HANDLE, u32, *const u32, u32, *const u128) -> i32, |f| unsafe {
+            f(part, 0, rip.as_ptr(), 1, value.as_ptr())
+        });
+        let mut buf = vec![0u64; 2048];
+        let mut written = 0u32;
+        call!("WHvGetVirtualProcessorXsaveState", unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32, *mut u32) -> i32, |f| unsafe {
+            f(part, 0, buf.as_mut_ptr().cast(), 16384, &mut written)
+        });
+        call!("WHvGetVirtualProcessorInterruptControllerState", unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32, *mut u32) -> i32, |f| unsafe {
+            f(part, 0, buf.as_mut_ptr().cast(), 16384, &mut written)
+        });
+        // WHV_INTERRUPT_CONTROL: fixed, physical, edge; APIC 0, vector 0x30.
+        let interrupt = [0u64, 0x30u64 << 32];
+        call!("WHvRequestInterrupt", unsafe extern "system" fn(HANDLE, *const u64, u32) -> i32, |f| unsafe { f(part, interrupt.as_ptr(), 16) });
+        call!("WHvSuspendPartitionTime", unsafe extern "system" fn(HANDLE) -> i32, |f| unsafe { f(part) });
+        call!("WHvResumePartitionTime", unsafe extern "system" fn(HANDLE) -> i32, |f| unsafe { f(part) });
+        call!("WHvCancelRunVirtualProcessor", unsafe extern "system" fn(HANDLE, u32, u32) -> i32, |f| unsafe { f(part, 0, 0) });
+        let (mut result, mut gpa) = (0u64, 0u64);
+        // WHvTranslateGvaFlagValidateRead.
+        call!("WHvTranslateGva", unsafe extern "system" fn(HANDLE, u32, u64, u32, *mut u64, *mut u64) -> i32, |f| unsafe {
+            f(part, 0, 0xFFF0, 1, &mut result, &mut gpa)
+        });
+        let mut bitmap = 0u64;
+        call!("WHvQueryGpaRangeDirtyBitmap", unsafe extern "system" fn(HANDLE, u64, u64, *mut u64, u32) -> i32, |f| unsafe {
+            f(part, 0x1000, 0x1000, &mut bitmap, 8)
+        });
+        // WHvAdviseGpaRangeCodePopulate of the dirty-tracked page, for read.
+        let range = [0x1000u64, 0x1000];
+        let populate = [0u32, 0];
+        call!("WHvAdviseGpaRange", unsafe extern "system" fn(HANDLE, *const u64, u32, i32, *const c_void, u32) -> i32, |f| unsafe {
+            f(part, range.as_ptr(), 1, 0, populate.as_ptr().cast(), 8)
+        });
+        call!("WHvUnmapGpaRange", unsafe extern "system" fn(HANDLE, u64, u64) -> i32, |f| unsafe { f(part, 0x1000, 0x1000) });
     }
 }
 
@@ -3918,28 +4518,44 @@ fn whp_token(base: &str) {
     let profile = format!("wick.whp-token.{}", std::process::id());
     let (ac_psid, ac_made) = appcontainer_profile(&profile);
     let ac_sid = sid_string(ac_psid);
+    // An AppContainer SID with no profile: DeriveAppContainerSidFromAppContainerName
+    // of a name never registered, as a jailer could give each jail without
+    // making and deleting a profile.
+    let bare_psid = appcontainer_sid(&format!("{profile}.bare"));
+    let bare_sid = sid_string(bare_psid);
     // (name, the lockdown token's restricting SIDs besides the jail's, or
-    // None for an AppContainer with the given capabilities; preload; the
-    // partition made and set up before the revert).
+    // None for an AppContainer with the given capabilities; LPAC; the
+    // profile's SID or the bare one; preload; when the partition is made:
+    // "0" after the revert, "1" made and set up before it, "p" option P's
+    // whole life, `Whp::p_before` and `Whp::p_after`).
     let none: Vec<&str> = Vec::new();
-    let variants: Vec<(&str, Option<Vec<&str>>, Vec<&str>, bool, bool)> = vec![
-        ("jail-as-now", Some(session.to_vec()), none.clone(), true, false),
-        ("jail-own-sid", Some(Vec::new()), none.clone(), true, false),
-        ("jail-own-sid-no-preload", Some(Vec::new()), none.clone(), false, false),
-        ("jail-au", Some(vec!["S-1-5-11"]), none.clone(), true, false),
-        ("jail-everyone", Some(vec!["S-1-1-0"]), none.clone(), true, false),
-        ("jail-users", Some(vec!["S-1-5-32-545"]), none.clone(), true, false),
-        ("jail-interactive", Some(vec!["S-1-5-4"]), none.clone(), true, false),
-        ("jail-own-sid-made-before-revert", Some(Vec::new()), none.clone(), true, true),
-        ("jail-as-now-made-before-revert", Some(session.to_vec()), none.clone(), true, true),
-        ("jail-cap", Some(vec![cap.as_str()]), none.clone(), true, false),
-        ("appcontainer", None, none.clone(), true, false),
-        ("appcontainer-cap", None, vec!["hypervisorPlatform"], true, false),
+    let hv = vec!["hypervisorPlatform"];
+    let variants: Vec<(&str, Option<Vec<&str>>, Vec<&str>, bool, bool, bool, &str)> = vec![
+        ("jail-as-now", Some(session.to_vec()), none.clone(), false, true, true, "0"),
+        ("jail-own-sid", Some(Vec::new()), none.clone(), false, true, true, "0"),
+        ("jail-own-sid-no-preload", Some(Vec::new()), none.clone(), false, true, false, "0"),
+        ("jail-au", Some(vec!["S-1-5-11"]), none.clone(), false, true, true, "0"),
+        ("jail-everyone", Some(vec!["S-1-1-0"]), none.clone(), false, true, true, "0"),
+        ("jail-users", Some(vec!["S-1-5-32-545"]), none.clone(), false, true, true, "0"),
+        ("jail-interactive", Some(vec!["S-1-5-4"]), none.clone(), false, true, true, "0"),
+        // The two devices' groups together (VidExo's Authenticated Users,
+        // HvService's Everyone), and Authenticated Users with Users.
+        ("jail-au-everyone", Some(vec!["S-1-5-11", "S-1-1-0"]), none.clone(), false, true, true, "0"),
+        ("jail-au-users", Some(vec!["S-1-5-11", "S-1-5-32-545"]), none.clone(), false, true, true, "0"),
+        ("jail-own-sid-made-before-revert", Some(Vec::new()), none.clone(), false, true, true, "1"),
+        ("jail-as-now-made-before-revert", Some(session.to_vec()), none.clone(), false, true, true, "1"),
+        ("jail-own-sid-p", Some(Vec::new()), none.clone(), false, true, true, "p"),
+        ("jail-cap", Some(vec![cap.as_str()]), none.clone(), false, true, true, "0"),
+        ("appcontainer", None, none.clone(), false, true, true, "0"),
+        ("appcontainer-cap", None, hv.clone(), false, true, true, "0"),
+        ("appcontainer-cap-bare-sid", None, hv.clone(), false, false, true, "0"),
+        ("lpac-cap", None, hv.clone(), true, true, true, "0"),
+        ("lpac-cap-registry-com", None, vec!["hypervisorPlatform", "registryRead", "lpacCom"], true, true, true, "0"),
     ];
     // As the jail's root: the jail's SID may read and run what is there,
-    // and the AppContainer's.
-    assert_eq!(set_dacl(&bin, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;0x1200a9;;;{jail_sid})(A;OICI;0x1200a9;;;{ac_sid})")), 0);
-    for (name, groups, caps, preload, early) in &variants {
+    // and the AppContainers'.
+    assert_eq!(set_dacl(&bin, &format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})(A;OICI;0x1200a9;;;{jail_sid})(A;OICI;0x1200a9;;;{ac_sid})(A;OICI;0x1200a9;;;{bare_sid})")), 0);
+    for (name, groups, caps, lpac, profiled, preload, early) in &variants {
         let who = if let Some(groups) = groups {
             let mut restricting = vec![jail_sid.as_str()];
             restricting.extend(groups.iter().copied());
@@ -3965,10 +4581,11 @@ fn whp_token(base: &str) {
             set_integrity(initial, "S-1-16-6144");
             Who::Restricted { primary, initial: impersonation(initial) }
         } else {
-            Who::AppContainer { sid: ac_psid, caps: caps.iter().map(|c| capability_sid(c)).collect(), lpac: false }
+            let sid = if *profiled { ac_psid } else { bare_psid };
+            Who::AppContainer { sid, caps: caps.iter().map(|c| capability_sid(c)).collect(), lpac: *lpac }
         };
         let out = inheritable(GetStd(-11));
-        let cmd = format!("\"{exe}\" whp-token-child {name} {} {}", u8::from(*preload), u8::from(*early));
+        let cmd = format!("\"{exe}\" whp-token-child {name} {} {early}", u8::from(*preload));
         match start(&cmd, &bin, &who, null_mut(), null_mut(), &[out], [out, out, out], true) {
             // SAFETY: the suspended child.
             Ok(child) => unsafe {
@@ -4001,7 +4618,8 @@ fn whp_token(base: &str) {
 fn whp_token_child(args: &[String]) {
     let tag = &args[0];
     let preload = args[1] == "1";
-    let early = args.get(2).is_some_and(|a| a == "1");
+    let p = args.get(2).is_some_and(|a| a == "p");
+    let early = p || args.get(2).is_some_and(|a| a == "1");
     let mut m = null_mut();
     if preload {
         m = load_system32(tag, "preload", "WinHvPlatform.dll");
@@ -4009,6 +4627,21 @@ fn whp_token_child(args: &[String]) {
     }
     let mut devices = Vec::new();
     let before = format!("{tag} before-revert");
+    if p {
+        let whp = if m.is_null() { None } else { Whp::load(tag, m) };
+        let made = whp.as_ref().and_then(|w| w.p_before(&before));
+        // SAFETY: plain call; the initial token goes.
+        let reverted = unsafe { RevertToSelf() } != 0;
+        // SAFETY: the pseudo handle of this process's token (GetCurrentProcessToken).
+        let restricted = unsafe { IsTokenRestricted(-4isize as HANDLE) } != 0;
+        println!("{tag} revert {reverted} token-restricted {restricted}");
+        whp_device_opens(tag);
+        match (whp, made) {
+            (Some(w), Some((part, caps))) => w.p_after(&format!("{tag} after-revert"), part, &caps),
+            _ => println!("{tag} no partition was made before the revert"),
+        }
+        return;
+    }
     let made = if early && !m.is_null() {
         Whp::load(tag, m).and_then(|w| {
             w.present(&before);
