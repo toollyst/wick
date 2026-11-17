@@ -5013,9 +5013,15 @@ mod tests {
     /// the missing pages made `PROT_NONE`, which would store "nothing" for
     /// pages the guest may use). Then a read after the register gets the
     /// asked protection of its missing pages. Without the count the register
-    /// does not wait, and the hook's wait for it fails.
+    /// does not wait, and the hook's wait for it fails. In a process of its
+    /// own, as the other race tests: another test's register in flight
+    /// (`REGISTERING`) sends the read down the locked path, where the hook
+    /// is not called ("the change did not run without the lock").
     #[test]
     fn test_a_protection_read_racing_a_register_is_the_asked_one() {
+        if !in_own_process("wick_uffd::tests::test_a_protection_read_racing_a_register_is_the_asked_one") {
+            return;
+        }
         let (a, ua) = create(0, false, true).unwrap();
         let ps = test_page_size();
         let mem = map(2);
