@@ -19,6 +19,11 @@ pub(crate) fn ewouldblock() -> io::Error {
     io::Error::from_raw_os_error(WSAEWOULDBLOCK)
 }
 
+/// `ELOOP` (`libc::ELOOP`).
+pub(crate) fn eloop() -> io::Error {
+    io::Error::from_raw_os_error(libc::ELOOP)
+}
+
 /// `EBADF`.
 #[allow(dead_code)]
 pub(crate) fn ebadf() -> io::Error {

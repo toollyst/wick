@@ -35,8 +35,12 @@
 //!   once (`test_pipe_write_room_reads_0_while_a_read_waits`), so
 //!   [`EventSet::OUT`] fails with `ERROR_NOT_SUPPORTED`.
 //!
-//! - another [`Epoll`] (a nested epoll): readable while it has something to
-//!   report; a forwarder thread waits on its completion port (see `Nest`).
+//! - another [`Epoll`] (a nested epoll): readable while its own wait would
+//!   report something, checked when the outer instance looks, as Linux
+//!   polls a nested instance's ready items again; a forwarder thread waits
+//!   on its completion port (see `Nest`). As on Linux, an addition that
+//!   would close a loop, or make a chain of instances watching each other
+//!   deeper than 4 (`EP_MAX_NESTS`), fails with `ELOOP`.
 //!
 //! Like Linux, regular files cannot be registered (`EPERM`).
 //! [`EventSet::ONE_SHOT`] is supported.
@@ -91,7 +95,7 @@ use windows_sys::Win32::System::Console::{
     ENABLE_LINE_INPUT, INPUT_RECORD, KEY_EVENT,
 };
 
-use super::errors::einval;
+use super::errors::{einval, eloop};
 pub use crate::epoll_types::{epoll_event, ControlOperation, EpollEvent, EventSet};
 
 fn os_error(code: u32) -> io::Error {
@@ -128,14 +132,30 @@ enum Kind {
 /// process with `STATUS_THREADPOOL_HANDLE_EXCEPTION`. So once an instance is
 /// nested, a forwarder thread waits on its port in its place, keeps the
 /// packets for the instance's next [`Epoll::wait`], and sets `wake`, the
-/// manual-reset event the outer instance watches. The instance is readable
-/// while `wake` is set; its [`Epoll::wait`] resets it, then waits on it in
-/// place of the port. The forwarder waits for that before it waits on the
-/// port again: a level-triggered source still ready posts again, without
-/// spinning while nobody takes the packets.
+/// manual-reset event the outer instance's port waits on. Its
+/// [`Epoll::wait`] resets `wake`, then waits on it in place of the port.
+/// The forwarder waits for that before it waits on the port again: a
+/// level-triggered source still ready posts again, without spinning while
+/// nobody takes the packets.
+///
+/// `wake` only wakes the outer instance. Whether the instance is readable
+/// is decided when the outer one looks ([`Nest::ready_now`]), as Linux's
+/// `__ep_eventpoll_poll` polls each item of the ready list again
+/// (`ep_item_poll`) and reports `EPOLLIN` only if one is ready now
+/// (fs/eventpoll.c): a kept packet its own wait would report, or a
+/// level-triggered source ready now. A packet can be stale by then: the
+/// forwarder keeps a packet from before the instance's own wait read its
+/// source, and sets `wake` after that wait
+/// (`test_nested_epoll_stale_packets_do_not_make_the_outer_ready`). Linux
+/// drops an item found not ready from the ready list; so the packets that
+/// would report nothing are dropped, `wake` is reset and the forwarder
+/// waits on the port again.
 #[derive(Debug)]
 struct Nest {
     poller: Arc<Poller>,
+    /// The instance's interest list (`Epoll::interests`), locked after
+    /// `pending`.
+    interests: Arc<Mutex<HashMap<RawFd, Interest>>>,
     wake: OwnedHandle,
     /// Set (auto-reset) when the packets were taken.
     taken: OwnedHandle,
@@ -144,6 +164,14 @@ struct Nest {
     stop: AtomicBool,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
+
+/// How deep instances may watch each other, as Linux's `EP_MAX_NESTS`.
+const MAX_NESTS: usize = 4;
+
+/// Held while an instance is added to another, before either's interest
+/// list, as Linux's `epnested_mutex` (fs/eventpoll.c `ep_ctl_lock`): no two
+/// additions can close a loop between them.
+static NESTING: Mutex<()> = Mutex::new(());
 
 fn new_event(manual: bool) -> io::Result<OwnedHandle> {
     // SAFETY: creates an unnamed event, not signalled.
@@ -162,10 +190,78 @@ fn nests() -> &'static Mutex<HashMap<RawFd, std::sync::Weak<Nest>>> {
     NESTS.get_or_init(Mutex::default)
 }
 
+/// The instance `fd` names, if it is the one whose event is `wake` (a
+/// registration made when it was added).
+fn nest_of(fd: RawFd, wake: RawFd) -> Option<Arc<Nest>> {
+    let nest = nests().lock().unwrap().get(&fd).and_then(std::sync::Weak::upgrade)?;
+    (nest.wake_fd() == wake).then_some(nest)
+}
+
+/// Whether `to` may be added to `into`: no loop, and no chain of instances
+/// watching each other longer than [`MAX_NESTS`], counting the instances
+/// above `into` as well as those below `to`, as Linux's `ep_loop_check`
+/// (fs/eventpoll.c, since f2e467a48287 "eventpoll: Fix semi-unbounded
+/// recursion"; `EP_MAX_NESTS` itself bounds the walks here). Called under
+/// [`NESTING`], so no instance gains a nested one meanwhile.
+fn nesting_allowed(into: &Arc<Nest>, to: &Arc<Nest>) -> bool {
+    type Edges = [(*const Nest, *const Nest)];
+    // ep_loop_check_proc: the depth below `n`; past MAX_NESTS on a loop.
+    fn down(n: *const Nest, into: *const Nest, edges: &Edges, depth: usize) -> usize {
+        let mut result = 0;
+        for &(_, child) in edges.iter().filter(|(parent, _)| *parent == n) {
+            if child == into || depth > MAX_NESTS {
+                return MAX_NESTS + 1;
+            }
+            result = result.max(down(child, into, edges, depth + 1) + 1);
+            if result > MAX_NESTS {
+                return result;
+            }
+        }
+        result
+    }
+    // ep_get_upwards_depth_proc: the depth above `n`.
+    fn up(n: *const Nest, edges: &Edges, depth: usize) -> usize {
+        if depth > MAX_NESTS {
+            return MAX_NESTS + 1;
+        }
+        edges
+            .iter()
+            .filter(|(_, child)| *child == n)
+            .map(|&(parent, _)| up(parent, edges, depth + 1) + 1)
+            .max()
+            .unwrap_or(0)
+    }
+    let all: Vec<Arc<Nest>> = nests()
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    // Which instance watches which, each list locked on its own. The
+    // children are kept, so that no address is reused during the check.
+    let mut edges: Vec<(*const Nest, *const Nest)> = Vec::new();
+    let mut children: Vec<Arc<Nest>> = Vec::new();
+    for nest in &all {
+        let interests = nest.interests.lock().unwrap();
+        for (fd, interest) in interests.iter() {
+            if let Kind::Epoll { wake } = interest.kind {
+                if let Some(child) = nest_of(*fd, wake) {
+                    edges.push((Arc::as_ptr(nest), Arc::as_ptr(&child)));
+                    children.push(child);
+                }
+            }
+        }
+    }
+    let into = Arc::as_ptr(into);
+    let depth = down(Arc::as_ptr(to), into, &edges, 0);
+    depth <= MAX_NESTS && depth + 1 + up(into, &edges, 0) <= MAX_NESTS
+}
+
 impl Nest {
-    fn new(poller: Arc<Poller>) -> io::Result<Arc<Self>> {
+    fn new(poller: Arc<Poller>, interests: Arc<Mutex<HashMap<RawFd, Interest>>>) -> io::Result<Arc<Self>> {
         Ok(Arc::new(Nest {
             poller,
+            interests,
             wake: new_event(true)?,
             taken: new_event(false)?,
             pending: Mutex::default(),
@@ -230,6 +326,204 @@ impl Nest {
         // SAFETY: as above.
         unsafe { SetEvent(self.taken.as_raw_handle()) };
         fired
+    }
+
+    /// Whether the instance's wait would report something now: what the
+    /// outer instance reports it readable for, as Linux's
+    /// `__ep_eventpoll_poll` (fs/eventpoll.c). Nothing is consumed: the
+    /// packets stay for the instance's wait and no one-shot or
+    /// edge-triggered registration is disarmed, as `ep_item_poll` only
+    /// polls. Packets that would report nothing (a source read since, a
+    /// registration gone or disarmed) are dropped, as Linux drops an item
+    /// found not ready from the ready list, with what the instance's wait
+    /// does for them (a pipe found empty resets its watcher's event); then
+    /// `wake` is reset and the forwarder waits on the port again, where a
+    /// source still ready posts again. Allocates nothing.
+    fn ready_now(&self) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        let interests = self.interests.lock().unwrap();
+        if pending.iter().any(|ev| reports(ev, &interests)) || any_level_ready(&interests) {
+            return true;
+        }
+        if pending.is_empty() {
+            return false;
+        }
+        for ev in pending.iter() {
+            let (fd, _) = unkey(ev.key);
+            if let Some(Interest {
+                kind: Kind::Pipe { event },
+                ..
+            }) = interests.get(&fd)
+            {
+                if pipe_state(fd) == PipeState::Empty {
+                    // SAFETY: the event is open while registered.
+                    unsafe { ResetEvent(handle(*event)) };
+                }
+            }
+        }
+        pending.clear();
+        // SAFETY: the events are open while `self` is.
+        unsafe { ResetEvent(self.wake.as_raw_handle()) };
+        drop(interests);
+        drop(pending);
+        // SAFETY: as above.
+        unsafe { SetEvent(self.taken.as_raw_handle()) };
+        false
+    }
+}
+
+/// Whether the instance `fd` names, registered with `wake`, is readable
+/// now ([`Nest::ready_now`]); not if it is gone.
+fn nested_ready(fd: RawFd, wake: RawFd) -> bool {
+    nest_of(fd, wake).is_some_and(|nest| nest.ready_now())
+}
+
+/// Whether a packet or direct check would be reported by the wait of the
+/// instance whose interest list is `interests` (as [`Epoll::collect`]
+/// reports it, without disarming anything).
+fn reports(ev: &Fired, interests: &HashMap<RawFd, Interest>) -> bool {
+    let (fd, sub) = unkey(ev.key);
+    let Some(interest) = interests.get(&fd) else {
+        return false;
+    };
+    !interest.disarmed
+        && !wakes_only(ev, interest)
+        && !(fired_bits(ev, fd, sub, interest) & reportable(interest)).is_empty()
+}
+
+/// Whether a level-triggered source of the instance whose interest list is
+/// `interests` is ready now (what [`Epoll::sweep`] finds, as its wait
+/// would report it).
+fn any_level_ready(interests: &HashMap<RawFd, Interest>) -> bool {
+    let mut ready = false;
+    for (fd, interest) in interests {
+        level_fired(*fd, interest, &mut |ev| ready = ready || reports(&ev, interests));
+        if ready {
+            return true;
+        }
+    }
+    false
+}
+
+/// A packet that only wakes the wait: an eventfd's state now is in the
+/// sweep that follows (the packet may predate a read); the same for a
+/// nested instance, whose wait resets its event.
+fn wakes_only(ev: &Fired, interest: &Interest) -> bool {
+    ev.packet && matches!(interest.kind, Kind::EventFd { .. } | Kind::Epoll { .. }) && !interest.edge()
+}
+
+/// What a registration reports: what was asked for, plus the conditions
+/// epoll always reports.
+fn reportable(interest: &Interest) -> EventSet {
+    interest.events | EventSet::ERROR | EventSet::HANG_UP
+}
+
+/// The events a packet or direct check of `fd`'s source `sub` stands for,
+/// before [`reportable`]. Consumes nothing, but for console records that
+/// read as no bytes ([`console_ready`]), which no reader sees.
+fn fired_bits(ev: &Fired, fd: RawFd, sub: usize, interest: &Interest) -> EventSet {
+    let mut bits = EventSet::empty();
+    match (interest.kind, sub) {
+        (Kind::Socket | Kind::Redirect, _) => {
+            if ev.readable {
+                bits |= EventSet::IN;
+                if socket_hung_up(interest.armed) {
+                    bits |= EventSet::HANG_UP | EventSet::READ_HANG_UP;
+                }
+            }
+            if ev.writable {
+                bits |= EventSet::OUT;
+            }
+            if ev.interrupt {
+                bits |= EventSet::HANG_UP | EventSet::ERROR;
+            }
+            if ev.err {
+                bits |= EventSet::ERROR;
+            }
+        }
+        (Kind::EventFd { .. }, SUB_SPACE) => bits |= EventSet::OUT,
+        (Kind::Pipe { .. }, _) => match pipe_state(fd) {
+            PipeState::Data => bits |= EventSet::IN,
+            PipeState::Closed => bits |= EventSet::IN | EventSet::HANG_UP,
+            PipeState::Empty => {}
+        },
+        (Kind::Console, _) => {
+            if console_ready(handle(fd)) {
+                bits |= EventSet::IN;
+            }
+        }
+        _ => bits |= EventSet::IN,
+    }
+    bits
+}
+
+/// Calls `out` with each level-triggered source of `fd` that is ready now
+/// (eventfds, sockets, pipes and nested instances), checked without
+/// consuming anything.
+fn level_fired(fd: RawFd, interest: &Interest, out: &mut impl FnMut(Fired)) {
+    if interest.disarmed || interest.edge() {
+        return;
+    }
+    let want_in = interest.events.contains(EventSet::IN);
+    let want_out = interest.events.contains(EventSet::OUT);
+    let fired = |sub, readable, writable, err| Fired {
+        key: key(fd, sub),
+        readable,
+        writable,
+        interrupt: false,
+        err,
+        packet: false,
+    };
+    match interest.kind {
+        Kind::EventFd { space } => {
+            if want_in && signalled(fd) {
+                out(fired(SUB_MAIN, true, false, false));
+            }
+            if want_out && signalled(space) {
+                out(fired(SUB_SPACE, true, false, false));
+            }
+        }
+        Kind::Socket | Kind::Redirect => {
+            let mut events = 0;
+            if want_in {
+                events |= POLLRDNORM;
+            }
+            if want_out {
+                events |= POLLWRNORM;
+            }
+            let mut pfd = WSAPOLLFD {
+                fd: socket(interest.armed),
+                events,
+                revents: 0,
+            };
+            // SAFETY: one valid entry, no wait.
+            if unsafe { WSAPoll(&mut pfd, 1, 0) } > 0 {
+                let r = pfd.revents;
+                let readable = r & (POLLRDNORM | POLLHUP) != 0;
+                let writable = r & POLLWRNORM != 0;
+                let err = r & POLLERR != 0;
+                if readable || writable || err {
+                    out(fired(SUB_MAIN, readable, writable, err));
+                }
+            }
+        }
+        // Console readiness is checked when collected; other handles may be
+        // auto-reset, which a check would consume.
+        Kind::Console | Kind::Waitable => {}
+        // Checked directly, as it consumes nothing.
+        Kind::Pipe { .. } => {
+            if want_in && pipe_state(fd) != PipeState::Empty {
+                out(fired(SUB_MAIN, true, false, false));
+            }
+        }
+        // What the nested instance's own wait would report, checked as Linux
+        // polls a nested instance (`ep_item_poll`), not its event, which a
+        // stale packet can have set.
+        Kind::Epoll { wake } => {
+            if want_in && nested_ready(fd, wake) {
+                out(fired(SUB_MAIN, true, false, false));
+            }
+        }
     }
 }
 
@@ -430,7 +724,8 @@ fn is_socket(fd: RawFd) -> bool {
     }
 }
 
-fn kind_of(fd: RawFd) -> io::Result<Kind> {
+/// How `fd` is watched; `nested` is the instance it names, if it is one.
+fn kind_of(fd: RawFd, nested: Option<&Arc<Nest>>) -> io::Result<Kind> {
     if libc::wick_fd::attached::<Redirect>(fd).is_some() {
         return Ok(Kind::Redirect);
     }
@@ -440,8 +735,7 @@ fn kind_of(fd: RawFd) -> io::Result<Kind> {
     if is_socket(fd) {
         return Ok(Kind::Socket);
     }
-    let nest = nests().lock().unwrap().get(&fd).and_then(std::sync::Weak::upgrade);
-    if let Some(nest) = nest {
+    if let Some(nest) = nested {
         nest.start()?;
         return Ok(Kind::Epoll {
             wake: nest.wake_fd(),
@@ -612,7 +906,8 @@ thread_local! {
 #[derive(Debug)]
 pub struct Epoll {
     poller: Arc<Poller>,
-    interests: Mutex<HashMap<RawFd, Interest>>,
+    /// Shared with `nest`, for an outer instance's look ([`Nest::ready_now`]).
+    interests: Arc<Mutex<HashMap<RawFd, Interest>>>,
     /// Locked after `interests`.
     links: Mutex<HashMap<RawFd, Links>>,
     nest: Arc<Nest>,
@@ -625,10 +920,11 @@ impl Epoll {
     pub fn new() -> io::Result<Self> {
         libc::wick_nofile::check(1)?;
         let poller = Arc::new(Poller::new()?);
-        let nest = Nest::new(poller.clone())?;
+        let interests = Arc::default();
+        let nest = Nest::new(poller.clone(), Arc::clone(&interests))?;
         let epoll = Epoll {
             poller,
-            interests: Mutex::default(),
+            interests,
             links: Mutex::default(),
             nest,
         };
@@ -711,6 +1007,21 @@ impl Epoll {
 
     /// Adds, changes or removes `fd` in the interest list.
     pub fn ctl(&self, operation: ControlOperation, fd: RawFd, event: EpollEvent) -> io::Result<()> {
+        // An instance added to another: checked for loops and depth under
+        // `NESTING`, taken before any interest list, as Linux takes
+        // `epnested_mutex` and runs `ep_loop_check` before the instance's
+        // own lock (fs/eventpoll.c `ep_ctl_lock`).
+        let nested = match operation {
+            ControlOperation::Add => nests().lock().unwrap().get(&fd).and_then(std::sync::Weak::upgrade),
+            _ => None,
+        };
+        let _nesting = nested.as_ref().map(|_| NESTING.lock().unwrap());
+        if let Some(to) = &nested {
+            // An instance in itself is EINVAL, as on Linux (below).
+            if fd != self.as_raw_fd() && !nesting_allowed(&self.nest, to) {
+                return Err(eloop());
+            }
+        }
         let mut interests = self.interests.lock().unwrap();
         let events = event.event_set();
         match operation {
@@ -731,7 +1042,7 @@ impl Epoll {
                 }
                 let kind = match old {
                     Some(old) => old.kind,
-                    None => kind_of(fd)?,
+                    None => kind_of(fd, nested.as_ref())?,
                 };
                 let mut links = self.links.lock().unwrap();
                 let mut link = Links::default();
@@ -851,9 +1162,10 @@ impl Epoll {
     /// wait allocated them before (the packets' room twice the caller's,
     /// for the event manager's 256 events), on every pass of the VMM's
     /// event loop, as the macOS instance did (d0dbe31;
-    /// `test_a_wait_allocates_nothing`). A nested instance's packets
-    /// (`Nest::take`) and a console in line input mode (`line_ready`) still
-    /// allocate when they are there.
+    /// `test_a_wait_allocates_nothing`). Looking at an instance nested in
+    /// this one (`Nest::ready_now`) allocates nothing either. A nested
+    /// instance's own packets (`Nest::take`) and a console in line input
+    /// mode (`line_ready`) still allocate when they are there.
     pub fn wait(&self, timeout: i32, events: &mut [EpollEvent]) -> io::Result<usize> {
         let Some(cap) = NonZeroUsize::new(events.len()) else {
             return Err(einval());
@@ -921,73 +1233,12 @@ impl Epoll {
         }
     }
 
-    /// Adds the level-triggered eventfds and sockets that are ready now to
-    /// `out`.
+    /// Adds the level-triggered sources that are ready now to `out`
+    /// ([`level_fired`]).
     fn sweep(&self, out: &mut Vec<Fired>) {
         let interests = self.interests.lock().unwrap();
         for (fd, interest) in interests.iter() {
-            if interest.disarmed || interest.edge() {
-                continue;
-            }
-            let want_in = interest.events.contains(EventSet::IN);
-            let want_out = interest.events.contains(EventSet::OUT);
-            let fired = |sub, readable, writable, err| Fired {
-                key: key(*fd, sub),
-                readable,
-                writable,
-                interrupt: false,
-                err,
-                packet: false,
-            };
-            match interest.kind {
-                Kind::EventFd { space } => {
-                    if want_in && signalled(*fd) {
-                        out.push(fired(SUB_MAIN, true, false, false));
-                    }
-                    if want_out && signalled(space) {
-                        out.push(fired(SUB_SPACE, true, false, false));
-                    }
-                }
-                Kind::Socket | Kind::Redirect => {
-                    let mut events = 0;
-                    if want_in {
-                        events |= POLLRDNORM;
-                    }
-                    if want_out {
-                        events |= POLLWRNORM;
-                    }
-                    let mut pfd = WSAPOLLFD {
-                        fd: socket(interest.armed),
-                        events,
-                        revents: 0,
-                    };
-                    // SAFETY: one valid entry, no wait.
-                    if unsafe { WSAPoll(&mut pfd, 1, 0) } > 0 {
-                        let r = pfd.revents;
-                        let readable = r & (POLLRDNORM | POLLHUP) != 0;
-                        let writable = r & POLLWRNORM != 0;
-                        let err = r & POLLERR != 0;
-                        if readable || writable || err {
-                            out.push(fired(SUB_MAIN, readable, writable, err));
-                        }
-                    }
-                }
-                // Console readiness is checked when collected; other handles
-                // may be auto-reset, which a check would consume.
-                Kind::Console | Kind::Waitable => {}
-                // Checked directly, as it consumes nothing.
-                Kind::Pipe { .. } => {
-                    if want_in && pipe_state(*fd) != PipeState::Empty {
-                        out.push(fired(SUB_MAIN, true, false, false));
-                    }
-                }
-                // A manual-reset event: checked directly.
-                Kind::Epoll { wake } => {
-                    if want_in && signalled(wake) {
-                        out.push(fired(SUB_MAIN, true, false, false));
-                    }
-                }
-            }
+            level_fired(*fd, interest, &mut |ev| out.push(ev));
         }
     }
 
@@ -1003,54 +1254,17 @@ impl Epoll {
             if interest.disarmed {
                 continue;
             }
-            // An eventfd's packet only wakes the wait: its state now is in
-            // the sweep that follows (the packet may predate a read).
-            // The same for a nested instance, whose wait resets its event.
-            if ev.packet
-                && matches!(interest.kind, Kind::EventFd { .. } | Kind::Epoll { .. })
-                && !interest.edge()
-            {
+            if wakes_only(ev, &interest) {
                 continue;
             }
-            let mut bits = EventSet::empty();
-            match (interest.kind, sub) {
-                (Kind::Socket | Kind::Redirect, _) => {
-                    if ev.readable {
-                        bits |= EventSet::IN;
-                        if socket_hung_up(interest.armed) {
-                            bits |= EventSet::HANG_UP | EventSet::READ_HANG_UP;
-                        }
-                    }
-                    if ev.writable {
-                        bits |= EventSet::OUT;
-                    }
-                    if ev.interrupt {
-                        bits |= EventSet::HANG_UP | EventSet::ERROR;
-                    }
-                    if ev.err {
-                        bits |= EventSet::ERROR;
-                    }
-                }
-                (Kind::EventFd { .. }, SUB_SPACE) => bits |= EventSet::OUT,
-                (Kind::Pipe { event }, _) => match pipe_state(fd) {
-                    PipeState::Data => bits |= EventSet::IN,
-                    PipeState::Closed => bits |= EventSet::IN | EventSet::HANG_UP,
-                    PipeState::Empty => {
-                        // A packet from before the reader emptied the pipe:
-                        // the watcher sets the event again on new data.
-                        // SAFETY: the event is open while registered.
-                        unsafe { ResetEvent(handle(event)) };
-                    }
-                },
-                (Kind::Console, _) => {
-                    if console_ready(handle(fd)) {
-                        bits |= EventSet::IN;
-                    }
-                }
-                _ => bits |= EventSet::IN,
+            let bits = fired_bits(ev, fd, sub, &interest);
+            if let (Kind::Pipe { event }, true) = (interest.kind, bits.is_empty()) {
+                // A packet from before the reader emptied the pipe: the
+                // watcher sets the event again on new data.
+                // SAFETY: the event is open while registered.
+                unsafe { ResetEvent(handle(event)) };
             }
-            // Only what was asked for, plus the conditions epoll always reports.
-            bits &= interest.events | EventSet::ERROR | EventSet::HANG_UP;
+            let bits = bits & reportable(&interest);
             if bits.is_empty() {
                 continue;
             }
@@ -1195,6 +1409,29 @@ mod tests {
         }
         let none = ALLOCATIONS.with(std::cell::Cell::get) - before;
         assert_eq!((ready_ones, none), (0, 0), "allocations in 100 waits with 3 eventfds ready, and in 100 with none");
+        // An outer instance's look at a nested one (`Nest::ready_now`):
+        // ready, and then with only stale packets left once the source was
+        // read. The forwarder's allocations are its own thread's.
+        let outer = Epoll::new().unwrap();
+        outer
+            .ctl(ControlOperation::Add, epoll.as_raw_fd(), EpollEvent::new(EventSet::IN, 9))
+            .unwrap();
+        evts[0].write(1).unwrap();
+        assert_eq!(outer.wait(2000, &mut ready).unwrap(), 1);
+        let before = ALLOCATIONS.with(std::cell::Cell::get);
+        for _ in 0..100 {
+            assert_eq!(outer.wait(0, &mut ready).unwrap(), 1);
+        }
+        let nested_ready = ALLOCATIONS.with(std::cell::Cell::get) - before;
+        evts[0].read().unwrap();
+        assert_eq!(outer.wait(0, &mut ready).unwrap(), 0);
+        let before = ALLOCATIONS.with(std::cell::Cell::get);
+        for _ in 0..100 {
+            assert_eq!(outer.wait(0, &mut ready).unwrap(), 0);
+        }
+        let nested_none = ALLOCATIONS.with(std::cell::Cell::get) - before;
+        assert_eq!((nested_ready, nested_none), (0, 0), "allocations in 100 outer waits with the nested instance ready, and in 100 with it not");
+        drop(outer);
     }
 
     // A rate limiter's timer (vmm's rng test_bandwidth_rate_limiter: the
@@ -1848,6 +2085,225 @@ mod tests {
         // while registered is undefined behaviour for the thread pool wait).
         drop(outer);
         drop(inner);
+    }
+
+    /// [`test_nested_epoll`] two levels deep: outer, mid, inner.
+    #[test]
+    fn test_nested_epoll_two_levels() {
+        let outer = Epoll::new().unwrap();
+        let mid = Epoll::new().unwrap();
+        let inner = Epoll::new().unwrap();
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        inner
+            .ctl(ControlOperation::Add, evt.as_raw_fd(), EpollEvent::new(EventSet::IN, 5))
+            .unwrap();
+        mid.ctl(ControlOperation::Add, inner.as_raw_fd(), EpollEvent::new(EventSet::IN, 2))
+            .unwrap();
+        outer
+            .ctl(ControlOperation::Add, mid.as_raw_fd(), EpollEvent::new(EventSet::IN, 1))
+            .unwrap();
+        assert!(wait_now(&outer).is_empty(), "nothing ready inside");
+        assert!(wait_now(&mid).is_empty(), "nothing ready inside");
+        let writer = {
+            let evt = evt.try_clone().unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                evt.write(1).unwrap();
+            })
+        };
+        let mut events = [EpollEvent::default(); 4];
+        assert_eq!(outer.wait(2000, &mut events).unwrap(), 1, "woken by the innermost source");
+        assert_eq!((events[0].data(), events[0].event_set()), (1, EventSet::IN));
+        writer.join().unwrap();
+        // Level-triggered at each level.
+        assert_eq!(wait_now(&outer), vec![(1, EventSet::IN)]);
+        assert_eq!(wait_now(&mid), vec![(2, EventSet::IN)]);
+        assert_eq!(wait_now(&inner), vec![(5, EventSet::IN)]);
+        evt.read().unwrap();
+        assert!(wait_now(&inner).is_empty());
+        assert!(wait_now(&mid).is_empty(), "the innermost source was read");
+        assert!(wait_now(&outer).is_empty(), "the innermost source was read");
+        // A one-shot registration in the inner one: the outer ones' looks do
+        // not use it up, only the inner one's wait does.
+        let once = EventFd::new(EFD_NONBLOCK).unwrap();
+        inner
+            .ctl(
+                ControlOperation::Add,
+                once.as_raw_fd(),
+                EpollEvent::new(EventSet::IN | EventSet::ONE_SHOT, 7),
+            )
+            .unwrap();
+        once.write(1).unwrap();
+        assert_eq!(outer.wait(2000, &mut events).unwrap(), 1);
+        for _ in 0..3 {
+            assert_eq!(wait_now(&outer), vec![(1, EventSet::IN)]);
+            assert_eq!(wait_now(&mid), vec![(2, EventSet::IN)]);
+        }
+        assert_eq!(wait_now(&inner), vec![(7, EventSet::IN)]);
+        // Fired: nothing more until modified, at any level.
+        assert!(wait_now(&inner).is_empty());
+        assert!(wait_now(&mid).is_empty());
+        assert!(wait_now(&outer).is_empty());
+        mid.ctl(ControlOperation::Delete, inner.as_raw_fd(), EpollEvent::default())
+            .unwrap();
+        evt.write(1).unwrap();
+        assert!(wait_now(&outer).is_empty(), "the inner instance was deleted from mid");
+        assert_eq!(wait_now(&inner), vec![(5, EventSet::IN)]);
+        drop(outer);
+        drop(mid);
+        drop(inner);
+    }
+
+    /// The rounds of [`test_nested_epoll_stale_packets_do_not_make_the_outer_ready`];
+    /// the ignored full runs have ten times as many.
+    const NESTED_RACE_ROUNDS: u64 = 20_000;
+
+    /// A chain of `levels` instances nested in one another above an eventfd,
+    /// handled as an event loop does, `rounds` times: the eventfd is written,
+    /// the outermost instance's wait wakes, each instance's wait reports the
+    /// next (the innermost one the eventfd), the eventfd is read, the
+    /// innermost instance's wait reports nothing. Returns the rounds in which
+    /// an instance did not report the one below while the eventfd was
+    /// written (missed), and those in which an instance above the innermost
+    /// one still reported the one below ready once it was read (stale).
+    fn nested_drain_race(levels: usize, rounds: u64) -> (u64, u64) {
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let chain: Vec<Epoll> = (0..=levels).map(|_| Epoll::new().unwrap()).collect();
+        chain[levels]
+            .ctl(ControlOperation::Add, evt.as_raw_fd(), EpollEvent::new(EventSet::IN, 100))
+            .unwrap();
+        for i in (0..levels).rev() {
+            chain[i]
+                .ctl(ControlOperation::Add, chain[i + 1].as_raw_fd(), EpollEvent::new(EventSet::IN, i as u64 + 1))
+                .unwrap();
+        }
+        let mut events = [EpollEvent::default(); 4];
+        let (mut missed, mut stale) = (0, 0);
+        for _ in 0..rounds {
+            evt.write(1).unwrap();
+            assert_eq!(chain[0].wait(2000, &mut events).unwrap(), 1, "woken by the innermost source");
+            let mut all = true;
+            for (i, epoll) in chain.iter().enumerate() {
+                let data = if i == levels { 100 } else { i as u64 + 1 };
+                all &= wait_now(epoll) == vec![(data, EventSet::IN)];
+            }
+            if !all {
+                missed += 1;
+            }
+            evt.read().unwrap();
+            assert!(wait_now(&chain[levels]).is_empty(), "the innermost source was read");
+            if chain[..levels].iter().rev().any(|epoll| !wait_now(epoll).is_empty()) {
+                stale += 1;
+            }
+        }
+        println!(
+            "NESTEDRACE levels {levels}: of {rounds} rounds, {missed} with an instance not reporting the one below \
+             while the eventfd was written, {stale} with an outer instance ready after the drain"
+        );
+        // The instances go before the eventfd, the outermost first.
+        drop(chain);
+        (missed, stale)
+    }
+
+    // An outer instance reports a nested one readable only while the nested
+    // one's wait would report something, as Linux's __ep_eventpoll_poll
+    // polls the nested instance's ready items again (ep_item_poll) and
+    // drops those not ready (fs/eventpoll.c). The forwarder (`Nest`) keeps
+    // a packet the eventfd posted before the inner wait read it and sets the
+    // event the outer instance watches after that wait: trusting the event
+    // made the outer instance report the drained inner one ready, the
+    // intermittent CI red of test_nested_epoll ("the inner source was
+    // read"). Two levels deep, a mid instance also missed the written
+    // eventfd while the inner instance's event was not set yet. On fc-win
+    // (Windows Server 2022, debug build), stale / missed rounds before the
+    // fix: one level 406 / 0 of 20,000 and 4506 / 0 of 200,000; two levels
+    // 1040 / 2335 of 20,000 and 9563 / 24681 of 200,000. After: 0 / 0 in
+    // each.
+    #[test]
+    fn test_nested_epoll_stale_packets_do_not_make_the_outer_ready() {
+        assert_eq!(nested_drain_race(1, NESTED_RACE_ROUNDS), (0, 0));
+    }
+
+    #[test]
+    fn test_nested_epoll_stale_packets_do_not_make_the_outer_ready_two_levels() {
+        assert_eq!(nested_drain_race(2, NESTED_RACE_ROUNDS), (0, 0));
+    }
+
+    #[test]
+    #[ignore = "the full run: 200,000 rounds, with --ignored --nocapture"]
+    fn test_nested_epoll_stale_packets_do_not_make_the_outer_ready_full() {
+        assert_eq!(nested_drain_race(1, NESTED_RACE_ROUNDS * 10), (0, 0));
+    }
+
+    #[test]
+    #[ignore = "the full run: 200,000 rounds, with --ignored --nocapture"]
+    fn test_nested_epoll_stale_packets_do_not_make_the_outer_ready_two_levels_full() {
+        assert_eq!(nested_drain_race(2, NESTED_RACE_ROUNDS * 10), (0, 0));
+    }
+
+    fn add_nested(outer: &Epoll, inner: &Epoll) -> io::Result<()> {
+        outer.ctl(ControlOperation::Add, inner.as_raw_fd(), EpollEvent::new(EventSet::IN, 0))
+    }
+
+    fn is_eloop(r: io::Result<()>) -> bool {
+        r.is_err_and(|e| e.raw_os_error() == Some(libc::ELOOP))
+    }
+
+    // An instance added where it would close a loop fails with ELOOP, as on
+    // Linux (fs/eventpoll.c do_epoll_ctl: ep_loop_check), directly or
+    // through others; one in itself with EINVAL. An outer instance's look
+    // at a nested one goes down through it (`Nest::ready_now`), so a loop
+    // would never end.
+    #[test]
+    fn test_nested_epoll_loops_fail_with_eloop() {
+        let a = Epoll::new().unwrap();
+        let b = Epoll::new().unwrap();
+        let c = Epoll::new().unwrap();
+        assert_eq!(
+            add_nested(&a, &a).unwrap_err().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        add_nested(&a, &b).unwrap();
+        assert!(is_eloop(add_nested(&b, &a)));
+        add_nested(&b, &c).unwrap();
+        assert!(is_eloop(add_nested(&c, &a)));
+        assert!(is_eloop(add_nested(&c, &b)));
+        // Without the link that closed it, no loop.
+        b.ctl(ControlOperation::Delete, c.as_raw_fd(), EpollEvent::default())
+            .unwrap();
+        add_nested(&c, &a).unwrap();
+        assert!(wait_now(&c).is_empty());
+        drop(c);
+        drop(b);
+        drop(a);
+    }
+
+    // At most EP_MAX_NESTS (4) levels of instances watching each other,
+    // counted above the instance added to as well as below the one added,
+    // as Linux since f2e467a48287 (ep_loop_check:
+    // depth + 1 + upwards_depth > EP_MAX_NESTS), whichever way the chain is
+    // built.
+    #[test]
+    fn test_nested_epoll_deeper_than_linux_s_limit_fails_with_eloop() {
+        // Top down: e0 > e1 > e2 > e3 > e4 is 4 levels; e5 below e4 is 5.
+        let e: Vec<Epoll> = (0..6).map(|_| Epoll::new().unwrap()).collect();
+        for i in 0..4 {
+            add_nested(&e[i], &e[i + 1]).unwrap();
+        }
+        assert!(is_eloop(add_nested(&e[4], &e[5])));
+        // Bottom up: f1 > ... > f5 is 4 levels; f0 above f1 is 5.
+        let f: Vec<Epoll> = (0..6).map(|_| Epoll::new().unwrap()).collect();
+        for i in (1..5).rev() {
+            add_nested(&f[i], &f[i + 1]).unwrap();
+        }
+        assert!(is_eloop(add_nested(&f[0], &f[1])));
+        // A link deleted makes room again.
+        e[3].ctl(ControlOperation::Delete, e[4].as_raw_fd(), EpollEvent::default())
+            .unwrap();
+        add_nested(&e[4], &e[5]).unwrap();
+        assert!(wait_now(&e[0]).is_empty());
+        drop(e);
+        drop(f);
     }
 
     const WAITABLE_CHILD_ENV: &str = "WICK_TEST_WAITABLE_CHILD";

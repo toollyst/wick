@@ -89,6 +89,10 @@ errnos! {
     EDEADLK = 1131;
     /// `ERROR_FILENAME_EXCED_RANGE`.
     ENAMETOOLONG = 206;
+    /// `ERROR_CANT_RESOLVE_FILENAME`, which `std` reads as a loop
+    /// (`io::ErrorKind::FilesystemLoop`): an `epoll` nested in a loop or too
+    /// deep (`vmm_sys_util::epoll`), as on Linux.
+    ELOOP = 1921;
     /// `ERROR_CALL_NOT_IMPLEMENTED`.
     ENOSYS = 120;
     /// `ERROR_DIR_NOT_EMPTY`.
@@ -181,10 +185,11 @@ pub fn wick_errno_from_win32(code: c_int) -> c_int {
         // ERROR_INVALID_USER_BUFFER.
         1784 => EFAULT,
         // Winsock's codes for what Win32 codes name elsewhere: WSAEBADF,
-        // WSAEFAULT, WSAEINVAL, WSAENAMETOOLONG, WSAENOTEMPTY.
+        // WSAEFAULT, WSAEINVAL, WSAELOOP, WSAENAMETOOLONG, WSAENOTEMPTY.
         10009 => EBADF,
         10014 => EFAULT,
         10022 => EINVAL,
+        10062 => ELOOP,
         10063 => ENAMETOOLONG,
         10066 => ENOTEMPTY,
         // WSAEOPNOTSUPP: an operation the socket does not support.
@@ -208,8 +213,8 @@ mod tests {
         for e in [
             EPERM, ENOENT, ESRCH, EINTR, EIO, ENXIO, E2BIG, ENOEXEC, EBADF, ECHILD, EAGAIN, ENOMEM, EACCES,
             EFAULT, EBUSY, EEXIST, EXDEV, ENODEV, ENOTDIR, EISDIR, EINVAL, ENFILE, EMFILE, ENOTTY, EFBIG,
-            ENOSPC, ESPIPE, EROFS, EMLINK, EPIPE, ERANGE, EDEADLK, ENAMETOOLONG, ENOSYS, ENOTEMPTY,
-            EOVERFLOW, ECANCELED, EOPNOTSUPP, EPROTO, ETIMEDOUT, EADDRINUSE, EADDRNOTAVAIL, ECONNREFUSED,
+            ENOSPC, ESPIPE, EROFS, EMLINK, EPIPE, ERANGE, EDEADLK, ENAMETOOLONG, ELOOP, ENOSYS,
+            ENOTEMPTY, EOVERFLOW, ECANCELED, EOPNOTSUPP, EPROTO, ETIMEDOUT, EADDRINUSE, EADDRNOTAVAIL, ECONNREFUSED,
             ECONNRESET, ECONNABORTED, ENOTCONN, EISCONN, ENOBUFS, EMSGSIZE, EINPROGRESS, EALREADY, ENOTSOCK,
             EAFNOSUPPORT, ENETUNREACH, EHOSTUNREACH, EPROTONOSUPPORT, ENOPROTOOPT,
         ] {
@@ -220,7 +225,7 @@ mod tests {
             (80, EEXIST), (14, ENOMEM), (1455, ENOMEM), (1450, ENOMEM), (1453, ENOMEM), (1816, ENOMEM),
             (39, ENOSPC), (232, EPIPE), (10045, EOPNOTSUPP),
             (121, ETIMEDOUT), (258, ETIMEDOUT), (1460, ETIMEDOUT), (1314, EPERM), (1004, EINVAL), (1784, EFAULT),
-            (10009, EBADF), (10014, EFAULT), (10022, EINVAL), (10063, ENAMETOOLONG), (10066, ENOTEMPTY),
+            (10009, EBADF), (10014, EFAULT), (10022, EINVAL), (10062, ELOOP), (10063, ENAMETOOLONG), (10066, ENOTEMPTY),
         ] {
             assert_eq!(wick_errno_from_win32(code), e, "code {code}");
         }

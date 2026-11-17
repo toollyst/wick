@@ -384,6 +384,20 @@ semantics on Win32. The details are in the comments of each
   (`FILE_PIPE_LOCAL_INFORMATION`) follows the room left, but reads 0 while
   the reader waits in a read, when a write completes at once
   (`test_pipe_write_room_reads_0_while_a_read_waits`).
+  An epoll nested in another (the vsock muxer's) is readable while its own
+  wait would report something: a completion port is not waitable, so a
+  forwarder thread keeps the inner instance's packets and sets an event the
+  outer one waits on, and the outer one, when it looks, checks those packets
+  and the inner instance's level-triggered sources again, consuming nothing,
+  as Linux's `__ep_eventpoll_poll` polls each ready item again
+  (`ep_item_poll`, fs/eventpoll.c), and drops the packets that went stale
+  (trusting the event made it report a drained inner instance ready in
+  about 1 of 100 rounds: `test_nested_epoll_stale_packets_do_not_make_the_outer_ready`,
+  one and two levels deep, `test_nested_epoll_two_levels`). An addition that
+  would close a loop, or make a chain deeper than `EP_MAX_NESTS` (4), fails
+  with `ELOOP`, as Linux's `ep_loop_check`
+  (`test_nested_epoll_loops_fail_with_eloop`,
+  `test_nested_epoll_deeper_than_linux_s_limit_fails_with_eloop`).
 - **eventfd = counter + manual-reset event.** The event is signalled while the
   counter is above zero. Counter, flags and lock live in a 4 KiB paging-file
   section, with a space event (counter < MAX). Every change happens under a
