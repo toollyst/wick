@@ -854,28 +854,53 @@ def stage_memory(ctx):
 
 
 def stage_uffd_charge(ctx):
-    """The jail's memory limit counts memory a userfaultfd filled and the process then read once, as Linux's memory
-    cgroup charges it (v6.12 mm/userfaultfd.c `mfill_atomic_pte_copy` :302, mm/memcontrol.c `commit_charge` :2370):
-    crates/compat/libc's uffd_charge_probe, run by the jailer under memory.max of 96 MiB (a fatal jetsam limit on the
-    process's phys_footprint, overlay/jailer/platform/macos/mod.rs :934 to :939), fills 64 MiB and reads it, and
-    lives. The control: the same with a second mapping of the pages read too, as the alias `wick_uffd` filled
-    through until its fills had views of their own, is killed (SIGKILL) at the read, 128 MiB. No VM: the probe is
-    not Firecracker, and the jailer execs it as root outside the jail, as the resource limit probe."""
+    """What the jail's memory limit counts, with crates/compat/libc's uffd_charge_probe run by the jailer under
+    memory.max of 96 MiB (a fatal jetsam limit on the process's phys_footprint, overlay/jailer/platform/macos/mod.rs
+    :934 to :939). No VM: the probe is not Firecracker, and the jailer execs it as root outside the jail, as the
+    resource limit probe. Six cases, each with what it must do:
+    - Charged once, must live: 64 MiB filled through a userfaultfd and then read counts once, as Linux's memory
+      cgroup charges it (v6.12 mm/userfaultfd.c `mfill_atomic_pte_copy` :302, mm/memcontrol.c `commit_charge`
+      :2370).
+    - Its control, must be killed (SIGKILL) at the read, 128 MiB: the same with a second mapping of the pages read
+      too, as the alias `wick_uffd` filled through until its fills had views of their own.
+    - The gap, must live, which records it (SECURITY.md, Not at parity yet, "macOS: the jail's memory limit does not
+      bound a compromised VMM"; docs/macos-memory-limit.md): 256 MiB of anonymous memory written only through
+      mappings made for it and removed after, its footprint near 0; and 256 MiB written, made reusable
+      (MADV_FREE_REUSABLE) and written again, 16 MiB at a time. Linux's memory cgroup would kill both at 96 MiB.
+      When one of these is killed, the gap has closed (or the limit counts differently): the stage fails, so that
+      the docs are brought in step.
+    - The gap's control, must be killed: the first way on a purgeable object, which the task owns and which is
+      charged by the object.
+    - The design being made for guest memory, must be killed during the fills, before the read (no "filled" line):
+      128 MiB of a purgeable object filled through a userfaultfd, each page charged at its fill, as on Linux."""
+    cases = (
+        ("uffd-charge", ["64"], False, "charged once", "64 MiB filled and read"),
+        ("uffd-charge-view", ["64", "second-view"], True, "control", "the same with a second view read"),
+        ("views-only", ["256", "views-only"], False, "the gap", "256 MiB written only through removed views"),
+        ("views-only-purgeable", ["256", "views-only-purgeable"], True, "the gap's control", "the same, purgeable"),
+        ("reusable", ["256", "reusable"], False, "the gap", "256 MiB written, made reusable and written again"),
+        ("uffd-charge-purgeable", ["128", "purgeable"], True, "the design", "128 MiB of a purgeable object filled"),
+    )
     results = []
-    for name, mode, expect_kill in (("uffd-charge", [], False), ("uffd-charge-view", ["second-view"], True)):
+    for name, args, expect_kill, role, what in cases:
         chroot_of(ctx.base, ctx.uffd_charge_probe, name)
         rc, out = run_jailer(ctx, jailer_base(ctx, name, ctx.uffd_charge_probe)
-                             + ["--cgroup-version", "2", "--cgroup", f"memory.max={96 << 20}", "--", "64"] + mode,
+                             + ["--cgroup-version", "2", "--cgroup", f"memory.max={96 << 20}", "--"] + args,
                              timeout=60)
         lines = [l for l in out.splitlines() if l.startswith("UFFD-CHARGE ")]
         print(f"   {name}: exit {rc}: {'; '.join(lines)}", flush=True)
         killed = rc == -signal.SIGKILL
-        check(killed == expect_kill and (killed or (rc == 0 and "UFFD-CHARGE done" in lines)),
-              f"{name}: 64 MiB filled and read under a 96 MiB limit: exit {rc}, wanted "
+        lived = rc == 0 and "UFFD-CHARGE done" in lines
+        check(killed if expect_kill else lived,
+              f"{name} ({role}): {what} under a 96 MiB limit: exit {rc}, wanted "
               f"{'SIGKILL' if expect_kill else '0'}: {out!r}")
-        last = lines[-1][len("UFFD-CHARGE "):] if lines else "no output"
-        results.append(f"{'with a second view' if mode else 'alone'}: {'killed' if killed else 'lived'} ({last})")
-    return "64 MiB filled through a userfaultfd and read under memory.max 96 MiB; " + ", ".join(results)
+        if args[1:] == ["purgeable"]:
+            check(not any(l.startswith("UFFD-CHARGE filled ") for l in lines),
+                  f"{name}: the fills ended under a 96 MiB limit, so a purgeable page is not charged at its fill: "
+                  f"{out!r}")
+        last = next((l[len("UFFD-CHARGE "):] for l in reversed(lines) if l != "UFFD-CHARGE done"), "no output")
+        results.append(f"{what} ({role}): {'killed' if killed else 'lived'} ({last})")
+    return "under memory.max 96 MiB: " + "; ".join(results)
 
 
 def stage_fsize(ctx):

@@ -889,12 +889,27 @@ upstream Firecracker and its jailer.
   VM and ask for one charge where two mappings touched the pages fail today and are listed as no-hvf
   (tools/macos/unit-test-differences.txt; CI's runners make no VM, this Mac is where they run). The other way, a
   page a userfaultfd filled and nothing has touched yet is held and charged to no one until something touches it,
-  where Linux charged it at the fill: at most the registered memory the handler filled ahead of the guest's
-  accesses (a fill in answer to a fault is followed by the access that faulted). The kill at the limit: under the
-  jailer's memory.max of 96 MiB, a process that fills 64 MiB through a userfaultfd and reads it lives, and the same
-  with a second mapping of the pages read too, as the alias was, is killed at the read (`jailer-test uffd-charge`,
-  no VM, root, in CI's macos job; not run on this Mac, where root is not used). A fix for two mappings is being
-  designed, not done; until then, give a jail's `memory.max` room for twice the guest memory the VMM will touch.
+  where Linux charged it at the fill. For a VMM that works as it should, that is at most the registered memory the
+  handler filled ahead of the guest's accesses (a fill in answer to a fault is followed by the access that
+  faulted); a compromised VMM can hold any amount that way (next entry). The kill at the limit: under the jailer's
+  memory.max of 96 MiB, a process that fills 64 MiB through a userfaultfd and reads it lives, and the same with a
+  second mapping of the pages read too, as the alias was, is killed at the read (`jailer-test uffd-charge`, no VM,
+  root, in CI's macos job; not run on this Mac, where root is not used). A fix for two mappings is being designed,
+  not done; until then, give a jail's `memory.max` room for twice the guest memory the VMM will touch.
+- **macOS: the jail's memory limit does not bound a compromised VMM.** The limit is a jetsam limit on the process's
+  phys_footprint (entry above), and a process can keep memory resident that this ledger does not count: anonymous
+  memory written only through a second mapping of it that is then removed (the calls a userfaultfd fill makes, which
+  the run-phase profile allows for that), or made reusable (`MADV_FREE_REUSABLE`) and written again. No counter per
+  process that was found serves as a bound either. So a compromised jailed VMM can hold memory past `memory.max`,
+  bounded by the host's memory and swap, not by the jail; macOS's memory-pressure jetsam of the whole host still
+  applies. Linux's memory cgroup charges every page when it is allocated, so a VMM in a cgroup cannot.
+  The accounting is xnu's known, public behaviour, not a new vulnerability; wick's part is what it means for the
+  jail. Under memory.max of 96 MiB, 256 MiB held either way must live, which records the gap, and the first way on
+  a purgeable object, charged by the object, must be killed (`jailer-test uffd-charge`, root, CI's macos job; not
+  run on this Mac). Not fixed; being designed: guest memory as objects the task owns (purgeable, nonvolatile),
+  charged by the object whatever maps them, which closes it for guest memory, not for the VMM's own memory. The
+  mechanics, the measurements and the probe for each, what was looked at for a bound per process, and the public
+  sources: [docs/macos-memory-limit.md](docs/macos-memory-limit.md).
 - **macOS jailer: no namespaces in the kernel.** macOS has no network or PID namespaces (XNU's system calls,
   bsd/kern/syscalls.master, have no `unshare`, `setns` or `clone`): IP networking is denied by the sandbox; a
   jailed VMM uses Unix socket endpoints in the jail or in the directory `--netns` names, the jail's network.
