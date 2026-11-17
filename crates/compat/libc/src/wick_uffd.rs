@@ -163,6 +163,11 @@ pub mod proto {
     pub const OP_MIRROR: u64 = 6;
     /// Copy and zeropage mode: do not wake the waiting threads.
     pub const MODE_DONTWAKE: u64 = 1;
+    // The Windows twin of the mirror constants below (and `OP_MIRROR`,
+    // `EVENT_PAGEFAULT`'s mirror-era value 3) lives in windows_uffd.rs's
+    // `proto`, duplicated, not shared; keep the two equal (its
+    // `test_the_mirror_proto_matches_the_macos_twin` holds them so). Change
+    // one, change the other.
     /// The waiter mirror's words: one per waiter slot.
     pub const MIRROR_WORDS: usize = 256;
     /// A tag's bit 0: its waiter waits.

@@ -56,17 +56,22 @@ use std::sync::Mutex;
 use crate::windows_stacklock::ProbedMutex;
 use std::vec::Vec;
 
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GetLastError, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, DuplicateHandle, ERROR_FILE_NOT_FOUND, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Networking::WinSock::{
     self as ws, AF_UNIX, INVALID_SOCKET, POLLERR, POLLHUP, POLLRDNORM, SOCKET, SOCKET_ERROR,
     SOCK_STREAM, WSAPOLLFD, WSAPROTOCOL_INFOW, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
 };
 use windows_sys::Win32::Storage::FileSystem::DeleteFileW;
 use windows_sys::Win32::System::Memory::{
-    DiscardVirtualMemory, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, VirtualProtect,
+    CreateFileMappingW, DiscardVirtualMemory, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS,
+    MapViewOfFile, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT,
+    UnmapViewOfFile, VirtualProtect,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateSemaphoreW, INFINITE, ReleaseSemaphore, Sleep, WaitForSingleObject, WaitOnAddress, WakeByAddressAll,
+    CreateSemaphoreW, GetCurrentProcess, INFINITE, ReleaseSemaphore, Sleep, WaitForSingleObject, WaitOnAddress,
+    WakeByAddressAll,
 };
 
 use crate::windows_fd::wick_wsa_startup;
@@ -99,6 +104,55 @@ pub mod proto {
     pub const MODE_DONTWAKE: u64 = 1;
     // Reply: `[result, count, 0, 0]`: `result` is the byte count, or a
     // negative errno; for a partial copy `-EAGAIN` with the count copied.
+
+    // ---- The waiter mirror (see the module's "The waiter mirror" doc below).
+    // These constants are the twin of macOS's `libc::wick_uffd::proto`
+    // (wick_uffd.rs): duplicated, not shared, so the backends stay
+    // independent, and held equal to it by `test_the_mirror_proto_matches_the_macos_twin`.
+    // When you change one, change the other. ----
+
+    /// Event: `[EVENT_PAGEFAULT2, addr, flags, tag]`, the mirror era's page
+    /// fault, carrying the waiter's `tag` (its word in the waiter mirror,
+    /// [`tag`]). A reader that predates the mirror hard-codes
+    /// [`EVENT_PAGEFAULT`] (1) and fails on this type loudly (an unrecognized
+    /// event), where it would have returned events whose waiters were woken.
+    /// Its value matches the macOS twin's `EVENT_PAGEFAULT` (3,
+    /// wick_uffd.rs:140), where that side renamed the type in place.
+    pub const EVENT_PAGEFAULT2: u64 = 3;
+    /// Request: `[OP_MIRROR, 0, 0, 0]`. Reply: `[size, 0, 0, 0]` with the
+    /// waiter mirror's section handle duplicated into the reader's process
+    /// read-only (`SECTION_MAP_READ`, never `DUPLICATE_SAME_ACCESS`;
+    /// [`super::dup_mirror_read_only`]), of `size` bytes ([`mirror_bytes`]); a
+    /// negative errno and no handle if it fails. A serving thread that
+    /// predates the mirror answers `-EINVAL` (an unknown request).
+    pub const OP_MIRROR: u64 = 6;
+    /// The waiter mirror's words: one per waiter slot.
+    pub const MIRROR_WORDS: usize = 256;
+    /// A tag's bit 0: its waiter waits.
+    pub const TAG_WAITING: u64 = 1;
+    /// A tag's slot field: bits 1 to 16. Wider than the table, so a reader
+    /// checks it against [`MIRROR_WORDS`].
+    const TAG_SLOT_SHIFT: u32 = 1;
+    const TAG_SLOT_MASK: u64 = 0xffff;
+    /// A tag's claim count: bits 17 to 63, the slot's own count of the
+    /// waiters it has held, so that no two waiters of a slot share a tag.
+    const TAG_COUNT_SHIFT: u32 = 17;
+
+    /// The tag of the `count`th waiter of slot `slot`, waiting.
+    pub const fn tag(count: u64, slot: usize) -> u64 {
+        (count << TAG_COUNT_SHIFT) | ((slot as u64 & TAG_SLOT_MASK) << TAG_SLOT_SHIFT) | TAG_WAITING
+    }
+
+    /// A tag's slot field, unchecked: up to 65535.
+    pub const fn tag_slot(tag: u64) -> usize {
+        ((tag >> TAG_SLOT_SHIFT) & TAG_SLOT_MASK) as usize
+    }
+
+    /// The mirror section's size: its words in whole pages of `page` bytes
+    /// (a view is mapped in whole pages).
+    pub const fn mirror_bytes(page: usize) -> usize {
+        (MIRROR_WORDS * 8).div_ceil(page) * page
+    }
 }
 
 /// The feature bit (`UFFD_FEATURE_EVENT_REMOVE`) for remove events.
@@ -108,6 +162,7 @@ const PAGE: u64 = 4096;
 const MAX_RANGES: usize = 64;
 const MAX_CTX: usize = 16;
 const MAX_WAITERS: usize = 256;
+const _: () = assert!(MAX_WAITERS == proto::MIRROR_WORDS);
 
 /// A registered range: one whole private mapping, made a section with an
 /// alias at its register, whose pages each belong to one userfaultfd or to
@@ -829,6 +884,137 @@ fn wake_where(which: impl Fn(usize, u64) -> bool) {
             unsafe { ReleaseSemaphore(w.sem.load(Ordering::Acquire) as HANDLE, 1, ptr::null_mut()) };
         }
     }
+}
+
+// ---- The waiter mirror's section. The macOS twin (`libc::wick_uffd`, "The
+// waiter mirror") keeps the mirror in a POSIX shared memory object it
+// `shm_open`s under a random name and unlinks at once; Windows needs no name
+// at all. This side keeps the section handle and a read-write view; each
+// reader is given the section read-only ([`dup_mirror_read_only`]) and maps
+// it ([`map_mirror_read_only`]). Here are the section and its read-only
+// transport, proven read-only by the four tests below; the fault/wake/read
+// wiring that uses them follows in the next step. ----
+
+/// The waiter mirror section's size in bytes (a whole page).
+fn mirror_bytes() -> usize {
+    proto::mirror_bytes(PAGE as usize)
+}
+
+/// Makes a userfaultfd's waiter mirror: an **unnamed** pagefile-backed
+/// section (`CreateFileMappingW` with a null name, so it is in no object
+/// namespace and no `OpenFileMappingW` can reach it, as `windows_sectrec`'s
+/// sections are), mapped read-write here. Returns the section handle and the
+/// read-write view; the caller keeps both. Strictly safer than the macOS
+/// twin, which has a name for the instant between its two opens and the
+/// unlink: this has no name at any point (SECURITY.md).
+pub fn new_mirror() -> io::Result<(HANDLE, *mut AtomicU64)> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+    let bytes = mirror_bytes();
+    // A DACL that grants Everyone (`WD`) only `SECTION_QUERY | SECTION_MAP_READ`
+    // (0x5) and no write: so a process that holds a handle to the section —
+    // only ever one this side duplicates read-only — cannot `DuplicateHandle`
+    // it up to `SECTION_MAP_WRITE` (the access check reads the DACL with the
+    // caller's token; without a write ACE it is refused;
+    // `test_a_mirror_handle_a_reader_gets_cannot_be_re_duplicated_to_writable`).
+    // The creator's own handle, returned by `CreateFileMappingW`, keeps the
+    // write `PAGE_READWRITE` asks for, as a creator's handle does. Granting
+    // Everyone read is no exposure: the section is unnamed, so no process can
+    // open it; a handle is reached only through this side's duplicate.
+    let sddl: Vec<u16> = "D:(A;;0x5;;;WD)".encode_utf16().chain([0]).collect();
+    let mut psd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: a NUL-terminated SDDL string and an out-pointer for the SD.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut psd, ptr::null_mut())
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: psd,
+        bInheritHandle: 0,
+    };
+    // SAFETY: an unnamed section (null name) with the read-only DACL; checked.
+    let section = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            &sa,
+            PAGE_READWRITE | SEC_COMMIT,
+            (bytes as u64 >> 32) as u32,
+            bytes as u32,
+            ptr::null(),
+        )
+    };
+    let e = io::Error::last_os_error();
+    // SAFETY: the SD allocated by the convert call; the section kept its copy.
+    unsafe { LocalFree(psd) };
+    if section.is_null() {
+        return Err(e);
+    }
+    // SAFETY: the creator's section handle (write kept); a read-write view.
+    let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, bytes) }.Value;
+    if view.is_null() {
+        let e = io::Error::last_os_error();
+        // SAFETY: the section handle made above.
+        unsafe { CloseHandle(section) };
+        return Err(e);
+    }
+    Ok((section, view.cast()))
+}
+
+/// Duplicates the mirror `section` into `target` (a process handle) with
+/// **`SECTION_MAP_READ` only** (`FILE_MAP_READ`'s value, 0x4), never
+/// `DUPLICATE_SAME_ACCESS`. This is a **distinct** path from the crate's
+/// other handle sends, which pass `DUPLICATE_SAME_ACCESS` (windows_fd.rs),
+/// so no caller gets the read-write handle by mistake: the reduced access is
+/// not a flag on a shared send, it is this function. The duplicate can map
+/// the mirror read-only and nothing more
+/// (`test_a_mirror_handle_a_reader_gets_cannot_be_re_duplicated_to_writable`).
+///
+/// # Safety
+/// `section` must be a live section handle and `target` a live process
+/// handle with `PROCESS_DUP_HANDLE`.
+pub unsafe fn dup_mirror_read_only(section: HANDLE, target: HANDLE) -> io::Result<HANDLE> {
+    let mut out: HANDLE = ptr::null_mut();
+    // SAFETY: the caller's live section and target process handles; the
+    // access is `FILE_MAP_READ` (== `SECTION_MAP_READ`), no `DUPLICATE_SAME_ACCESS`.
+    let ok = unsafe { DuplicateHandle(GetCurrentProcess(), section, target, &mut out, FILE_MAP_READ, 0, 0) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(out)
+}
+
+/// Maps a mirror `section` handle a reader received read-only
+/// (`MapViewOfFile` with `FILE_MAP_READ`). The reader indexes the returned
+/// words; it cannot write them (the handle lacks `SECTION_MAP_WRITE`). The
+/// macOS twin maps its read-only descriptor with `PROT_READ`.
+///
+/// # Safety
+/// `section` must be a live section handle with at least `SECTION_MAP_READ`.
+pub unsafe fn map_mirror_read_only(section: HANDLE) -> io::Result<*const AtomicU64> {
+    // SAFETY: the caller's live section handle; a read-only view of it.
+    let view = unsafe { MapViewOfFile(section, FILE_MAP_READ, 0, 0, mirror_bytes()) }.Value;
+    if view.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(view.cast())
+}
+
+/// Unmaps a mirror view ([`new_mirror`]'s read-write one or
+/// [`map_mirror_read_only`]'s read-only one).
+///
+/// # Safety
+/// `view` must be a mirror view this module mapped and not since unmapped,
+/// no longer in use.
+pub unsafe fn unmap_mirror(view: *const AtomicU64) {
+    // SAFETY: the caller's mirror view.
+    unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut c_void }) };
 }
 
 /// Called first in the process's exception handler (`windows_mm::on_exception`)
@@ -3189,6 +3375,151 @@ mod tests {
             unsafe { copy(ctx, data.as_ptr(), page, PAGE, true) }.unwrap();
         }
         event
+    }
+
+    // ---- The waiter mirror section's proto and read-only transport (piece 1
+    // of the mirror twin). The fault/wake/read wiring is a later step. ----
+
+    /// The mirror proto constants are the twin of macOS's
+    /// `libc::wick_uffd::proto`, which compiles only on macOS; this asserts
+    /// its literal values (named here so a change to either is caught):
+    /// wick_uffd.rs `EVENT_PAGEFAULT` 3 (:140), `OP_MIRROR` 6 (:163),
+    /// `MIRROR_WORDS` 256 (:167), `TAG_WAITING` 1 (:169), and `tag`/`tag_slot`
+    /// the same bit layout. The two protos are duplicated, not shared, so the
+    /// backends stay independent; change one, change the other.
+    #[test]
+    fn test_the_mirror_proto_matches_the_macos_twin() {
+        assert_eq!(proto::EVENT_PAGEFAULT2, 3);
+        assert_eq!(proto::OP_MIRROR, 6);
+        assert_eq!(proto::MIRROR_WORDS, 256);
+        assert_eq!(proto::TAG_WAITING, 1);
+        assert_eq!(proto::tag(5, 7), (5u64 << 17) | (7u64 << 1) | 1);
+        assert_eq!(proto::tag_slot(proto::tag(9, 42)), 42);
+        assert_eq!(proto::mirror_bytes(4096), 4096);
+        // The mirror fits one page of this host.
+        assert_eq!(mirror_bytes(), 4096);
+    }
+
+    /// Proof 1: the read-only handle a reader is given maps the mirror
+    /// read-only — this side's writes are visible — and a write view of it is
+    /// refused with `ERROR_ACCESS_DENIED`.
+    #[test]
+    fn test_a_mirror_handle_a_reader_gets_maps_read_only() {
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        let (section, rw) = new_mirror().unwrap();
+        // SAFETY: this process's pseudo handle.
+        let me = unsafe { GetCurrentProcess() };
+        // SAFETY: live section and process handles.
+        let ro = unsafe { dup_mirror_read_only(section, me) }.unwrap();
+        // SAFETY: the live read-only section handle.
+        let read = unsafe { map_mirror_read_only(ro) }.unwrap();
+        // SAFETY: the read-write and read-only views of the one section.
+        unsafe {
+            (*rw).store(0x1234_5678_9abc_def0, Ordering::SeqCst);
+            assert_eq!((*read).load(Ordering::SeqCst), 0x1234_5678_9abc_def0);
+        }
+        // SAFETY: the read-only handle; a write view must be refused.
+        let w = unsafe { MapViewOfFile(ro, FILE_MAP_WRITE, 0, 0, mirror_bytes()) }.Value;
+        assert!(w.is_null(), "a write view of a read-only mirror handle was allowed");
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        // SAFETY: a mirror view this test mapped.
+        unsafe { unmap_mirror(read) };
+        // SAFETY: a mirror view this test mapped.
+        unsafe { unmap_mirror(rw) };
+        // SAFETY: handles this test owns.
+        unsafe {
+            CloseHandle(ro);
+            CloseHandle(section);
+        }
+    }
+
+    /// Proof 2: a read-only mirror view cannot be re-protected writable
+    /// (`VirtualProtect` to `PAGE_READWRITE` fails), as macOS's `mprotect`
+    /// `PROT_WRITE` on a `PROT_READ` mapping is `EACCES`.
+    #[test]
+    fn test_a_read_only_mirror_view_cannot_be_made_writable() {
+        let (section, rw) = new_mirror().unwrap();
+        // SAFETY: pseudo handle.
+        // SAFETY: live section and this process's pseudo handle.
+        let ro = unsafe { dup_mirror_read_only(section, GetCurrentProcess()) }.unwrap();
+        // SAFETY: the live read-only section handle.
+        let read = unsafe { map_mirror_read_only(ro) }.unwrap();
+        let mut old: PAGE_PROTECTION_FLAGS = 0;
+        // SAFETY: the read-only view; the call must refuse `PAGE_READWRITE`.
+        let ok = unsafe { VirtualProtect(read as *mut c_void, mirror_bytes(), PAGE_READWRITE, &mut old) };
+        assert_eq!(ok, 0, "a read-only mirror view was re-protected writable");
+        // SAFETY: a mirror view this test mapped.
+        unsafe { unmap_mirror(read) };
+        // SAFETY: a mirror view this test mapped.
+        unsafe { unmap_mirror(rw) };
+        // SAFETY: handles this test owns.
+        unsafe {
+            CloseHandle(ro);
+            CloseHandle(section);
+        }
+    }
+
+    /// Proof 3 (load-bearing): the read-only handle a reader holds cannot be
+    /// re-duplicated with write access. This proves the **access mask** is
+    /// reduced, not only the view: a reader that could re-dup to write could
+    /// corrupt every waiter's mirror word.
+    #[test]
+    fn test_a_mirror_handle_a_reader_gets_cannot_be_re_duplicated_to_writable() {
+        let (section, rw) = new_mirror().unwrap();
+        // SAFETY: pseudo handle.
+        let me = unsafe { GetCurrentProcess() };
+        // SAFETY: live section and process handles.
+        let ro = unsafe { dup_mirror_read_only(section, me) }.unwrap();
+        let mut wide: HANDLE = ptr::null_mut();
+        // SAFETY: the read-only handle; a re-duplication asking for write.
+        let ok = unsafe { DuplicateHandle(me, ro, me, &mut wide, FILE_MAP_WRITE, 0, 0) };
+        if ok != 0 {
+            // SAFETY: a handle this call made.
+            unsafe { CloseHandle(wide) };
+            // SAFETY: a mirror view this test mapped.
+        unsafe { unmap_mirror(rw) };
+            // SAFETY: handles this test owns.
+            unsafe {
+                CloseHandle(ro);
+                CloseHandle(section);
+            }
+            panic!("a read-only mirror handle was re-duplicated to a writable one (access mask not reduced)");
+        }
+        // SAFETY: a mirror view this test mapped.
+        unsafe { unmap_mirror(rw) };
+        // SAFETY: handles this test owns.
+        unsafe {
+            CloseHandle(ro);
+            CloseHandle(section);
+        }
+    }
+
+    /// Proof 4: the mirror section has no name, so no `OpenFileMappingW` can
+    /// reach it; a reader reaches it only through a handle this side
+    /// duplicates. `NtQueryObject` confirms the object's name is empty
+    /// (windows_sectrec makes and relies on unnamed sections the same way).
+    #[test]
+    fn test_the_mirror_section_has_no_name() {
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryObject(handle: HANDLE, class: u32, info: *mut c_void, len: u32, returned: *mut u32) -> i32;
+        }
+        const OBJECT_NAME_INFORMATION: u32 = 1;
+        let (section, rw) = new_mirror().unwrap();
+        let mut buf = [0u8; 1024];
+        let mut got = 0u32;
+        // SAFETY: a valid section handle and an output buffer.
+        let status =
+            unsafe { NtQueryObject(section, OBJECT_NAME_INFORMATION, buf.as_mut_ptr().cast(), buf.len() as u32, &mut got) };
+        assert!(status >= 0, "NtQueryObject: {status:#x}");
+        // OBJECT_NAME_INFORMATION starts with a UNICODE_STRING; its Length (in
+        // bytes) is 0 for an object with no name.
+        let name_len = u16::from_ne_bytes([buf[0], buf[1]]);
+        assert_eq!(name_len, 0, "the mirror section has a name {name_len} bytes long");
+        // SAFETY: a mirror view this test mapped.
+        unsafe { unmap_mirror(rw) };
+        // SAFETY: a handle this test owns.
+        unsafe { CloseHandle(section) };
     }
 
     /// PROBECOST: the fill path's time per page with the stack probe of its
