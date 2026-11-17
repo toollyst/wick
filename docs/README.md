@@ -8,6 +8,7 @@
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Understand the design: the layers, the compatibility crates, the POSIX layer on Windows |
 | [PORTING.md](PORTING.md) | Write or check a host backend: each Linux facility, its macOS backend, the test that proves it, and where Windows stands |
 | [macos-memory-limit.md](macos-memory-limit.md) | Know what the jail's memory limit counts on macOS, and why it bounds a compromised VMM's guest memory but not its own: the mechanics, the measurements, the public sources and the fix (guest RAM as owned purgeable chunks, with discard and reclaim) |
+| [windows-jail-reach.md](windows-jail-reach.md) | Know what a jailed Firecracker reaches on Windows beyond its files: the devices, system services and names its token opens, measured from inside a real jail, how Linux's jail compares, and the fix planned |
 | [design-fs.md](design-fs.md) | Read the plan for sharing host folders with a guest (virtio-fs): the risks, the fix planned on each host, the tests meant to prove it. No code yet |
 | [design-gpu.md](design-gpu.md) | Read the plan for giving a guest the host's GPU (headless Vulkan): the stages, the risks and what stays open on each host. No code yet |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | Change wick: where code goes, the patch workflow, commits, tests and releases |

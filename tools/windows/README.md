@@ -48,7 +48,7 @@
   under the whole mitigation profile; each one's end ends the other). With a
   guest: `netguest` (frames through the endpoint in the jail's own directory of the network),
   `isolation` (`jail-probe.rs`, run through the jailer as the jailed binary,
-  may not read the user's files or SAM, write outside its jail, reach another
+  may not read the user's files or SAM, write files outside its jail, reach another
   jail's files, API socket or process, or open the operator's; the operator
   reaches the API socket), `boot` (a 2 vCPU guest in the jail), `bindlink`
   (upstream's `test_jailer_bind_mount_propagation` through bind links: a
