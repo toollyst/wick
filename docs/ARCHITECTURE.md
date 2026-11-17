@@ -397,9 +397,12 @@ semantics on Win32. The details are in the comments of each
   `WSADuplicateSocketW` protocol information. A plain peer (no wick framing)
   is read as Linux `recvmsg` reads it.
 - **timerfd = high-resolution waitable timer.** `read` returns the expiration
-  count and re-arms. Clocks: QPC (MONOTONIC), interrupt time (BOOTTIME),
-  `GetSystemTimePreciseAsFileTime` (REALTIME), process/thread times (CPU
-  clocks).
+  count and re-arms: the expirations due on the timer's clock since the last
+  read, each counted once however late the read comes, since the count is
+  taken from the clock under the timer's lock and the next due time moves past
+  them (`test_one_shot_and_periodic`). Clocks: QPC (MONOTONIC), interrupt
+  time (BOOTTIME), `GetSystemTimePreciseAsFileTime` (REALTIME),
+  process/thread times (CPU clocks).
 - **signals = APCs and an exception filter.** A signal to a thread is a
   special user APC (`QueueUserAPC2`, else `NtQueueApcThreadEx`), which
   interrupts the thread in user code or an alertable wait; a thread in a

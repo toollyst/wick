@@ -1122,14 +1122,42 @@ mod tests {
         assert_ne!(unsafe { WaitForSingleObject(handle(fd), 50) }, WAIT_OBJECT_0, "reset by read");
         assert_eq!(read_fd(fd), -1);
 
-        // Periodic, read late: several expirations at once.
+        // Periodic, read late: several expirations at once. A read counts
+        // the expirations due on the timer's clock from the set to its own
+        // look at that clock, each once, however long the sleep took on a
+        // loaded host: the bounds come from that clock read around the set
+        // (`s0`, `s1`) and around each read (`r0`, `r1`), not from the
+        // sleep. The first expiration is 10 ms after the set, then one each
+        // 10 ms.
+        let due = |set: i64, at: i64| {
+            isize::try_from((at - set - 10_000_000).div_euclid(10_000_000) + 1).unwrap()
+        };
+        let ms = |ns: i64| ns / 1_000_000;
         spec.it_value = to_timespec(10_000_000);
         spec.it_interval = to_timespec(10_000_000);
+        let s0 = now_ns(CLOCK_MONOTONIC).unwrap();
         // SAFETY: valid pointers.
         unsafe { timerfd_settime(fd, 0, &spec, std::ptr::null_mut()) };
-        std::thread::sleep(Duration::from_millis(105));
-        let n = read_fd(fd);
-        assert!((8..=12).contains(&n), "{n} expirations");
+        let s1 = now_ns(CLOCK_MONOTONIC).unwrap();
+        let mut counted = 0;
+        for (sleep, least_due) in [(105, 10), (35, 13)] {
+            std::thread::sleep(Duration::from_millis(sleep));
+            let r0 = now_ns(CLOCK_MONOTONIC).unwrap();
+            let n = read_fd(fd);
+            let r1 = now_ns(CLOCK_MONOTONIC).unwrap();
+            assert!(n > 0, "read {n} after {sleep} ms asleep");
+            // The second read adds only what fell due after the first: an
+            // expiration counted twice would put the sum above `most`.
+            counted += n;
+            let (least, most) = (due(s1, r0), due(s0, r1));
+            assert!(least >= least_due, "{sleep} ms asleep: {} ms since the set", ms(r0 - s1));
+            assert!(
+                (least..=most).contains(&counted),
+                "{counted} expirations counted, {least} to {most} due in {} to {} ms",
+                ms(r0 - s1),
+                ms(r1 - s0)
+            );
+        }
         // Disarm.
         spec.it_value = timespec::default();
         // SAFETY: valid pointers.
