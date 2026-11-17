@@ -152,7 +152,7 @@ overlay/vmm/       new vmm modules (vmm::platform, vmm::ext), compiled into upst
 crates/compat/     Linux-only dependencies on macOS and Windows (libc, kvm-ioctls, vmm-sys-util, ...)
 crates/ext/        wick's own features, behind vmm::ext
 crates/version/    the version the binaries report
-crates/fs/         host folder sharing (being built: the VMM↔server frame format and wick-fsd's FUSE decoder so far)
+crates/fs/         host folder sharing (being built: the VMM↔server frame format and wick-fsd's FUSE decoder and server core so far)
 tools/             setup, patch export and check, rebase, generators, Linux tests against upstream, boot tests, release
 ```
 

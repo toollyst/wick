@@ -4,7 +4,10 @@
 hello that checks the share id and protocol version, and the VMM's tracker of requests in flight; its unit tests and
 the `fs_frame` fuzz target), **wick-fsd's FUSE decoder and guest names** (`crates/fs/fsd/src/fuse`: the bounded
 decoder of §6, the reply encoder and layer 1 of row 1 with the escape mapping of §6.3; their unit tests and the
-`fs_decode` fuzz target; no server runs them yet), and the guest kernels of row 21: CI's `guest-kernels` job builds upstream's CI kernel
+`fs_decode` fuzz target), **wick-fsd's server core over an in-memory directory** (`crates/fs/fsd/src/session.rs`
+and its tables, limits, record and cache modes, the `ConfinedDir` interface of the host backends and `MemDir`, a test
+backend; its unit tests and the `fs_session` fuzz target; no host backend, confinement or serving loop yet, so no
+server runs), and the guest kernels of row 21: CI's `guest-kernels` job builds upstream's CI kernel
 (6.1, 6.18) with `CONFIG_VIRTIO_FS=y` (`tools/linux/guest-kernel.sh`), though nothing boots them yet. Nothing a guest
 can use exists yet, and nothing here describes what wick does today:
 today `PUT /extensions/fs` is refused as an unknown extension (`crates/ext/src/lib.rs`,
@@ -361,7 +364,14 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
   - worker threads; queued requests;
   - name ≤ 255 bytes;
   - xattr value ≤ 64 KiB, list ≤ 64 KiB;
-  - READDIR reply ≤ the request size.
+  - READDIR reply ≤ the request size;
+  - bytes the guest's writes may add in one run of the server (decision 7): 64 GiB by default, **provisional** until
+    the jailer's `--fs-share` sets it per share (virtio-fs staging 11);
+  - guest xattrs per node, counted as stored (4 bytes of lengths, the name and the value per attribute): 3 KiB by
+    default, **provisional** until what a default host file system holds beside the record is measured; ext4, the
+    tightest, keeps all of a file's xattrs in its inode and one block, 4 KiB by default [inf: measure].
+
+  The defaults are `crates/fs/fsd/src/limits.rs`'s `DEFAULT_*` constants.
 
   Exhaustion returns ENFILE/EMFILE/ENOSPC to the guest and is counted in metrics.
 - **Metadata emulation** (all hosts): mode bits, uid/gid, rdev, and the file type for symlinks, FIFOs, sockets and
@@ -374,6 +384,93 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
     junctions are shown as symlinks (readlink only) and never traversed by the server.
 - **Guest xattrs** are stored under a private prefix (`user.wick.x.*` / `wick.x.*` / an EA blob). The guest can never
   name the record, `security.*`, `trusted.*`, `system.*` or `com.apple.*`.
+
+### 4.3 The host backend interface (`ConfinedDir`)
+
+The server is common code on every host: the FUSE decoder, the node and handle tables, the limits, the record
+(§4.5) and the cache modes (§4.4). Below it, one trait, `ConfinedDir` (`crates/fs/fsd/src/dir.rs`), is all a host
+backend implements: Linux, macOS, Windows, and `MemDir`, an in-memory directory for tests and fuzzing. Its contract:
+
+- **One checked component beneath a held directory, never following a link.** Every name a backend is given has
+  passed layer 1 of row 1 (`Name::new`); a backend never takes a path. Linux opens with `openat2` beneath, macOS with
+  `O_RESOLVE_BENEATH` and `O_NOFOLLOW_ANY`, Windows with `NtCreateFile` relative to a handle with `OBJ_DONT_REPARSE`
+  (§6).
+- **Every name a backend returns is checked again** by the server, which skips (and counts) one that is not a guest
+  name.
+- **Nodes and identity.** A node is what the node table holds: Linux an `O_PATH` descriptor; macOS a directory's
+  `O_SEARCH` descriptor or (parent, name, identity) for anything else; Windows a handle opened by id. Identity is
+  (volume, 128-bit file id). Every operation that acts on an object the guest found earlier (open, unlink, rmdir,
+  link) is given the identity it expects and fails with ENOENT when the name now holds another object.
+- **Exact names.** A lookup whose stored name is not exactly the name asked for (an alias by case or normalization)
+  is ENOENT.
+- **Errors are Linux's errno on every host.** A refusal by layer 2 (the beneath flags) or 3 (the OS sandbox) is a
+  separate error carrying the layer and the host's code: the guest gets EACCES, the server counts it, and any one is a
+  bug in layer 1 (the corpus test of row 1 fails on it).
+- **Listing:** entries after a cookie, cookies 1 to `i64::MAX`; the server adds `.` and `..` itself.
+- **The record and guest xattrs** are stored and read as opaque bytes (§4.2): the backend never interprets the record,
+  and the server refuses a record of another length.
+- **Permission bits:** a backend keeps the server's own access to the object and never sets setuid, setgid or sticky
+  on the host.
+- **Rename** acts on two (directory, name) pairs, with Linux's errors (`fs/namei.c` `filename_renameat2`,
+  `__start_renaming`, `vfs_rename`) [src]: a directory into itself or beneath it is EINVAL; onto an ancestor of its
+  old parent ENOTEMPTY (EINVAL under exchange); two names of one object succeed with nothing changed. Of
+  `renameat2`'s flags:
+  - `RENAME_NOREPLACE` goes to the backend on every host: Linux `renameat2(RENAME_NOREPLACE)`, macOS
+    `renameatx_np(RENAME_EXCL)`, Windows `FileRenameInformationEx` without `FILE_RENAME_REPLACE_IF_EXISTS`.
+  - `RENAME_EXCHANGE` goes to the backend, which swaps the two names atomically (ENOENT if either is missing, and a
+    directory may be exchanged with a non-directory, as Linux allows): Linux `renameat2(RENAME_EXCHANGE)`, macOS
+    `renameatx_np(RENAME_SWAP)`. **The Windows backend refuses it with EINVAL**: NTFS has no atomic exchange. The
+    `FileRenameInformationEx` flags are `REPLACE_IF_EXISTS`, `POSIX_SEMANTICS`, `IGNORE_READONLY_ATTRIBUTE` and
+    storage-reserve and pin-state flags, none an exchange ([Microsoft Learn, `FILE_RENAME_INFORMATION`](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information))
+    [doc], and two renames through a third name are not atomic: another process could see the third name, or a crash
+    leave it. A guest that needs it gets EINVAL, as from a Linux file system without exchange (§9).
+  - `RENAME_WHITEOUT` is refused with EINVAL by the server on every host: it leaves a character-device node (0, 0)
+    in place of the source for overlayfs, and the server never makes device nodes on a host (they are emulated in
+    the record, §4.2).
+  - Both of `NOREPLACE` and `EXCHANGE`, or an unknown bit, is EINVAL, as Linux.
+
+### 4.4 Cache modes
+
+How long the guest may keep what the server tells it, per share. The names are virtiofsd's `cache=` (`passthrough/mod.rs`,
+`CachePolicy`) [src]. The guest has no mount option for it: it caches what each reply allows
+(`crates/fs/fsd/src/cache.rs`).
+
+| Mode | Entry, attribute and negative-entry timeout | Opens | INIT |
+| --- | --- | --- | --- |
+| `never` | 0, no negative entries | `FOPEN_DIRECT_IO`: every read reaches the host | |
+| `auto` (default) | 1 s, **provisional** (§10, question 10) | no `FOPEN_KEEP_CACHE`: a file's pages are dropped at each open (close-to-open, as NFS) | `FUSE_AUTO_INVAL_DATA`: a getattr that sees a new mtime or size drops them too |
+| `always` | the share's timeout, a day by default | `FOPEN_KEEP_CACHE`, `FOPEN_CACHE_DIR` | |
+
+A timeout is at most a day. Under `never`, a shared `mmap` of a file fails in the guest unless the server negotiates
+`FUSE_DIRECT_IO_ALLOW_MMAP` (FUSE 7.39), which it does not yet. `always` is for shares nothing else changes.
+
+### 4.5 The metadata record (`wick.stat`)
+
+What the guest set that a host object cannot hold as the guest means it (§4.2, Metadata emulation;
+`crates/fs/fsd/src/record.rs`). 40 bytes, little-endian, the same bytes on every host, so a share moved between hosts
+keeps it.
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 4 | magic `wkst` |
+| 4 | 2 | version, 1 |
+| 6 | 2 | flags: bit 0 mode, 1 uid, 2 gid, 3 rdev present |
+| 8 | 4 | mode: Linux `st_mode`, type bits and `0o7777` |
+| 12 | 4 | uid |
+| 16 | 4 | gid |
+| 20 | 4 | rdev major |
+| 24 | 4 | rdev minor |
+| 28 | 12 | reserved, 0 |
+
+- A record that breaks any rule is refused (the operation fails with EIO and is counted), never reinterpreted or
+  repaired: another length, magic or version; an unknown flag bit; a reserved byte, or an absent field's bytes, not
+  0; a mode with bits beyond the type and `0o7777` or no known type; a type the host object cannot carry (a host
+  directory only a directory's type, a host regular file any type but a directory's, a host symlink or other host
+  object none).
+- Without a record, or for a field it lacks, the guest sees the host's type and permission bits and the share's
+  configured owner. A host symlink shows `0o777`; another host object (FIFO, device) shows as a regular file with no
+  permission, and is never opened.
+- Times, size and link count are always the host's.
 
 ---
 
@@ -496,8 +593,12 @@ it means layer 1 let the request through.
   - rename with `FileRenameInformationEx` + `FILE_RENAME_POSIX_SEMANTICS` (replace a file with open handles) +
     `RootDirectory`;
   - delete with `FileDispositionInformationEx` POSIX semantics [inf: version minimum to confirm, believed 1709+].
-- **Names:** reject `:` and `\`. Escape characters NTFS forbids (`* ? " < > |`, 0x01–0x1F) and trailing dot/space
-  into the private-use range, as WSL DrvFs does [inf: confirm WSL's mapping], and round-trip them. NT relative opens
+- **Names:** reject `:` and `\`. Escape characters NTFS forbids (`* ? " < > |`, 0x01–0x1F) into the private-use
+  range, as WSL DrvFs does [inf: confirm WSL's mapping], and round-trip them: each character c becomes U+F000 + c
+  (U+F001–U+F01F, U+F022, U+F02A, U+F03A, U+F03C, U+F03E, U+F03F, U+F05C, U+F07C). A guest name holding any image, or
+  U+F02F (the image of `/`), is refused with EINVAL on every host, so a share behaves the same wherever it is served
+  (`crates/fs/fsd/src/fuse/name.rs`, `test_name_refuses_every_escape_image`). Trailing dots and spaces are kept by the
+  common mapping and handled by the Windows backend [inf: measure against WSL]. NT relative opens
   do not apply DOS device names (`CON`, `NUL`) [inf]. Refuse a share at a volume root (NTFS `$` metafiles).
 - **Case:** `FileCaseSensitiveInformation` per directory. Setting it needs elevation and an empty directory, and new
   subdirectories inherit it (Windows 10 build 17107+) [doc].
@@ -572,6 +673,8 @@ it means layer 1 let the request through.
 | Containment of dirs the host moves out | Landlock (dynamic) [inf] | Seatbelt (dynamic) [inf] | **no** (static ACLs): documented |
 | Case-sensitive share without admin | yes | case-sensitive APFS volume/image | **no** for existing dirs (admin + empty dir) |
 | Native symlinks without privilege | yes | yes | **no** (privilege or Developer Mode): emulated everywhere |
+| Atomic `RENAME_EXCHANGE` | `renameat2` | `renameatx_np(RENAME_SWAP)` | **no**: NTFS has no exchange (`FILE_RENAME_INFORMATION`'s flags, §4.3); EINVAL |
+| `RENAME_WHITEOUT` | **no** on every host: the server makes no device nodes; EINVAL | | |
 | Per-process handle limit | `RLIMIT_NOFILE` | `RLIMIT_NOFILE` | **none** [meas: `jailer-test.ps1 nofile`]: self-limit everywhere |
 | Host change notifications to the guest | **no** on any host (Linux driver) | no | no |
 | DAX | not in v1 on any host | | |
@@ -606,6 +709,8 @@ it means layer 1 let the request through.
 8. **Read-only shares on macOS/Windows:** do atime updates on reads (virtiofsd notes this on Linux) matter to
    operators?
 9. Share roots: home and system locations are refused by default (§0, decision 8). Open: the exact list per host.
+10. **Cache `auto` timeout:** 1 s, provisional (§4.4). Open: how soon a host-side edit must show in the guest,
+    measured against the metadata requests a shorter timeout costs.
 
 ---
 

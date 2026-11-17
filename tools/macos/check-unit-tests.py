@@ -40,7 +40,12 @@ The binaries run unsigned, as on CI's runners, which have no
 Hypervisor.framework: a test that creates a VM fails (`no-hvf`). On a Mac,
 tools/macos/test.sh runs them signed, each in a process of its own (one VM per
 process), signing them in place: after it, a binary cargo did not link
-again is still signed here (see test.sh). Runs cargo in lib/firecracker.
+again is still signed here (see test.sh), and its no-hvf tests pass, which
+this check reports as listed tests that pass and as count mismatches. Before
+a local run after test.sh, delete the test binaries test.sh signed (for
+example `codesign -d --entitlements -` on build/cargo_target/debug/deps/*
+names them) so cargo links them again unsigned. Runs cargo in
+lib/firecracker.
 The jailer's tests need root and run
 in their own CI step.
 """

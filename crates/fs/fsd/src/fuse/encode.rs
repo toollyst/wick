@@ -326,6 +326,27 @@ pub fn direntplus(entry: &EntryOut, off: u64, kind: u32, name: &[u8]) -> Vec<u8>
     out.0
 }
 
+/// A request as a guest's kernel lays it out: `fuse_in_header` (its `len`
+/// the whole) and the arguments. The guest's side, for the session's tests
+/// and the `fs_session` fuzz target; the server never sends one.
+pub fn request(opcode: u32, unique: u64, nodeid: u64, ids: (u32, u32), args: &[&[u8]]) -> Vec<u8> {
+    let body_len: usize = args.iter().map(|a| a.len()).sum();
+    let len = u32::try_from(super::IN_HEADER_LEN + body_len).unwrap_or(u32::MAX);
+    let mut out = Out::default();
+    out.u32(len)
+        .u32(opcode)
+        .u64(unique)
+        .u64(nodeid)
+        .u32(ids.0)
+        .u32(ids.1)
+        .u32(1)
+        .zeros(4);
+    for a in args {
+        out.0.extend_from_slice(a);
+    }
+    out.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1248,7 +1248,7 @@ jobs:
   # frames the virtio-fs device and wick-fsd exchange, checked with
   # Firecracker's toolchain (crates/fs/rust-toolchain.toml, which rustup reads
   # from the working directory) and Firecracker's lints, on every host wick
-  # builds for. Its fuzz targets, fs_frame and fs_decode, run in the fuzz job; its
+  # builds for. Its fuzz targets, fs_frame, fs_decode and fs_session, run in the fuzz job; its
   # Cargo.lock is in the dependencies job's checks.
   fs:
     strategy:

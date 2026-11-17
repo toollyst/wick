@@ -63,6 +63,14 @@ macro_rules! errnos {
                 pub const $name: Errno = Errno($value);
             )*
 
+            /// The errno with Linux's number `value`, if this module names it.
+            pub fn from_linux(value: i32) -> Option<Errno> {
+                match value {
+                    $($value => Some(Errno::$name),)*
+                    _ => None,
+                }
+            }
+
             fn name(self) -> Option<&'static str> {
                 match self.0 {
                     $($value => Some(stringify!($name)),)*
@@ -78,6 +86,7 @@ errnos! {
     ENOENT = 2,
     EINTR = 4,
     EIO = 5,
+    ENXIO = 6,
     E2BIG = 7,
     EBADF = 9,
     EAGAIN = 11,
@@ -104,6 +113,7 @@ errnos! {
     ENOTEMPTY = 39,
     ELOOP = 40,
     ENODATA = 61,
+    EPROTO = 71,
     EOVERFLOW = 75,
     EILSEQ = 84,
     EOPNOTSUPP = 95,

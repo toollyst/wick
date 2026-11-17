@@ -258,8 +258,8 @@ mod tests {
 
     #[test]
     fn test_name_refuses_every_escape_image() {
-        // The set the Windows owner gave (docs/design-fs.md, Q8 item 1),
-        // and nothing else in the Private Use Area: each image alone and
+        // The set docs/design-fs.md §6.3 (Names) escapes, and nothing else
+        // in the Private Use Area: each image alone and
         // inside a name is EINVAL; its neighbours are names.
         let images = image_set();
         assert_eq!(images.len(), 31 + IMAGES.len());
@@ -289,8 +289,8 @@ mod tests {
             "\u{F001}\u{F01F}\u{F022}\u{F02A}\u{F03A}\u{F03C}\u{F03E}\u{F03F}\u{F05C}\u{F07C}"
         );
         // Everything else is kept, including characters NTFS takes and
-        // trailing dots and spaces (their handling is the Windows owner's,
-        // from WSL's measured behaviour).
+        // trailing dots and spaces: the Windows backend handles those
+        // (docs/design-fs.md §6.3, Names).
         let kept = "a b.é\u{7f}\u{F000}\u{F080}. ";
         assert_eq!(escape(Name::new(kept.as_bytes()).unwrap()), kept);
     }

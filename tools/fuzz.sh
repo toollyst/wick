@@ -55,6 +55,7 @@ host_targets() {
     fi
     echo fs_frame
     echo fs_decode
+    echo fs_session
 }
 
 # Windows: the targets are built with AddressSanitizer, whose runtime is a
@@ -123,6 +124,8 @@ target_args() {
     # A request of a few KiB (every bound but MAX_WRITE's, which the unit
     # tests take), built twice: as it comes and around an opcode.
     fs_decode) echo "-max_len=16384" ;;
+    # Up to 64 requests of a few KiB each on one session.
+    fs_session) echo "-max_len=65536" ;;
     *) die "unknown target '$1' (tools/fuzz.sh --list)" ;;
     esac
 }

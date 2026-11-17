@@ -89,3 +89,10 @@ path = "fuzz_targets/fs_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fs_session"
+path = "fuzz_targets/fs_session.rs"
+test = false
+doc = false
+bench = false
