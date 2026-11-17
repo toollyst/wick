@@ -868,6 +868,15 @@ unsafe fn discard_piece(ptr: *mut c_void, len: size_t, backing: Backing, prot: c
         // SAFETY: the caller's contract.
         Backing::Shared | Backing::File => unsafe { libc::madvise(ptr, len, libc::MADV_DONTNEED) },
         Backing::Anonymous => {
+            // Owned (purgeable) guest memory is discarded per 2 MiB chunk (a
+            // whole chunk freed and replaced, giving its charge back; a
+            // partial chunk zeroed with its charge pinned), so the charge
+            // stays accountable to the jail (docs/macos-memory-limit.md). The
+            // VMM's own anonymous memory takes the plain fresh-pages replace.
+            if crate::wick_owned::is_owned(ptr as u64, len as u64) {
+                // SAFETY: a mapped sub-range of one owned range (just checked).
+                return unsafe { crate::wick_owned::discard(ptr as u64, len as u64, prot) };
+            }
             // Fresh zero pages, released from the guest meanwhile. Kept
             // `MAP_NORESERVE`, as Firecracker's guest memory is made
             // (`discard_range` keeps it for the same reason).

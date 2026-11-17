@@ -62,15 +62,26 @@ const VM_FLAGS_OVERWRITE: c_int = 0x4000;
 const VM_PROT_RW: c_int = libc::PROT_READ | libc::PROT_WRITE;
 /// `KERN_SUCCESS`.
 const KERN_SUCCESS: c_int = 0;
+/// `MADV_ZERO` (macOS `<sys/mman.h>`): zero the pages in place without
+/// faulting new ones in. On a purgeable object the pages are zeroed and the
+/// object keeps them (its charge stays; own3.c), so a partial discard zeroes
+/// now and the charge returns only when the whole chunk is freed. Not
+/// `MADV_FREE_REUSABLE`: a page it frees that the guest writes again is not
+/// charged again, which would let a guest past the limit (linux_items `madvise`).
+const MADV_ZERO: c_int = 11;
 
 /// One range of guest memory made of purgeable chunks. The chunks are
 /// `[base, base + len)` split every [`CHUNK`] bytes (the last chunk is shorter
-/// when `len` is not a multiple of `CHUNK`). Later revisions add the per-chunk
-/// dead-page state the partial discard and the reclaim keep here.
-#[derive(Clone, Copy)]
+/// when `len` is not a multiple of `CHUNK`). `dead[i]` counts the pages of
+/// chunk `i` a partial discard has zeroed (`MADV_ZERO`) without giving their
+/// charge back: the object still owns them, so the chunk's charge stays until
+/// the whole chunk is discarded; the count is what the reclaim (a later
+/// revision) triggers on. A whole-chunk discard frees the chunk's object and
+/// resets its count to zero (the fresh object holds nothing).
 struct Owned {
     base: u64,
     len: u64,
+    dead: Vec<u32>,
 }
 
 /// Every owned guest-memory range of this process. A VMM has a handful (one
@@ -136,7 +147,11 @@ pub unsafe fn allocate(addr: *mut c_void, len: usize, prot: c_int) -> *mut c_voi
         }
     }
 
-    OWNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Owned { base, len });
+    let nchunks = len.div_ceil(CHUNK) as usize;
+    OWNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(Owned { base, len, dead: std::vec![0u32; nchunks] });
     // Parity with the `mmap` this stands in for: it clears any stale huge-page
     // record of the range (these chunks are not huge pages).
     crate::wick_uffd::note_mapping(base, len, false);
@@ -156,9 +171,9 @@ unsafe fn release(base: u64, len: u64) {
 }
 
 /// Whether `[start, start + len)` lies in a registered owned guest-memory
-/// range. The discard path (a later revision) uses it to tell guest memory
-/// from the VMM's own anonymous memory. (`pub(crate)` and unused until then.)
-#[allow(dead_code)]
+/// range. The discard path ([`crate::linux_items`]'s `discard_piece`) uses it
+/// to tell guest memory, which [`discard`] handles, from the VMM's own
+/// anonymous memory, which the plain anonymous replace handles as before.
 pub(crate) fn is_owned(start: u64, len: u64) -> bool {
     let end = start.saturating_add(len);
     OWNED
@@ -166,4 +181,98 @@ pub(crate) fn is_owned(start: u64, len: u64) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .any(|o| o.base <= start && end <= o.base + o.len)
+}
+
+/// The host page size.
+fn page_size() -> u64 {
+    // SAFETY: `sysconf` has no preconditions.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+}
+
+/// The dead-page count of the chunk that contains `start` (0 when `start` is
+/// in no owned range). The reclaim (a later revision) triggers on it; a test
+/// reads it to check a partial discard counted the pages it zeroed.
+pub fn dead_pages(start: u64) -> u32 {
+    let owned = OWNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for o in owned.iter() {
+        if o.base <= start && start < o.base + o.len {
+            return o.dead[((start - o.base) / CHUNK) as usize];
+        }
+    }
+    0
+}
+
+/// Discards `[start, start + len)` of owned guest memory, per 2 MiB chunk,
+/// through the backend's replace hook so the guest's stage 2 follows:
+/// - a chunk the discard fully covers is freed and replaced by a fresh
+///   purgeable object of the chunk's protection (its `purgeable_nonvolatile`
+///   charge returned, the guest reads zero), as proven under a live guest by
+///   the b-core spike (−CHUNK, stage 2 follows);
+/// - a chunk only partly covered has the covered pages zeroed in place with
+///   `MADV_ZERO` (the object keeps them, so the chunk's charge stays pinned
+///   until the whole chunk goes) and those pages counted dead for the reclaim
+///   (a later revision).
+///
+/// The caller has checked the range is owned ([`is_owned`]), so it lies in one
+/// registered range. Returns 0, or -1 with `errno` set, as the `mmap` /
+/// `madvise` discard it replaces.
+///
+/// # Safety
+/// `[start, start + len)` must be a mapped sub-range of one owned range.
+pub unsafe fn discard(start: u64, len: u64, prot: c_int) -> c_int {
+    if len == 0 {
+        return 0;
+    }
+    let end = start + len;
+    let page = page_size();
+    let mut owned = OWNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(o) = owned.iter_mut().find(|o| o.base <= start && end <= o.base + o.len) else {
+        // The caller checked `is_owned`; a miss here is a straddle or a race.
+        crate::linux_items::set_errno(libc::ENOMEM);
+        return -1;
+    };
+    let base = o.base;
+    let first = (start - base) / CHUNK;
+    let last = (end - 1 - base) / CHUNK;
+    for i in first..=last {
+        let cbase = base + i * CHUNK;
+        let csize = CHUNK.min(o.len - i * CHUNK);
+        let cend = cbase + csize;
+        let os = start.max(cbase);
+        let oe = end.min(cend);
+        if os == cbase && oe == cend {
+            // Whole chunk: free its object, a fresh purgeable one in its place.
+            let ok = crate::wick_guest::replacing(cbase, csize, false, || {
+                let mut a = cbase;
+                // SAFETY: a fixed purgeable allocation over the chunk's range.
+                unsafe {
+                    mach_vm_allocate(mach_task_self_, &mut a, csize, VM_FLAGS_OVERWRITE | VM_FLAGS_PURGABLE)
+                        == KERN_SUCCESS
+                        && a == cbase
+                }
+            });
+            if !ok {
+                crate::linux_items::set_errno(libc::ENOMEM);
+                return -1;
+            }
+            if prot != VM_PROT_RW {
+                // SAFETY: over the fresh chunk just made.
+                unsafe { mach_vm_protect(mach_task_self_, cbase, csize, 0, prot) };
+            }
+            o.dead[i as usize] = 0;
+        } else {
+            // Partial: zero the covered pages; the object keeps them (charge pinned).
+            let olen = oe - os;
+            let ok = crate::wick_guest::replacing(os, olen, false, || {
+                // SAFETY: a mapped sub-range of the chunk.
+                unsafe { libc::madvise(os as *mut c_void, olen as usize, MADV_ZERO) == 0 }
+            });
+            if !ok {
+                return -1; // `errno` set by `madvise`.
+            }
+            let dead = &mut o.dead[i as usize];
+            *dead = (*dead + (olen / page) as u32).min((csize / page) as u32);
+        }
+    }
+    0
 }

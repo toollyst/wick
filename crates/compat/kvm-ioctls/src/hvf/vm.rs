@@ -2916,6 +2916,118 @@ mod tests {
         );
     }
 
+    /// Reserves a 2 MiB-aligned range and makes it owned purgeable chunks (as
+    /// the guest-memory allocator does), maps it as a guest slot, and has the
+    /// guest write `0x77` to every page. Returns `(base, len, ipa)`.
+    fn owned_slot_written(vm: &VmFd, vcpu: &mut VcpuFd, len: u64) -> (u64, u64, u64) {
+        const CHUNK: u64 = 2 << 20;
+        let reserve = len + CHUNK;
+        // SAFETY: a new anonymous reservation of the test's.
+        let raw = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                reserve as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "reserve");
+        let base = (raw as u64).next_multiple_of(CHUNK);
+        // SAFETY: the reserved, chunk-aligned range; nothing else maps it.
+        let mem = unsafe {
+            libc::wick_owned::allocate(base as *mut core::ffi::c_void, len as usize, libc::PROT_READ | libc::PROT_WRITE)
+        };
+        assert_eq!(mem as u64, base, "owned allocate returns its range");
+        let ipa = GUEST_BASE + (1 << 30);
+        let region = kvm_userspace_memory_region {
+            slot: 1,
+            guest_phys_addr: ipa,
+            memory_size: len,
+            userspace_addr: base,
+            flags: 0,
+        };
+        // SAFETY: the mapping stays for the test.
+        unsafe { vm.set_user_memory_region(region).unwrap() };
+        guest_pass(vcpu, ipa, ipa + len); // the guest writes 0x77 to every page
+        assert_eq!(host_pass(base, len), 0x77 * (len / host_page_size()), "guest's writes are its memory");
+        (base, len, ipa)
+    }
+
+    /// A whole-chunk discard of owned memory (`libc::wick_owned::discard`)
+    /// through the backend's replace hook: the chunk's purgeable object is
+    /// freed and replaced, so its charge comes back (footprint −CHUNK), the
+    /// chunk reads zero, its neighbours keep their data, and stage 2 follows
+    /// (the guest's later write to the chunk is seen by the host). This is the
+    /// committed form of the b-core spike, on the product's discard path.
+    #[test]
+    fn test_owned_whole_chunk_discard_returns_the_charge() {
+        const CHUNK: u64 = 2 << 20;
+        let page = host_page_size();
+        let (vm, mut vcpu, _c, _l) = vm_with_memory(1, &FILL);
+        let (base, _len, ipa) = owned_slot_written(&vm, &mut vcpu, 8 << 20); // four chunks
+        let at = |off: u64| -> u64 { unsafe { std::ptr::read_volatile((base + off) as *const u64) } };
+
+        let before = phys_footprint();
+        let coff = CHUNK; // discard chunk index 1
+        // SAFETY: a whole chunk of the owned range.
+        let r = unsafe { libc::wick_owned::discard(base + coff, CHUNK, libc::PROT_READ | libc::PROT_WRITE) };
+        assert_eq!(r, 0, "discard returns 0");
+        let after = phys_footprint();
+
+        let returned = before as i64 - after as i64;
+        assert!(
+            returned >= (CHUNK - 4 * page) as i64,
+            "the whole chunk's charge comes back (want ~+{} MiB, was {:+} MiB)",
+            CHUNK >> 20,
+            returned >> 20
+        );
+        assert_eq!(at(coff), 0, "the discarded chunk reads zero");
+        assert_eq!(at(coff + CHUNK - page), 0, "chunk end zero");
+        assert_eq!(at(coff - page), 0x77, "the page before the chunk kept its data");
+        assert_eq!(at(coff + CHUNK), 0x77, "the page after the chunk kept its data");
+        assert_eq!(libc::wick_owned::dead_pages(base + coff), 0, "a freed chunk has no dead pages");
+
+        // Stage 2 follows the replace: the guest writes the chunk again and the host sees it.
+        guest_pass(&mut vcpu, ipa + coff, ipa + coff + CHUNK);
+        assert_eq!(at(coff), 0x77, "guest rewrote the chunk and the host sees it: stage 2 followed");
+    }
+
+    /// A partial (sub-chunk) discard of owned memory: the covered pages are
+    /// zeroed in place (`MADV_ZERO`) through the replace hook, the object keeps
+    /// them so the chunk's charge stays pinned (footprint unchanged, not given
+    /// back), the pages read zero, their neighbours keep their data, the dead
+    /// count rises, and stage 2 follows (the guest's rewrite is seen).
+    #[test]
+    fn test_owned_partial_discard_zeroes_and_pins_the_charge() {
+        let page = host_page_size();
+        let (vm, mut vcpu, _c, _l) = vm_with_memory(1, &FILL);
+        let (base, _len, ipa) = owned_slot_written(&vm, &mut vcpu, 4 << 20); // two chunks
+        let at = |off: u64| -> u64 { unsafe { std::ptr::read_volatile((base + off) as *const u64) } };
+
+        let before = phys_footprint();
+        let poff = 1 << 20; // one page inside chunk 0, not a whole chunk
+        // SAFETY: a mapped sub-range of the owned range.
+        let r = unsafe { libc::wick_owned::discard(base + poff, page, libc::PROT_READ | libc::PROT_WRITE) };
+        assert_eq!(r, 0, "discard returns 0");
+        let after = phys_footprint();
+
+        assert!(
+            (before as i64 - after as i64).abs() < (1 << 20),
+            "a partial discard keeps the charge pinned (footprint unchanged, was {:+} KiB)",
+            (after as i64 - before as i64) >> 10
+        );
+        assert_eq!(at(poff), 0, "the discarded page reads zero");
+        assert_eq!(at(poff - page), 0x77, "the page before kept its data");
+        assert_eq!(at(poff + page), 0x77, "the page after kept its data");
+        assert_eq!(libc::wick_owned::dead_pages(base + poff), 1, "the zeroed page is counted dead");
+
+        // Stage 2 follows: the guest writes the page again and the host sees it.
+        guest_pass(&mut vcpu, ipa + poff, ipa + poff + page);
+        assert_eq!(at(poff), 0x77, "guest rewrote the page and the host sees it: stage 2 followed");
+    }
+
     /// Guest programs: at [`GUEST_BASE`], writes X3 to X1, then to X4 (MMIO:
     /// the exit); at `GUEST_BASE + 16`, reads X1 into X5 and writes it to X4.
     const STORE_THEN_LOAD: [u32; 7] = [
