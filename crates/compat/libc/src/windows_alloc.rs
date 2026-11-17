@@ -221,6 +221,38 @@ fn no_reclaim_here() -> Option<&'static str> {
     }
 }
 
+/// The band a refused allocation of `size` falls in (the module doc's 1, 2,
+/// 3), from the two limits alone so it can be decided and tested without a
+/// live allocation ([`test_band_decision`]): the live commit limit is not
+/// static — the system-managed pagefile auto-grows it (Learn, `MEMORYSTATUSEX`
+/// `ullTotalPageFile`) — so a live over-commit is not a reliable way to reach
+/// band 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Band {
+    /// 1: above the host's commit limit; null, whatever the job's limit.
+    Null,
+    /// 2: above the job's limit (`limit`), not the host's; end with 137.
+    End137 { limit: usize },
+    /// 3: within both limits (or neither is known); the reclaim may help.
+    Reclaim,
+}
+
+/// Which band `size` is in, given the host's commit limit and the job's
+/// memory limit (each `None` when it cannot be read). Band 1 is tested first:
+/// a size above the host's commit limit is null under a job's limit, over one,
+/// and out of a job, as Linux's malloc is null above RAM and swap whatever
+/// `memory.max` is. A limit that cannot be read is no limit (a failed read
+/// never turns a refusal into a 137).
+fn band_decision(size: usize, commit_limit: Option<usize>, job_limit: Option<usize>) -> Band {
+    if commit_limit.is_some_and(|total| size > total) {
+        return Band::Null;
+    }
+    if let Some(limit) = job_limit.filter(|&limit| size > limit) {
+        return Band::End137 { limit };
+    }
+    Band::Reclaim
+}
+
 /// An allocation of `size` bytes ([`Kind`]) the system refused; `again`
 /// asks for it once more.
 #[cold]
@@ -242,33 +274,31 @@ fn refused(size: usize, kind: Kind, again: impl FnOnce() -> *mut u8) -> *mut u8 
         Kind::Realloc(old) => old,
         _ => 0,
     };
-    // 1: more than the host can commit at all, as Linux's malloc is refused
-    // above RAM and swap, whatever memory.max is. The job's memory limit is
-    // not consulted: a size above the commit limit is null under a job's
-    // limit, over one (the host, not the job, cannot hold it; Linux's malloc
-    // is null there too), and out of a job. This is right both ways
-    // `ullTotalPageFile` can be read (Learn, `MEMORYSTATUSEX`: "the system
-    // or the current process, whichever is smaller"): as the system's, a
-    // size above it cannot be committed on the host; and were it ever the
-    // process's own commit limit below the host's, a size above it still
-    // cannot be committed, so null is right. Measured, neither a job memory
-    // limit (`memory.max`) nor a per-process one lowers it, on Windows
-    // Server 2022 20348 and 2025 26100, and `SetInformationJobObject`
-    // accepts a job limit above it, so a size above the host under such a
-    // job reaches here (`host_commit_limit`, the HEAPABOVE rows).
-    let job = job_memory_limit();
-    if host_commit_limit().is_some_and(|total| size > total) {
-        return core::ptr::null_mut();
-    }
-    // 2: more than the job's limit holds in all: no reclaim can make room.
-    if let Some(limit) = job.filter(|&limit| size > limit) {
-        crate::windows_mm::end_at_the_limit(format_args!(
-            "wick: heap: {what} of {size} bytes (from {from}) is more than the memory limit of {limit} bytes (the \
-             jail's memory.max) holds in all, so no reclaim ran; Linux's malloc gives it and the cgroup OOM killer \
-             ends the VMM at the touch of the page past the limit, Windows commits it at the allocation; the VMM \
-             ends (exit {})",
-            crate::windows_mm::OOM_EXIT
-        ));
+    // The band the size falls in, from the host's commit limit and the job's
+    // memory limit ([`band_decision`]). Band 1 (null) is tested first: a size
+    // above the host's commit limit is null under a job's limit, over one (the
+    // host, not the job, cannot hold it; Linux's malloc is null there too), and
+    // out of a job. Measured, neither a job memory limit (`memory.max`) nor a
+    // per-process one lowers the commit limit, on Windows Server 2022 20348 and
+    // 2025 26100, and `SetInformationJobObject` accepts a job limit above it,
+    // so a size above the host under such a job reaches band 1 (the HEAPABOVE
+    // rows). A limit that cannot be read is no limit for 1 and 2.
+    match band_decision(size, host_commit_limit(), job_memory_limit()) {
+        // 1: more than the host can commit at all; null, as the system's
+        // allocator answers and as Linux's malloc is above RAM and swap.
+        Band::Null => return core::ptr::null_mut(),
+        // 2: more than the job's limit holds in all: no reclaim can make room.
+        Band::End137 { limit } => {
+            crate::windows_mm::end_at_the_limit(format_args!(
+                "wick: heap: {what} of {size} bytes (from {from}) is more than the memory limit of {limit} bytes (the \
+                 jail's memory.max) holds in all, so no reclaim ran; Linux's malloc gives it and the cgroup OOM \
+                 killer ends the VMM at the touch of the page past the limit, Windows commits it at the allocation; \
+                 the VMM ends (exit {})",
+                crate::windows_mm::OOM_EXIT
+            ));
+        }
+        // 3: within both limits; the reclaim may make room (below).
+        Band::Reclaim => {}
     }
     if let Some(why) = no_reclaim_here() {
         crate::windows_mm::end_at_the_limit(format_args!(
@@ -292,4 +322,33 @@ fn refused(size: usize, kind: Kind, again: impl FnOnce() -> *mut u8) -> *mut u8 
         if freed > 0 { ", and the allocation was refused again" } else { "" },
         crate::windows_mm::OOM_EXIT
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Band, band_decision};
+
+    /// The band decision, with injected limits (no live allocation): band 1
+    /// (null) when the size is above the host's commit limit, whatever the
+    /// job's limit; band 2 (end 137) when it is above the job's limit but not
+    /// the host's; band 3 (reclaim) within both or with neither known. This is
+    /// the deterministic proof of band 1, which a live over-commit cannot give
+    /// on a host whose system-managed pagefile auto-grows the commit limit
+    /// (the HEAPABOVE live rows are best-effort for that reason).
+    #[test]
+    fn test_band_decision() {
+        // Band 1: above the host's commit limit, whatever the job's limit.
+        assert_eq!(band_decision(100, Some(50), None), Band::Null, "no job");
+        assert_eq!(band_decision(100, Some(50), Some(200)), Band::Null, "job above the commit limit");
+        assert_eq!(band_decision(100, Some(50), Some(10)), Band::Null, "the commit limit decides first");
+        assert_eq!(band_decision(100, Some(99), Some(99)), Band::Null, "one byte above");
+        // Band 2: above the job's limit, not the host's.
+        assert_eq!(band_decision(100, Some(200), Some(50)), Band::End137 { limit: 50 });
+        assert_eq!(band_decision(100, None, Some(50)), Band::End137 { limit: 50 }, "no commit limit read");
+        // Band 3: within both limits, or neither known. Equal is not "above".
+        assert_eq!(band_decision(100, Some(200), Some(200)), Band::Reclaim, "within both");
+        assert_eq!(band_decision(100, None, None), Band::Reclaim, "neither known");
+        assert_eq!(band_decision(100, Some(100), Some(100)), Band::Reclaim, "a size equal to the limits");
+        assert_eq!(band_decision(100, Some(200), None), Band::Reclaim, "within the commit limit, no job");
+    }
 }

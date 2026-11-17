@@ -1348,8 +1348,8 @@ upstream Firecracker and its jailer.
   control, five runs, with the VM's API latency, its CPU with no `cpu.max` and under one CPU's, and a second jailed
   VM's 1 kHz loop rate). It has run on AMD in CI: before the gate the held LVT timer write failed its own legacy
   get with 0x80370308 in three of three windows-guest runs, always on vp 3; with the gate the storm holds with no
-  refusal, two of three CI acceptance runs passing so far (every storm held, a write up to about 1,520 us), the
-  third in CI and the 10 PC rounds not yet run. The exit path itself has run on Windows, in record builds only: GPEXITREC
+  refusal, three of three CI acceptance runs passing (every storm held, a write up to about 1,520 us), the 10 PC
+  rounds not yet run. The exit path itself has run on Windows, in record builds only: GPEXITREC
   (`test_gp_exits_on_an_x2apic_partition_on_record`, a guest's #GP exits on an x2APIC partition) and
   `boot-test.ps1 x2apic` (a Linux guest booted on such a partition) passed on CI's AMD runners in CI runs 43680983973
   and 43688550565. Its LVT timer write in TSC-deadline mode is the one #GP that
