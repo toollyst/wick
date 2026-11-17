@@ -679,6 +679,11 @@ fn new_placeholder_aligned(len: usize) -> Option<usize> {
 #[cfg(test)]
 pub(crate) static REFUSE_ALIGNED_PLACEMENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Tests: [`uffd_alias`] makes the section of a process whose exception
+/// handler could not be added (not reserved), though it was.
+#[cfg(test)]
+pub(crate) static UFFD_UNRESERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The regions overlapping [start, end), by base.
 fn overlapping(t: &Table, start: usize, end: usize) -> Vec<usize> {
     let mut v: Vec<usize> = t
@@ -3937,7 +3942,11 @@ pub(crate) fn uffd_alias(start: usize, len: usize, resident: &[u8]) -> Result<(u
                 && r.noaccess.is_empty() => {}
         _ => return Err(crate::EINVAL),
     }
-    if exception_handler() {
+    #[cfg(test)]
+    let unreserved = UFFD_UNRESERVED.load(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let unreserved = false;
+    if exception_handler() && !unreserved {
         return uffd_alias_chunked(&mut t, start, len, resident).map(|alias| (alias, true));
     }
     let hi = u32::try_from((len as u64) >> 32).unwrap();

@@ -1238,6 +1238,13 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
 /// range that only overlaps a registered one, or holds a page of it that
 /// was unmapped or mapped over, is `EBUSY` too, where Linux registers the
 /// new vma (a stated difference: docs/COMPATIBILITY.md's uffd row).
+///
+/// On a range not on a reserved section, the missing pages are closed once
+/// the range is published; a close that fails (`VirtualProtect` refused)
+/// returns its error with the range unregistered whole, as [`unregister`]
+/// leaves it, and its slot kept, so the memory registers again
+/// ([`unregister_whole_at_a_failed_close`]). Linux's register changes no
+/// page's protection and has no such failure.
 pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     // The range checked as Linux's register checks it (fs/userfaultfd.c,
     // v6.1, `validate_range` at :1309): page aligned, not empty, within the
@@ -1404,11 +1411,65 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     if !reserved {
         let mut runs = Vec::new();
         for_each_missing(start, len, |s, l| runs.push((s, l)));
-        for (s, l) in runs {
-            protect(s, l, false)?;
+        for (i, &(s, l)) in runs.iter().enumerate() {
+            if let Err(e) = close_run(i, s, l) {
+                unregister_whole_at_a_failed_close(range, ctx, start, &runs);
+                return Err(e);
+            }
         }
     }
     Ok(())
+}
+
+/// [`register`]'s close of its missing run number `i` (from 0),
+/// `[s, s + l)`.
+fn close_run(i: usize, s: u64, l: u64) -> io::Result<()> {
+    #[cfg(test)]
+    if tests::CLOSE_FAILS_AT.load(Ordering::SeqCst) == i + 1 {
+        return Err(tests::refused());
+    }
+    #[cfg(not(test))]
+    let _ = i;
+    protect(s, l, false)
+}
+
+/// [`register`]'s range at `start`, published with userfaultfd `ctx`, after
+/// a close of one of its missing runs (`runs`, every one of the range's)
+/// failed: the range is unregistered whole, as [`unregister`] leaves it, so
+/// that the failed register leaves no registration. Its missing pages,
+/// closed or not yet, are zeroed and given the protection `mprotect` gave
+/// them ([`release_missing`]), then every page is no one's ([`NONE`]), and
+/// the waiters of `ctx` on the range, on a page closed meanwhile, are woken
+/// (the access runs again on the opened page). The slot is kept, as an
+/// unregister keeps it, so the memory registers again ([`register_again`]):
+/// freed, its memory would be the section's view, which [`register`] takes
+/// for no anonymous private mapping (`EINVAL`). Under [`LOCK`]. A run that
+/// cannot be opened ends the process with a line: it would stay closed, or
+/// read as zeros while it is missing, in a range said to be in no
+/// registration.
+fn unregister_whole_at_a_failed_close(range: &Range, ctx: usize, start: u64, runs: &[(u64, u64)]) {
+    let alias = range.alias.load(Ordering::Acquire);
+    for &(s, l) in runs {
+        #[cfg(test)]
+        let opened = if tests::REOPEN_FAILS.load(Ordering::SeqCst) { Err(tests::refused()) } else { release_missing(range, start, alias, s, l) };
+        #[cfg(not(test))]
+        let opened = release_missing(range, start, alias, s, l);
+        if let Err(e) = opened {
+            std::eprintln!(
+                "wick: userfaultfd: a register could not reopen its missing pages {s:#x}+{l:#x} after a close of one failed ({e}): they would stay closed in memory no userfaultfd has, so the process ends"
+            );
+            std::process::abort();
+        }
+    }
+    let end = range.end.load(Ordering::Acquire);
+    // The missing bit before the owner (the order [`Range`]'s doc gives).
+    for page in 0..(end - start) / PAGE {
+        Range::set(&range.missing, page, false);
+    }
+    for page in 0..(end - start) / PAGE {
+        range.set_owner(page, NONE);
+    }
+    wake_ctx(ctx, start, end - start);
 }
 
 /// Registers again with `ctx` the pages of `[start, end)` that no
@@ -1424,7 +1485,13 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
 /// (`windows_mm::released_take`); a page not pending holds its memory and
 /// keeps the protection it has now. So a page unregistered while missing is
 /// missing again, as Linux's page that was never faulted in after the
-/// unregister, and a page touched since is not.
+/// unregister, and a page touched since is not. A range not on a reserved
+/// section (only in a process whose exception handler could not be added:
+/// `windows_mm::exception_handler`, `uffd_alias`) keeps no record: its
+/// missing pages were zeroed and opened when they left ([`release_missing`]),
+/// so every page counts as holding memory and none is missing again, where
+/// Linux's page unregistered while missing would be
+/// (`test_a_register_whose_close_fails_leaves_the_range_in_no_registration`).
 fn register_again(r: &'static Range, ctx: usize, start: u64, end: u64) -> io::Result<()> {
     let base = r.start.load(Ordering::Acquire);
     let (first, last) = ((start - base) / PAGE, (end - base) / PAGE);
@@ -10739,6 +10806,121 @@ mod tests {
     /// The registers that found a change of memory running without the lock
     /// ([`unlocked_change`]) and waited for it.
     pub(super) static REGISTER_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+    /// [`register`]'s close of its missing runs on a range not on a reserved
+    /// section: the run of this number (from 1) fails, as if `VirtualProtect`
+    /// had refused it; 0 for none.
+    pub(super) static CLOSE_FAILS_AT: AtomicUsize = AtomicUsize::new(0);
+
+    /// [`register`], after a close failed: its reopening fails too.
+    pub(super) static REOPEN_FAILS: AtomicBool = AtomicBool::new(false);
+
+    /// The error [`CLOSE_FAILS_AT`] and [`REOPEN_FAILS`] give.
+    pub(super) fn refused() -> io::Error {
+        io::Error::from_raw_os_error(windows_sys::Win32::Foundation::ERROR_COMMITMENT_LIMIT.cast_signed())
+    }
+
+    /// A register on a range not on a reserved section (the section of a
+    /// process whose exception handler could not be added:
+    /// `windows_mm::UFFD_UNRESERVED`) whose close of its second missing run
+    /// fails, after the range is published, returns that error with the
+    /// range in no registration: no page missing or any userfaultfd's, each
+    /// readable with what it held (a missing one zeros), a fill `ENOENT`, and
+    /// the same memory registers again, as memory unregistered whole does
+    /// (`test_memory_unregistered_whole_registers_again`). Linux's register
+    /// changes no page's protection, so it has no such failure. In a process
+    /// of its own, as it changes how the process's ranges are made.
+    #[test]
+    fn test_a_register_whose_close_fails_leaves_the_range_in_no_registration() {
+        let (code, text) = run_child("close_fails_child", None);
+        for l in text.lines().filter(|l| l.starts_with("CLOSEFAIL") || l.starts_with("UNMAPCHECK") || l.starts_with("wick:")) {
+            std::eprintln!("{l}");
+        }
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_register_whose_close_fails_leaves_the_range_in_no_registration in a process of its own"]
+    fn close_fails_child() {
+        const PAGES: u64 = 8;
+        watchdog(60);
+        crate::windows_mm::UFFD_UNRESERVED.store(true, Ordering::SeqCst);
+        let (a, ua) = create(0, false, true).unwrap();
+        let mem = map((PAGES * PAGE) as usize);
+        // Pages 0, 2 and 4 hold memory: the missing runs are 1, 3 and 5 to 7.
+        let held = |page: u64| page < 6 && page.is_multiple_of(2);
+        for page in (0..PAGES).filter(|&p| held(p)) {
+            // SAFETY: a page of the test's own mapping.
+            unsafe { ptr::write_volatile((mem + page * PAGE) as *mut u8, 0x40 + page as u8) };
+        }
+        CLOSE_FAILS_AT.store(2, Ordering::SeqCst);
+        let r = register(a, mem, PAGES * PAGE);
+        CLOSE_FAILS_AT.store(0, Ordering::SeqCst);
+        std::println!("CLOSEFAIL the register whose second close fails: {r:?}");
+        let mut c = Checks::new();
+        let code = r.as_ref().err().and_then(io::Error::raw_os_error);
+        c.check(code == refused().raw_os_error(), std::format!("the register: {r:?}"));
+        let states = states(mem, PAGES * PAGE);
+        for page in 0..PAGES {
+            let at = mem + page * PAGE;
+            let owner = find(at).and_then(|(r, p)| r.owner(p));
+            std::println!("CLOSEFAIL page {page}: missing {}, owner {owner:?}, protection {:#x}", is_missing(at), states[page as usize].1);
+            c.check(!is_missing(at), std::format!("page {page} is missing"));
+            c.check(owner.is_none(), std::format!("page {page} is userfaultfd {owner:?}'s"));
+            c.check(states[page as usize].1 == PAGE_READWRITE, std::format!("page {page}'s protection {:#x}", states[page as usize].1));
+            if states[page as usize].1 == PAGE_READWRITE {
+                // SAFETY: a page of the test's own mapping, readable.
+                let b = unsafe { ptr::read_volatile(at as *const u8) };
+                let want = if held(page) { 0x40 + page as u8 } else { 0 };
+                c.check(b == want, std::format!("page {page} reads {b:#x}, not {want:#x}"));
+            }
+        }
+        // SAFETY: a page.
+        let f = unsafe { copy(a, page_of(0x77).as_ptr(), mem + PAGE, PAGE, true) };
+        c.check(f == Err((crate::ENOENT, 0)), std::format!("a fill after the register: {f:?}"));
+        let again = register(a, mem, PAGES * PAGE);
+        std::println!("CLOSEFAIL the same memory registered again: {again:?}");
+        c.check(again.is_ok(), std::format!("the register again: {again:?}"));
+        if again.is_ok() {
+            // Not on a reserved section, every page registered again holds
+            // memory ([`register_again`]): none is missing.
+            let missing: std::vec::Vec<u64> = (0..PAGES).filter(|&p| is_missing(mem + p * PAGE)).collect();
+            std::println!("CLOSEFAIL registered again, the pages missing: {missing:?}");
+            c.check(missing.is_empty(), std::format!("pages missing after the register again: {missing:?}"));
+            c.check(unregister(a, mem, PAGES * PAGE).is_ok(), "the unregister after the register again");
+        }
+        release(a, ua);
+        assert_eq!(munmap_of(mem, PAGES * PAGE), 0);
+        c.done();
+    }
+
+    /// A register whose close fails and whose reopening fails too ends the
+    /// process with a line: its pages would be closed, or read as zeros
+    /// though missing, in a range it reports as not registered.
+    #[test]
+    fn test_a_register_whose_reopening_fails_ends_the_process() {
+        let (code, text) = run_child("reopen_fails_child", None);
+        for l in text.lines().filter(|l| l.starts_with("CLOSEFAIL") || l.starts_with("wick:")) {
+            std::eprintln!("{l}");
+        }
+        assert!(code.is_some_and(|c| c != 0 && c != 3), "{code:x?} {text}");
+        assert!(text.contains("wick: userfaultfd: a register could not reopen"), "{code:x?} {text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_register_whose_reopening_fails_ends_the_process in a process of its own"]
+    fn reopen_fails_child() {
+        watchdog(60);
+        crate::windows_mm::UFFD_UNRESERVED.store(true, Ordering::SeqCst);
+        let (a, _ua) = create(0, false, true).unwrap();
+        let mem = map((4 * PAGE) as usize);
+        // SAFETY: a page of the test's own mapping.
+        unsafe { ptr::write_volatile((mem + PAGE) as *mut u8, 1) };
+        CLOSE_FAILS_AT.store(2, Ordering::SeqCst);
+        REOPEN_FAILS.store(true, Ordering::SeqCst);
+        let r = register(a, mem, 4 * PAGE);
+        std::println!("CLOSEFAIL the register returned: {r:?}");
+    }
 
     /// What [`unlocked_change`] calls between its check and the change: a
     /// test's own.

@@ -673,6 +673,18 @@ has the per-control details and results.
   once, not with how often (`test_register_and_unmap_in_a_loop_keeps_the_array_count_flat`): 352 KiB for 1 GiB of
   4 KiB pages, a power of two, under 704 KiB with any arrays its slot outgrew. Windows Server 2022 20348 and 2025
   26100; each test ran on the code with its check taken out and failed there (the commit names each).
+- **Windows: a register whose close of a missing page failed returned the error with its range registered** (from
+  b0dfb35b, the Windows userfaultfd's start; found by reading, not observed). A range not on a reserved section
+  (since those came, only in a process whose exception handler could not be added) is published, then its missing
+  pages are closed (`PAGE_NOACCESS`); a close that `VirtualProtect` refused returned its error with the range
+  registered, the runs before it closed and the rest open while missing, read as zeros with no fault. Now the range
+  is unregistered whole, as an unregister leaves it: its missing pages opened with the protection `mprotect` gave
+  them, every page no userfaultfd's, the waiters woken, and its slot kept, so the memory registers again; a freed
+  slot would leave the memory the section's view, which a register refuses with `EINVAL`
+  (`test_a_register_whose_close_fails_leaves_the_range_in_no_registration`, through a hook that fails the second
+  close; 15 of its checks failed on the code before, and the register again failed with the slot freed). A reopening
+  that fails too ends the process with a line (`test_a_register_whose_reopening_fails_ends_the_process`). Linux's
+  register changes no page's protection and has no such failure. Windows Server 2022 20348 and 2025 26100.
 - **Windows: a guest access to guest RAM that the host refuses ended the VMM with an access violation, and a store to
   a read-only memory slot waited a million runs again or for ever** (found by reading, review of the WHP run loop's
   memory access exit; failing first in the decision's own shape: `test_a_ram_access_is_decided_in_kvms_order`, 11
