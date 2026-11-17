@@ -68,10 +68,10 @@
 #   their parent tests run in a child process). All 138 fail unsigned alone
 #   with CreateVm(Error(1)) and pass signed alone.
 #   cpu-template-helper: 30 tests; 25 pass, 5 fail (no-hvf).
-#   compat-kvm-ioctls: 113 tests; 34 pass, 78 fail, 1 ignored (counted again
-#   on 2026-11-17, after the three *_is_charged_once tests, by
+#   compat-kvm-ioctls: 114 tests; 34 pass, 79 fail, 1 ignored (counted again
+#   on 2026-11-17, after the four *_charged_once tests, by
 #   check-unit-tests.py --crate compat-kvm-ioctls), all
-#   no-hvf: 77 with Error(1) at hv_vm_create, and the vCPU thread's latency
+#   no-hvf: 78 with Error(1) at hv_vm_create, and the vCPU thread's latency
 #   tier's test_a_wfi_ends_when_its_timer_is_due, which fails on a runner
 #   before it makes its VM, at its own requirement of a launcher that raised
 #   no timer coalescing, since the runners' processes are coalesced as
@@ -96,10 +96,11 @@ no-hvf cpu-template-helper tests::test_template_verify_command
 no-hvf cpu-template-helper utils::tests::test_build_microvm
 
 # compat-kvm-ioctls: the Hypervisor.framework backend's own tests.
-# Three of them, *_is_charged_once, also fail on this Mac, signed, by their
+# Three of the four *_charged_once tests also fail on this Mac, signed, by their
 # assertion: a page is charged to phys_footprint once for each mapping that
-# touched it (SECURITY.md, Not at parity yet); CI's runners make no VM, so
-# this Mac is where they run.
+# touched it (SECURITY.md, Not at parity yet); the fourth,
+# test_filled_pages_only_the_guest_reads_are_charged_once, passes here.
+# CI's runners make no VM, so this Mac is where they run.
 no-hvf compat-kvm-ioctls hvf::debug::tests::test_a_running_vcpu_is_busy_for_a_dup_handle
 no-hvf compat-kvm-ioctls hvf::debug::tests::test_a_stopped_vcpu_reads_and_writes_from_a_dup_handle
 no-hvf compat-kvm-ioctls hvf::debug::tests::test_brk_exits_as_kvm_debug_with_guest_debugging
@@ -155,6 +156,7 @@ no-hvf compat-kvm-ioctls hvf::vm::tests::test_an_mprotect_of_memory_in_no_slot_t
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_an_unregistered_irqfd_raises_nothing
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_anonymous_guest_memory_is_charged_once
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_clocks_do_not_go_back_on_a_vcpu_thread
+no-hvf compat-kvm-ioctls hvf::vm::tests::test_filled_pages_only_the_guest_reads_are_charged_once
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_guest_writes_during_a_discard_wait_for_the_new_pages
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_id_register_writes_reach_the_guest
 no-hvf compat-kvm-ioctls hvf::vm::tests::test_irqfd_writes_registrations_and_the_irqfd_thread_do_not_wait_for_each_other
@@ -319,10 +321,3 @@ no-hvf vmm vstate::vm::tests::test_msi_vector_group_update_invalid_vector
 no-hvf vmm vstate::vm::tests::test_new
 no-hvf vmm vstate::vm::tests::test_register_memory_regions
 no-hvf vmm vstate::vm::tests::test_too_many_regions
-
-# compat-libc: a page a userfaultfd filled and the process then read is
-# charged to phys_footprint twice, once for the fill's alias and once for the
-# memory (SECURITY.md, Not at parity yet, "macOS: a page is charged to the
-# memory limit once for each mapping that touched it"); measured on an M1 Pro,
-# macOS 27.2: 128 MiB for 64.
-bug compat-libc wick_uffd::tests::test_a_filled_page_is_charged_once

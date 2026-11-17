@@ -2673,11 +2673,12 @@ mod tests {
     /// whose memory cgroup charges a page once, when it is allocated (v6.12
     /// mm/memcontrol.c `commit_charge` :2370), whatever then maps it: the
     /// VMM, KVM's stage 2. Prints the footprint after each step (FOOTPRINT
-    /// lines). Fails today on this Mac, 192 MiB: once for the alias the fill
-    /// wrote through, once for the guest's stage 2, once for the host's
-    /// mapping (SECURITY.md, Not at parity yet, "macOS: a page is charged to
-    /// the memory limit once for each mapping that touched it"); listed as
-    /// no-hvf, since CI's runners make no VM, so this Mac is where it runs.
+    /// lines). Fails today on this Mac, 128 MiB: once for the guest's stage
+    /// 2 and once for the host's mapping (the view the fill wrote through is
+    /// gone, `wick_uffd::fill`) (SECURITY.md, Not at parity yet, "macOS: a
+    /// page is charged to the memory limit once for each mapping that
+    /// touched it"); listed as no-hvf, since CI's runners
+    /// make no VM, so this Mac is where it runs.
     #[test]
     fn test_a_guest_read_of_filled_pages_is_charged_once() {
         let page = host_page_size();
@@ -2698,7 +2699,7 @@ mod tests {
                     libc::wick_uffd::register(ctx, mem, len).unwrap();
                     uffd.set(Some((ctx, user)));
                 }),
-                ("filled through the alias", &mut |_, mem, _, len| {
+                ("filled", &mut |_, mem, _, len| {
                     let (ctx, _) = uffd.get().unwrap();
                     for i in 0..len / page {
                         // SAFETY: `data` holds a page.
@@ -2707,7 +2708,7 @@ mod tests {
                 }),
                 ("read by the guest", &mut |vcpu, _, ipa, len| guest_pass(vcpu, ipa, ipa + len)),
                 ("read by the host", &mut |_, mem, _, len| assert_eq!(host_pass(mem, len), 0x5a * (len / page))),
-                ("released (alias gone)", &mut |_, _, _, _| {
+                ("released", &mut |_, _, _, _| {
                     let (_, user) = uffd.take().unwrap();
                     // SAFETY: the user end.
                     unsafe { libc::close(user) };
@@ -2717,6 +2718,51 @@ mod tests {
             1,
         );
         assert!(charged_once(charged), "{FOOTPRINT_MIB} MiB filled and read by the guest and the host is charged {charged} MiB");
+    }
+
+    /// 64 MiB of guest memory a userfaultfd filled and only the guest then
+    /// read is charged 64 MiB, as on Linux (above): the fill writes through a
+    /// view that is gone once it is done and charges nothing itself
+    /// (`wick_uffd::fill`), so the guest's stage 2 is the one mapping that
+    /// touched the pages. Listed as no-hvf (above).
+    #[test]
+    fn test_filled_pages_only_the_guest_reads_are_charged_once() {
+        let page = host_page_size();
+        let uffd = std::cell::Cell::new(None::<(usize, libc::c_int)>);
+        let anonymous = |len: usize| {
+            // SAFETY: a fresh anonymous mapping, kept for the test.
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) };
+            assert_ne!(p, libc::MAP_FAILED);
+            p
+        };
+        let data = vec![0x5au8; page as usize];
+        let charged = footprint_steps(
+            &READ,
+            anonymous,
+            &mut [
+                ("registered", &mut |_, mem, _, len| {
+                    let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+                    libc::wick_uffd::register(ctx, mem, len).unwrap();
+                    uffd.set(Some((ctx, user)));
+                }),
+                ("filled", &mut |_, mem, _, len| {
+                    let (ctx, _) = uffd.get().unwrap();
+                    for i in 0..len / page {
+                        // SAFETY: `data` holds a page.
+                        assert_eq!(unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), mem + i * page, page, false) }, Ok(page));
+                    }
+                }),
+                ("read by the guest", &mut |vcpu, _, ipa, len| guest_pass(vcpu, ipa, ipa + len)),
+                ("released", &mut |_, _, _, _| {
+                    let (_, user) = uffd.take().unwrap();
+                    // SAFETY: the user end.
+                    unsafe { libc::close(user) };
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }),
+            ],
+            1,
+        );
+        assert!(charged_once(charged), "{FOOTPRINT_MIB} MiB filled and read by the guest is charged {charged} MiB");
     }
 
     /// 64 MiB of anonymous guest memory with no userfaultfd, written by the

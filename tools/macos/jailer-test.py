@@ -853,6 +853,31 @@ def stage_memory(ctx):
     return "guest writes 700 MiB; " + ", ".join(results)
 
 
+def stage_uffd_charge(ctx):
+    """The jail's memory limit counts memory a userfaultfd filled and the process then read once, as Linux's memory
+    cgroup charges it (v6.12 mm/userfaultfd.c `mfill_atomic_pte_copy` :302, mm/memcontrol.c `commit_charge` :2370):
+    crates/compat/libc's uffd_charge_probe, run by the jailer under memory.max of 96 MiB (a fatal jetsam limit on the
+    process's phys_footprint, overlay/jailer/platform/macos/mod.rs :934 to :939), fills 64 MiB and reads it, and
+    lives. The control: the same with a second mapping of the pages read too, as the alias `wick_uffd` filled
+    through until its fills had views of their own, is killed (SIGKILL) at the read, 128 MiB. No VM: the probe is
+    not Firecracker, and the jailer execs it as root outside the jail, as the resource limit probe."""
+    results = []
+    for name, mode, expect_kill in (("uffd-charge", [], False), ("uffd-charge-view", ["second-view"], True)):
+        chroot_of(ctx.base, ctx.uffd_charge_probe, name)
+        rc, out = run_jailer(ctx, jailer_base(ctx, name, ctx.uffd_charge_probe)
+                             + ["--cgroup-version", "2", "--cgroup", f"memory.max={96 << 20}", "--", "64"] + mode,
+                             timeout=60)
+        lines = [l for l in out.splitlines() if l.startswith("UFFD-CHARGE ")]
+        print(f"   {name}: exit {rc}: {'; '.join(lines)}", flush=True)
+        killed = rc == -signal.SIGKILL
+        check(killed == expect_kill and (killed or (rc == 0 and "UFFD-CHARGE done" in lines)),
+              f"{name}: 64 MiB filled and read under a 96 MiB limit: exit {rc}, wanted "
+              f"{'SIGKILL' if expect_kill else '0'}: {out!r}")
+        last = lines[-1][len("UFFD-CHARGE "):] if lines else "no output"
+        results.append(f"{'with a second view' if mode else 'alone'}: {'killed' if killed else 'lived'} ({last})")
+    return "64 MiB filled through a userfaultfd and read under memory.max 96 MiB; " + ", ".join(results)
+
+
 def stage_fsize(ctx):
     """VM: a snapshot past the jail's file size limit raises SIGXFSZ, on which
     Firecracker stops as upstream's test_negative_file_size_limit asserts
@@ -1520,6 +1545,7 @@ STAGES = {
     "vmnet": stage_vmnet,
     "vmnet-guest": stage_vmnet_guest,
     "memory": stage_memory,
+    "uffd-charge": stage_uffd_charge,
     "cpu": stage_cpu,
     "hugepages": stage_hugepages,
     "uffd": stage_uffd,
@@ -1533,6 +1559,7 @@ class Context:
         self.jailer = args.jailer
         self.firecracker = args.firecracker
         self.uffd_handler = args.uffd_handler
+        self.uffd_charge_probe = args.uffd_charge_probe
         self.vub = args.vhost_user_blk
         self.out = args.out
         self.rlimit_probe = None
@@ -1556,6 +1583,7 @@ def main():
     p.add_argument("--firecracker", required=True)
     p.add_argument("--uffd-handler", required=True)
     p.add_argument("--vhost-user-blk", required=True)
+    p.add_argument("--uffd-charge-probe", required=True)
     p.add_argument("--cache", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--no-vm", action="store_true", help="skip the stages that boot a VM")

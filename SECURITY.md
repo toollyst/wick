@@ -458,8 +458,9 @@ has the per-control details and results.
   (devices/virtio/mem/device.rs: `update_slot` before `discard_range`), so the alias of its filled pages became
   `PROT_NONE`; once the slot was plugged again, the handler's fill of a page the guest touched ended Firecracker by
   SIGBUS. Those calls in that order are measured at the libc's level
-  (`test_a_slot_unplugged_and_plugged_again_is_filled_through_its_alias`, SIGBUS with the alias left as the remap made
-  it), not in a VM. Now the alias is made read-write after the remap (`discarding`), and a fill gives the page the
+  (`test_a_slot_unplugged_and_plugged_again_is_filled`, SIGBUS with the alias left as the remap made it), not in a
+  VM. Then the alias was made read-write after the remap (`discarding`); there is no alias now: each fill writes
+  through a mapping of the pages made read-write for it and taken away after it (`fill_view`), and gives the page the
   protection asked.
 - **macOS: a userfaultfd's release after its registered memory was unmapped changed whatever was mapped there since**
   (from 6c4320c5, the compatibility `libc` with its userfaultfd, to the commit that brought
@@ -836,22 +837,31 @@ upstream Firecracker and its jailer.
   M1 Pro, macOS 27.2, 64 MiB at a time, three rounds each the same: phys_footprint counts a page once for each
   mapping that has touched it. Guest memory the guest wrote (Hypervisor.framework's stage 2) and the VMM then read
   is charged 128 MiB, anonymous or a shared memory object as the compatibility memfd makes
-  (`test_anonymous_guest_memory_is_charged_once`, `test_shared_guest_memory_is_charged_once`); memory a userfaultfd
-  filled (through its alias, `wick_uffd`'s second mapping of every registered range) is charged 64 MiB at the fill,
-  64 more when the guest reads it and 64 more when the VMM reads it, 192 MiB, of which the alias's 64 are given
-  back when the userfaultfd is released (`test_a_guest_read_of_filled_pages_is_charged_once`); without a guest,
-  filled and read by the process, 128 MiB (`test_a_filled_page_is_charged_once`). A guest's write alone is charged
-  once (`test_madvise_dontneed_replaces_guest_pages` bounds it now). Linux charges a page to the memory cgroup once,
-  when it is allocated (v6.12 mm/memory.c `alloc_anon_folio` :4711, mm/shmem.c :1818; mm/memcontrol.c
-  `commit_charge` :2370 refuses a second charge), whatever then maps it, KVM's stage 2 included. So a jailed VMM is
-  killed by jetsam when the pages both its guest and it have touched (a device's queues and buffers; every page, when
-  it writes a snapshot's memory) reach half of what Linux would let them be, and a restore through a userfaultfd
-  handler at a third, while the userfaultfd is registered, for the pages the guest and the VMM both touched. The
-  four tests fail today and are listed (tools/macos/unit-test-differences.txt: the libc one as a bug, the three that
-  make a VM as no-hvf, as CI's runners make none; this Mac is where they run). The kill at the limit itself is from
-  the ledger's source above, not run with these figures (setting a jetsam limit takes root; `jailer-test memory`
-  runs the limit as root in CI's macos job, with no such factor). A fix is being designed, not done; until then,
-  give a jail's `memory.max` room for twice the guest memory the VMM will touch, three times under a userfaultfd.
+  (`test_anonymous_guest_memory_is_charged_once`, `test_shared_guest_memory_is_charged_once`), and so is memory a
+  userfaultfd filled that the guest and then the VMM read (`test_a_guest_read_of_filled_pages_is_charged_once`). A
+  userfaultfd fill writes through a mapping of the pages made for it and taken away once it is done
+  (`libc::wick_uffd::fill_view`), so the fill itself is charged nothing and the pages are charged by the mappings
+  that touch them after: 64 MiB filled and read by the guest alone is charged 64 MiB
+  (`test_filled_pages_only_the_guest_reads_are_charged_once`), and filled and read by the process 64 MiB
+  (`test_a_filled_page_is_charged_once`); before, the fill wrote through `wick_uffd`'s alias, a second mapping of every
+  registered range kept while it was registered, and these were 128 and 128 MiB, and 192 MiB read by the guest and
+  the VMM; CI's macOS runner charged the same way (CI's macos job at 6a7a8237: `test_a_filled_page_is_charged_once`
+  failed there as listed, "compat-libc: 102 pass, 1 fail as listed"), so the charge per mapping is macOS's, not one
+  Mac's. A guest's write alone is charged once (`test_madvise_dontneed_replaces_guest_pages` bounds it). Linux
+  charges a page to the memory cgroup once, when it is allocated (v6.12 mm/memory.c `alloc_anon_folio` :4711,
+  mm/shmem.c :1818; mm/memcontrol.c `commit_charge` :2370 refuses a second charge), and a `UFFDIO_COPY` page at the
+  fill (mm/userfaultfd.c `mfill_atomic_pte_copy` :302), whatever then maps it, KVM's stage 2 included. So a jailed
+  VMM is killed by jetsam when the pages both its guest and it have touched (a device's queues and buffers; every
+  page, when it writes a snapshot's memory) reach half of what Linux would let them be. The three tests that make a
+  VM and ask for one charge where two mappings touched the pages fail today and are listed as no-hvf
+  (tools/macos/unit-test-differences.txt; CI's runners make no VM, this Mac is where they run). The other way, a
+  page a userfaultfd filled and nothing has touched yet is held and charged to no one until something touches it,
+  where Linux charged it at the fill: at most the registered memory the handler filled ahead of the guest's
+  accesses (a fill in answer to a fault is followed by the access that faulted). The kill at the limit: under the
+  jailer's memory.max of 96 MiB, a process that fills 64 MiB through a userfaultfd and reads it lives, and the same
+  with a second mapping of the pages read too, as the alias was, is killed at the read (`jailer-test uffd-charge`,
+  no VM, root, in CI's macos job; not run on this Mac, where root is not used). A fix for two mappings is being
+  designed, not done; until then, give a jail's `memory.max` room for twice the guest memory the VMM will touch.
 - **macOS jailer: no namespaces in the kernel.** macOS has no network or PID namespaces (XNU's system calls,
   bsd/kern/syscalls.master, have no `unshare`, `setns` or `clone`): IP networking is denied by the sandbox; a
   jailed VMM uses Unix socket endpoints in the jail or in the directory `--netns` names, the jail's network.

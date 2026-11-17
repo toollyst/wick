@@ -17,9 +17,10 @@
 //!   backend keeps missing pages inaccessible in stage 2
 //!   ([`crate::wick_guest::Hooks::stage2`]) and resolves stage-2 faults with
 //!   [`fault`].
-//! - Pages are filled through a second mapping of the same memory
-//!   (`mach_vm_remap`) and only then made accessible, so no thread sees a page
-//!   half filled.
+//! - Pages are filled through a second mapping of them made for the fill
+//!   (`mach_vm_remap`, [`fill_view`]) and taken away after it, and only then
+//!   made accessible, so no thread sees a page half filled and the pages are
+//!   mapped, and charged to the footprint, once.
 //! - `madvise(MADV_DONTNEED)` on registered pages makes them missing again and
 //!   queues a remove event ([`discarding`]).
 //! - `mprotect` of registered memory ([`protecting`]) changes the present
@@ -33,7 +34,7 @@
 //!   Linux's registration goes with the vma: the new memory, or a mapping
 //!   made later in the hole, is in no registration.
 //!
-//! A registered range is one alias and one set of per-page arrays: the
+//! A registered range is one set of per-page arrays: the
 //! missing bit, the protection asked, and the owner, the userfaultfd the
 //! page is registered with or none ([`Range::owner`]). Linux's registration
 //! belongs to the vma and an unregister of part of one splits it; here the
@@ -44,7 +45,7 @@
 //! `unregister_range`), many scattered runs under a balloon
 //! (tests/integration_tests/functional/test_uffd.py), where a range per
 //! part would run out of the [`MAX_RANGES`] slots. The cost is a byte a
-//! page (64 KiB a GiB of 16 KiB pages). A range is freed with its alias
+//! page (64 KiB a GiB of 16 KiB pages). A range is freed
 //! once no page of it has an owner; its slot keeps the arrays for the next
 //! range that fits ([`Range`]).
 //!
@@ -73,7 +74,8 @@
 //!   call; the missing bit, then the owner. A thread waiting on such a page
 //!   waits on until its userfaultfd wakes or releases it, as Linux's.
 //! - fill (`UFFDIO_COPY`, `UFFDIO_ZEROPAGE`): every page must be the
-//!   caller's ([`range_of`]); the data is written through the alias, the
+//!   caller's ([`range_of`]); the data is written through a view made for
+//!   the fill and taken away after it ([`fill_view`]), the
 //!   pages given their asked protection, then the missing bits cleared, then
 //!   the waiters woken. A reader between sees a missing page that is
 //!   accessible: [`fault`] waits for the wake, or the access, retried, goes
@@ -199,9 +201,6 @@ pub const FEATURE_EVENT_REMOVE: u64 = 1 << 3;
 const MAX_RANGES: usize = 64;
 /// `VM_FLAGS_ANYWHERE`.
 const VM_FLAGS_ANYWHERE: c_int = 1;
-/// `VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE`: at the address given, replacing
-/// what is mapped there.
-const VM_FLAGS_FIXED_OVERWRITE: c_int = 0x4000;
 const MAX_CTX: usize = 16;
 const MAX_WAITERS: usize = 256;
 const _: () = assert!(MAX_WAITERS == proto::MIRROR_WORDS);
@@ -236,7 +235,7 @@ const PROT_RWX: c_int = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
 /// `gen` is a sequence count that makes a reader without [`LOCK`] read the
 /// slot whole ([`lookup`]). A writer, always under [`LOCK`], records its
 /// thread in `writer`, makes `gen` odd, changes `start`, `end`, `page`,
-/// `alias` and the array pointers, and makes `gen` even again: the window
+/// and the array pointers, and makes `gen` even again: the window
 /// holds those stores only, no allocation, lock or system call (the arrays
 /// are made and reset before it). Changes of one page's bits in a live
 /// slot (a fill, a discard, an unregister of pages, a protection) do not
@@ -250,14 +249,12 @@ struct Range {
     /// `MAP_HUGETLB` mapping ([`note_mapping`]), where a fault is reported
     /// for and a fill covers a whole huge page, as Linux's hugetlb does.
     page: AtomicU64,
-    /// Second mapping of `[start, end)`, always readable and writable.
-    alias: AtomicU64,
     /// One bit per page: the page is missing.
     missing: AtomicPtr<AtomicU64>,
     /// One byte per page: the userfaultfd the page is registered with, or
     /// [`NONE`] once an unregister or an unmapping took it out. Linux's
     /// registration belongs to the vma, and an unregister of part of one
-    /// splits it; here the range stays one alias and one set of arrays, and
+    /// splits it; here the range stays one set of arrays, and
     /// each page has its owner, so that any userfaultfd may register the
     /// part unregistered with no new range (see the module doc).
     owner: AtomicPtr<AtomicU64>,
@@ -277,7 +274,6 @@ impl Range {
             start: AtomicU64::new(0),
             end: AtomicU64::new(0),
             page: AtomicU64::new(0),
-            alias: AtomicU64::new(0),
             missing: AtomicPtr::new(ptr::null_mut()),
             owner: AtomicPtr::new(ptr::null_mut()),
             asked: AtomicPtr::new(ptr::null_mut()),
@@ -359,8 +355,8 @@ impl Range {
 /// A change under [`LOCK`] of a page past its slot's array: the arrays are
 /// sized for the slot's range at its register, so this is a broken
 /// invariant, and a change dropped would lose a registration or a fill
-/// silently. Ends the process, as the alias that cannot follow a discard
-/// does ([`discarding_or_refusing`]).
+/// silently. Ends the process, as a fill's view that cannot be taken away
+/// does ([`drop_fill_view`]).
 fn past_capacity(array: &str, page: u64) -> ! {
     std::eprintln!("wick: userfaultfd page {page} is past its slot's {array} array");
     std::process::abort();
@@ -618,6 +614,7 @@ unsafe extern "C" {
         count: *mut u32,
         object_name: *mut libc::mach_port_t,
     ) -> c_int;
+    fn mach_vm_deallocate(target_task: libc::mach_port_t, address: u64, size: u64) -> c_int;
     fn mach_vm_remap(
         target_task: libc::mach_port_t,
         target_address: *mut u64,
@@ -865,8 +862,12 @@ enum Found<T> {
 /// stores, unless the writer's thread is preempted in it. A slot odd by the
 /// calling thread is [`Found::Mine`]. A start over needs a write of that
 /// slot that began after the first read, and two writes of one slot are
-/// separated by at least one system call outside the window (the alias's
-/// mapping at a register, its unmapping at a release), so a lookup, a few
+/// separated by at least one system call outside the window (a register
+/// reads the memory's map entries and residency before its window,
+/// `mapped_entries` and `missing_pages`; a release follows the change that
+/// freed the range: an unmapping's own call, an unregister's read of the
+/// map entries, the read of a userfaultfd's end that found it closed), so a
+/// lookup, a few
 /// loads, starts over again only if each of its tries overlaps a window.
 /// Async-signal-safe.
 fn lookup<T>(addr: u64, read: impl Fn(&'static Range, u64) -> T) -> Found<T> {
@@ -1666,21 +1667,6 @@ pub fn create(features: u64, nonblocking: bool, cloexec: bool) -> io::Result<(us
     Ok((index, user))
 }
 
-/// Whether any of `[start, end)` is the alias of a registered range. A fill
-/// writes through the alias holding [`LOCK`]: were the alias registered
-/// itself, the fill would fault on its missing pages and wait for a fill
-/// of them, which needs [`LOCK`], forever. Linux fills page tables and has
-/// no alias; this is memory a userfaultfd cannot take, refused with
-/// `EINVAL` as Linux refuses such a vma (`vma_can_userfault`), not `EBUSY`,
-/// which says another userfaultfd has the memory until it unregisters it.
-fn overlaps_an_alias(start: u64, end: u64) -> bool {
-    RANGES.iter().any(|r| {
-        let s = r.start.load(Ordering::Acquire);
-        let alias = r.alias.load(Ordering::Acquire);
-        s != 0 && alias != 0 && start < alias + (r.end.load(Ordering::Acquire) - s) && alias < end
-    })
-}
-
 /// One past the highest address a process maps: `MACH_VM_MAX_ADDRESS`
 /// (mach/arm/vm_param.h, 128 TiB less 32 MiB), what Linux's
 /// `validate_range` checks against its `TASK_SIZE`.
@@ -1880,21 +1866,11 @@ fn any_owned(r: &Range) -> bool {
     (0..pages).any(|page| r.owned(page))
 }
 
-/// Frees slot `r`: its range is no longer registered memory and its alias
-/// goes. Its arrays stay with the slot ([`Range`]), for the next range that
-/// fits in them.
+/// Frees slot `r`: its range is no longer registered memory. Its arrays
+/// stay with the slot ([`Range`]), for the next range that fits in them.
 fn release(r: &Range) {
-    let (s, e) = (r.start.load(Ordering::Acquire), r.end.load(Ordering::Acquire));
-    let mut alias = 0;
-    r.changing(|| {
-        r.start.store(0, Ordering::Release);
-        alias = r.alias.swap(0, Ordering::AcqRel);
-    });
+    r.changing(|| r.start.store(0, Ordering::Release));
     REGISTERED.fetch_sub(1, Ordering::AcqRel);
-    if alias != 0 {
-        // SAFETY: unmaps the alias created at register.
-        unsafe { libc::munmap(alias as *mut _, (e - s) as usize) };
-    }
 }
 
 /// Registers `[start, start + len)` with userfaultfd `ctx`, as Linux's
@@ -1903,7 +1879,6 @@ fn release(r: &Range) {
 /// (holes are left out; none at all is `EINVAL`), and the first entry that
 /// fails decides, with nothing registered:
 ///
-/// - the alias of a registered range: `EINVAL` ([`overlaps_an_alias`]);
 /// - not readable and writable: `EPERM` (Linux refuses only memory that can
 ///   never be written, and takes anonymous memory with other protections,
 ///   which fills here would change); registered memory is, whatever its
@@ -1951,9 +1926,6 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     let mut parts: Vec<(u64, u64, u64)> = Vec::new();
     let rw = libc::PROT_READ | libc::PROT_WRITE;
     for &(s, e, prot) in &entries {
-        if overlaps_an_alias(s, e) {
-            return Err(errno_err(libc::EINVAL));
-        }
         if prot & rw != rw && !all_registered(s, e) {
             return Err(errno_err(libc::EPERM));
         }
@@ -2023,64 +1995,11 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     if RANGES.iter().filter(|r| r.start.load(Ordering::Acquire) == 0).count() < new.len() {
         return Err(errno_err(libc::ENOMEM));
     }
-    // Their memory may have been unmapped or mapped over since ([`unmapping`]):
-    // the alias follows the pages there now, before anything is registered.
-    for &(r, page, _, _) in &again {
-        let at = r.start.load(Ordering::Acquire) + page * r.page_size();
-        if let Err(e) = realias(r, at, at + r.page_size()) {
-            std::eprintln!("wick: userfaultfd alias of {at:#x} cannot follow its pages to register them again ({e})");
-            return Err(errno_err(libc::ENOMEM));
-        }
-    }
-    let mut made: Vec<(u64, u64, u64, u64, Vec<bool>)> = Vec::new();
-    let undo = |made: &[(u64, u64, u64, u64, Vec<bool>)]| {
-        for &(s, e, _, alias, _) in made {
-            // SAFETY: unmaps an alias made below.
-            unsafe { libc::munmap(alias as *mut _, (e - s) as usize) };
-        }
-    };
+    let mut made: Vec<(u64, u64, u64, Vec<bool>)> = Vec::new();
     for &(s, e, ps) in &new {
-        let mut alias = 0u64;
-        let (mut cur, mut max) = (0, 0);
-        // SAFETY: maps the same memory a second time, shared, anywhere.
-        let kr = unsafe {
-            mach_vm_remap(
-                mach_task_self_,
-                &mut alias,
-                e - s,
-                0,
-                VM_FLAGS_ANYWHERE,
-                mach_task_self_,
-                s,
-                0,
-                &mut cur,
-                &mut max,
-                1, // VM_INHERIT_NONE
-            )
-        };
-        if kr != 0 {
-            undo(&made);
-            return Err(errno_err(libc::ENOMEM));
-        }
-        made.push((s, e, ps, alias, Vec::new()));
-        // The alias has the protection of the memory (the most restrictive
-        // of the part), and pages are filled through it and then made
-        // readable and writable: memory that is not would fault on a fill,
-        // or change its protection. Guest memory always is.
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
-        if cur & rw != rw {
-            undo(&made);
-            return Err(errno_err(libc::EPERM));
-        }
-        match missing_pages(s, e - s, ps) {
-            Ok(missing) => made.last_mut().unwrap().4 = missing,
-            Err(err) => {
-                undo(&made);
-                return Err(err);
-            }
-        }
+        made.push((s, e, ps, missing_pages(s, e - s, ps)?));
     }
-    for (s, e, ps, alias, missing) in made {
+    for (s, e, ps, missing) in made {
         let pages = (e - s) / ps;
         // The free slot with the least room that fits, else the first free
         // one: a small range leaves a large slot's arrays to a large range.
@@ -2132,7 +2051,6 @@ pub fn register(ctx: usize, start: u64, len: u64) -> io::Result<()> {
         range.changing(|| {
             range.end.store(e, Ordering::Release);
             range.page.store(ps, Ordering::Release);
-            range.alias.store(alias, Ordering::Release);
             range.missing.store(missing_bits, Ordering::Release);
             range.owner.store(owner, Ordering::Release);
             range.asked.store(asked, Ordering::Release);
@@ -2193,8 +2111,8 @@ fn range_of(ctx: usize, start: u64, len: u64) -> Result<&'static Range, c_int> {
 
 /// Unregisters `[start, start + len)`, as Linux's `userfaultfd_unregister`
 /// (fs/userfaultfd.c, v6.12): the range is checked as `validate_range`
-/// checks it; it must hold a VM map entry (holes are left out), none of
-/// them the alias of a registered range, and a `MAP_HUGETLB` mapping at
+/// checks it; it must hold a VM map entry (holes are left out), and a
+/// `MAP_HUGETLB` mapping at
 /// its start, or a registered one cut by it, only at huge page boundaries
 /// (`EINVAL`). Its registered pages, whichever userfaultfd has them (Linux
 /// does not ask), become ordinary memory: missing ones zero pages, their
@@ -2209,9 +2127,6 @@ pub fn unregister(_ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
         return Err(libc::EINVAL);
     };
     if huge_segment(first, first_end).1 && !start.is_multiple_of(huge) {
-        return Err(libc::EINVAL);
-    }
-    if entries.iter().any(|&(s, e, _)| overlaps_an_alias(s, e)) {
         return Err(libc::EINVAL);
     }
     // Linux cuts a registered hugetlb vma only at huge page boundaries.
@@ -2253,9 +2168,22 @@ pub fn unregister(_ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
     Ok(())
 }
 
-/// Fills missing pages from `dst` on with `fill(alias_dst, len)`: stops at
-/// the first page that is present. Returns the byte count; `EEXIST` if the
-/// first page is present, `EAGAIN` with the count when only some were filled.
+/// Fills missing pages from `dst` on with `fill(view, len)`, through a view
+/// of the pages of their own ([`fill_view`]): stops at the first page that
+/// is present. The pages are reachable once they are filled and the view is
+/// gone: then they take the protection asked of them, and the guest's stage
+/// 2 maps them. With the view gone the pages are mapped nowhere, so they are
+/// charged to the process's footprint (phys_footprint, which counts a page
+/// for each mapping that touched it) by the first mapping that touches
+/// them: the guest's stage 2 or the VMM's own. Linux charges a page to the
+/// memory cgroup at the fill (v6.12 mm/userfaultfd.c `mfill_atomic_pte_copy`
+/// :302) and a zeropage not at all (the shared zero page, :348 to :360); a
+/// page filled here and never touched is held and charged to no one until
+/// it is (SECURITY.md, Not at parity yet, "macOS: a page is charged to the
+/// memory limit once for each mapping that touched it"). Reading each page
+/// through the range here would charge it at the fill, and again when the
+/// guest touches it. Returns the byte count; `EEXIST` if the first page is
+/// present, `EAGAIN` with the count when only some were filled.
 fn fill(
     ctx: usize,
     dst: u64,
@@ -2266,7 +2194,6 @@ fn fill(
     let _guard = lock();
     let range = range_of(ctx, dst, len).map_err(|e| (e, 0))?;
     let base = range.start.load(Ordering::Acquire);
-    let alias = range.alias.load(Ordering::Acquire);
     let ps = range.page_size();
     let first = (dst - base) / ps;
     let mut n = 0;
@@ -2281,7 +2208,9 @@ fn fill(
         return Err((libc::EEXIST, 0));
     }
     let bytes = n * ps;
-    fill((alias + (dst - base)) as *mut u8, bytes as usize, 0);
+    let view = fill_view(dst, bytes).map_err(|e| (e, 0))?;
+    fill(view as *mut u8, bytes as usize, 0);
+    drop_fill_view(view, bytes);
     protect_as_asked(range, dst, dst + bytes).map_err(|e| (e.raw_os_error().unwrap_or(libc::EIO), 0))?;
     stage2(dst, bytes, true);
     for page in first..first + n {
@@ -2309,7 +2238,7 @@ pub unsafe fn copy(
     wake_up: bool,
 ) -> Result<u64, (c_int, u64)> {
     fill(ctx, dst, len, wake_up, |to, n, _| {
-        // SAFETY: `to` is the alias of missing pages; `src` per the contract.
+        // SAFETY: `to` is a view of missing pages; `src` per the contract.
         unsafe { ptr::copy_nonoverlapping(src, to, n) }
     })
 }
@@ -2317,7 +2246,7 @@ pub unsafe fn copy(
 /// `UFFDIO_ZEROPAGE`: fills missing pages from `start` on with zeros.
 pub fn zeropage(ctx: usize, start: u64, len: u64, wake_up: bool) -> Result<u64, (c_int, u64)> {
     fill(ctx, start, len, wake_up, |to, n, _| {
-        // SAFETY: `to` is the alias of missing pages.
+        // SAFETY: `to` is a view of missing pages.
         unsafe { ptr::write_bytes(to, 0, n) }
     })
 }
@@ -2332,27 +2261,31 @@ pub fn wake_range(ctx: usize, start: u64, len: u64) -> Result<(), c_int> {
     Ok(())
 }
 
-/// Maps `[a, b)` of range `r` (mapped memory) over the same part of its
-/// alias, read-write: the alias, through which every fill writes, then
-/// shares the pages the range has now. A discard of private memory, and
-/// memory mapped where the range was, give the range new pages; the alias
-/// kept the old ones. The remap gives the alias the pages' protection, the
-/// one asked of them ([`protecting`]), so it is made writable again after.
-fn realias(r: &Range, a: u64, b: u64) -> Result<(), std::string::String> {
-    let s = r.start.load(Ordering::Acquire);
-    let mut at = r.alias.load(Ordering::Acquire) + (a - s);
+/// A mapping of the pages `[dst, dst + len)` (missing pages of a range,
+/// `PROT_NONE` there) of their own, read-write, at another address, for one
+/// fill to write through while the pages stay out of every other thread's
+/// reach; [`drop_fill_view`] takes it away once the fill is done, so that the
+/// pages are mapped, and charged to the process's footprint, once (SECURITY.md,
+/// Not at parity yet, "macOS: a page is charged to the memory limit once for
+/// each mapping that touched it"). It maps the pages the range has now, so a
+/// discard or a mapping made over the range since needs nothing done for it.
+/// The remap gives the view the pages' protection (`PROT_NONE`) and their
+/// maximum, which for memory a userfaultfd takes allows reading and writing
+/// (a register refuses other memory, `EPERM`). Errors: `ENOMEM` when the
+/// kernel refuses the view, `EPERM` when its maximum does not allow writing.
+fn fill_view(dst: u64, len: u64) -> Result<u64, c_int> {
+    let mut view = 0u64;
     let (mut cur, mut max) = (0, 0);
-    // SAFETY: maps `[a, b)` of the range, which is mapped, over the same
-    // part of its alias, which is ours.
+    // SAFETY: maps the same pages a second time, shared, anywhere.
     let kr = unsafe {
         mach_vm_remap(
             mach_task_self_,
-            &mut at,
-            b - a,
+            &mut view,
+            len,
             0,
-            VM_FLAGS_FIXED_OVERWRITE,
+            VM_FLAGS_ANYWHERE,
             mach_task_self_,
-            a,
+            dst,
             0,
             &mut cur,
             &mut max,
@@ -2360,9 +2293,26 @@ fn realias(r: &Range, a: u64, b: u64) -> Result<(), std::string::String> {
         )
     };
     if kr != 0 {
-        return Err(std::format!("mach_vm_remap: {kr}"));
+        return Err(libc::ENOMEM);
     }
-    protect(at, b - a, libc::PROT_READ | libc::PROT_WRITE).map_err(|e| std::format!("made writable: {e}"))
+    let rw = libc::PROT_READ | libc::PROT_WRITE;
+    if max & rw != rw || protect(view, len, rw).is_err() {
+        drop_fill_view(view, len);
+        return Err(libc::EPERM);
+    }
+    Ok(view)
+}
+
+/// Takes away a view [`fill_view`] made. A view that stays would keep the
+/// pages charged twice and writable at an address no one tracks, so a
+/// refusal ends the process, naming the call.
+fn drop_fill_view(view: u64, len: u64) {
+    // SAFETY: the view made by fill_view, used by no one any more.
+    let kr = unsafe { mach_vm_deallocate(mach_task_self_, view, len) };
+    if kr != 0 {
+        std::eprintln!("wick: userfaultfd fill: mach_vm_deallocate of its view {view:#x}+{len:#x} failed: {kr}");
+        std::process::abort();
+    }
 }
 
 /// Wraps a `MADV_DONTNEED` of `[start, start + len)`: registered pages are
@@ -2431,16 +2381,6 @@ pub fn discarding_or_refusing(
             let (a, b) = (a.max(s), b.min(e));
             if a >= b {
                 continue;
-            }
-            // A discard of private anonymous memory replaces its pages
-            // (`linux_items::discard_piece`): the alias, through which
-            // pages are filled, must share the new ones, or a fill would go
-            // to the old pages, which the alias would also keep resident.
-            if let Err(e) = realias(r, a, b) {
-                // The alias would fill the old pages: the next fill would
-                // corrupt the guest silently.
-                std::eprintln!("wick: userfaultfd alias of {a:#x}+{:#x} cannot follow the discarded pages ({e})", b - a);
-                std::process::abort();
             }
             // The range's whole pages inside the piece.
             let (first, last) = ((a - s).div_ceil(ps), (b - s) / ps);
@@ -2563,10 +2503,7 @@ fn vmas(a: u64, b: u64) -> Vec<(usize, u64, u64)> {
 /// and held until the whole pages it reached are in no registration: no
 /// fill, release or other change of the ranges runs in between, which would
 /// take the new memory (or another mapping made in a hole) for the old
-/// registration's. A range with no page left registered is freed, its
-/// alias with it; otherwise the alias's part is replaced with an empty
-/// reservation, so it no longer keeps the old pages, and a register of the
-/// pages again maps the alias over the new ones ([`realias`]). With
+/// registration's. A range with no page left registered is freed. With
 /// `mapped_anew`, pages that were missing are mapped into the guest's stage
 /// 2 (the backend's window, inside the change, mapped them as missing). A
 /// thread waiting on one of the pages waits on, as Linux's: its
@@ -2617,29 +2554,6 @@ pub fn unmapping<T>(start: u64, len: u64, mapped_anew: bool, change: impl FnOnce
         }
         if !any_owned(r) {
             release(r);
-            continue;
-        }
-        // SAFETY: the alias's part for those pages, ours; replaced with an
-        // empty reservation of the same size.
-        let alias = r.alias.load(Ordering::Acquire) + first * ps;
-        let p = unsafe {
-            libc::mmap(
-                alias as *mut _,
-                ((last - first) * ps) as usize,
-                libc::PROT_NONE,
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if p as u64 != alias {
-            // Only the old pages' memory is at stake: they stay held.
-            std::eprintln!(
-                "wick: userfaultfd alias of {:#x}+{:#x} keeps the pages unmapped there: {}",
-                s + first * ps,
-                (last - first) * ps,
-                io::Error::last_os_error()
-            );
         }
     }
     result
@@ -3865,8 +3779,8 @@ mod tests {
     /// mapped parts of a range are registered and unregistered and its holes
     /// left out; a range of holes only is `EINVAL`. Nothing but this test
     /// may map memory while the holes are open, or a mapping can take them.
-    /// Among other tests' threads, one did (their mappings, the aliases
-    /// `register` makes), so it runs in a process of its own: this binary
+    /// Among other tests' threads, one did (their mappings, the views
+    /// fills make), so it runs in a process of its own: this binary
     /// again, this test only. There the serving thread did (Rust's start of
     /// a thread maps its signal stack and guard page), so the holes are made
     /// only once that thread has answered a request.
@@ -3877,8 +3791,7 @@ mod tests {
         }
         let (ctx, user) = create(0, false, true).unwrap();
         let ps = test_page_size();
-        // Parts of two pages, holes of one: no alias `register` makes (one
-        // per part, its size) fits in a hole.
+        // Parts of two pages, holes of one.
         let mem = map(8);
         let chan = channel(user);
         for page in [2, 5] {
@@ -4463,18 +4376,21 @@ mod tests {
         info.ri_phys_footprint
     }
 
-    /// 64 MiB of registered memory filled with `UFFDIO_COPY` and then read
-    /// through the memory, as the VMM reads guest memory a handler filled,
-    /// is charged 64 MiB, as on Linux, whose memory cgroup charges a page
-    /// once, when it is allocated (v6.12 mm/memcontrol.c `commit_charge`
-    /// :2370 refuses a second charge), whatever then maps it. Prints the
-    /// footprint after each step (FOOTPRINT lines). Fails today, and is
-    /// listed (tools/macos/unit-test-differences.txt, bug): the page is
-    /// charged once for the alias the fill wrote it through and again for
-    /// the memory, 128 MiB (SECURITY.md, Not at parity yet, "macOS: a page
-    /// is charged to the memory limit once for each mapping that touched
-    /// it"). In a process of its own, so that no other test's memory moves
-    /// the footprint meanwhile.
+    /// 64 MiB of registered memory filled, half with `UFFDIO_COPY` and half
+    /// with `UFFDIO_ZEROPAGE`, and then read through the memory, as the VMM
+    /// reads guest memory a handler filled, is charged 64 MiB, as on Linux,
+    /// whose memory cgroup charges a page once, when it is allocated (v6.12
+    /// mm/userfaultfd.c `mfill_atomic_pte_copy` :302; mm/memcontrol.c
+    /// `commit_charge` :2370 refuses a second charge), whatever then maps
+    /// it. Here the charge comes at the read, not at the fill ([`fill`]). Prints the
+    /// footprint after each step (FOOTPRINT lines). The fill writes through
+    /// a view that is gone once it is done ([`fill_view`]), and charges the
+    /// page in the memory itself; before, the page stayed mapped by the
+    /// range's alias and was charged for it and again for the memory, 128
+    /// MiB (SECURITY.md, Not at parity yet, "macOS: a page is charged to
+    /// the memory limit once for each mapping that touched it"). In a
+    /// process of its own, so that no other test's memory moves the
+    /// footprint meanwhile.
     #[test]
     fn test_a_filled_page_is_charged_once() {
         if !in_own_process("wick_uffd::tests::test_a_filled_page_is_charged_once") {
@@ -4497,24 +4413,26 @@ mod tests {
             );
             now
         };
-        for i in 0..pages {
+        let half = pages / 2;
+        for i in 0..half {
             // SAFETY: a readable page of source.
             assert_eq!(unsafe { copy(ctx, src.as_ptr(), mem + i * ps, ps, false) }, Ok(ps));
         }
-        let filled = step("filled through the alias", before);
+        assert_eq!(zeropage(ctx, mem + half * ps, (pages - half) * ps, false), Ok((pages - half) * ps));
+        let filled = step("filled through views", before);
         let mut sum = 0u64;
         for i in 0..pages {
             // SAFETY: filled pages of the mapping.
             sum += u64::from(unsafe { ptr::read_volatile((mem + i * ps) as *const u8) });
         }
-        assert_eq!(sum, 0x5a * pages);
+        assert_eq!(sum, 0x5a * half);
         let read = step("read through the memory", filled);
         close(&[user]);
         until("the release", || CTXS[ctx].fd.load(Ordering::SeqCst) < 0);
-        step("released (the alias gone)", read);
+        step("released", read);
         // SAFETY: the test's own mapping.
         unsafe { libc::munmap(mem as *mut _, (pages * ps) as usize) };
-        let charged = (read - before) >> 20;
+        let charged = read.saturating_sub(before) >> 20;
         assert!(charged <= MIB + 4, "{MIB} MiB filled and read is charged {charged} MiB");
     }
 
@@ -4629,7 +4547,7 @@ mod tests {
         close(&[ua]);
     }
 
-    /// The slots in use: each a registered range and its alias.
+    /// The slots in use: each a registered range.
     fn slots_in_use() -> usize {
         RANGES.iter().filter(|r| r.start.load(Ordering::Acquire) != 0).count()
     }
@@ -5069,7 +4987,7 @@ mod tests {
     /// A register that starts while a `MAP_FIXED` mapping over the memory
     /// runs without the lock registers the new memory: its pages missing,
     /// a fill lands in it. Without the order the register took the old
-    /// memory (a written page present, the alias over the old pages), and
+    /// memory (a written page present), and
     /// the mapping then replaced it under the registration.
     #[test]
     fn test_a_register_racing_a_map_fixed_registers_the_new_memory() {
@@ -5567,8 +5485,8 @@ mod tests {
     }
 
     /// Memory mapped over one page of a registered range and registered
-    /// again by the same userfaultfd is filled in the new memory: the alias,
-    /// through which fills write, follows the pages there now ([`realias`]).
+    /// again by the same userfaultfd is filled in the new memory: a fill
+    /// writes through a view of the pages there now ([`fill_view`]).
     #[test]
     fn test_a_page_mapped_over_and_registered_again_is_filled_in_the_new_memory() {
         let (ctx, user) = create(0, false, true).unwrap();
@@ -5895,9 +5813,9 @@ mod tests {
     /// discarded (devices/virtio/mem/device.rs: `update_slot` before
     /// `discard_range`), then made read-write; the handler's next fill there
     /// lands, as on Linux, where the discard leaves the pages missing in their
-    /// vma. The discard's remap of the alias must leave it writable.
+    /// vma.
     #[test]
-    fn test_a_slot_unplugged_and_plugged_again_is_filled_through_its_alias() {
+    fn test_a_slot_unplugged_and_plugged_again_is_filled() {
         let (a, ua) = create(FEATURE_EVENT_REMOVE, false, true).unwrap();
         let ps = test_page_size();
         let mem = map(2);
@@ -5911,7 +5829,7 @@ mod tests {
         assert_eq!(r, 0);
         assert!(is_missing(mem) && is_missing(mem + ps));
         mprotect(mem, 2 * ps, RW);
-        // SAFETY: `data` holds a page; the alias must be writable.
+        // SAFETY: `data` holds a page.
         assert_eq!(unsafe { copy(a, data.as_ptr(), mem, ps, true) }, Ok(ps));
         // SAFETY: filled just now.
         assert_eq!(unsafe { ptr::read_volatile(mem as *const u8) }, 0x5a);
@@ -6372,7 +6290,8 @@ mod tests {
 
     #[test]
     fn test_register_needs_read_write_memory() {
-        // Fills write through the alias, which has the memory's protection.
+        // Fills write through a view of the memory, whose maximum
+        // protection the view has (`fill_view`).
         let (ctx, user) = create(0, false, true).unwrap();
         let ps = test_page_size();
         let mem = map(3);
@@ -6390,42 +6309,71 @@ mod tests {
         close(&[user]);
     }
 
-    /// A range over the alias of a registered range is refused (`EINVAL`):
-    /// its missing pages would be the alias's, and a fill of the first
-    /// range, which writes through the alias holding [`LOCK`], would fault
-    /// on them and wait for a fill of the second, which needs [`LOCK`]:
-    /// forever. In a process of its own, under an alarm, so that the hang
-    /// ends the process and fails the test: a fill of two pages takes
-    /// microseconds, and 10 s is far beyond any wait for the CPU.
+    /// Whether `addr` is in a VM map entry.
+    fn is_mapped(addr: u64) -> bool {
+        const VM_REGION_BASIC_INFO_64: c_int = 9;
+        let (mut at, mut size, mut object) = (addr, 0u64, 0);
+        let mut info = [0 as c_int; 16];
+        let mut count = 9u32;
+        // SAFETY: valid output buffers, as `mapped_entries`.
+        let kr = unsafe {
+            mach_vm_region(
+                mach_task_self_,
+                &mut at,
+                &mut size,
+                VM_REGION_BASIC_INFO_64,
+                info.as_mut_ptr(),
+                &mut count,
+                &mut object,
+            )
+        };
+        kr == 0 && at <= addr && addr < at + size
+    }
+
+    /// A fill writes through a view of the pages of its own, read-write and
+    /// outside the range, while the pages stay missing and `PROT_NONE` in
+    /// the range, so a thread that reads them meanwhile waits and never
+    /// sees a page half written, as on Linux, where `UFFDIO_COPY` maps the
+    /// page only once it is copied (v6.12 mm/userfaultfd.c
+    /// `mfill_atomic_pte_copy` :302, `mfill_atomic_install_pte`); the view
+    /// is gone once the fill is done, so the pages are mapped, and charged,
+    /// once ([`test_a_filled_page_is_charged_once`]). Through `copy`'s and
+    /// `zeropage`'s own `fill`, with a writer that checks halfway, of a
+    /// page of data and of zeros.
     #[test]
-    fn test_register_refuses_another_ranges_alias() {
-        if !in_own_process("wick_uffd::tests::test_register_refuses_another_ranges_alias") {
-            return;
-        }
+    fn test_a_fill_writes_through_a_view_that_goes_with_it() {
         let (ctx, user) = create(0, false, true).unwrap();
         let ps = test_page_size();
         let mem = map(2);
-        let chan = channel(user);
         register(ctx, mem, 2 * ps).unwrap();
-        let alias = find(mem).unwrap().0.alias.load(Ordering::Acquire);
-        let whole = register(ctx, alias, 2 * ps);
-        let part = register(ctx, alias + ps, ps);
-        // Through a handler's channel too, over the alias and what follows.
-        let other = map(1);
-        let (around, _) = request(chan, [proto::OP_REGISTER, alias + ps, 2 * ps, 0], &[]);
-        // SAFETY: plain alarm; its default action ends the process.
-        unsafe { libc::alarm(10) };
-        assert_eq!(zeropage(ctx, mem, 2 * ps, true), Ok(2 * ps));
-        // SAFETY: as above.
-        unsafe { libc::alarm(0) };
-        assert_eq!(whole.unwrap_err().raw_os_error(), Some(libc::EINVAL));
-        assert_eq!(part.unwrap_err().raw_os_error(), Some(libc::EINVAL));
-        assert_eq!(around, err(libc::EINVAL));
-        assert!(!is_missing(alias) && !is_missing(alias + ps));
-        // Other memory is taken.
-        let (r, _) = request(chan, [proto::OP_REGISTER, other, ps, 0], &[]);
-        assert_eq!(r, 0);
-        close(&[chan, user]);
+        for (page, byte) in [(0u64, 0x5au8), (1, 0)] {
+            let dst = mem + page * ps;
+            let reader = std::thread::spawn(move || {
+                // SAFETY: registered memory: the read waits for the fill.
+                unsafe { ptr::read_volatile((dst + ps - 1) as *const u8) }
+            });
+            until("the reader's wait", || WAITERS.iter().any(|w| w.page.load(Ordering::SeqCst) == dst));
+            let mut view = 0u64;
+            let r = fill(ctx, dst, ps, true, |to, n, _| {
+                view = to as u64;
+                assert!(view + n as u64 <= mem || view >= mem + 2 * ps, "the view {view:#x} is in the range");
+                assert_eq!(prot_of(view), libc::PROT_READ | libc::PROT_WRITE);
+                // SAFETY: the view, `n` bytes.
+                unsafe { ptr::write_bytes(to, byte, n / 2) };
+                assert!(is_missing(dst), "the page is not missing halfway through its fill");
+                assert_eq!(prot_of(dst), libc::PROT_NONE, "the page is reachable halfway through its fill");
+                std::thread::sleep(Duration::from_millis(20));
+                assert!(!reader.is_finished(), "a read went on halfway through the fill");
+                // SAFETY: as above.
+                unsafe { ptr::write_bytes(to.add(n / 2), byte, n - n / 2) };
+            });
+            assert_eq!(r, Ok(ps));
+            assert_ne!(view, 0, "the fill wrote nothing");
+            assert!(!is_mapped(view), "the view {view:#x} outlived its fill");
+            assert_eq!(reader.join().unwrap(), byte);
+            assert!(!is_missing(dst));
+        }
+        close(&[user]);
     }
 
     #[test]
@@ -6479,12 +6427,11 @@ mod tests {
     }
 
     /// A discard of registered memory replaces its pages
-    /// (`linux_items::discard_piece`): the alias through which pages are
-    /// filled follows, so a copy after the discard lands in the pages the
-    /// memory now has, not in the old ones (which would also have kept the
-    /// old pages resident).
+    /// (`linux_items::discard_piece`): a copy after the discard lands in the
+    /// pages the memory now has, not in the old ones (which would also have
+    /// kept the old pages resident).
     #[test]
-    fn test_discarded_pages_are_filled_through_the_new_alias() {
+    fn test_discarded_pages_are_filled_in_the_new_pages() {
         let (ctx, user) = create(0, false, true).unwrap();
         let ps = test_page_size();
         let mem = map(4);
