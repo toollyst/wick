@@ -279,7 +279,8 @@ Firecracker VMM  ── ext device "fs" (feature `fs`) ── copies bounded opa
    (sandbox unchanged)                                                            │ one AF_UNIX stream,
                                                                                   │ connected before narrowing
 wick-fsd (one per VM per share; started by the operator/adapter, outside the jail) ◀─┘
-   stage 0 (operator rights, no guest input): open share root, check volume, build confinement
+   stage 0 (operator rights, no guest input): open share root, check volume, accept one connection, check its
+            peer, unlink the listener, build confinement
    stage 1 (confined): FUSE decode → confined-directory layer → host file system
 ```
 
@@ -293,7 +294,9 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
   Hot-plug is refused (`update` → error) in v1.
 - Frame (built: `crates/fs/frame`, whose doc comment has the byte layout): a 24-byte little-endian header
   `{u32 len, u16 kind, u16 queue, u64 cookie, u32 writable_cap, u32 reserved}`, then the payload. Kinds: hello (each
-  side's first frame: protocol version and share id, checked by the other side), request (VMM → server: a chain's
+  side's first frame: protocol version and share id, checked by the other side; an id is 1 to 64 characters of
+  `[a-z0-9_-]`, no capitals, since it names the jail's `fs-<id>.sock` and `Data` and `data` would be one file on a
+  file system that ignores case, NTFS or APFS as macOS formats it), request (VMM → server: a chain's
   readable bytes) and reply (server → VMM: the bytes for that chain).
   - `len ≤ 1 MiB + 4 KiB`, checked from the header alone, before any payload is buffered. The writable capacity of a
     chain must hold `fuse_out_header`, or the chain is completed with used length 0. Linux's driver then fails the
@@ -328,14 +331,17 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
   - parse arguments (`--shared-dir`, `--socket`, `--read-only`, limits);
   - open the share root;
   - check the volume: local, not the volume root or a system location, case sensitivity (§7), xattr/EA support;
-  - set up the confinement (§6);
-  - bind and listen on the socket.
-- **Stage 1** (confined):
+  - bind and listen on the socket;
   - accept **exactly one** connection, then close and unlink the listener;
   - check the peer: Linux `SO_PEERCRED`, macOS `LOCAL_PEERCRED`/`getpeereid`, Windows `SIO_AF_UNIX_GETPEERPID` (works
-    across the AppContainer boundary [meas: a probe of Windows sandbox mechanisms on Windows Server 2022 build 20348, 2026-11-10; the probe is not in the repository]) → the expected uid or jail SID;
-  - serve until EOF, then exit. Refusing to start is the only answer to a missing control: the server has no
-    "unconfined" flag at all (Kata's failure mode).
+    across the AppContainer boundary [meas: a probe of Windows sandbox mechanisms on Windows Server 2022 build 20348, 2026-11-10; the probe is not in the repository]) → the expected uid or jail SID. The check is made here, by
+    the process with the operator's rights: a confined server could not open the peer to read its identity (on
+    Windows an LPAC process cannot open the VMM);
+  - only then set up the confinement (§6), with the connected socket and the share root its only handles.
+- **Stage 1** (confined): serve the one connection until EOF, then exit. It never accepts. Refusing to start is the
+  only answer to a missing control: the server has no "unconfined" flag at all (Kata's failure mode).
+- **Only bytes cross between the VMM and the server.** Neither opens the other. A shared object needed later (a
+  bounded bounce ring, DAX, vhost-user) is made by the jailer or stage 0 and handed to both.
 - **FUSE decoder**:
   - safe Rust, no `unsafe`; each frame is parsed from a private copy (no double fetch possible).
   - Every length is checked against the frame: `fuse_in_header.len`, the name NUL inside bounds, `total_extlen`
@@ -471,7 +477,8 @@ it means layer 1 let the request through.
     (no child processes, no win32k, ACG, strict handles, no extension points).
     `DisallowFsctlSystemCalls` cannot be set, because the server needs FSCTLs (sparse files, zero data, reparse
     queries), and it fails on build 20348 anyway [meas: a probe of Windows sandbox mechanisms on Windows Server 2022 build 20348, 2026-11-10; the probe is not in the repository].
-  - The listening socket and the share-root handle are inherited by the LPAC child. A handle does not bypass access
+  - The connected socket (stage 0 accepted it and checked the peer, §4.2) and the share-root handle are inherited
+    by the LPAC child. A handle does not bypass access
     checks on relative opens, hence the ACE [inf: confirm].
   - Granting the ACE to existing children rewrites their security descriptors (O(n) files, persistent). Children
     with protected DACLs stay unreachable, which fails closed.

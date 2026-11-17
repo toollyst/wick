@@ -146,7 +146,7 @@ pub enum FrameError {
         /// The peer's.
         theirs: u32,
     },
-    /// A share id with a character outside `[A-Za-z0-9_-]`, empty or longer
+    /// A share id with a character outside `[a-z0-9_-]`, empty or longer
     /// than [`MAX_ID_LEN`].
     BadId,
     /// The peer serves, or asks for, another share.
@@ -189,7 +189,7 @@ impl fmt::Display for FrameError {
             }
             FrameError::BadId => write!(
                 f,
-                "share id must be 1 to {MAX_ID_LEN} characters of [A-Za-z0-9_-]"
+                "share id must be 1 to {MAX_ID_LEN} characters of [a-z0-9_-]"
             ),
             FrameError::OtherShare => write!(f, "the peer is for another share"),
             FrameError::UnknownCookie(cookie) => {
@@ -432,15 +432,19 @@ pub fn parse(buf: &[u8], sender: Sender) -> Result<Option<Frame<'_>>, FrameError
         .map(|payload| Frame { header, payload }))
 }
 
-/// Checks a share id: 1 to [`MAX_ID_LEN`] characters of `[A-Za-z0-9_-]`. The
+/// Checks a share id: 1 to [`MAX_ID_LEN`] characters of `[a-z0-9_-]`. The
 /// id becomes part of file names (the jail's `fs-<id>.sock`), so nothing
-/// else is allowed.
+/// else is allowed, and no capital letter: on a file system that ignores
+/// case (NTFS, APFS as macOS formats it), `Data` and `data` would name one
+/// socket, so two shares of a VM could not both bind, or one VMM would
+/// reach the other share's server. The hello's id check refuses that, but
+/// one rule here keeps the ids of every host apart.
 pub fn check_id(id: &str) -> Result<(), FrameError> {
     let ok = !id.is_empty()
         && id.len() <= MAX_ID_LEN
         && id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
     if ok { Ok(()) } else { Err(FrameError::BadId) }
 }
 
@@ -891,11 +895,15 @@ mod tests {
 
     #[test]
     fn test_share_ids() {
-        for id in ["a", "docs", "A-b_9", &"x".repeat(MAX_ID_LEN)] {
+        for id in ["a", "docs", "a-b_9", "0", "-", "_", &"x".repeat(MAX_ID_LEN)] {
             assert_eq!(check_id(id), Ok(()), "{id}");
         }
         for id in [
             "",
+            "A",
+            "Docs",
+            "a-B_9",
+            "dataZ",
             ".",
             "..",
             "a/b",
@@ -908,6 +916,21 @@ mod tests {
             assert_eq!(check_id(id), Err(FrameError::BadId), "{id:?}");
             assert_eq!(hello_frame(id), Err(FrameError::BadId), "{id:?}");
         }
+        // Every byte as a one-byte id: exactly `[a-z0-9_-]`.
+        for b in 0..=u8::MAX {
+            let allowed = b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-';
+            if let Ok(id) = std::str::from_utf8(&[b]) {
+                assert_eq!(check_id(id).is_ok(), allowed, "{b:#x}");
+            }
+        }
+        // A peer's hello with a capital in its id is refused, so `Data` can
+        // never be taken for `data` on a host that folds case.
+        let mut frame = hello_frame("data").unwrap();
+        let at = frame.len() - 4;
+        frame[at] = b'D';
+        let got = parse(&frame, Sender::Server).unwrap().unwrap();
+        assert_eq!(parse_hello(&got), Err(FrameError::BadId));
+        assert_eq!(check_hello(&got, "data"), Err(FrameError::BadId));
     }
 
     #[test]

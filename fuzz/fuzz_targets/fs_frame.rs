@@ -7,7 +7,8 @@
 //! bytes reach the server inside requests.
 //!
 //! Parsing a stream frame by frame must never accept a frame outside the
-//! format's bounds or a kind the sender never sends, must hand out exactly
+//! format's bounds or a kind the sender never sends, nor a hello whose share
+//! id is not `[a-z0-9_-]`, must hand out exactly
 //! the payload the header announces, must re-encode an accepted header to
 //! the same bytes, and must ask for more bytes only while the frame is
 //! incomplete.
@@ -25,8 +26,8 @@ use std::collections::BTreeMap;
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use wick_fs_frame::{
-    FrameError, Full, HEADER_LEN, Header, InFlight, Kind, MAX_FRAME_LEN, MAX_IN_FLIGHT_REPLY_BYTES,
-    MAX_PAYLOAD_LEN, Sender, check_hello, parse, parse_hello,
+    FrameError, Full, HEADER_LEN, Header, InFlight, Kind, MAX_FRAME_LEN, MAX_ID_LEN,
+    MAX_IN_FLIGHT_REPLY_BYTES, MAX_PAYLOAD_LEN, Sender, check_hello, parse, parse_hello,
 };
 
 #[derive(Arbitrary, Debug)]
@@ -59,7 +60,19 @@ fn check_stream(stream: &[u8], sender: Sender) {
                 match header.kind() {
                     Kind::Hello => {
                         assert_eq!((header.queue(), header.cookie(), header.writable_cap()), (0, 0, 0));
-                        let _ = parse_hello(&frame);
+                        // An accepted hello's id is 1 to MAX_ID_LEN of `[a-z0-9_-]` (no
+                        // capital: ids must not fold together on a host that
+                        // ignores case), or empty for another version.
+                        if let Ok(hello) = parse_hello(&frame) {
+                            assert!(
+                                hello.id.len() <= MAX_ID_LEN
+                                    && hello.id.bytes().all(|b| {
+                                        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+                                    }),
+                                "accepted id {:?}",
+                                hello.id
+                            );
+                        }
                         let _ = check_hello(&frame, "docs");
                     }
                     Kind::Request => {
