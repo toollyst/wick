@@ -148,6 +148,13 @@ name = "wick-fs-frame"
 version = "0.1.0"
 
 [[package]]
+name = "wick-fsd"
+version = "0.1.0"
+dependencies = [
+ "wick-fs-frame",
+]
+
+[[package]]
 name = "wick-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -156,6 +163,7 @@ dependencies = [
  "libfuzzer-sys",
  "log",
  "wick-fs-frame",
+ "wick-fsd",
 ]
 
 [[package]]

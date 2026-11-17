@@ -26,6 +26,9 @@ log = "0.4.33"
 # The frames between the virtio-fs device and wick-fsd (fs_frame); a crate
 # without dependencies, taken by path from crates/fs's workspace.
 wick-fs-frame = { path = "../crates/fs/frame" }
+# wick-fsd's FUSE decoder and guest names (fs_decode); no dependencies but
+# the frame crate.
+wick-fsd = { path = "../crates/fs/fsd" }
 
 # The compatibility crates Firecracker builds with (docs/ARCHITECTURE.md).
 [patch.crates-io]
@@ -76,6 +79,13 @@ bench = false
 [[bin]]
 name = "fs_frame"
 path = "fuzz_targets/fs_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fs_decode"
+path = "fuzz_targets/fs_decode.rs"
 test = false
 doc = false
 bench = false

@@ -54,6 +54,7 @@ host_targets() {
         echo uffd_protocol
     fi
     echo fs_frame
+    echo fs_decode
 }
 
 # Windows: the targets are built with AddressSanitizer, whose runtime is a
@@ -119,6 +120,9 @@ target_args() {
     # Frames of up to a few KiB (the bounds checks do not depend on the
     # payload's size) and a few hundred tracker operations.
     fs_frame) echo "-max_len=16384" ;;
+    # A request of a few KiB (every bound but MAX_WRITE's, which the unit
+    # tests take), built twice: as it comes and around an opcode.
+    fs_decode) echo "-max_len=16384" ;;
     *) die "unknown target '$1' (tools/fuzz.sh --list)" ;;
     esac
 }
