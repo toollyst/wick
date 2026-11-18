@@ -1311,6 +1311,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The job's start, from which a failure's Seatbelt reports and crash
+      # reports are collected (the last two steps).
+      - name: Start mark (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "$RUNNER_TEMP/fs-reports"
+          date '+%Y-%m-%d %H:%M:%S' > "$RUNNER_TEMP/fs-start"
       - name: Clippy, warnings as errors
         run: cargo clippy --locked --all-targets -- -D warnings
       # On record first: the descriptors this step's shell holds above the
@@ -1454,6 +1461,42 @@ jobs:
         run: >-
           cargo test --locked -p wick-fsd --test memory -- --nocapture 2>&1
           | grep -E "^memory:|test result"
+      # What names a call the profile killed, so that one failed run decides
+      # it: Seatbelt's lines from the unified log since the job's start (each
+      # denial names the process and the call, "deny(1) syscall-mach 10";
+      # wick-fsd's and the tests' deny lines printed, every line kept), and
+      # each crash report made
+      # since then, the user's and root's (a confined process killed by
+      # Seatbelt leaves one, with the sandbox's exit reason, naming the
+      # process; root's runs are the sudo step's; ReportCrash writes a few
+      # per burst only, measured here, so the log is the full account, and
+      # confine_probe's expected kills are in both). Uploaded with the job's
+      # failure only.
+      - name: Seatbelt and crash reports (macOS)
+        if: failure() && runner.os == 'macOS'
+        run: |
+          out="$RUNNER_TEMP/fs-reports"
+          start="$(cat "$RUNNER_TEMP/fs-start")"
+          /usr/bin/log show --start "$start" --style compact --predicate 'sender == "Sandbox"' > "$out/sandbox.log" || true
+          echo "Seatbelt lines since $start: $(wc -l < "$out/sandbox.log")"
+          # wick-fsd's and the test binaries' (cargo's <name>-<16 hex>);
+          # the other processes' lines stay in the file.
+          grep -E 'Sandbox: (wick-fsd|[a-z_]+-[0-9a-f]{16})\([0-9]+\) deny\(' "$out/sandbox.log" | head -400 || true
+          for d in "$HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports; do
+            sudo find "$d" -type f -newer "$RUNNER_TEMP/fs-start" -print0 2>/dev/null |
+              while IFS= read -r -d '' f; do
+                echo "crash report: $f"
+                sudo cp "$f" "$out/" && sudo chown "$(id -u)" "$out/$(basename "$f")"
+              done
+          done
+      - name: Upload the Seatbelt and crash reports (macOS)
+        if: failure() && runner.os == 'macOS'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fs-reports-${{ matrix.runner }}
+          path: ${{ runner.temp }}/fs-reports/
+          if-no-files-found: ignore
+          retention-days: 14
       # Every test's result in one format (tools/ci-results.py, results.tsv),
       # for the docs' run claims; a step that did not run gives no rows.
       - name: Results in one format
