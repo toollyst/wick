@@ -342,7 +342,11 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   listed test that passes, on a listed name that is not a test, and on a
   crate whose counts (passing, failing as listed, ignored) are not its
   `count` line in that file's header: a test added or removed changes the
-  line in the same commit. A test
+  line in the same commit. Before pushing such a commit,
+  `python3 -I tools/macos/check-unit-tests.py --list-only` builds and lists
+  every crate's tests without running one and fails on a line that is not
+  what a run gives when exactly the listed tests fail (it names the line to
+  write); `--selftest` checks its counting. A test
   that creates a VM is listed `no-hvf`; `tools/macos/test.sh` runs it on a
   Mac, signed, in a process of its own. Each test binary gets an empty
   directory of its own for the endpoints of interfaces named without `/`

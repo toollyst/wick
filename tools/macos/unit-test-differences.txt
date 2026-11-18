@@ -68,7 +68,14 @@
 # counted once). check-unit-tests.py fails on a crate whose run does not give
 # its line's three numbers, or that has no line, so a test added or removed
 # changes its crate's line in the same commit. Counted on an M1 Pro, macOS
-# 27.2, 2026-11-18, by check-unit-tests.py over every crate.
+# 27.2, 2026-11-18, by check-unit-tests.py over every crate; compat-libc's
+# line from CI run 44207018536, whose macos job counted 118 pass after
+# a7a9b15a added test_a_discard_woken_by_the_release_returns_after_its_teardown
+# (every other line was that run's). Before a push of a commit that adds or
+# removes a test in a counted crate:
+# `python3 -I tools/macos/check-unit-tests.py --list-only`, which builds and
+# lists the tests without running them and compares the counts a run gives
+# when exactly the listed tests fail.
 #   count vmm 932 pass 139 fail 84 ignored
 #   count acpi-tables 22 pass 0 fail 0 ignored
 #   count clippy-tracing 17 pass 0 fail 0 ignored
@@ -85,7 +92,7 @@
 #   count compat-event-manager 0 pass 0 fail 0 ignored
 #   count compat-kvm-bindings 0 pass 0 fail 0 ignored
 #   count compat-kvm-ioctls 34 pass 87 fail 2 ignored
-#   count compat-libc 117 pass 0 fail 1 ignored
+#   count compat-libc 118 pass 0 fail 1 ignored
 #   count compat-memfd 5 pass 0 fail 0 ignored
 #   count compat-micro-http 0 pass 0 fail 0 ignored
 #   count compat-os 9 pass 0 fail 0 ignored

@@ -94,6 +94,7 @@ jobs:
         run: |
           python3 -I -B tools/libtest-results.py --selftest
           python3 -I tools/ci-results.py --selftest
+          python3 -I -B tools/macos/check-unit-tests.py --selftest
       - name: Numbers derived from the tree are current
         run: |
           python3 -I -B tools/check-derived.py --selftest

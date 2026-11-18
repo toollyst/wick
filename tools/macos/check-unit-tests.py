@@ -29,6 +29,16 @@ So nothing goes unrun silently, nothing is left behind unnoticed, and the
 lists cannot rot.
 
     python3 -I tools/macos/check-unit-tests.py [--crate NAME ...] [--out DIR] [--summary FILE]
+    python3 -I tools/macos/check-unit-tests.py --list-only [--crate NAME ...]
+    python3 -I tools/macos/check-unit-tests.py --selftest
+
+--list-only builds the test binaries and lists their tests (`--list`, and
+`--list --ignored`) without running one: each crate's counts are then what a
+run gives if every listed test fails and every other one passes, and they
+must be its header line. So a commit that adds or removes a test in a
+counted crate is caught before a push, in about the time of a build; a test
+that passes or fails unexpectedly is still the run's to find. It also checks
+that every listed name is a test of its crate.
 
 With --out, DIR keeps each crate's output (<crate>.log, every test binary's
 in turn) and every test's result (tests.tsv: crate, test, result, and whether
@@ -313,6 +323,82 @@ def failure_output(out, test):
     return body[:end].rstrip()
 
 
+def expected_counts(names, ignored, want):
+    """(pass, fail as listed, ignored) of a crate whose tests are `names`,
+    `ignored` of them ignored, if exactly its listed tests `want` fail (and
+    the others pass), as a run counts them."""
+    ran = names - ignored
+    fail = ran & want
+    return len(ran - fail), len(fail), len(ignored)
+
+
+def count_error(crate, header, got, differences):
+    """The error for `crate`'s counts `got` against the header's, or None."""
+    if crate not in header:
+        shown = os.path.relpath(differences, ROOT)
+        shown = differences if shown.startswith("..") else shown
+        return (f"{crate}: no count line in {shown}'s header; "
+                f"its counts are '#   count {crate} {got[0]} pass {got[1]} fail {got[2]} ignored'")
+    had = header[crate]
+    if had != got:
+        return (f"{crate}: the header counts {had[0]} pass, {had[1]} fail, {had[2]} ignored; "
+                f"the run counts {got[0]} pass, {got[1]} fail, {got[2]} ignored "
+                f"('#   count {crate} {got[0]} pass {got[1]} fail {got[2]} ignored')")
+    return None
+
+
+def list_only(selected, all_crates, entries, header, differences, errors):
+    """--list-only: each crate's counts from its tests' listing, no run."""
+    env = environment()
+    for crate in selected:
+        if crate not in all_crates:
+            errors.append(f"unknown crate {crate}")
+            continue
+        exes, err = build(all_crates[crate])
+        if exes is None:
+            errors.append(f"{crate}: the tests do not build:\n    " + "\n    ".join(err))
+            continue
+        names, ignored = set(), set()
+        for exe, cwd in exes:
+            exe_env = package_env(env, cwd)
+            names |= listed(exe, cwd, exe_env)
+            ignored |= listed(exe, cwd, exe_env, ignored=True)
+        want = {test for (c, test) in entries if c == crate}
+        for test in sorted(want - names):
+            errors.append(f"{crate}: listed {test} is not a test of the crate")
+        for test in sorted(want & ignored):
+            errors.append(f"{crate}: listed {test} ({entries[(crate, test)]}) is ignored")
+        got = expected_counts(names, ignored, want)
+        print(f"{crate}: {got[0]} pass, {got[1]} fail as listed, {got[2]} ignored (listed, not run)", flush=True)
+        e = count_error(crate, header, got, differences)
+        if e:
+            errors.append(e.replace("the run counts", "the listing counts"))
+
+
+def selftest():
+    """The counting and the messages --list-only and a run share."""
+    names = {"a", "b", "c", "d", "e"}
+    assert expected_counts(names, {"e"}, {"b", "c"}) == (2, 2, 1)
+    assert expected_counts(names, set(), set()) == (5, 0, 0)
+    # A listed test that is ignored is not counted as failing.
+    assert expected_counts(names, {"b"}, {"b"}) == (4, 0, 1)
+    header = {"x": (2, 2, 1)}
+    assert count_error("x", header, (2, 2, 1), DIFFERENCES) is None
+    # One test more, as compat-libc's in CI run 44207018536: the line to write.
+    e = count_error("x", header, (3, 2, 1), DIFFERENCES)
+    assert e and "the header counts 2 pass, 2 fail, 1 ignored" in e and "'#   count x 3 pass 2 fail 1 ignored'" in e, e
+    e = count_error("y", header, (1, 0, 0), DIFFERENCES)
+    assert e and "no count line" in e and "'#   count y 1 pass 0 fail 0 ignored'" in e, e
+    # The header's own lines parse back to what the selftest wrote.
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "differences.txt")
+        with open(p, "w") as f:
+            f.write("#   count x 3 pass 2 fail 1 ignored\n#   count x 1 pass 0 fail 0 ignored\n#   count z 1 pass\n")
+        counts, errs = read_counts(p)
+        assert counts == {"x": (1, 0, 0)} and len(errs) == 2, (counts, errs)
+    print("check-unit-tests: selftest ok (7 cases)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--crate", action="append", help="only these crates (names as in the list)")
@@ -320,7 +406,13 @@ def main():
     ap.add_argument("--litter", default=LITTER)
     ap.add_argument("--out", type=pathlib.Path, help="where each crate's output and every test's result are kept")
     ap.add_argument("--summary", type=pathlib.Path, help="append a Markdown summary here")
+    ap.add_argument("--list-only", action="store_true",
+                    help="build and list the tests, run none: the header's counts against the listing")
+    ap.add_argument("--selftest", action="store_true", help="check the counting and its messages")
     a = ap.parse_args()
+    if a.selftest:
+        selftest()
+        return
     if a.out:
         a.out.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -341,6 +433,11 @@ def main():
         if crate not in all_crates:
             errors.append(f"listed crate {crate} is not one this check runs ({', '.join(all_crates)})")
     selected = a.crate or list(all_crates)
+    if a.list_only:
+        list_only(selected, all_crates, entries, header, a.differences, errors)
+        for e in errors:
+            print(f"error: {e}")
+        sys.exit(1 if errors else 0)
     env = environment()
     totals = {"pass": 0, "listed": 0, "ignored": 0}
     for crate in selected:
@@ -430,15 +527,9 @@ def main():
         counts.append(line)
         print(line, flush=True)
         got = (len(ran - failed), len(failed & want), len(ignored))
-        if crate not in header:
-            shown = os.path.relpath(a.differences, ROOT)
-            shown = a.differences if shown.startswith("..") else shown
-            errors.append(f"{crate}: no count line in {shown}'s header; "
-                          f"its counts are '#   count {crate} {got[0]} pass {got[1]} fail {got[2]} ignored'")
-        elif finished and header[crate] != got:
-            had = header[crate]
-            errors.append(f"{crate}: the header counts {had[0]} pass, {had[1]} fail, {had[2]} ignored; "
-                          f"the run counts {got[0]} pass, {got[1]} fail, {got[2]} ignored")
+        e = count_error(crate, header, got, a.differences)
+        if e and (crate not in header or finished):
+            errors.append(e)
     total = f"all: {totals['pass']} pass, {totals['listed']} fail as listed, {totals['ignored']} ignored"
     print(total)
     for e in errors:
