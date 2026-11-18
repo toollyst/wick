@@ -568,8 +568,27 @@ jobs:
     needs: linux-boot
     if: ${{ !cancelled() }}
     runs-on: macos-latest
-    # 18.5 minutes in run 43833851623, and the unit step's second vmm run
-    # (below) adds about 5; 21.3 with it in run 43881982686.
+    # The macOS jobs' limits (this job, macos-15-root-vmnet, macos-seatbelt,
+    # fuzz and fs, each over its whole matrix) are from the step times of
+    # the last ten runs that reached them, 44307674793 to 44398279915 (each
+    # step's start and end in GitHub's job records):
+    #   a step gets the larger of 5 minutes and 1.5 times its longest time;
+    #   a step under tools/macos/watchdog.py gets at least the watchdog's
+    #   bound plus 2 minutes (plus its other commands' time), so that a hang
+    #   is sampled by the watchdog before the step ends; a step that never
+    #   took 45 s gets only its job's limit;
+    #   a job gets 1.5 times its longest run, or its longest run with a
+    #   watchdog step at that step's limit, whichever is larger, rounded up
+    #   to 5 minutes, and at least 10.
+    # A job's clock starts when a runner takes it; the queue does not count
+    # (fs on macos-latest in run 44329264407 waited 10.1 minutes for a runner
+    # and ran 6.5 under a limit of 15). A job no runner takes ends after
+    # about 15 minutes with 0 steps whatever its limit (CONTRIBUTING.md,
+    # "Tests", the three kinds of cancel). A step at its limit fails and
+    # the steps that run after a failure still run; a job at its limit is
+    # cancelled whole.
+    # This job: longest run 26.1 minutes (run 44362564244); the unit step's
+    # watchdog (1500 s) gives that step 27, and the job 40.
     timeout-minutes: 40
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
@@ -593,10 +612,12 @@ jobs:
       # setup or build (steps.build: skipped or failed), whose cause it
       # would bury under failures of its own.
       - name: Build firecracker
+        timeout-minutes: 5
         id: build
         working-directory: lib/firecracker
         run: cargo build --locked -p firecracker --bin firecracker
       - name: Clippy
+        timeout-minutes: 5
         working-directory: lib/firecracker
         run: cargo clippy --locked -p vmm -p firecracker -p wick-ext -p jailer --lib --bins --tests -- -D warnings
       # Host folder sharing's device, built only with Firecracker's `fs`
@@ -605,6 +626,7 @@ jobs:
       # feature, which has it). Its tests run with the unit tests below
       # (check-unit-tests.py's wick-ext-fs).
       - name: virtio-fs device (fs feature)
+        timeout-minutes: 5
         if: (success() || failure()) && steps.build.outcome == 'success'
         working-directory: lib/firecracker
         run: |
@@ -618,6 +640,7 @@ jobs:
       # it themselves and upstream's keep upstream's warnings. A link to an
       # item built on another host only (a `windows` module) is plain text.
       - name: Rustdoc links
+        timeout-minutes: 5
         if: (success() || failure()) && steps.build.outcome == 'success'
         working-directory: lib/firecracker
         run: |
@@ -646,6 +669,7 @@ jobs:
       # The jailer's tests run as root, as upstream's do (they set resource
       # limits and change owners); the runners have passwordless sudo.
       - name: Jailer unit tests
+        timeout-minutes: 5
         if: (success() || failure()) && steps.build.outcome == 'success'
         working-directory: lib/firecracker
         run: |
@@ -664,6 +688,7 @@ jobs:
         if: (success() || failure()) && steps.build.outcome == 'success'
         run: python3 -I tools/macos/jailer-test.py --freeze-self-check
       - name: Jailer scenario tests (without a VM)
+        timeout-minutes: 5
         if: (success() || failure()) && steps.build.outcome == 'success'
         id: jailer_scenarios
         run: tools/macos/jailer-test.sh --no-vm
@@ -807,12 +832,14 @@ jobs:
       # Last in the job, so a unit test's failure does not keep the jailer and
       # harness steps above from running.
       - name: Unit tests of every crate but the jailer (tools/macos/unit-test-differences.txt)
+        timeout-minutes: 27
         # Runs after an earlier step's failure too: each step answers its own question.
         if: (success() || failure()) && steps.build.outcome == 'success'
         # Under the watchdog (macos-seatbelt's steps say why): about twice its
         # usual 13 minutes (8 in run 43833851623, and vmm's second run's
-        # 274 s; 12.1 in run 43881982686, its two vmm runs 251 and 274 s),
-        # and inside the job's 40.
+        # 274 s; 12.1 in run 43881982686, its two vmm runs 251 and 274 s;
+        # the longest of the last ten 13.3, run 44362564244), and inside the
+        # step's 27 and the job's 40.
         run: >-
           python3 -I tools/macos/watchdog.py 1500 --out "$RUNNER_TEMP/unit/watchdog" --
           python3 -I tools/macos/check-unit-tests.py --out "$RUNNER_TEMP/unit" --summary "$GITHUB_STEP_SUMMARY"
@@ -885,9 +912,19 @@ jobs:
   # the job is for is that the root step ran (boot-test.py under sudo
   # reached the stage), that its results are the user's, and that no
   # root-owned file is left in the build directories or the source tree.
+  #
+  # It also runs the jailer's scenarios that need no VM, as the macos job does
+  # on macOS 26, so that each runs as root on both majors (the jail stage's
+  # API process serving after an idle past libmalloc's reclamation period
+  # among them, SECURITY.md, "Heap").
   macos-15-root-vmnet:
     runs-on: macos-15
-    timeout-minutes: 40
+    # Limits as the macos job's comment says. The vmnet stage's longest run
+    # was 2.9 minutes (run 44398279915), its step 2.6. The jailer scenarios
+    # have not run here yet: their step has the macos job's limit for the
+    # same step (5; 2.2 there at most), and the job 15, to be derived again
+    # from this job's own runs.
+    timeout-minutes: 15
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
@@ -899,6 +936,7 @@ jobs:
       - uses: ./.github/actions/upstream
       - run: tools/setup.sh
       - name: boot-test.sh's vmnet stage as root, before macOS 26
+        timeout-minutes: 5
         id: vmnet
         run: |
           sudo python3 --version
@@ -965,6 +1003,33 @@ jobs:
             echo "$left"
             exit 1
           fi
+      # As in the macos job, on macOS 15: the scripts build as the user and
+      # ask for sudo for what needs root.
+      - name: Jailer scenario tests (without a VM)
+        timeout-minutes: 5
+        # After the vmnet step's failure too, never after a failed setup.
+        if: (success() || failure()) && steps.vmnet.conclusion != 'skipped'
+        id: jailer_scenarios
+        run: tools/macos/jailer-test.sh --no-vm
+      - name: Upload the jailer scenarios' logs
+        if: failure() && steps.jailer_scenarios.conclusion == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-15-jailer-test
+          path: build/jailer-test/
+          if-no-files-found: warn
+          retention-days: 14
+      # What the scenarios' root runs left in the source tree (the macos
+      # job's step of the same name says why it matters).
+      - name: No root-owned files in the source tree
+        if: (success() || failure()) && steps.jailer_scenarios.conclusion != 'skipped'
+        run: |
+          left=$(find . \( -path ./build -o -path ./lib/firecracker/build \) -prune -o -user 0 -print)
+          if [ -n "$left" ]; then
+            echo "root-owned files in the source tree after the root steps:"
+            echo "$left"
+            exit 1
+          fi
       # Every test's result in one format (tools/ci-results.py, results.tsv),
       # for the docs' run claims; a step that did not run gives no rows.
       - name: Results in one format
@@ -981,6 +1046,11 @@ jobs:
           if [ -n "$d" ] && [ -f "$d/summary.txt" ]; then
             python3 -I tools/ci-results.py add summary "$d/summary.txt" --suite tools/macos/boot-test.py \
               --out "$RUNNER_TEMP/results.tsv" ${XFAIL:+--xfail "$XFAIL"}
+          fi
+          d=""
+          for x in build/jailer-test/*/; do d="$x"; done
+          if [ -n "$d" ] && [ -f "$d/summary.txt" ]; then
+            python3 -I tools/ci-results.py add summary "$d/summary.txt" --suite tools/macos/jailer-test.py --out "$RUNNER_TEMP/results.tsv"
           fi
           r="$RUNNER_TEMP/results.tsv"
           if [ -f "$r" ]; then python3 -I tools/ci-results.py validate "$r"; else echo "no results: no test step wrote its output"; fi
@@ -1010,7 +1080,10 @@ jobs:
       matrix:
         runner: [macos-15, macos-26]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # Limits as the macos job's comment says: longest run 4.8 minutes (run
+    # 44307674793, macOS 26); the host sandbox step's 900 s watchdog gives
+    # that step 19 and the job 25.
+    timeout-minutes: 25
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
       # A hung process's stacks (sample) in every step: watchdog.py, the vmm
@@ -1037,10 +1110,12 @@ jobs:
       # setup or build (steps.build: skipped or failed), whose cause it
       # would bury under failures of its own.
       - name: Build the tests
+        timeout-minutes: 5
         id: build
         working-directory: lib/firecracker
         run: cargo test --locked -p vmm --lib --no-run
       - name: Host sandbox tests
+        timeout-minutes: 19
         working-directory: lib/firecracker
         run: |
           # Each test's line kept for the results (tee); the step's exit is the tests'.
@@ -1079,6 +1154,7 @@ jobs:
       # dead before its first marker (c7d32e2); run alone, repeatedly, it
       # shows whether that is intermittent and how often.
       - name: API process profile test, 20 runs
+        timeout-minutes: 5
         if: (success() || failure()) && steps.build.outcome == 'success'
         working-directory: lib/firecracker
         run: |
@@ -1098,6 +1174,7 @@ jobs:
       # macos job has one. The test binary is the one the steps above built;
       # one test thread, as check-unit-tests.py runs them; none makes a VM.
       - name: FIFO relay and API process tests
+        timeout-minutes: 8
         if: (success() || failure()) && steps.build.outcome == 'success'
         working-directory: lib/firecracker
         run: |
@@ -1165,7 +1242,10 @@ jobs:
       matrix:
         runner: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # Limits as the macos job's comment says: longest run 13.5 minutes (run
+    # 44333428364, Windows); the fuzzing step's longest 11.1 (the same run,
+    # macOS).
+    timeout-minutes: 25
     defaults:
       run:
         shell: bash
@@ -1174,6 +1254,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install the pinned nightly and cargo-fuzz
+        timeout-minutes: 5
         run: |
           rustup toolchain install "$(tools/fuzz.sh --toolchain)" --profile minimal
           cargo install cargo-fuzz --locked --version 0.13.2
@@ -1187,6 +1268,7 @@ jobs:
       # virtio-fs device's request/reply core (fs_copy::tests) on Windows,
       # where wick-ext's fs is not built yet.
       - name: The fuzzed modules' unit tests
+        timeout-minutes: 5
         id: fuzz_units
         run: cargo test --manifest-path fuzz/Cargo.toml --lib 2>&1 | tee "$RUNNER_TEMP/tests.log"
       # Every test's result in one format (tools/ci-results.py, results.tsv),
@@ -1209,6 +1291,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
       - name: Fuzz each target for 60 seconds
+        timeout-minutes: 17
         run: tools/fuzz.sh -t 60
       - name: Upload the inputs that failed
         if: failure()
@@ -1303,10 +1386,11 @@ jobs:
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15, windows-latest]
     runs-on: ${{ matrix.runner }}
-    # macOS's jobs took 8 to 9 minutes before the server-under-report step,
-    # which builds crates/fs again (the discovery build) and runs the
-    # request tests three times.
-    timeout-minutes: 25
+    # Limits as the macos job's comment says: longest run 9.4 minutes (run
+    # 44384853363, macos-latest, the first with the server-under-report
+    # step, which builds crates/fs again and runs the request tests three
+    # times); the unit step's longest 5.5 and that step's 2.0 (the same run).
+    timeout-minutes: 15
     defaults:
       run:
         shell: bash
@@ -1329,6 +1413,7 @@ jobs:
       # starts its own process without them), and on Linux what a user
       # namespace of the runner's user is here (design-fs §6.1).
       - name: Unit tests
+        timeout-minutes: 9
         id: fs_units
         run: |
           case "$RUNNER_OS" in
@@ -1477,6 +1562,7 @@ jobs:
       # reported), and on a failed test; it runs whatever the steps before
       # it gave.
       - name: The server's calls under the reporting profile (macOS)
+        timeout-minutes: 5
         if: runner.os == 'macOS' && !cancelled()
         run: python3 -I ../../tools/macos/fs-server-report.py --runs 3 --out "$RUNNER_TEMP/fs-reports/server-report.txt"
       # What names a call the profile killed, so that one failed run decides

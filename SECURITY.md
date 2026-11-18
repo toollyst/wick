@@ -200,7 +200,8 @@ longer does. From 26b9b3be (2026-11-11) to 7fd38e70 (2026-11-16) the jailed API 
 profile without the trap, so on macOS 26 or 27 its first free 10 s or more after the ring's last sample would have
 killed it (measured on 27.2 in the same configuration: "deny(1) syscall-mach 63"); no release holds that window. No
 run had kept the jailed API process serving past 10 s before `jailer-test jail` began to (requests before and after an
-idle of 11 s, the same API process throughout, on CI's macOS 15 and 26 runners).
+idle of 11 s, the same API process throughout): on CI's macOS 26 runner (the `macos` job), and on macOS 15 from the
+commit that put the no-VM scenarios in the `macos-15-root-vmnet` job, CI's run of that job being the first.
 
 The configuration is checked on each launch: libmalloc's report on a direct launch, without the variables (two
 reports, the second with them) and with them (one) (`test_a_direct_launch_starts_again_with_libmallocs_configuration`,

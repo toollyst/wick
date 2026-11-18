@@ -501,7 +501,44 @@ Ubuntu's restriction refuses it. CI's fs job also loads an AppArmor profile that
 grants the built wick-fsd and `confine_probe` user namespaces and runs them
 as its user with `WICK_FS_TEST_USERNS_GRANTED=1`, which tells the tests that
 user namespaces are granted (a refusal then fails them); it removes the
-profile after.
+profile after. In a Docker container, run as root, the confined tests need
+what a runner's root has: `--cap-add SYS_ADMIN` (else the server's
+`unshare` fails with EPERM), `--cap-add SYS_PTRACE` (else the tests' read of
+the confined process's `/proc/<pid>/root` fails with EACCES: it is not
+dumpable) and `--security-opt seccomp=unconfined --security-opt
+apparmor=unconfined`.
+
+### A CI job that did not run
+
+A job that ended without its result says why in its annotations (the run's
+page, or `gh api repos/<owner>/<repo>/check-runs/<job id>/annotations`).
+Three kinds of end are not a test's failure:
+
+- "The job was not acquired by Runner of type hosted even after multiple
+  attempts": 0 steps, about 15 minutes after the job was queued, whatever
+  its `timeout-minutes` (macOS jobs at limits of 15 and 30 alike, with
+  GitHub's notice that macOS arm64 runners are short). No runner took it, so
+  nothing of the commit ran there.
+- "Canceling since a higher priority waiting request for
+  ci-refs/heads/main-push- exists": a later push to the branch replaced the
+  run (the workflow's `concurrency`), with or without steps run. The later
+  run's result is the one that counts.
+- "The job has exceeded the maximum execution time of 30m0s": the job's own
+  `timeout-minutes`, and the job is cancelled whole. A step's own limit
+  fails that step instead, "The action '<step>' has timed out after <n>
+  minutes." (actions/runner, `StepsRunner.cs`), and the steps that run after
+  a failure still run. Either is a failure: find its cause (above, "No
+  pretending"), never raise the limit without the step times that show it
+  is too low. The limits and how they were set are in ci.yml's comment at
+  the `macos` job; a job's clock starts when a runner takes it, so the
+  queue does not count.
+
+A job that never got a runner is not a pass: the commit's result on that
+host is unknown until the job has run. Whoever pushed the commit re-runs it
+once the run has ended, `gh run rerun <run id> --failed` (it re-runs the
+failed and cancelled jobs and those that need them, a new attempt of the
+same run), and reads that result before calling the commit green; a run
+replaced by a later push needs no re-run.
 
 ## Fuzzing
 
