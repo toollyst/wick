@@ -886,12 +886,25 @@ mod macos {
     /// apart by this rule alone). The jail's directory is reached through a
     /// descriptor opened before the chroot, from which a relative path
     /// climbs out (`..`), so Unix sockets are then connected to only in the
-    /// jail, in the jail's directory and directly in the network: file
-    /// rules do not cover `connect` or `sendto` (measured: both reach a
-    /// socket elsewhere with only the file rules), `network-outbound` does.
+    /// jail, in the jail's directory and directly in the network.
+    ///
+    /// With or without a network, a Unix socket is connected or sent to
+    /// only where the jail reaches (a denial with an error, as on Linux a
+    /// path outside the chroot is not there): file rules do not cover
+    /// `connect` or `sendto` (measured: both reach a socket elsewhere with
+    /// only the file rules), `network-outbound` does. Without a network the
+    /// chroot already hides every other socket, as the jail holds no
+    /// descriptor of a directory outside it; this rule is the sandbox's own
+    /// limit behind it, where the jail's profile let a jailed process
+    /// without `--netns` connect and send to any Unix socket on the host
+    /// by its path until 2026-11-18 (`test_jailed_profile_limits_operations`).
+    /// A bind outside the jail already failed with EPERM in both phases
+    /// (measured by the same test; no sandbox report names the operation
+    /// that refuses it).
     pub fn files_in_jail(root: &Path, netns: Option<&Path>) -> Result<String, SandboxError> {
         let root = quoted(root, "jail")?;
         let mut rule = format!("(allow file-read* file-write* (subpath \"{root}\"))\n");
+        let mut reach = format!("(remote unix-socket (subpath \"{root}\"))");
         if let Some(netns) = netns {
             let network = netns
                 .parent()
@@ -902,12 +915,11 @@ mod macos {
             rule.push_str(&format!(
                 "(allow file-read* file-write* (require-all (subpath \"{netns}\") (vnode-type SOCKET)))\n\
                  (allow file-read-metadata file-write-data (require-all {switch} (vnode-type SOCKET)))\n\
-                 (allow file-read-metadata (literal \"{network}\"))\n\
-                 (deny network-outbound (remote unix-socket))\n\
-                 (allow network-outbound (remote unix-socket (subpath \"{root}\")) \
-                 (remote unix-socket (subpath \"{netns}\")) (remote unix-socket {switch}))\n"
+                 (allow file-read-metadata (literal \"{network}\"))\n"
             ));
+            reach.push_str(&format!(" (remote unix-socket (subpath \"{netns}\")) (remote unix-socket {switch})"));
         }
+        rule.push_str(&format!("(deny network-outbound (remote unix-socket))\n(allow network-outbound {reach})\n"));
         Ok(rule)
     }
 
@@ -5750,6 +5762,201 @@ mod macos {
             let _l = std::os::unix::net::UnixListener::bind(jail.join("s")).unwrap();
             std::os::unix::net::UnixStream::connect(jail.join("s")).unwrap();
             println!("CHILD-OK");
+        }
+
+        /// The operations a jailed profile leaves to rules other than its
+        /// file rules, without `--netns`: one child per case and phase makes
+        /// one attempt, outside the jail where the operation names something,
+        /// with no profile (`none`, the control), under the jailed start's
+        /// profile (`profile_for` with the jail and no network) in each phase
+        /// (`setup`, `run`), and under the API process's (`api`, where it
+        /// makes sockets). Each is `ok`, `err N` (the call failed with errno
+        /// N), `kr N` (a Mach error) or `killed`; the table is printed
+        /// (`--nocapture`). Unix sockets outside the jail were connected and
+        /// sent to in both phases until `files_in_jail` limited
+        /// `network-outbound` to the jail without a network too.
+        #[test]
+        fn test_jailed_profile_limits_operations() {
+            let base = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("wick-jail-sweep-{}", std::process::id()));
+            let jail = base.join("jail");
+            std::fs::create_dir_all(&jail).unwrap();
+            let _stream = std::os::unix::net::UnixListener::bind(base.join("out.sock")).unwrap();
+            let _dgram = std::os::unix::net::UnixDatagram::bind(base.join("outd.sock")).unwrap();
+            let _inside = std::os::unix::net::UnixListener::bind(jail.join("in.sock")).unwrap();
+            let mut wrong = Vec::new();
+            for (case, expected) in JAIL_SWEEP {
+                for (phase, want) in ["none", "setup", "run", "api"].into_iter().zip(*expected) {
+                    if want.is_empty() {
+                        continue;
+                    }
+                    let _ = std::fs::remove_file(base.join("bound.sock"));
+                    let out = child(
+                        "jailed_sweep_child",
+                        &[
+                            ("WICK_TEST_JAIL", jail.to_str().unwrap()),
+                            ("WICK_TEST_CASE", case),
+                            ("WICK_TEST_PHASE", phase),
+                            ("WICK_TEST_PID", &std::process::id().to_string()),
+                        ],
+                    );
+                    // SAFETY: a NUL-terminated name (made if the case was allowed).
+                    unsafe { libc::shm_unlink(c"/wick-sweep-other".as_ptr()) };
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let got = if let Some(r) = stdout.lines().find_map(|l| l.strip_prefix("SWEEP ")) {
+                        r.to_owned()
+                    } else if denied(&out)
+                        || std::os::unix::process::ExitStatusExt::signal(&out.status) == Some(libc::SIGKILL)
+                    {
+                        "killed".to_owned()
+                    } else {
+                        panic!("{case} {phase}: {}", text(&out));
+                    };
+                    println!("sweep {case:<14} {phase:<5} {got}");
+                    let fits = match want {
+                        "*" => true,
+                        "!ok" => got != "ok",
+                        want => got == want,
+                    };
+                    if !fits {
+                        wrong.push(format!("{case} {phase}: {got}, expected {want}"));
+                    }
+                }
+            }
+            std::fs::remove_dir_all(&base).unwrap();
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        /// The cases of [`test_jailed_profile_limits_operations`], each with
+        /// what is expected with no profile, in the setup phase, in the run
+        /// phase and under the API process's profile (empty: not tried; `*`:
+        /// anything; `!ok`: anything but `ok`). A Unix socket in the jail
+        /// is reached; one outside it is not (an error, as on Linux a path
+        /// outside the chroot is not there), nor bound; IP networking, a
+        /// Mach service, another name's shared memory and a signal to
+        /// another process are denials; another process's information
+        /// fails with an error (`PROFILE`). Writing a sysctl (the value it
+        /// has) fails without the profile too unless the test runs as root:
+        /// as root the profile's answer is asked to be a refusal only. The
+        /// API process makes no socket (`socket` is in none of its lists).
+        #[rustfmt::skip]
+        const JAIL_SWEEP: &[(&str, [&str; 4])] = &[
+            ("connect-in",    ["ok",     "ok",     "ok",     ""]),
+            ("connect-out",   ["ok",     "err 1",  "err 1",  "killed"]),
+            ("send-out",      ["ok",     "err 1",  "err 1",  "killed"]),
+            ("bind-out",      ["ok",     "err 1",  "err 1",  "killed"]),
+            ("tcp",           ["*",      "killed", "killed", "killed"]),
+            ("mach-lookup",   ["ok",     "killed", "killed", ""]),
+            ("shm-other",     ["ok",     "killed", "killed", ""]),
+            ("sysctl-write",  ["*",      "!ok",    "!ok",    ""]),
+            ("pidinfo-other", ["ok",     "err 1",  "err 1",  ""]),
+            ("signal-other",  ["ok",     "killed", "killed", ""]),
+        ];
+
+        #[test]
+        #[ignore = "run by test_jailed_profile_limits_operations in a separate process"]
+        fn jailed_sweep_child() {
+            use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+            unsafe extern "C" {
+                static bootstrap_port: u32;
+                fn bootstrap_look_up(bp: u32, name: *const c_char, sp: *mut u32) -> libc::c_int;
+            }
+            let jail = std::path::PathBuf::from(std::env::var("WICK_TEST_JAIL").unwrap());
+            let base = jail.parent().unwrap().to_owned();
+            let case = std::env::var("WICK_TEST_CASE").unwrap();
+            let phase = std::env::var("WICK_TEST_PHASE").unwrap();
+            // Another process of this uid: the test's.
+            let other: libc::pid_t = std::env::var("WICK_TEST_PID").unwrap().parse().unwrap();
+            // The sysctl's value, read before the profile, to write back.
+            let mut maxfiles: libc::c_int = 0;
+            let mut size = size_of::<libc::c_int>();
+            // SAFETY: a NUL-terminated name, a value of its size.
+            let read = unsafe {
+                libc::sysctlbyname(
+                    c"kern.maxfiles".as_ptr(),
+                    (&raw mut maxfiles).cast(),
+                    &raw mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(read, 0);
+            match phase.as_str() {
+                "none" => {}
+                "api" => {
+                    select(Policy::Default);
+                    apply_api().unwrap();
+                }
+                _ => {
+                    let narrowed = Token::issue(NARROWED).unwrap();
+                    install(&profile_for(Some(&jail), None).unwrap()).unwrap();
+                    if phase == "run" {
+                        narrowed.consume().unwrap();
+                    }
+                }
+            }
+            let io = |r: std::io::Result<()>| match r {
+                Ok(()) => "ok".to_owned(),
+                Err(e) => format!("err {}", e.raw_os_error().unwrap_or(-1)),
+            };
+            let rc = |r: libc::c_int| {
+                if r == 0 {
+                    "ok".to_owned()
+                } else {
+                    format!("err {}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+                }
+            };
+            let got = match case.as_str() {
+                "connect-in" => io(UnixStream::connect(jail.join("in.sock")).map(drop)),
+                "connect-out" => io(UnixStream::connect(base.join("out.sock")).map(drop)),
+                "send-out" => {
+                    io(UnixDatagram::unbound().and_then(|d| d.send_to(b"x", base.join("outd.sock"))).map(drop))
+                }
+                "bind-out" => io(UnixListener::bind(base.join("bound.sock")).map(drop)),
+                "tcp" => io(std::net::TcpStream::connect("127.0.0.1:9").map(drop)),
+                "mach-lookup" => {
+                    let mut port = 0u32;
+                    // SAFETY: the bootstrap port, a NUL-terminated name, an out-port.
+                    let kr = unsafe {
+                        bootstrap_look_up(bootstrap_port, c"com.apple.system.notification_center".as_ptr(), &mut port)
+                    };
+                    if kr == 0 { "ok".to_owned() } else { format!("kr {kr}") }
+                }
+                "shm-other" => {
+                    // SAFETY: a NUL-terminated name.
+                    let fd = unsafe { libc::shm_open(c"/wick-sweep-other".as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) };
+                    rc(fd.min(0))
+                }
+                // SAFETY: a NUL-terminated name and a value of its size (the
+                // one the sysctl has).
+                "sysctl-write" => rc(unsafe {
+                    libc::sysctlbyname(
+                        c"kern.maxfiles".as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        (&raw mut maxfiles).cast(),
+                        size_of::<libc::c_int>(),
+                    )
+                }),
+                "pidinfo-other" => {
+                    // SAFETY: plain data, filled by the call.
+                    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                    let size = libc::c_int::try_from(size_of::<libc::proc_bsdinfo>()).unwrap();
+                    // SAFETY: another pid, a buffer of its size.
+                    let n = unsafe { libc::proc_pidinfo(other, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+                    if n == size {
+                        "ok".to_owned()
+                    } else {
+                        format!("err {}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+                    }
+                }
+                // SAFETY: signal 0 to another process of this uid, a check only.
+                "signal-other" => rc(unsafe { libc::kill(other, 0) }),
+                other => panic!("{other}"),
+            };
+            println!("SWEEP {got}");
         }
 
         #[test]
