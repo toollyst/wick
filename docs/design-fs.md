@@ -1308,7 +1308,7 @@ it means layer 1 let the request through.
     | ACCESS | a node lookup (LOOKUP's) |
     | LOOKUP | `fstatat64` (470), `getattrlistat` (476, the stored name), `openat` (unchecked), `fstat64` (339) |
     | GETATTR | `fstat64` or `fstatat64` |
-    | SETATTR | size: `openat`, `ftruncate` (201); mode: `fchmod` (unchecked); times: `fsetattrlist` (229, libc's `futimens`); ids: the record by `fsetxattr` (unchecked) |
+    | SETATTR | size: `openat`, `ftruncate` (201); mode: `fchmod` (unchecked); times: `fsetattrlist` (229, libc's `futimens`), and a time set to now reads the wall clock, which libc makes as `gettimeofday` (116) about once in a million reads (below); ids: the record by `fsetxattr` (unchecked) |
     | READLINK | a symlink the host made: `readlinkat` (473; never reported by a discovery run, measured by a run of `requests.rs` without it: killed, `deny(1) syscall-unix 473`), `fstatat64`; the guest's own (kept as files): `pread` (153) |
     | CREATE, MKNOD, SYMLINK | `openat`, `fsetxattr`, `fstat64`, `fstatat64` |
     | MKDIR | `mkdirat` (475) |
@@ -1324,6 +1324,20 @@ it means layer 1 let the request through.
     | OPENDIR, READDIR, READDIRPLUS | `fcntl_nocancel` (406, libc's `fdopendir`: `F_SETFD`), `getdirentries64` (344), `lseek` (199), `fstatat64`, `close` |
     | FALLOCATE | `fstat64`, `lseek`, `pwrite`, `fcntl(F_PREALLOCATE, F_PUNCHHOLE)`, `ftruncate`, `fstatfs64` |
     | step 4's read-back | `fcntl(F_GETFD)` |
+
+    `gettimeofday` (116): the server reads the wall clock under the profile in one place, SETATTR of a time to now
+    (`Session`'s `now()`, `SystemTime::now`, libc's `clock_gettime(CLOCK_REALTIME)`). libc reads the commpage's time
+    and makes the system call when it cannot: libsyscall's `__commpage_gettimeofday_internal` (xnu-11417) returns 1
+    while the kernel is updating that time (`TimeStamp_tick` 0; the kernel updates it at every
+    `clock_gettimeofday_and_absolute_time` and `clock_update_calendar`, osfmk/kern/clock.c) or when it is more than a
+    second old, and `gettimeofday` then calls `__gettimeofday`. Measured on macOS 27.2: 20,000,000 back-to-back
+    `clock_gettime(CLOCK_REALTIME)` under a profile reporting 116 gave 13 reports (12 of them as "12 duplicate
+    reports"), 3000 reads 1 ms apart none. A discovery build of the server reported it once in a run of the confined tests (that build then read the wall
+    clock for its own per-request lines too, so which read it was is not known). So until 116 was
+    listed a confined server was killed at about one SETATTR-to-now in a million, on every major. It is listed; it
+    only reads the time, and Firecracker's profile lists it too. confine_probe makes the call by its number under the
+    profile (expected done), so the race does not decide the case;
+    `test_a_confined_server_sets_times_to_now_again_and_again` (requests.rs) makes 20000 such SETATTRs confined.
 
   - **How the lists were made, and the limit of that.** A discovery build (`--cfg wick_fsd_discovery`, never
     released) ends the profile with `(allow default (with report))` and allows unlisted calls with a report;

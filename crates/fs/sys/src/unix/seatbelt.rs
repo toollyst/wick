@@ -353,6 +353,28 @@ pub mod probe {
         if kr == 0 && port != 0 { Ok(()) } else { Err(HostErrno(libc::EPERM)) }
     }
 
+    /// The `gettimeofday` system call itself (116), as libc makes it when
+    /// the commpage's time cannot be read (`clock_gettime(CLOCK_REALTIME)`,
+    /// Rust's `SystemTime::now`, falls back to it: libsyscall
+    /// `__commpage_gettimeofday_internal` returns 1 while the kernel updates
+    /// that time or when it is a second old). Made by number, so whether it
+    /// is allowed does not depend on that race. `Ok` when it returned.
+    pub fn gettimeofday_by_number() -> Result<()> {
+        const SYS_GETTIMEOFDAY: c_int = 116;
+        let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+        // SAFETY: gettimeofday(tp, tzp, mach_time): a valid timeval and two
+        // null pointers, which the kernel skips.
+        let r = unsafe {
+            libc::syscall(
+                SYS_GETTIMEOFDAY,
+                std::ptr::from_mut(&mut tv),
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<u64>(),
+            )
+        };
+        if r == -1 { Err(last()) } else { Ok(()) }
+    }
+
     /// `task_info(MACH_TASK_BASIC_INFO)` of this task: a kernel MIG
     /// routine (3409) sent by `mach_msg2_trap` to the task's own port
     /// (`mach_task_self_`, a variable: no trap to get it). `Ok` when the

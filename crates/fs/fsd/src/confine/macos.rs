@@ -103,6 +103,16 @@ pub const SYSCALLS: &[(u16, &str, &str)] = &[
         "FSYNC on a file system without F_FULLFSYNC (its ENOTSUP); from the code, never run: every volume a share \
          can be on that the tests make (APFS) has F_FULLFSYNC",
     ),
+    (
+        116,
+        "gettimeofday",
+        "SETATTR of a time to now (`Session`'s `now()`, `SystemTime::now`): libc's `clock_gettime(CLOCK_REALTIME)` \
+         reads the commpage's time and makes this call when it cannot (libsyscall \
+         `__commpage_gettimeofday_internal`: the kernel updating that time, `TimeStamp_tick` 0, or the time a \
+         second old; xnu-11417); measured on macOS 27.2, 13 calls in 20,000,000 back-to-back reads (reported \
+         `allow syscall-unix 116`), so about one SETATTR-to-now in a million; confine_probe makes it by number. \
+         It only reads the time",
+    ),
     (133, "sendto", "replies to the VMM (std's write to a stream socket)"),
     (153, "pread", "READ"),
     (199, "lseek", "READDIR from an offset (the directory stream's seek), FALLOCATE's walk over holes (SEEK_HOLE/SEEK_DATA)"),
@@ -653,7 +663,7 @@ mod tests {
 (allow file-read* file-read-data file-read-metadata file-read-xattr file-test-existence (subpath "/private/tmp/share"))
 (allow file-write* file-write-create file-write-data file-write-mode file-write-times file-write-unlink file-write-xattr file-link (subpath "/private/tmp/share"))
 (deny file-mount file-mount-update file-unmount (subpath "/private/tmp/share") (with send-signal SIGKILL))
-(allow syscall-unix (syscall-number 29 53 73 75 92 95 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
+(allow syscall-unix (syscall-number 29 53 73 75 92 95 116 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
 (allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_deallocate_trap MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
 (when (defined? 'mach_vm_reallocate) (allow syscall-mig (kernel-mig-routine mach_vm_reallocate)))
 (deny system-fcntl (with send-signal SIGKILL))
@@ -675,7 +685,7 @@ mod tests {
 (when (defined? 'file-ungraft) (deny file-ungraft (subpath "/private/tmp/share")))
 (allow file-read* file-read-data file-read-metadata file-read-xattr file-test-existence (subpath "/private/tmp/share"))
 (deny file-mount file-mount-update file-unmount file-write* file-write-create file-write-data file-write-mode file-write-times file-write-unlink file-write-xattr file-link (subpath "/private/tmp/share") (with send-signal SIGKILL))
-(allow syscall-unix (syscall-number 29 53 73 75 92 95 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
+(allow syscall-unix (syscall-number 29 53 73 75 92 95 116 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
 (allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_deallocate_trap MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
 (when (defined? 'mach_vm_reallocate) (allow syscall-mig (kernel-mig-routine mach_vm_reallocate)))
 (deny system-fcntl (with send-signal SIGKILL))

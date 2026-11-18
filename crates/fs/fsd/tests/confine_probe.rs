@@ -529,6 +529,10 @@ mod macos {
             // (mach_port_mod_refs, 19; both measured from crash reports,
             // docs/design-fs.md §6.2).
             ("a kernel MIG routine not listed (task_info)", |_| ok(probe::task_info()), KILLED),
+            // libc's fallback when the commpage's time cannot be read (a
+            // race with the kernel's update, about one read in a million):
+            // made by number, so the case does not depend on the race.
+            ("gettimeofday by its number (libc's fallback of a wall-clock read)", |_| ok(probe::gettimeofday_by_number()), 1),
             ("a bootstrap lookup", |_| ok(probe::bootstrap_look_up("com.apple.system.notification_center")), KILLED),
             // The share's operations refused there with an error, not the
             // kill (confine::macos::ERROR_IN_SHARE: LINK's evaluation reaches

@@ -302,6 +302,40 @@ fn test_every_request_confined_answered_as_unconfined() {
     remove(&base);
 }
 
+/// A confined server answering SETATTR of the times to now 20000 times
+/// stays up and answers each: the server's one wall-clock read under the
+/// profile (`Session`'s `now()`), which libc makes as the `gettimeofday`
+/// system call (116) about once in a million reads, when the commpage's time
+/// is being updated (docs/design-fs.md §6.2; confine_probe makes the call by
+/// number, which decides it; this is the request path that reaches it).
+#[test]
+fn test_a_confined_server_sets_times_to_now_again_and_again() {
+    let base = scratch("times-now");
+    let share = base.join("share");
+    std::fs::create_dir(&share).unwrap();
+    if let Some(r) = remote::confined_over(&share, &remote::socket_in(&base)) {
+        let mut g = G::over(r);
+        // The server's own file (as root the test's would be root's, and
+        // the server, 65534, could not set its times).
+        let t = &mut Transcript::new();
+        let create = [&le32(2)[..], &le32(0o644), &le32(0), &le32(0)].concat();
+        let r = step(t, &mut g, "create", Opcode::Create, ROOT, &[&create, &name(b"f")]);
+        let (f, fh) = (u64_at(&r, 0), u64_at(&r, ATTR_IN_ENTRY + 88));
+        step(t, &mut g, "release", Opcode::Release, f, &[&release_in(fh)]);
+        assert_eq!(t, &[("create", 0), ("release", 0)]);
+        let now = FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW;
+        for i in 0..20_000 {
+            let r = g
+                .raw(Opcode::Setattr, f, &[&setattr_in(now, 0, 0, (0, 0), 0, (0, 0))])
+                .unwrap_or_else(|| panic!("SETATTR {i}: no answer, the server is gone"));
+            assert_eq!(i32::from_le_bytes(r[4..8].try_into().unwrap()), 0, "SETATTR {i} refused");
+        }
+        g.forget(f, 1);
+        remote::finish_clean(&mut g.s);
+    }
+    remove(&base);
+}
+
 /// A confined server answering READs of 1 MiB, again and again, stays up
 /// and answers each with the file's bytes (docs/design-fs.md §6.2). Each
 /// READ's reply is a zeroed block of the size read (session.rs, `read`),
