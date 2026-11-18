@@ -1062,7 +1062,23 @@ it means layer 1 let the request through.
   itself reaches the share through descriptors only, so where the share's parents are does not change it.
   - **As built** (`crates/fs/fsd/src/confine/macos.rs`, the calls in `crates/fs/sys/src/unix/seatbelt.rs`), after
     stage 0 has accepted the one connection, checked its peer, and the backend holds the share's root. There is no
-    fork: the process that accepted the connection serves it.
+    fork: the process that accepted the connection serves it. wick-fsd on macOS forks nothing and spawns nothing at
+    any point (its sources have no `fork`, `posix_spawn` or `Command` outside tests), and once confined the profile
+    kills a fork (confine_probe's "fork" case). That matters beyond the confinement: a fork made while another thread
+    is inside a first-time `os_once` gives the child that gate held by a thread it does not have, and libSystem's fork
+    child handlers abort it before it can exec (`_notify_fork_child`: "os_once_t is corrupt", "crashed on child
+    side of fork pre-exec"; CI run 44375259298 on macOS 15.8.2, a test whose other thread's libsandbox made the
+    process's first libnotify registration through `os_log`; 1117 of 1500 children in a C program on macOS 27.2,
+    a thread's first `notify_register_check` against the main thread's `fork`). The tests start programs with
+    descriptors set up through `sys::launch`, which on macOS is `posix_spawn` with file actions, no fork in the test
+    process (`test_a_launch_while_another_thread_first_registers_with_libnotify`: 100 rounds, each a fresh process
+    whose other thread makes its first registration, none lost; std's fork with `pre_exec` on record beside it);
+    the forking helpers (`command_with_*`) are Linux-only; the probe's own fork (`probe::fork`) is refused unless
+    the process has one thread, as Linux's `confine::fork` is. Every other product fork on macOS refuses unless the
+    process has one thread: the jailer's (`--daemonize`'s two, the new pid namespace's, the freezer's self-check and
+    supervisor) through overlay/jailer/platform/macos/mod.rs `fork_alone` (`test_daemonize_refuses_a_second_thread`;
+    the jailer starts no thread), Firecracker's (the jail's API process, the profile's compiler) through
+    overlay/vmm/ext/api_process.rs `fork_alone`.
     0. libc's first uses that read what the profile denies, made once before it on the share's root and kept by
        libc for the process's life (`first_uses`; `confine` takes its proof, so no profile is applied before it):
        one `fdopendir` of the root, closed again (below, after the allocator table). Its failure, the root not

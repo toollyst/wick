@@ -551,7 +551,7 @@ mod macos {
                 ok(std::fs::File::open(c.inside).and_then(|f| f.read_at(&mut [0; 6], 0)))
             }, 1),
             ("exec", |_| ok(std::process::Command::new("/usr/bin/true").status()), KILLED),
-            ("fork", |_| match probe::fork() {
+            ("fork", |_| match probe::fork_unchecked() {
                 Ok(Forked::Child) => probe::exit_now(0),
                 r => ok(r),
             }, KILLED),

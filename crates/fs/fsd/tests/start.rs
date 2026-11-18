@@ -12,32 +12,28 @@
 
 use std::io::Read;
 use std::os::fd::OwnedFd;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
-use wick_fs_sys as sys;
+use wick_fs_sys::launch::{self, Descriptors, Io};
 
-fn wick_fsd(dir: &std::path::Path, ready: Option<OwnedFd>) -> Command {
+fn wick_fsd(dir: &std::path::Path, ready: Option<OwnedFd>) -> (Command, Descriptors) {
     wick_fsd_at(dir, "40", ready)
 }
 
-/// wick-fsd over `dir/share` with `--ready-fd at`, `ready` (if any) left
-/// open there.
-fn wick_fsd_at(dir: &std::path::Path, at: &str, ready: Option<OwnedFd>) -> Command {
+/// wick-fsd over `dir/share` with `--ready-fd at`, and `ready` (if any)
+/// to be left open there by [`launch`] (no fork in this test process:
+/// sys/src/unix/launch.rs says why).
+fn wick_fsd_at(dir: &std::path::Path, at: &str, ready: Option<OwnedFd>) -> (Command, Descriptors) {
     std::fs::create_dir_all(dir.join("share")).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_wick-fsd"));
     cmd.arg("--share-dir")
         .arg(dir.join("share"))
         .arg("--socket")
         .arg(dir.join("fs.sock"))
-        .args(["--id", "t", "--ready-fd", at])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(fd) = ready {
-        sys::command_with_inherited(&mut cmd, vec![(fd, at.parse().unwrap())]);
-    }
-    cmd
+        .args(["--id", "t", "--ready-fd", at]);
+    let inherited = ready.map(|fd| (fd, at.parse().unwrap())).into_iter().collect();
+    (cmd, Descriptors { inherited, ..Default::default() })
 }
 
 fn scratch(tag: &str) -> std::path::PathBuf {
@@ -55,7 +51,8 @@ fn scratch(tag: &str) -> std::path::PathBuf {
 fn test_ready_fd_is_never_a_standard_stream() {
     let dir = scratch("std");
     for n in ["0", "1", "2", "-1"] {
-        let out = wick_fsd_at(&dir, n, None).output().unwrap();
+        let (cmd, fds) = wick_fsd_at(&dir, n, None);
+        let out = launch::output(&cmd, fds).unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{n}: {err}");
         assert!(err.contains(&format!("--ready-fd {n}: 0 to 2 are the standard streams")), "{n}: {err}");
@@ -75,10 +72,9 @@ fn test_ready_fd_is_never_a_standard_stream() {
 fn test_closed_standard_streams_are_dev_null_to_the_server() {
     let dir = scratch("closed");
     let (mut read_end, write_end) = std::io::pipe().unwrap();
-    let mut cmd = wick_fsd(&dir, Some(write_end.into()));
-    sys::command_with_closed(&mut cmd, &[1, 2]);
-    let mut child = cmd.spawn().unwrap();
-    drop(cmd);
+    let (cmd, mut fds) = wick_fsd(&dir, Some(write_end.into()));
+    fds.closed = vec![1, 2];
+    let mut child = launch::launch(&cmd, [Io::Null, Io::Piped, Io::Piped], fds).unwrap();
     // The byte, then the pipe's end: --ready-fd is closed.
     let mut got = Vec::new();
     read_end.read_to_end(&mut got).unwrap();
@@ -113,7 +109,8 @@ fn test_ready_fd_must_be_a_pipe_s_write_end_or_a_socket() {
         ("a pipe's read end", Some(OwnedFd::from(read_end)), "40: pipe "),
         ("nothing", None, "--ready-fd 40: 9 "),
     ] {
-        let out = wick_fsd(&dir, fd).output().unwrap();
+        let (cmd, fds) = wick_fsd(&dir, fd);
+        let out = launch::output(&cmd, fds).unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{what}: {err}");
         assert!(err.contains(named), "{what}: {err}");
@@ -133,10 +130,9 @@ fn test_ready_fd_must_be_a_pipe_s_write_end_or_a_socket() {
 fn test_ready_fd_gets_one_byte_and_is_closed() {
     let dir = scratch("byte");
     let (mut read_end, write_end) = std::io::pipe().unwrap();
-    let mut cmd = wick_fsd(&dir, Some(write_end.into()));
-    let mut child = cmd.spawn().unwrap();
-    // The test's own copy of the write end goes with the command.
-    drop(cmd);
+    let (cmd, fds) = wick_fsd(&dir, Some(write_end.into()));
+    // The test's own copy of the write end goes with the launch.
+    let mut child = launch::launch(&cmd, [Io::Null, Io::Piped, Io::Piped], fds).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut got = Vec::new();

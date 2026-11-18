@@ -211,13 +211,45 @@ pub mod probe {
         Parent(libc::pid_t),
     }
 
-    /// `fork`; the caller has one thread.
+    /// `fork`, refused (EBUSY) unless the process has one thread, the
+    /// caller: a fork made while another thread is in a first-time
+    /// `os_once` aborts the child in libSystem's fork handlers
+    /// ([`crate::launch`]).
     pub fn fork() -> Result<Forked> {
-        // SAFETY: the caller's process has one thread (harness = false).
+        if threads()? != 1 {
+            return Err(HostErrno(libc::EBUSY));
+        }
+        // SAFETY: the process has one thread, the caller (checked above).
         match check(unsafe { libc::fork() })? {
             0 => Ok(Forked::Child),
             pid => Ok(Forked::Parent(pid)),
         }
+    }
+
+    /// `fork` itself, with no count of the threads first: the confined
+    /// case that a fork is killed, where the count's `proc_pidinfo` would be
+    /// killed before the fork is asked (the probe's children have one
+    /// thread, the parent's caller).
+    pub fn fork_unchecked() -> Result<Forked> {
+        // SAFETY: as in [`fork`], whose check the caller's process passed.
+        match check(unsafe { libc::fork() })? {
+            0 => Ok(Forked::Child),
+            pid => Ok(Forked::Parent(pid)),
+        }
+    }
+
+    /// This process's threads, as the kernel counts them
+    /// (`proc_pidinfo(PROC_PIDTASKINFO)`, `pti_threadnum`).
+    pub fn threads() -> Result<usize> {
+        // SAFETY: a zeroed proc_taskinfo is valid; the call fills it.
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).unwrap_or(0);
+        // SAFETY: this process's pid, a buffer of `size` bytes.
+        let got = unsafe { libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDTASKINFO, 0, std::ptr::from_mut(&mut info).cast(), size) };
+        if got != size {
+            return Err(last());
+        }
+        usize::try_from(info.pti_threadnum).map_err(|_| HostErrno(libc::EOVERFLOW))
     }
 
     /// How a child ended.

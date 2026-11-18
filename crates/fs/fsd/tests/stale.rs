@@ -195,10 +195,9 @@ fn test_a_chain_deeper_than_the_cache_is_walked_within_one_spare_descriptor() {
     if std::env::var_os(ALONE).is_none() {
         let mut alone = std::process::Command::new(std::env::current_exe().unwrap());
         alone.args([NAME, "--exact", "--test-threads=1", "--nocapture"]).env(ALONE, "1");
-        sys::command_with_only_stdio(&mut alone);
-        let out = alone.output().unwrap();
+        let out = sys::launch::output(&alone, sys::launch::Descriptors { only_stdio: true, ..Default::default() }).unwrap();
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        assert!(out.status.success() && text.contains("1 passed"), "the walk in a process of its own:\n{text}");
+        assert!(out.status.success() && text.contains("1 passed"), "the walk in a process of its own: {:?}:\n{text}", out.status);
         return;
     }
     const DEPTH: usize = 8;

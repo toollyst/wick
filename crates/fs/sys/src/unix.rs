@@ -23,6 +23,7 @@ impl fmt::Debug for HostErrno {
 pub mod confine;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
+pub mod launch;
 
 /// What every call here returns.
 pub type Result<T> = std::result::Result<T, HostErrno>;
@@ -1346,19 +1347,19 @@ pub fn maxfilesperproc() -> Result<u64> {
 /// launcher: in the child, after std has set up 0 to 2 and before the exec,
 /// every descriptor above 2 is marked close-on-exec (std's own pipe for an
 /// exec failure is already). For a test whose bound is on the process's
-/// descriptor table (Linux: `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`, each
-/// descriptor below the soft limit where the kernel has no `close_range`;
-/// macOS: each below `getdtablesize()`, which is at most
-/// `kern.maxfilesperproc`).
+/// descriptor table: `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`, each
+/// descriptor below `getdtablesize()` where the kernel has no `close_range`.
+/// Linux only, as are the other `command_with_*`: they fork in user space
+/// (std's `pre_exec`), which on macOS can abort the child when another
+/// thread is in a first-time `os_once` ([`launch`] says how; there it
+/// starts the program with `posix_spawn`).
+#[cfg(target_os = "linux")]
 pub fn command_with_only_stdio(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
     let closure = || {
-        #[cfg(target_os = "linux")]
-        {
-            // SAFETY: no pointer; marks the range close-on-exec.
-            if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, libc::CLOSE_RANGE_CLOEXEC) } == 0 {
-                return Ok(());
-            }
+        // SAFETY: no pointer; marks the range close-on-exec.
+        if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, libc::CLOSE_RANGE_CLOEXEC) } == 0 {
+            return Ok(());
         }
         // SAFETY: async-signal-safe calls on descriptor numbers only.
         let top = unsafe { libc::getdtablesize() };
@@ -1509,10 +1510,11 @@ pub fn is_write_channel(fd: BorrowedFd<'_>) -> Result<bool> {
 /// Has `cmd`'s child start with each of `fds` closed, as a launcher that
 /// runs it with `>&-` does: for the tests of what a process that finds a
 /// standard stream closed is given.
-pub fn command_with_closed(cmd: &mut std::process::Command, fds: &'static [c_int]) {
+#[cfg(target_os = "linux")]
+pub fn command_with_closed(cmd: &mut std::process::Command, fds: Vec<c_int>) {
     use std::os::unix::process::CommandExt;
     let closure = move || {
-        for &fd in fds {
+        for &fd in &fds {
             // SAFETY: async-signal-safe; closes a descriptor of the child.
             unsafe { libc::close(fd) };
         }
@@ -1528,6 +1530,7 @@ pub fn command_with_closed(cmd: &mut std::process::Command, fds: &'static [c_int
 /// Has `cmd`'s child start with each of `fds` at its number (not
 /// close-on-exec), as a launcher that leaves descriptors open does: for the
 /// tests of a server that must not keep what it was started with.
+#[cfg(target_os = "linux")]
 pub fn command_with_inherited(cmd: &mut std::process::Command, fds: Vec<(OwnedFd, c_int)>) {
     use std::os::unix::process::CommandExt;
     let closure = move || {
@@ -1627,6 +1630,91 @@ mod tests {
     /// 140 and 141 left open as a launcher leaves them): every descriptor
     /// above the standard streams but the one kept is closed, and standard
     /// input is `/dev/null`.
+    /// How a child of a test ended, for its failure: the status (its exit
+    /// code or signal) and its standard output and error in full.
+    fn ended(out: &std::process::Output) -> String {
+        format!(
+            "in a process of its own: {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    /// A program started while another thread of this process makes its
+    /// first libnotify registration starts every time (macOS): `launch`
+    /// makes no fork in this process, so the child cannot meet libnotify's
+    /// `os_once` gate half-taken, which aborts a forked child in libSystem's
+    /// fork child handler (`_notify_fork_child`, "os_once_t is corrupt";
+    /// CI run 44375259298, macOS 15.8.2, this file's
+    /// test_close_inherited_..., whose parent's other thread was libsandbox's
+    /// first `os_log`). Each round is a fresh copy of this test binary, as
+    /// the registration is a process's first only once; a round runs the
+    /// registration on a thread of its own while the main thread starts
+    /// `/usr/bin/true` with `launch`, all its descriptors set up.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_a_launch_while_another_thread_first_registers_with_libnotify() {
+        const ALONE: &str = "WICK_FS_SYS_TEST_LAUNCH_RACE";
+        const NAME: &str = "unix::tests::test_a_launch_while_another_thread_first_registers_with_libnotify";
+        const ROUNDS: usize = 100;
+        const RECORD_ROUNDS: usize = 10;
+        const FORK: &str = "WICK_FS_SYS_TEST_LAUNCH_RACE_FORK";
+        if std::env::var_os(ALONE).is_none() {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([NAME, "--exact", "--test-threads=1", "--nocapture"]).env(ALONE, "1");
+            for round in 0..ROUNDS {
+                let out = launch::output(&cmd, launch::Descriptors::default()).unwrap();
+                assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"), "round {round}: {}", ended(&out));
+            }
+            // On record, never checked: the same rounds with std's fork
+            // (`Command` with a `pre_exec` closure that does nothing).
+            let lost = (0..RECORD_ROUNDS)
+                .filter(|_| {
+                    let mut forking = std::process::Command::new(std::env::current_exe().unwrap());
+                    forking.args([NAME, "--exact", "--test-threads=1", "--nocapture"]).env(ALONE, "1").env(FORK, "1");
+                    let out = launch::output(&forking, launch::Descriptors::default()).unwrap();
+                    !String::from_utf8_lossy(&out.stdout).contains("forked child: exit status: 0")
+                })
+                .count();
+            println!("record: with std's fork (pre_exec), {lost} of {RECORD_ROUNDS} children lost");
+            return;
+        }
+        unsafe extern "C" {
+            fn notify_register_check(name: *const libc::c_char, token: *mut c_int) -> u32;
+        }
+        let go = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = {
+            let go = go.clone();
+            std::thread::spawn(move || {
+                while !go.load(std::sync::atomic::Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                let mut token = 0;
+                // SAFETY: a NUL-terminated name and an out-parameter.
+                unsafe { notify_register_check(c"org.toollyst.wick.test.launch".as_ptr(), &mut token) }
+            })
+        };
+        let (r, w) = std::io::pipe().unwrap();
+        let fds = launch::Descriptors { inherited: vec![(r.into(), 140), (w.into(), 141)], closed: vec![1], only_stdio: true };
+        let true_ = std::process::Command::new("/usr/bin/true");
+        if std::env::var_os(FORK).is_some() {
+            use std::os::unix::process::CommandExt;
+            let mut forked = true_;
+            // SAFETY: the closure does nothing.
+            unsafe { forked.pre_exec(|| Ok(())) };
+            go.store(true, std::sync::atomic::Ordering::Release);
+            let status = forked.status();
+            first.join().unwrap();
+            println!("forked child: {}", status.map_or_else(|e| e.to_string(), |s| s.to_string()));
+            return;
+        }
+        go.store(true, std::sync::atomic::Ordering::Release);
+        let out = launch::output(&true_, fds).unwrap();
+        assert_eq!(first.join().unwrap(), 0, "notify_register_check");
+        assert!(out.status.success(), "/usr/bin/true: {}", ended(&out));
+    }
+
     #[test]
     fn test_close_inherited_leaves_the_standard_streams_and_the_one_kept() {
         const ALONE: &str = "WICK_FS_SYS_TEST_CLOSE_ALONE";
@@ -1635,17 +1723,19 @@ mod tests {
             let (r, w) = std::io::pipe().unwrap();
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args([NAME, "--exact", "--test-threads=1", "--nocapture"]).env(ALONE, "1");
-            command_with_inherited(&mut cmd, vec![(r.into(), 140), (w.into(), 141)]);
-            let out = cmd.output().unwrap();
-            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-            assert!(out.status.success() && text.contains("1 passed"), "in a process of its own:\n{text}");
+            let fds = launch::Descriptors { inherited: vec![(r.into(), 140), (w.into(), 141)], ..Default::default() };
+            let out = launch::output(&cmd, fds).unwrap();
+            assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"), "{}", ended(&out));
             return;
         }
         let before = open_descriptors().unwrap();
+        // On stderr, so that a failure shows them with the rest.
+        eprintln!("before: {:?}", before.iter().map(|&fd| descriptor_described(fd)).collect::<Vec<_>>());
         assert!(before.contains(&140) && before.contains(&141), "{before:?}");
         close_inherited(Some(141)).unwrap();
         stdin_from_null().unwrap();
         let after = open_descriptors().unwrap();
+        eprintln!("after: {:?}", after.iter().map(|&fd| descriptor_described(fd)).collect::<Vec<_>>());
         assert_eq!(after, [0, 1, 2, 141], "{:?}", after.iter().map(|&fd| descriptor_described(fd)).collect::<Vec<_>>());
         assert!(descriptor_described(0).ends_with(" /dev/null"), "{}", descriptor_described(0));
         close_inherited(None).unwrap();
@@ -1662,11 +1752,10 @@ mod tests {
         if std::env::var_os(ALONE).is_none() {
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args([NAME, "--exact", "--test-threads=1", "--nocapture"]).env(ALONE, "1");
-            command_with_closed(&mut cmd, &[1]);
-            let out = cmd.output().unwrap();
+            let out = launch::output(&cmd, launch::Descriptors { closed: vec![1], ..Default::default() }).unwrap();
             // Its stdout is /dev/null: what it says is on stderr only.
             let err = String::from_utf8_lossy(&out.stderr);
-            assert!(out.status.success() && out.stdout.is_empty(), "in a process of its own: {err}");
+            assert!(out.status.success() && out.stdout.is_empty(), "{}", ended(&out));
             assert!(err.contains("1: character device /dev/null"), "{err}");
             return;
         }
@@ -1711,11 +1800,12 @@ mod tests {
         let listed = |only: bool| {
             let mut cmd = std::process::Command::new("/bin/ls");
             cmd.arg("/dev/fd/");
-            if only {
-                command_with_only_stdio(&mut cmd);
-            }
-            let out = cmd.output().unwrap();
-            assert!(out.status.success());
+            let out = if only {
+                launch::output(&cmd, launch::Descriptors { only_stdio: true, ..Default::default() }).unwrap()
+            } else {
+                cmd.output().unwrap()
+            };
+            assert!(out.status.success(), "{}", ended(&out));
             String::from_utf8(out.stdout).unwrap().split_whitespace().map(|n| n.parse::<i32>().unwrap()).collect::<Vec<_>>()
         };
         let plain = listed(false);
