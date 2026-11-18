@@ -1303,7 +1303,10 @@ jobs:
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15, windows-latest]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    # macOS's jobs took 8 to 9 minutes before the server-under-report step,
+    # which builds crates/fs again (the discovery build) and runs the
+    # request tests three times.
+    timeout-minutes: 25
     defaults:
       run:
         shell: bash
@@ -1465,6 +1468,17 @@ jobs:
         run: >-
           cargo test --locked -p wick-fsd --test memory -- --nocapture 2>&1
           | grep -E "^memory:|test result"
+      # wick-fsd itself under its profile with every unlisted call allowed and
+      # reported (a discovery build, its own target directory): the request
+      # tests three times, and each call or operation no list names printed
+      # with the tests and the requests in flight, on this macOS build and
+      # its libraries' versions (docs/design-fs.md §6.2). It fails on any
+      # such line, on a test measured in no run (its control call never
+      # reported), and on a failed test; it runs whatever the steps before
+      # it gave.
+      - name: The server's calls under the reporting profile (macOS)
+        if: runner.os == 'macOS' && !cancelled()
+        run: python3 -I ../../tools/macos/fs-server-report.py --runs 3 --out "$RUNNER_TEMP/fs-reports/server-report.txt"
       # What names a call the profile killed, so that one failed run decides
       # it: Seatbelt's lines from the unified log since the job's start (each
       # denial names the process and the call, "deny(1) syscall-mach 10";

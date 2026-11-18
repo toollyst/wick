@@ -452,7 +452,9 @@ lay them out); fuzz target `fs_proxy`. No guest has used it yet (commit 12's boo
   [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]`. It refuses a socket path that exists
   (it never removes what it did not make), says it is ready (a byte on `--ready-fd`, else a `ready` line), accepts
   one connection, closes and unlinks the listener at once, and serves only a peer of `--peer-uid` (default: its own
-  uid). At the end it writes its counters to stderr (layer-2 refusals among them).
+  uid). At the end it writes its counters to stderr (layer-2 refusals among them). `wick-fsd --version` prints its
+  version, and a discovery build (§6.2, how the lists were checked) adds that it is one, never a product, there and
+  as its first line on stderr.
 - **Stage 1** (confined): serve the one connection until EOF, then exit. It never accepts. Refusing to start is the
   only answer to a missing control: the server has no "unconfined" flag at all (Kata's failure mode).
 - **Only bytes cross between the VMM and the server.** Neither opens the other. A shared object needed later (a
@@ -1354,6 +1356,33 @@ it means layer 1 let the request through.
     and a file rule's kill leaves a report with no details. Crash reports are lossy too: of `confine_probe`'s 23
     kills in one run macOS wrote reports for the first five only (19:00:18 on 2026-11-18), and in some runs none,
     so a missing report shows nothing.
+
+    **The server itself under the reporting profile** (`tools/macos/fs-server-report.py`, CI's fs job on macos-15 and
+    macos-latest). The two defects found on macOS 15, `mach_vm_deallocate` and the `sysctl` of `fdopendir`, were calls
+    the server's own request paths make and the allocator probe's shapes did not; this measures the server. The
+    script builds crates/fs with `--cfg wick_fsd_discovery` into `build/fs-discovery` (check-tree holds that no other
+    tracked file sets the cfg). There `profile()` is the product's function with the same lists, ending with the
+    discovery rules above, so nothing is copied that could drift; the server says each request it serves on stderr
+    with the time (5 ms apart, a spin that makes no call; its clock is the wall clock read once before the profile
+    and the monotonic clock after, so its lines make no call either), and once
+    confined makes one control call no list names (`task_info`), whose report also gives the difference between the
+    log's clock and the server's (measured: some milliseconds). It runs requests.rs (every
+    request kind, the error paths, 64 READs of 1 MiB, a directory of 3000 entries), links.rs, corpus.rs and
+    connection.rs three times, reads Seatbelt's reports of each confined server, and prints the macOS build (sw_vers,
+    the libraries' versions from the dyld cache) with each unlisted call or operation: how many runs reported it, the
+    tests, and the request in flight: the requests the server said in the 4 ms up to the report on the log's clock
+    (a report's time moves by a few milliseconds against the call: measured with `readlinkat` taken out of the list,
+    the report fell on READLINK in one run and on the LOOKUP before it in the other, 3 ms apart), so one or two
+    candidates. It runs requests.rs without the 20000 SETATTRs' test (every-request makes that request). It fails on
+    any such line, on a test none of whose servers had its control reported, and on a failed test. Reports are lost:
+    on macOS 27.2 here, the servers of the first run's first seconds (about 9 s: connection.rs, corpus.rs, links.rs)
+    had no report in the log in 6 of 6 runs of the script, with or without a pause or the test binaries started
+    before, where the rest of that run's and every later run's had theirs (cause not found). So the tests run one at
+    a time, each server's control says whether it was measured, and each test needs one run in which it was. Such a
+    build never passes for the product: it says it is one as its first line on stderr and in
+    `--version` (`test_a_build_says_whether_it_is_a_discovery_build`, run in both builds). The reports' limits above
+    hold: an empty union is what the runs reached, and the library path that makes a call is not in a report (a
+    killed run's crash report names it).
   - The memory limit is jetsam; the CPU limit uses the jailer's mechanism.
 - **Resolution:**
   - `openat(dirfd, name, O_NOFOLLOW_ANY|O_RESOLVE_BENEATH|O_CLOEXEC)` (§4.3; `O_NOFOLLOW` as well is EINVAL), with

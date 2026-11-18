@@ -23,6 +23,61 @@
 //! commit). The `wick-fsd` binary (`src/main.rs`) puts them together; on a
 //! host without confinement it refuses to start.
 
+/// A discovery build (`--cfg wick_fsd_discovery`, built only by
+/// tools/macos/fs-server-report.py into a target directory of its own): its
+/// macOS profile allows and reports every call it does not list instead of
+/// killing it (`confine::macos`), and it says each request it serves on
+/// stderr. Never a product: it says so at its start and in `--version`
+/// (`test_a_build_says_whether_it_is_a_discovery_build`), and
+/// tools/check-tree.py fails a tree that sets the cfg anywhere else.
+#[allow(unexpected_cfgs)]
+pub const DISCOVERY_BUILD: bool = cfg!(wick_fsd_discovery);
+
+/// What `wick-fsd --version` prints.
+pub fn version_line() -> String {
+    let build = if DISCOVERY_BUILD {
+        " (discovery build: its profile allows and reports what it does not list; never a product)"
+    } else {
+        ""
+    };
+    format!("wick-fsd {}{build}", env!("CARGO_PKG_VERSION"))
+}
+
+/// A discovery build's clock: the wall clock read once, at its first line
+/// (main's, before the profile), and the monotonic clock since. The wall
+/// clock's read can be a system call (`gettimeofday`, 116, when the
+/// commpage's time is being updated or is a second old: libsyscall
+/// `__commpage_gettimeofday_internal`), which the build would then report
+/// as its own; the monotonic clock never is one.
+static DISCOVERY_CLOCK: std::sync::OnceLock<(std::time::Instant, u128)> = std::sync::OnceLock::new();
+
+/// In a discovery build, `what` on stderr with the time in microseconds
+/// since the epoch (`wick-fsd: discovery: <what> at <µs>`), which
+/// tools/macos/fs-server-report.py matches with the time of Seatbelt's
+/// reports; nothing otherwise. The first call, main's, reads the wall clock.
+pub fn discovery_say(what: std::fmt::Arguments<'_>) {
+    if DISCOVERY_BUILD {
+        let (start, wall) = DISCOVERY_CLOCK.get_or_init(|| {
+            let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            (std::time::Instant::now(), wall.as_micros())
+        });
+        eprintln!("wick-fsd: discovery: {what} at {}", wall + start.elapsed().as_micros());
+    }
+}
+
+/// In a discovery build, 5 ms spent before each request (a spin on the
+/// monotonic clock, which makes no system call): Seatbelt's reports carry
+/// the time to the millisecond, so requests this far apart can each be told
+/// as the one in flight, give or take one; nothing otherwise.
+pub fn discovery_spacing() {
+    if DISCOVERY_BUILD {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(5);
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 pub mod cache;
 pub mod confine;
 pub mod dir;

@@ -158,3 +158,27 @@ fn test_ready_fd_gets_one_byte_and_is_closed() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// What keeps a discovery build (`--cfg wick_fsd_discovery`, whose macOS
+/// profile allows and reports what it does not list) from being taken for
+/// the product: `--version` says which build it is, and a discovery build
+/// says so first on stderr, before anything else it does. This test is
+/// built with the same flags as the binary, so it checks each build's own
+/// words.
+#[test]
+fn test_a_build_says_whether_it_is_a_discovery_build() {
+    let out = Command::new(env!("CARGO_BIN_EXE_wick-fsd")).arg("--version").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let line = String::from_utf8_lossy(&out.stdout);
+    let discovery = "(discovery build: its profile allows and reports what it does not list; never a product)";
+    assert_eq!(line.trim_end(), wick_fsd::version_line(), "{out:?}");
+    assert!(line.starts_with("wick-fsd "), "{line}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    if wick_fsd::DISCOVERY_BUILD {
+        assert!(line.contains(discovery), "{line}");
+        assert_eq!(err.lines().next(), Some(format!("wick-fsd: {}", wick_fsd::version_line()).as_str()), "{err}");
+    } else {
+        assert!(!line.contains("discovery"), "{line}");
+        assert!(err.is_empty(), "{err}");
+    }
+}

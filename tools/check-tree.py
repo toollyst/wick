@@ -19,6 +19,12 @@
   row's text still passes. Cells are split as GitHub splits them: at
   every `|` not escaped as `\\|`, inside code spans too. Rows in fenced
   code blocks are not tables.
+- A discovery build's cfg (DISCOVERY below) is set by its own script and
+  nowhere else: such a build allows, and reports, what its profile or its
+  mitigations do not list, so no Cargo.toml, Cargo config, build script,
+  workflow or other script may name it. Rust code reads it (`#[cfg]`,
+  `cfg!`) and the docs explain it; a build.rs, which could set it
+  (`cargo:rustc-cfg`), may not name it.
 """
 
 import re
@@ -29,6 +35,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 # Spelled in two pieces so that this file does not name it.
 NOTES = "agent" + "-state"
+# Each discovery cfg (spelled in pieces, as NOTES) and the tracked files that
+# may set it: the scripts that build a discovery build into a target
+# directory of their own.
+DISCOVERY = {
+    "wick_fsd" + "_discovery": {"tools/macos/fs-server-report.py"},
+    "wick_sandbox" + "_discovery": {"tools/macos/sandbox-discovery.sh", "tools/windows/mitigation-audit.ps1"},
+}
+
+
+def discovery_errors(path, text):
+    """An error for each discovery cfg `path` names where it may not."""
+    errors = []
+    for cfg, setters in DISCOVERY.items():
+        if cfg not in text or path in setters or path.endswith(".md"):
+            continue
+        if path.endswith(".rs") and Path(path).name != "build.rs":
+            continue
+        n = next(i for i, line in enumerate(text.split("\n"), 1) if cfg in line)
+        errors.append(f"{path}:{n}: names {cfg}, which only {', '.join(sorted(setters))} may set")
+    return errors
 
 
 def tracked(root):
@@ -94,6 +120,7 @@ def check(root):
                 errors.append(f"{path}:{n}: names {NOTES}, which is not in the repository: {line.strip()[:160]}")
         if path.endswith(".md"):
             errors += [e for _, e in table_errors(path, text)]
+        errors += discovery_errors(path, text)
     return errors
 
 
@@ -144,9 +171,35 @@ def selftest():
         if got != ["b.md", "patches/0001-x.patch"]:
             fails += 1
             print(f"selftest FAIL: the name in tracked files: {got}")
+    # A discovery cfg: read by Rust code and named by docs and its own
+    # script; anywhere else (a Cargo config, a build script, a workflow,
+    # another script) it is an error.
+    cfg = "wick_fsd" + "_discovery"
+    with __import__("tempfile").TemporaryDirectory() as tmp:
+        t = Path(tmp)
+        subprocess.run(["git", "init", "-q", str(t)], check=True)
+        files = {
+            "src/lib.rs": f"#[cfg({cfg})]\n",
+            "docs/d.md": f"`--cfg {cfg}`\n",
+            "tools/macos/fs-server-report.py": f'RUSTFLAGS = "--cfg {cfg}"\n',
+            "Cargo.toml": f'[build]\nrustflags = ["--cfg", "{cfg}"]\n',
+            ".cargo/config.toml": f'[build]\nrustflags = ["--cfg", "{cfg}"]\n',
+            "fsd/build.rs": f'fn main() {{ println!("cargo:rustc-cfg={cfg}"); }}\n',
+            ".github/workflows/ci.yml": f"env:\n  RUSTFLAGS: --cfg {cfg}\n",
+            "tools/other.sh": f"export RUSTFLAGS='--cfg {cfg}'\n",
+        }
+        for name, text in files.items():
+            (t / name).parent.mkdir(parents=True, exist_ok=True)
+            (t / name).write_text(text)
+        subprocess.run(["git", "-C", str(t), "add", "."], check=True)
+        got = sorted(e.split(":")[0] for e in check(t))
+        want = [".cargo/config.toml", ".github/workflows/ci.yml", "Cargo.toml", "fsd/build.rs", "tools/other.sh"]
+        if got != want:
+            fails += 1
+            print(f"selftest FAIL: the discovery cfg: {got}, wanted {want}")
     if fails:
         sys.exit(f"check-tree: selftest: {fails} failed")
-    print(f"check-tree: selftest ok ({len(cases) + 2} cases)")
+    print(f"check-tree: selftest ok ({len(cases) + 3} cases)")
 
 
 def main():

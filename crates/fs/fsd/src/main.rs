@@ -10,6 +10,7 @@
 //!          [--cache auto|never|always] [--cache-timeout-ms N]
 //!          [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD (3 or more)]
 //!          [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]
+//! wick-fsd --version
 //! ```
 //!
 //! Stage 0, with the operator's rights and no byte from the VMM: the share's
@@ -50,7 +51,11 @@ struct Args {
 
 const USAGE: &str = "usage: wick-fsd --share-dir DIR --socket PATH --id ID [--read-only] [--cache auto|never|always] \
                      [--cache-timeout-ms N] [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD (3 or more)] \
-                     [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]";
+                     [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]; \
+                     or wick-fsd --version";
+
+/// `parse`'s answer to `--version`: the line is printed, nothing served.
+const VERSION_ASKED: &str = "--version";
 
 fn number<T: std::str::FromStr>(flag: &str, v: Option<String>) -> Result<T, String> {
     let v = v.ok_or_else(|| format!("{flag} needs a value"))?;
@@ -81,6 +86,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--max-handles" => limits.max_handles = number(&flag, it.next())?,
             "--max-bytes" => limits.max_bytes = number(&flag, it.next())?,
             "--help" | "-h" => return Err(USAGE.into()),
+            "--version" => return Err(VERSION_ASKED.into()),
             other => return Err(format!("unknown option {other}\n{USAGE}")),
         }
     }
@@ -182,8 +188,16 @@ fn start(_: &Args) -> Result<Start, String> {
 }
 
 fn main() -> ExitCode {
+    if wick_fsd::DISCOVERY_BUILD {
+        eprintln!("wick-fsd: {}", wick_fsd::version_line());
+        wick_fsd::discovery_say(format_args!("start"));
+    }
     let args = match parse(std::env::args().skip(1)) {
         Ok(a) => a,
+        Err(e) if e == VERSION_ASKED => {
+            println!("{}", wick_fsd::version_line());
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
             eprintln!("wick-fsd: {e}");
             return ExitCode::from(2);
@@ -210,6 +224,21 @@ fn run(_: &Args, _: Start) -> Result<(), String> {
     Err("this host has no confinement for wick-fsd yet (Linux and macOS have; Windows comes with its port), and \
          wick-fsd does not serve unconfined"
         .into())
+}
+
+/// A discovery build's control (tools/macos/fs-server-report.py): one call
+/// no list names, `task_info` (a kernel MIG routine), made once under the
+/// profile, which that build allows and reports; the script requires its
+/// report from every server, so an empty union is a measurement, not a log
+/// that said nothing. Not in any other build.
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+fn discovery_control() {
+    #[cfg(wick_fsd_discovery)]
+    {
+        wick_fsd::discovery_say(format_args!("control task_info"));
+        let _ = wick_fs_sys::seatbelt::probe::task_info();
+    }
 }
 
 /// Stage 0 on a Unix host: the share checked, the soft RLIMIT_NOFILE set,
@@ -375,5 +404,6 @@ fn run(args: &Args, start: Start) -> Result<(), String> {
     // share's root (the backend holds no other descriptor before a request).
     confine::confine(plan, &canonical, first, &[conn_fd, root_fd]).map_err(|r| r.0)?;
     eprintln!("wick-fsd: {}: confined (Seatbelt profile of the share, ids dropped)", args.id);
+    discovery_control();
     serve_all(args, &mut conn, &mut session)
 }

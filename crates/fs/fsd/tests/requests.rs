@@ -302,6 +302,120 @@ fn test_every_request_confined_answered_as_unconfined() {
     remove(&base);
 }
 
+/// Requests the guest gets an error for, each once: the error paths' calls
+/// (a failed lookup, open, unlink or rename, an errno answered) made where
+/// each is made, in an order where each has something to fail on.
+fn error_requests<L: Link>(g: &mut G<L>) -> Transcript {
+    let t = &mut Transcript::new();
+    step(t, g, "lookup missing", Opcode::Lookup, ROOT, &[&name(b"missing")]);
+    step(t, g, "lookup a name too long", Opcode::Lookup, ROOT, &[&name(&[b'n'; 300])]);
+    let e = u64_at(&step(t, g, "mkdir e", Opcode::Mkdir, ROOT, &[&le32(0o755), &le32(0), &name(b"e")]), 0);
+    let create = [&le32(2)[..], &le32(0o644), &le32(0), &le32(0)].concat();
+    let r = step(t, g, "create e/f", Opcode::Create, e, &[&create, &name(b"f")]);
+    let (f, fh) = (u64_at(&r, 0), u64_at(&r, ATTR_IN_ENTRY + 88));
+    step(t, g, "mkdir existing", Opcode::Mkdir, ROOT, &[&le32(0o755), &le32(0), &name(b"e")]);
+    let exclusive = [&le32(2 | 0o100 | 0o200)[..], &le32(0o644), &le32(0), &le32(0)].concat();
+    step(t, g, "create existing exclusive", Opcode::Create, e, &[&exclusive, &name(b"f")]);
+    step(t, g, "rmdir not empty", Opcode::Rmdir, ROOT, &[&name(b"e")]);
+    step(t, g, "rmdir a file", Opcode::Rmdir, e, &[&name(b"f")]);
+    step(t, g, "unlink missing", Opcode::Unlink, e, &[&name(b"missing")]);
+    step(t, g, "unlink a directory", Opcode::Unlink, ROOT, &[&name(b"e")]);
+    step(t, g, "opendir a file", Opcode::Opendir, f, &[&[0; 8]]);
+    step(t, g, "readlink a file", Opcode::Readlink, f, &[]);
+    step(t, g, "getxattr missing", Opcode::Getxattr, f, &[&le32(64), &le32(0), b"user.none\0"]);
+    step(t, g, "removexattr missing", Opcode::Removexattr, f, &[b"user.none\0"]);
+    step(t, g, "rename missing", Opcode::Rename, e, &[&le64(e), &name(b"missing"), &name(b"x")]);
+    step(t, g, "link a directory", Opcode::Link, ROOT, &[&le64(e), &name(b"e2")]);
+    step(t, g, "read a handle never opened", Opcode::Read, f, &[&io_in(fh + 1000, 0, 64)]);
+    step(t, g, "release", Opcode::Release, f, &[&release_in(fh)]);
+    step(t, g, "unlink f", Opcode::Unlink, e, &[&name(b"f")]);
+    step(t, g, "rmdir e", Opcode::Rmdir, ROOT, &[&name(b"e")]);
+    for n in [f, e] {
+        g.forget(n, 1);
+    }
+    std::mem::take(t)
+}
+
+/// The error paths confined answer as in this process: the same errors,
+/// the server up after each.
+#[test]
+fn test_error_paths_confined_answered_as_unconfined() {
+    let base = scratch("errors");
+    let host = base.join("host");
+    std::fs::create_dir(&host).unwrap();
+    let dir = HostDir::new(sys::open_root(&host).unwrap(), Options { case_insensitive_ok: true, ..Options::default() }).unwrap();
+    let unconfined = error_requests(&mut G::new(dir));
+    let failed = unconfined.iter().filter(|(_, e)| *e < 0).count();
+    assert!(failed >= 14, "fewer errors than the requests made for them: {unconfined:?}");
+    let share = base.join("share");
+    std::fs::create_dir(&share).unwrap();
+    if let Some(r) = remote::confined_over(&share, &remote::socket_in(&base)) {
+        let mut g = G::over(r);
+        let confined = error_requests(&mut g);
+        remote::finish_clean(&mut g.s);
+        assert_eq!(confined, unconfined, "the confined server answered otherwise");
+    }
+    remove(&base);
+}
+
+/// The names of a READDIR answer (`fuse_dirent`s: ino, off, namelen, type,
+/// the name padded to 8) and the last entry's offset.
+fn dirents(body: &[u8]) -> (Vec<Vec<u8>>, u64) {
+    let (mut names, mut at, mut last) = (Vec::new(), 0, 0);
+    while at + 24 <= body.len() {
+        last = u64_at(body, at + 8);
+        let len = usize::try_from(u32::from_le_bytes(body[at + 16..at + 20].try_into().unwrap())).unwrap();
+        names.push(body[at + 24..at + 24 + len].to_vec());
+        at += (24 + len).div_ceil(8) * 8;
+    }
+    (names, last)
+}
+
+/// A confined server lists a directory of 3000 entries with long names
+/// whole, READDIR by READDIR of 64 KiB (more directory reads, and larger
+/// buffers, than the every-request set's one small directory).
+#[test]
+fn test_a_confined_server_lists_a_big_directory() {
+    const ENTRIES: usize = 3000;
+    let base = scratch("big-dir");
+    let share = base.join("share");
+    std::fs::create_dir_all(share.join("big")).unwrap();
+    let mut want: Vec<Vec<u8>> = (0..ENTRIES).map(|i| format!("{i:05}-{}", "n".repeat(120)).into_bytes()).collect();
+    for n in &want {
+        std::fs::write(share.join("big").join(std::str::from_utf8(n).unwrap()), b"").unwrap();
+    }
+    if let Some(r) = remote::confined_over(&share, &remote::socket_in(&base)) {
+        let mut g = G::over(r);
+        let big = g.lookup(ROOT, b"big").unwrap();
+        let r = g.raw(Opcode::Opendir, big, &[&[0; 8]]).expect("opendir: no answer, the server is gone");
+        assert_eq!(i32::from_le_bytes(r[4..8].try_into().unwrap()), 0, "opendir refused");
+        let dfh = u64_at(&r[16..], 0);
+        let (mut got, mut off, mut reads) = (Vec::new(), 0, 0);
+        loop {
+            let r = g
+                .raw(Opcode::Readdir, big, &[&io_in(dfh, off, 64 << 10)])
+                .unwrap_or_else(|| panic!("readdir {reads}: no answer, the server is gone"));
+            assert_eq!(i32::from_le_bytes(r[4..8].try_into().unwrap()), 0, "readdir {reads} refused");
+            let (names, last) = dirents(&r[16..]);
+            if names.is_empty() {
+                break;
+            }
+            got.extend(names);
+            off = last;
+            reads += 1;
+        }
+        g.raw(Opcode::Releasedir, big, &[&release_in(dfh)]).expect("releasedir: no answer, the server is gone");
+        g.forget(big, 1);
+        remote::finish_clean(&mut g.s);
+        got.retain(|n| n != b"." && n != b"..");
+        got.sort();
+        want.sort();
+        assert!(reads > 1, "listed in {reads} READDIR");
+        assert_eq!(got, want, "the listing");
+    }
+    remove(&base);
+}
+
 /// A confined server answering SETATTR of the times to now 20000 times
 /// stays up and answers each: the server's one wall-clock read under the
 /// profile (`Session`'s `now()`), which libc makes as the `gettimeofday`

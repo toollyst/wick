@@ -280,6 +280,14 @@ impl<D: ConfinedDir> Session<D> {
     pub fn handle(&mut self, payload: &[u8], writable_cap: usize) -> Option<Vec<u8>> {
         let (unique, done) = match decode(payload, &Wire::default()) {
             Ok(request) => {
+                // The request in flight when Seatbelt reports a call, by the
+                // time (a discovery build only).
+                crate::discovery_spacing();
+                crate::discovery_say(format_args!(
+                    "request {:?} node {}",
+                    Opcode::from_wire(request.header.opcode),
+                    request.header.nodeid
+                ));
                 let done = self.dispatch(&request.header, request.op, writable_cap);
                 (request.header.unique, done)
             }

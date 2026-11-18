@@ -190,13 +190,37 @@ impl Server {
             .spawn()
             .unwrap_or_else(|e| panic!("{}: not started, the fork or the exec failed: {e}", program.display()));
         let stderr = Arc::new(Mutex::new(String::new()));
+        // For tools/macos/fs-server-report.py: each server's pid with the
+        // test that started it, and its stderr (a discovery build's request
+        // lines) as it comes, under WICK_FS_REPORT_DIR.
+        let report = std::env::var_os("WICK_FS_REPORT_DIR").map(PathBuf::from);
+        if let Some(dir) = &report {
+            let test = std::thread::current().name().unwrap_or("?").to_string();
+            let mut pids = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("pids")).unwrap();
+            pids.write_all(format!("{} {test}\n", child.id()).as_bytes()).unwrap();
+        }
         {
             let mut pipe = child.stderr.take().unwrap();
             let into = stderr.clone();
+            let mut tee = report.map(|d| std::fs::File::create(d.join(format!("{}.stderr", child.id()))).unwrap());
             std::thread::spawn(move || {
-                let mut s = String::new();
-                let _ = pipe.read_to_string(&mut s);
-                into.lock().unwrap().push_str(&s);
+                let mut chunk = [0u8; 4096];
+                // A character cut by a read waits for the rest.
+                let mut pending = Vec::new();
+                while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                    if let Some(f) = tee.as_mut() {
+                        let _ = f.write_all(&chunk[..n]);
+                    }
+                    pending.extend_from_slice(&chunk[..n]);
+                    let whole = match std::str::from_utf8(&pending) {
+                        Ok(_) => pending.len(),
+                        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                        Err(_) => pending.len(),
+                    };
+                    into.lock().unwrap().push_str(&String::from_utf8_lossy(&pending[..whole]));
+                    pending.drain(..whole);
+                }
+                into.lock().unwrap().push_str(&String::from_utf8_lossy(&pending));
             });
         }
         let socket = PathBuf::from(&args[args.iter().position(|a| a == "--socket").unwrap() + 1]);
