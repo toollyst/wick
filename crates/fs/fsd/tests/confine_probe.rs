@@ -285,6 +285,15 @@ mod macos {
             ("revoke of a file of the share", |c| in_share(c, InShare::Revoke), KILLED),
             ("a lock on a file of the share", |c| in_share(c, InShare::Lock), KILLED),
             ("a fifo in the share", |c| in_share(c, InShare::Fifo), KILLED),
+            // graftdmg and ungraftdmg on the share (confine::macos::
+            // ERROR_IN_SHARE_IF_DEFINED): killed on every major at their
+            // numbers (549, 555), which SYSCALLS does not list and Seatbelt
+            // checks, before the kernel's entitlement check or macOS 26's
+            // file-graft rule; macOS 15 has no file-graft operation at all.
+            // Unconfined, the kernel refuses both (EPERM without
+            // com.apple.private.vfs.graftdmg): on record below.
+            ("a graft onto the share", |c| in_share(c, InShare::Graft), KILLED),
+            ("an ungraft of the share", |c| in_share(c, InShare::Ungraft), KILLED),
             ("exec of a file of the share", |c| ok(std::process::Command::new(c.inside).status()), KILLED),
             // `..` of the root is refused beneath it, by the backend's open.
             (".. beneath the root", |c| ok(sys::open_dir(c.root, b"..")), 0),
@@ -322,7 +331,7 @@ mod macos {
         // its entitlement) is told apart from the profile's.
         let root_dir = std::fs::File::open(&share).unwrap();
         let file = std::fs::File::open(share.join("inside")).unwrap();
-        for form in [InShare::Flags, InShare::Owner, InShare::SetUgid, InShare::Clone, InShare::Ioctl, InShare::Snapshot, InShare::Chroot, InShare::Revoke, InShare::Lock, InShare::Fifo, InShare::FinderInfo, InShare::FcntlLock] {
+        for form in [InShare::Flags, InShare::Owner, InShare::SetUgid, InShare::Clone, InShare::Ioctl, InShare::Snapshot, InShare::Chroot, InShare::Revoke, InShare::Lock, InShare::Fifo, InShare::FinderInfo, InShare::FcntlLock, InShare::Graft, InShare::Ungraft] {
             let r = probe::in_share(form, root_dir.as_fd(), file.as_fd(), &share.join("inside"));
             println!("unconfined {form:?}: {r:?}");
         }

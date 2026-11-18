@@ -1136,7 +1136,15 @@ it means layer 1 let the request through.
       a rule on a composite whatever their order (measured), so no composite rule widens a leaf one. Read-only
       shares: every write operation and `file-write*` killed in the share;
     - killed: `file-mount`, `file-mount-update`, `file-unmount` (`KILLED_IN_SHARE`);
-    - refused with an error (EPERM), not killed: `ERROR_IN_SHARE`, the next paragraph.
+    - refused with an error (EPERM), not killed: `ERROR_IN_SHARE`, the next paragraph; `file-graft` and
+      `file-ungraft` (`ERROR_IN_SHARE_IF_DEFINED`) each in a rule of its own emitted only where the macOS defines
+      the operation, `(when (defined? 'file-graft) (deny file-graft (subpath ...)))`: macOS 26 made them
+      (xnu-12377's `mpo_graft_check_graft` and `_ungraft`), and macOS 15 has neither the MAC check nor the operation,
+      so a profile naming them did not compile there and every share was refused (CI run 44317533490). Every
+      other name the profile uses is required: a missing one fails the compile and the share is refused, naming it.
+      `test_every_name_of_the_profile_is_defined_on_this_macos` checks each symbol of the profile on its own on each
+      macOS CI runs, and that the two are unbound exactly on macOS 15. The rule is the same where they exist: the
+      profile with these lines compiled to the same bytes as the one naming them in the error line (macOS 27.2).
 
     Outside the share every file operation is the default's kill, `file-map-executable` and the rest included.
 
@@ -1180,7 +1188,7 @@ it means layer 1 let the request through.
     | `file-map-executable` | the call, unlisted (`mmap`, 197): killed | a share file mapped executable: killed |
     | `process-exec` | the call, unlisted: killed | exec of a file of the share: killed |
     | `network*` | the call, unlisted: killed | a TCP connection: killed |
-    | `file-graft`, `file-ungraft` | the call, unlisted (`graftdmg`): killed, or the rule's EPERM if Seatbelt does not check its number (not probed) | none |
+    | `file-graft`, `file-ungraft` | the call, unlisted (`graftdmg` 549, `ungraftdmg` 555): killed at its number on every major, before the kernel's entitlement check (`com.apple.private.vfs.graftdmg`, EPERM without it; bsd/vfs/vfs_syscalls.c) and before macOS 26's rule; macOS 15 has no such operation | `graftdmg` and `ungraftdmg` on the share: killed (measured on macOS 27.2; macOS 15 and 26 not run yet, CI); EPERM both |
     | `file-search` | the call, unlisted (`searchfs`): as the row above | none |
     | `file-write-acl` | the call, unlisted (`chmod_extended`, `fchmod_extended`): as the row above | none |
     | `file-issue-extension` | `sandbox_issue_extension` is a Sandbox mac-syscall: killed | none |

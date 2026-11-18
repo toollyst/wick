@@ -183,7 +183,6 @@ pub const ERROR_IN_SHARE: &[&str] = &[
     "system-automount",
     "file-chroot",
     "file-clone",
-    "file-graft",
     "file-ioctl",
     "file-issue-extension",
     "file-lock",
@@ -191,12 +190,26 @@ pub const ERROR_IN_SHARE: &[&str] = &[
     "file-mknod",
     "file-revoke",
     "file-search",
-    "file-ungraft",
     "file-write-acl",
     "file-write-finderinfo",
     "file-write-flags",
     "file-write-owner",
     "file-write-setugid",
+];
+
+/// Refused in the share with an error as [`ERROR_IN_SHARE`], where this
+/// macOS defines the operation (`(when (defined? '<op>) ...)`), with why it
+/// may be absent. Every other name the profile uses is required on every
+/// major: a missing one fails the compile and the share is refused, naming
+/// it (`test_every_name_of_the_profile_is_defined_on_this_macos`).
+pub const ERROR_IN_SHARE_IF_DEFINED: &[(&str, &str)] = &[
+    (
+        "file-graft",
+        "macOS 26's MAC check of graftdmg (xnu-12377 mpo_graft_check_graft); macOS 15 (xnu-11417) has no such check and \
+         no such operation: there graftdmg (549) is decided at its number, unlisted, and the kernel refuses it without \
+         the com.apple.private.vfs.graftdmg entitlement first (bsd/vfs/vfs_syscalls.c)",
+    ),
+    ("file-ungraft", "as file-graft, for ungraftdmg (555; mpo_graft_check_ungraft)"),
 ];
 
 /// The share's file operations LINK's evaluation does not reach, killed
@@ -214,6 +227,9 @@ pub fn profile(canonical: &Path, read_only: bool) -> Result<String, Refusal> {
     let names = |ops: &mut dyn Iterator<Item = &str>| ops.collect::<Vec<_>>().join(" ");
     let mut p = String::from(BASE);
     p.push_str(&format!("(deny {} {within})\n", names(&mut ERROR_IN_SHARE.iter().copied())));
+    for (op, _) in ERROR_IN_SHARE_IF_DEFINED {
+        p.push_str(&format!("(when (defined? '{op}) (deny {op} {within}))\n"));
+    }
     // The composite operations too: a call can be checked as one (measured:
     // futimens's fsetattrlist asks `file-write*`, denied as `file*` is).
     p.push_str(&format!("(allow file-read* {} {within})\n", names(&mut FILE_READ_OPS.iter().map(|(o, _)| *o))));
@@ -436,6 +452,57 @@ mod tests {
         sb::compile(&ro).unwrap();
     }
 
+    /// Every symbol the profile names (operations, filters, actions, trap and
+    /// MIG names, fcntl commands) is bound in this macOS's libsandbox, each
+    /// checked on its own (`(define wick-probe-symbol <symbol>)`), so that
+    /// one run names every missing one where the profile's compile stops at
+    /// the first. The names a rule emits only where they are defined
+    /// (`ERROR_IN_SHARE_IF_DEFINED`, the `(when (defined? '...))` lines) are
+    /// unbound exactly on macOS 15 (Darwin 24) and bound from macOS 26 (Darwin
+    /// 25) on, so none of them is dropped where it exists.
+    #[test]
+    fn test_every_name_of_the_profile_is_defined_on_this_macos() {
+        let darwin: u32 = {
+            let out = std::process::Command::new("/usr/bin/uname").arg("-r").output().unwrap();
+            let release = String::from_utf8(out.stdout).unwrap();
+            release.trim().split('.').next().unwrap().parse().unwrap()
+        };
+        let bound = |sym: &str| sb::compile(&format!("(version 1)\n(define wick-probe-symbol {sym})\n")).is_ok();
+        let mut symbols = std::collections::BTreeSet::new();
+        for text in [profile(Path::new("/private/tmp/share"), false).unwrap(), profile(Path::new("/private/tmp/share"), true).unwrap()] {
+            // Strings out (the share's path, the info type), then each token
+            // that is not a number or a quoted symbol.
+            let mut plain = String::new();
+            let mut in_string = false;
+            for ch in text.chars() {
+                match ch {
+                    '"' => in_string = !in_string,
+                    '(' | ')' if !in_string => plain.push(' '),
+                    _ if !in_string => plain.push(ch),
+                    _ => {}
+                }
+            }
+            for token in plain.split_whitespace() {
+                if !token.starts_with('\'') && token.parse::<u64>().is_err() {
+                    symbols.insert(token.to_string());
+                }
+            }
+        }
+        let optional: Vec<String> = ERROR_IN_SHARE_IF_DEFINED.iter().map(|(o, _)| (*o).to_string()).collect();
+        let unbound: Vec<&String> = symbols.iter().filter(|s| !optional.contains(s) && !bound(s)).collect();
+        let optional_unbound: Vec<&String> = optional.iter().filter(|o| !bound(o)).collect();
+        println!(
+            "Darwin {darwin}: {} symbols of the profile, unbound: {unbound:?}; emitted where defined, unbound: {optional_unbound:?}",
+            symbols.len()
+        );
+        assert!(unbound.is_empty(), "the profile names symbols this macOS (Darwin {darwin}) does not define: {unbound:?}");
+        if darwin <= 24 {
+            assert_eq!(optional_unbound, optional.iter().collect::<Vec<_>>(), "Darwin {darwin}: expected none of {optional:?} defined");
+        } else {
+            assert!(optional_unbound.is_empty(), "Darwin {darwin}: {optional_unbound:?} not defined, so their rules would be dropped");
+        }
+    }
+
     /// The whole text, pinned for a read-write and a read-only share
     /// (printed with `--nocapture`, and in full on a difference).
     #[test]
@@ -457,7 +524,9 @@ mod tests {
 (deny syscall-mig (with send-signal SIGKILL))
 (deny system-mac-syscall (with send-signal SIGKILL))
 (deny generic-issue-extension (with send-signal SIGKILL))
-(deny file* fs-snapshot* network* process-exec system-automount file-chroot file-clone file-graft file-ioctl file-issue-extension file-lock file-map-executable file-mknod file-revoke file-search file-ungraft file-write-acl file-write-finderinfo file-write-flags file-write-owner file-write-setugid (subpath "/private/tmp/share"))
+(deny file* fs-snapshot* network* process-exec system-automount file-chroot file-clone file-ioctl file-issue-extension file-lock file-map-executable file-mknod file-revoke file-search file-write-acl file-write-finderinfo file-write-flags file-write-owner file-write-setugid (subpath "/private/tmp/share"))
+(when (defined? 'file-graft) (deny file-graft (subpath "/private/tmp/share")))
+(when (defined? 'file-ungraft) (deny file-ungraft (subpath "/private/tmp/share")))
 (allow file-read* file-read-data file-read-metadata file-read-xattr file-test-existence (subpath "/private/tmp/share"))
 (allow file-write* file-write-create file-write-data file-write-mode file-write-times file-write-unlink file-write-xattr file-link (subpath "/private/tmp/share"))
 (deny file-mount file-mount-update file-unmount (subpath "/private/tmp/share") (with send-signal SIGKILL))
@@ -478,7 +547,9 @@ mod tests {
 (deny syscall-mig (with send-signal SIGKILL))
 (deny system-mac-syscall (with send-signal SIGKILL))
 (deny generic-issue-extension (with send-signal SIGKILL))
-(deny file* fs-snapshot* network* process-exec system-automount file-chroot file-clone file-graft file-ioctl file-issue-extension file-lock file-map-executable file-mknod file-revoke file-search file-ungraft file-write-acl file-write-finderinfo file-write-flags file-write-owner file-write-setugid (subpath "/private/tmp/share"))
+(deny file* fs-snapshot* network* process-exec system-automount file-chroot file-clone file-ioctl file-issue-extension file-lock file-map-executable file-mknod file-revoke file-search file-write-acl file-write-finderinfo file-write-flags file-write-owner file-write-setugid (subpath "/private/tmp/share"))
+(when (defined? 'file-graft) (deny file-graft (subpath "/private/tmp/share")))
+(when (defined? 'file-ungraft) (deny file-ungraft (subpath "/private/tmp/share")))
 (allow file-read* file-read-data file-read-metadata file-read-xattr file-test-existence (subpath "/private/tmp/share"))
 (deny file-mount file-mount-update file-unmount file-write* file-write-create file-write-data file-write-mode file-write-times file-write-unlink file-write-xattr file-link (subpath "/private/tmp/share") (with send-signal SIGKILL))
 (allow syscall-unix (syscall-number 29 53 73 92 95 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
@@ -507,6 +578,7 @@ mod tests {
             .chain(FILE_WRITE_OPS)
             .map(|(o, _)| *o)
             .chain(ERROR_IN_SHARE.iter().copied())
+            .chain(ERROR_IN_SHARE_IF_DEFINED.iter().map(|(o, _)| *o))
             .chain(KILLED_IN_SHARE.iter().copied())
             .collect();
         let missing: Vec<&String> =

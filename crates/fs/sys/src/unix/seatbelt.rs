@@ -472,6 +472,11 @@ pub mod probe {
         check(unsafe { libc::fstatat(libc::AT_FDCWD, path.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) }).map(drop)
     }
 
+    /// `graftdmg` and `ungraftdmg`'s numbers, from xnu's
+    /// bsd/kern/syscalls.master (the same in xnu-11417 and xnu-12377).
+    const SYS_GRAFTDMG: c_int = 549;
+    const SYS_UNGRAFTDMG: c_int = 555;
+
     /// The calls by which the share's operations that are refused with an
     /// error there (`confine::macos::ERROR_IN_SHARE`) are made, on a file or
     /// directory of the share: `Ok` only when the call did what it asks.
@@ -479,6 +484,7 @@ pub mod probe {
         unsafe extern "C" {
             fn revoke(path: *const c_char) -> c_int;
             fn fs_snapshot_create(dirfd: c_int, name: *const c_char, flags: u32) -> c_int;
+            fn syscall(number: c_int, ...) -> c_int;
         }
         let (r, f) = (root.as_raw_fd(), file.as_raw_fd());
         let path = CString::new(file_path.as_os_str().as_encoded_bytes()).map_err(|_| HostErrno(libc::EINVAL))?;
@@ -509,6 +515,16 @@ pub mod probe {
                     libc::ioctl(f, 0x4004_6418, &mut n)
                 }
                 InShare::Snapshot => fs_snapshot_create(r, c"wick-probe".as_ptr(), 0),
+                // graftdmg(dmg_fd, mountdir, graft_type, gda): the share's
+                // file as the image, the share's directory as the mount
+                // point, type 1, zeroed arguments (the kernel copies them in
+                // only past its entitlement check). No libc wrapper.
+                InShare::Graft => {
+                    let args = [0u8; 4096];
+                    syscall(SYS_GRAFTDMG, f, dir.as_ptr(), 1u32, args.as_ptr())
+                }
+                // ungraftdmg(mountdir, flags).
+                InShare::Ungraft => syscall(SYS_UNGRAFTDMG, dir.as_ptr(), 0u64),
                 InShare::Chroot => libc::chroot(dir.as_ptr()),
                 InShare::Revoke => revoke(path.as_ptr()),
                 InShare::Lock => libc::flock(f, libc::LOCK_SH | libc::LOCK_NB),
@@ -567,6 +583,11 @@ pub mod probe {
         Lock,
         /// `mkfifoat` (`file-mknod`).
         Fifo,
+        /// `graftdmg` (549; `file-graft` from macOS 26, an unlisted call
+        /// everywhere).
+        Graft,
+        /// `ungraftdmg` (555; `file-ungraft` from macOS 26).
+        Ungraft,
         /// `fcntl(F_SETLK)` of a read lock (`file-lock`, by a listed call;
         /// under wick-fsd's profile `system-fcntl` decides first).
         FcntlLock,
