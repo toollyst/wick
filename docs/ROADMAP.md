@@ -91,8 +91,30 @@ saying "works". M3 is done when one PC run at a single commit passes `all`, `dif
 `foreign-snapshot` and `linux-snapshot` with CI's artifact (a refusal it records counts as the stage passing, as
 its row in docs/COMPATIBILITY.md says), and those two rows say "works" for what the run covered. A KVM-made state's
 XSAVE area is in the standard format, so wick's layout mark, which a WHP-made area carries in its software-available
-bytes, means nothing to it: its local APIC state is taken in KVM's layout; a WHP-made state without the mark (a build
-from before `KVM_GET_LAPIC` gave KVM's layout) is refused (docs/COMPATIBILITY.md, the Interrupt controller row).
+bytes, means nothing to it: its local APIC state is read in KVM's layout; a WHP-made state without the mark (a build
+from before `KVM_GET_LAPIC` gave KVM's layout) is refused (docs/COMPATIBILITY.md, the Interrupt controller row). WHP
+itself refuses that standard-format area, so a KVM-made state does not get past `KVM_SET_XSAVE2` today, and Linux
+refuses the compacted area a Windows-made state carries (docs/COMPATIBILITY.md, A snapshot restored on another host
+OS). The item that changes this:
+
+- **The XSAVE area between hosts, both directions** (not started; scheduled for M3's cross-host snapshot work).
+  - KVM to WHP: `KVM_SET_XSAVE` of a standard-format area (wick's `XsaveMaker::Kvm`) places each component at its
+    compacted offset for this host, in `XCOMP_BV`'s order and with 64-byte alignment where CPUID leaf 0xD's ECX bit 1
+    says, then sets `XCOMP_BV` to this host's own. The supervisor components the standard area cannot hold get
+    their initial state; whether WHP takes them so is part of the test.
+  - WHP to KVM: an area Linux takes, in the standard format with no supervisor component. CET's two components are
+    dropped; a guest given KVM v6.1's CPUID has no CET to lose, as the backend refuses CR4.CET (whp/cr4.rs).
+    Where this conversion belongs is part of the item: Firecracker stores the area as `KVM_GET_XSAVE2` gives it, and
+    the same host's restore needs WHP's own.
+  - The test: each direction round-trips on CI's AMD and Intel runners, the registers of every component in use
+    compared, and `boot-test.ps1 linux-snapshot` gets past `KVM_SET_XSAVE2`.
+  - Not measured: a Windows-made state restored on a Windows host whose processor has more XSAVE components. That
+    host's WHP is given a compacted area whose `XCOMP_BV` differs from its own (wick's `KVM_SET_XSAVE` refuses only
+    components the host lacks). CI's runners differ in exactly this (`XCOMP_BV` 0x8000000000001807 on the AMD EPYC
+    7763, 0x80000000000618e7 on the Intel Xeon with AMX: the Host CPU row). A snapshot made in one job and loaded in
+    another, handed over as an artifact as `linux-snapshot`'s is, can measure it when the two jobs land on the two
+    runner models. GitHub does not let a job choose the model, so a run names the models it got. A PC with another
+    processor than the runner's measures it too.
 
 **Every boot test stage that has run on real hardware passes** (AMD Ryzen 9 7900, Windows 11 Pro build
 26300): boot, smp, block, vsock, net, snapshot, diff, uffd, pci, restores (20 restores, each paused and snapshotted
