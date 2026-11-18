@@ -8,11 +8,14 @@
 //! A chain becomes a request frame (its readable bytes, unparsed), or an
 //! answer the device gives the chain itself. A reply frame becomes the bytes
 //! for the chain it answers, once checked. The device reads of FUSE only
-//! what it needs to give old guest kernels the checks v7.1's driver makes
-//! itself (`virtio_fs_verify_response`, Linux 68b69fa0edb2; v6.1 to v7.0
-//! trust the reply): bytes 8..16 of each request (`fuse_in_header.unique`)
-//! and bytes 0..16 of each reply (`fuse_out_header`: `len` and `unique`).
-//! No opcode, no `error`, no argument is read.
+//! what it needs to give guest kernels the header checks Linux's driver makes
+//! itself in its newest form (`virtio_fs_verify_response`: `len` and
+//! `unique` from 68b69fa0edb2, in v7.1; the `error` range and an error
+//! reply's length from 5364d081125a, in 7.4-rc3 only; v6.1 to v7.0 check
+//! none): bytes 8..16 of each request (`fuse_in_header.unique`) and bytes
+//! 0..16 of each reply (`fuse_out_header`: `len`, `error`, `unique`). No
+//! opcode and no argument is read, so that commit's check of a reply's
+//! fixed-size arguments is not made here.
 //!
 //! Once the server is lost (its connection ended or it sent a frame that
 //! breaks a rule) every chain waiting for a reply, and every chain taken
@@ -30,6 +33,10 @@ pub const OUT_HEADER_LEN: usize = 16;
 
 /// Linux's `EIO`.
 const EIO: i32 = 5;
+
+/// Linux's `ERESTARTSYS` (include/linux/errno.h): a reply's `error` must be
+/// above its negation.
+const ERESTARTSYS: i32 = 512;
 
 /// A chain as the device read it off a queue.
 #[derive(Clone, Copy, Debug)]
@@ -245,6 +252,21 @@ impl Proxy {
         if head[8..16] != pending.unique {
             return restore(self, pending, "a reply whose unique is not its request's".to_string());
         }
+        // The `error` checks of Linux's own virtio_fs_verify_response from
+        // commit 5364d081125a ("virtiofs: validate fixed-output response
+        // length", in 7.4-rc3, no release yet):
+        //     if (oh->error <= -ERESTARTSYS || oh->error > 0) {
+        //     ...
+        //     if (oh->error) {
+        //         if (len != sizeof(*oh)) {
+        // ERESTARTSYS is 512 (include/linux/errno.h).
+        let error = i32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+        if error <= -ERESTARTSYS || error > 0 {
+            return restore(self, pending, format!("a reply whose error {error} is outside -511..=0"));
+        }
+        if error != 0 && payload.len() != OUT_HEADER_LEN {
+            return restore(self, pending, format!("an error reply ({error}) of {} bytes, not the header alone", payload.len()));
+        }
         Ok(Answer {
             cookie,
             queue: pending.queue,
@@ -367,6 +389,42 @@ mod tests {
                 assert_eq!(&x.bytes[..8], &[16, 0, 0, 0, 0xfb, 0xff, 0xff, 0xff], "{what}");
             }
             assert!(p.lost().unwrap().contains(what), "{what}: {:?}", p.lost());
+        }
+    }
+
+    /// Each boundary of 5364d081125a's `error` checks: -511 to 0 pass, -512
+    /// and 1 (and the extremes) lose the server; an error reply passes as
+    /// the header alone and loses it with one byte more; a success may be
+    /// longer.
+    #[test]
+    fn test_the_error_range_and_an_error_reply_s_length() {
+        let cases: [(i32, usize, bool); 11] = [
+            (0, 0, true),
+            (0, 8, true),
+            (-1, 0, true),
+            (-511, 0, true),
+            (-512, 0, false),
+            (-513, 0, false),
+            (i32::MIN, 0, false),
+            (1, 0, false),
+            (i32::MAX, 0, false),
+            (-5, 1, false),
+            (-511, 64, false),
+        ];
+        for (error, extra, passes) in cases {
+            let mut p = Proxy::new(4);
+            let r = request(42, 40);
+            let cookie = sent(&mut p, &chain(&r, 100));
+            let len = u32::try_from(16 + extra).unwrap();
+            let body = out(len, error, 42, extra);
+            let a = answers(&mut p, &reply(cookie, &body));
+            if passes {
+                assert_eq!(a, vec![Answer { cookie, queue: 1, head: 7, bytes: body }], "error {error}, {extra} bytes more");
+                assert!(p.lost().is_none(), "error {error}, {extra} bytes more");
+            } else {
+                assert_eq!(a, vec![Answer { cookie, queue: 1, head: 7, bytes: eio(42u64.to_le_bytes()) }], "error {error}");
+                assert!(p.lost().unwrap().contains("error"), "error {error}, {extra} bytes more: {:?}", p.lost());
+            }
         }
     }
 

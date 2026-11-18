@@ -48,6 +48,9 @@ enum Op {
 enum Shape {
     /// A correct header: `len`, error, the request's `unique`.
     Good { error: i32 },
+    /// The same with an error near the range a reply's may take
+    /// (-511..=0): `-(errno % 1024)`.
+    Errno { errno: u16 },
     /// A header whose `len` is off by `delta`.
     BadLen { delta: i8 },
     /// Another `unique`.
@@ -117,15 +120,22 @@ fuzz_target!(|ops: Vec<Op>| {
                 let cookie = target.unwrap_or(other);
                 let expected_unique = waiting.get(&cookie).map(|w| w.unique).unwrap_or([0; 8]);
                 let mut payload = Vec::new();
-                let (len_ok, unique_ok) = match shape {
-                    Shape::Good { error } => {
+                let (len_ok, unique_ok, error_ok) = match shape {
+                    Shape::Good { .. } | Shape::Errno { .. } => {
+                        let error = match shape {
+                            Shape::Errno { errno } => -(i32::from(errno) % 1024),
+                            Shape::Good { error } => error,
+                            _ => unreachable!(),
+                        };
                         payload.extend_from_slice(&0u32.to_le_bytes());
                         payload.extend_from_slice(&error.to_le_bytes());
                         payload.extend_from_slice(&expected_unique);
                         payload.extend_from_slice(&extra);
                         let len = u32::try_from(payload.len()).unwrap();
                         payload[..4].copy_from_slice(&len.to_le_bytes());
-                        (true, true)
+                        // 5364d081125a's verify_response: -511..=0, and an
+                        // error reply is the header alone.
+                        (true, true, (-511..=0).contains(&error) && (error == 0 || extra.is_empty()))
                     }
                     Shape::BadLen { delta } => {
                         let delta = if delta == 0 { 1 } else { delta };
@@ -135,18 +145,18 @@ fuzz_target!(|ops: Vec<Op>| {
                         payload.extend_from_slice(&extra);
                         let len = i64::try_from(payload.len()).unwrap() + i64::from(delta);
                         payload[..4].copy_from_slice(&(len as u32).to_le_bytes());
-                        (false, true)
+                        (false, true, true)
                     }
                     Shape::BadUnique { unique } => {
                         let unique = if unique.to_le_bytes() == expected_unique { unique ^ 1 } else { unique };
                         payload.extend_from_slice(&16u32.to_le_bytes());
                         payload.extend_from_slice(&0i32.to_le_bytes());
                         payload.extend_from_slice(&unique.to_le_bytes());
-                        (true, false)
+                        (true, false, true)
                     }
                     Shape::Short { len } => {
                         payload.resize(usize::from(len % 16), 0);
-                        (false, true)
+                        (false, true, true)
                     }
                 };
                 let Ok(header) = Header::reply(cookie, payload.len()) else { continue };
@@ -155,7 +165,8 @@ fuzz_target!(|ops: Vec<Op>| {
                     && waiting.get(&cookie).is_some_and(|w| payload.len() as u64 <= u64::from(clamp_writable(w.writable)))
                     && payload.len() >= OUT_HEADER_LEN
                     && len_ok
-                    && unique_ok;
+                    && unique_ok
+                    && error_ok;
                 let answers = proxy.reply(&frame);
                 if good {
                     let w = waiting.remove(&cookie).unwrap();

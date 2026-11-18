@@ -11,7 +11,8 @@
 //! After every request:
 //! - a reply frame exists exactly when the request had buffers, and fits
 //!   them; a reply of a header or more carries its own length and the
-//!   request's unique, and an error reply is the header alone;
+//!   request's unique, an error from -511 to 0 (what the VMM's device lets
+//!   through), and an error reply is the header alone;
 //! - the session's tables keep their rules (`Session::check`: every handle
 //!   on a held node, every limit kept);
 //! - each node's guest lookup count and open handles are what a model kept
@@ -298,7 +299,9 @@ fuzz_target!(|input: Input| {
             let len = u32::from_le_bytes(reply[0..4].try_into().unwrap()) as usize;
             let error = i32::from_le_bytes(reply[4..8].try_into().unwrap());
             assert_eq!(len, reply.len());
-            assert!(error <= 0);
+            // The range the VMM's device lets through (crates/ext/src/fs/
+            // copy.rs, Linux's virtio_fs_verify_response at 5364d081125a).
+            assert!((-511..=0).contains(&error));
             if error < 0 {
                 assert_eq!(len, 16);
             }

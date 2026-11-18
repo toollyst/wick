@@ -88,7 +88,7 @@
 #   count snapshot-editor 6 pass 0 fail 0 ignored
 #   count utils 16 pass 0 fail 0 ignored
 #   count wick-ext 1 pass 0 fail 0 ignored
-#   count wick-ext-fs 23 pass 0 fail 0 ignored
+#   count wick-ext-fs 25 pass 0 fail 0 ignored
 #   count wick-version 2 pass 0 fail 0 ignored
 #   count compat-event-manager 0 pass 0 fail 0 ignored
 #   count compat-kvm-bindings 0 pass 0 fail 0 ignored

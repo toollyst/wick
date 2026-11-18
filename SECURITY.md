@@ -1835,17 +1835,21 @@ start on Windows, whose confinement is not built ([docs/design-fs.md](docs/desig
 The device adds no rule or system call to the VMM's sandbox, connects to its server before the sandbox narrows and
 never again, and never blocks the event loop on the server (`test_server_hang_never_blocks_the_loop`); the reply
 bytes it waits for are capped at 16 MiB. Of FUSE it reads bytes 8..16 of each request (`unique`) and bytes 0..16 of
-each reply (`len`, `unique`), and nothing else: each reply must be at least 16 bytes, its `len` its byte count and at
-most the chain's writable bytes, its `unique` the request's, or the server is lost and every request is answered
-`-EIO` from then on, without a reconnect (`test_each_reply_header_mismatch_loses_the_server`,
-`test_hostile_replies`, `test_server_death_fails_inflight_with_eio`). That check is for guest kernels before Linux
-v7.1, whose driver checks a reply itself (`virtio_fs_verify_response`, commit
-<https://git.kernel.org/torvalds/c/68b69fa0edb2>); v6.1 to v7.0, wick's
-CI kernels (6.1, 6.18) among them, take `len` as given. What a server taken over still reaches in such a guest,
-from the v6.1 source: a reply shorter than a request's fixed-size out arguments, with a correct `len`, leaves the
-rest of those arguments as the guest kernel's own uninitialized heap (`argbuf` is `kmalloc`'d, fs/fuse/virtio_fs.c
-:505, and copied whole, :520 to :545), and an `error` outside -511..0 is returned to the caller as is (fs/fuse/dev.c
-:512), both of which v7.1 refuses; and whatever any FUSE server is trusted with. The host is not reached by either.
+each reply (`len`, `error`, `unique`), and nothing else: each reply must be at least 16 bytes, its `len` its byte
+count and at most the chain's writable bytes, its `unique` the request's, its `error` from -511 to 0, and an error
+reply the header alone, or the server is lost and every request is answered `-EIO` from then on, without a
+reconnect (`test_each_reply_header_mismatch_loses_the_server`, `test_the_error_range_and_an_error_reply_s_length`,
+`test_hostile_replies`, `test_server_death_fails_inflight_with_eio`). These are the checks Linux's driver makes
+itself in its newest form (`virtio_fs_verify_response`): `len` and `unique` from v7.1 (commit
+<https://git.kernel.org/torvalds/c/68b69fa0edb2>), the `error` checks from commit
+<https://git.kernel.org/torvalds/c/5364d081125a>, which is in 7.4-rc3 and in no release as of 2026-11-18; v6.1 to
+v7.0, wick's CI kernels (6.1, 6.18) among them, check none. What a server taken over still reaches in a guest
+without that commit (every released kernel), from the v6.1 source: a successful reply shorter than a request's
+fixed-size out arguments, with a correct `len`, leaves the rest of those arguments as the guest kernel's own
+uninitialized heap (`argbuf` is `kmalloc`'d, fs/fuse/virtio_fs.c :505, and copied whole, :520 to :545), which that
+commit closes in the kernel and the VMM does not check (it would need each opcode's argument sizes); and whatever
+any FUSE server is trusted with. The host is not reached by either. A guest's reset of the device loses its share
+for the rest of the VMM's life (`test_reset_loses_the_server`).
 A snapshot of a microVM with a share is refused before any state is saved, on both transports
 (`test_fs_snapshot_refused`).
 

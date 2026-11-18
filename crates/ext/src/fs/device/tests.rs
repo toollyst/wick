@@ -459,8 +459,11 @@ fn test_hostile_chains() {
 fn test_hostile_replies() {
     // Each loses the server: the waiting chain gets -EIO, and nothing is
     // written past its writable buffer.
-    let cases: [(&str, BadReply); 5] = [
+    let cases: [(&str, BadReply); 8] = [
         ("longer than the chain", |c| frame(c, &out(116, 0, 21, 100))),
+        ("an error above 0", |c| frame(c, &out(16, 1, 21, 0))),
+        ("an error of -512", |c| frame(c, &out(16, -512, 21, 0))),
+        ("an error reply with a body", |c| frame(c, &out(20, -5, 21, 4))),
         ("a cookie no request has", |c| frame(c + 1000, &out(16, 0, 21, 0))),
         ("a header that is not one", |_| vec![0xee; HEADER_LEN + 16]),
         ("another request's unique", |c| frame(c, &out(16, 0, 22, 0))),
@@ -481,6 +484,39 @@ fn test_hostile_replies() {
         assert!(rig.dev.lock().unwrap().proxy.lost().is_some(), "{what}");
         assert_eq!(rig.metrics().server_lost.fetch(), 1, "{what}");
     }
+}
+
+/// A writable buffer outside guest memory is found when the reply is
+/// written, not when the chain is walked: the write stops at it, the used
+/// length is the bytes written before it, `event_fails` counts it, and the
+/// server is not lost (the reply was good).
+#[test]
+fn test_a_writable_buffer_outside_guest_memory() {
+    let mut rig = Rig::new(share(16));
+    let r = rig.alloc(40);
+    rig.mem.write_slice(&request(31, 40), r).unwrap();
+    let w = rig.alloc(16);
+    let outside = GuestAddress(MEM as u64 + 0x1000);
+    // The first writable buffer in memory, the second outside it.
+    let a = rig.raw_chain(1, &[(r, 40, 0), (w, 16, VIRTQ_DESC_F_WRITE), (outside, 100, VIRTQ_DESC_F_WRITE)]);
+    rig.run();
+    let (h, _) = rig.request();
+    assert_eq!(h.writable_cap(), 116, "both buffers counted when the chain was walked");
+    let body = out(40, 0, 31, 24);
+    rig.reply(h.cookie(), &body);
+    rig.run();
+    assert_eq!(rig.used(1), vec![(a, 16)]);
+    assert_eq!(rig.read(w, 16), body[..16]);
+    assert_eq!(rig.metrics().event_fails.count(), 1);
+    // The only writable buffer outside: nothing written, used length 0.
+    let b = rig.raw_chain(1, &[(r, 40, 0), (outside, 100, VIRTQ_DESC_F_WRITE)]);
+    rig.run();
+    let (h, _) = rig.request();
+    rig.reply(h.cookie(), &out(16, 0, 31, 0));
+    rig.run();
+    assert_eq!(rig.used(1), vec![(b, 0)]);
+    assert_eq!(rig.metrics().event_fails.count(), 2);
+    assert!(rig.dev.lock().unwrap().proxy.lost().is_none());
 }
 
 fn frame(cookie: u64, payload: &[u8]) -> Vec<u8> {

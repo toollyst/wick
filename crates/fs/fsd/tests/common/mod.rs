@@ -64,19 +64,32 @@ pub fn name(n: &[u8]) -> Vec<u8> {
 /// 65534 cannot search: every case by path then failed at the directory's
 /// permission, before the profile was asked (CI run 44317533490's root step
 /// of confine_probe). Linux's is `/tmp` already.
+///
+/// The name is predictable and `/tmp` is anyone's to write in, so the tree
+/// is made with `create_dir`, which fails on any name already there (a
+/// directory, a file or a link another user planted, a link not followed)
+/// rather than taking it; what this process left there before is removed
+/// first by [`remove`], which removes a link itself, never what it names.
 pub fn scratch(tag: &str) -> PathBuf {
     let tmp = if sys::euid() == 0 { PathBuf::from("/tmp") } else { std::env::temp_dir() };
     let p = tmp.join(format!("wick-fsd-{tag}-{}", std::process::id()));
     remove(&p);
-    std::fs::create_dir_all(&p).unwrap();
+    std::fs::create_dir(&p).unwrap_or_else(|e| panic!("making {}: {e}", p.display()));
     std::fs::canonicalize(&p).unwrap()
 }
 
-/// Removes a test's tree, giving back the permissions a test took away.
+/// Removes a test's tree, giving back the permissions a test took away. A
+/// name that is not a directory (a link above all) is removed as a name:
+/// neither `chmod` nor the removal follows it.
 pub fn remove(p: &Path) {
-    if !p.exists() {
+    let Ok(m) = std::fs::symlink_metadata(p) else { return };
+    if !m.is_dir() {
+        let _ = std::fs::remove_file(p);
         return;
     }
+    // A real directory: chmod -R follows no link it meets inside (macOS's
+    // default -P; GNU's chmod ignores links in a recursive walk), nor does
+    // remove_dir_all.
     let _ = std::process::Command::new("chmod").args(["-R", "u+rwx"]).arg(p).status();
     let _ = std::fs::remove_dir_all(p);
 }
@@ -121,10 +134,35 @@ pub trait Link {
     }
 }
 
+/// The header checks the VMM's device makes of every reply before it
+/// reaches the guest (crates/ext/src/fs/copy.rs, Linux's
+/// virtio_fs_verify_response at 5364d081125a): at least a header, its `len`
+/// the reply's, its `unique` the request's, its `error` from -511 to 0, and
+/// an error reply the header alone. A reply of wick-fsd's that broke one
+/// would make the device give up on its own server: every reply every test
+/// gets, in process or from a confined server, passes here.
+pub fn check_reply(req: &[u8], reply: &[u8]) {
+    assert!(reply.len() >= 16, "a reply of {} bytes", reply.len());
+    let len = u32_at(reply, 0) as usize;
+    let error = i32::from_le_bytes(reply[4..8].try_into().unwrap());
+    assert_eq!(len, reply.len(), "the header's len");
+    // The device pairs a reply with bytes 8..16 of its request, 0 where the
+    // request is shorter (copy.rs, unique_of).
+    let unique = req.get(8..16).unwrap_or(&[0; 8]);
+    assert_eq!(&reply[8..16], unique, "the reply's unique");
+    assert!((-511..=0).contains(&error), "error {error}");
+    if error != 0 {
+        assert_eq!(len, 16, "an error reply ({error}) with a body");
+    }
+}
+
 impl<D: ConfinedDir> Link for Session<D> {
     fn send(&mut self, req: &[u8], cap: usize) -> Option<Vec<u8>> {
         let reply = self.handle(req, cap);
         self.check().unwrap();
+        if let Some(r) = &reply {
+            check_reply(req, r);
+        }
         reply
     }
 
@@ -426,5 +464,6 @@ pub fn call(s: &mut Session<HostDir>, op: Opcode, nodeid: u64, args: &[&[u8]]) -
     let bytes = request(op as u32, 7, nodeid, (UID, GID), args);
     let reply = s.handle(&bytes, CAP).unwrap();
     s.check().unwrap();
+    check_reply(&bytes, &reply);
     (i32::from_le_bytes(reply[4..8].try_into().unwrap()), reply[16..].to_vec())
 }

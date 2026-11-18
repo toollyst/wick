@@ -284,7 +284,9 @@ when allocating a host-backed memory resource" [D].
 - On macOS, Metal revokes a process's access after "too many timeouts or hangs" (`MTLCommandBufferError.accessRevoked` [D]).
 - On Linux, DRM schedulers time out jobs and can reset the GPU [I].
 - **All hosts:** the first device-lost (`VK_ERROR_DEVICE_LOST`) in any worker ends **all** of that VM's workers. The
-  device goes to `DEVICE_NEEDS_RESET` and is not brought back for the VM's life, so one VM causes at most one hang.
+  device fails every request from then on (an error to the guest, as the virtio-fs device answers `-EIO` once its
+  server is lost; upstream's transports give a device no way to set `DEVICE_NEEDS_RESET`, design-fs.md §4.1) and is
+  not brought back for the VM's life, so one VM causes at most one hang.
   A `gpu.device_lost` metric records it. The workers run at low GPU priority:
   - Windows: `D3DKMTSetProcessSchedulingPriorityClass` set by the jailer on the worker (it takes a process handle [D]).
   - Linux: Vulkan global priority LOW where offered [I].
@@ -344,8 +346,9 @@ when allocating a host-backed memory resource" [D].
 
 **R15. A crashed or compromised worker or back-end hurts the VMM.**
 - **All hosts:**
-  - Socket EOF from the back-end puts the device in `DEVICE_NEEDS_RESET`, unmaps the window, and leaves the VM
-    running (the GPU is gone).
+  - Socket EOF from the back-end makes the device fail every request from then on (not `DEVICE_NEEDS_RESET`, which
+    upstream's transports do not let a device set; design-fs.md §4.1), unmaps the window, and leaves the VM running
+    (the GPU is gone).
   - No respawn (no exploit retries against a fresh ASLR layout).
   - A metric `gpu.backend_exits` counts it.
 - **Planned test:** `gpu-crash` stage.

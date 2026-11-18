@@ -122,8 +122,13 @@ struct Walked {
     writable_len: u64,
 }
 
-/// Reads a chain: readable buffers first, then writable ones, none
-/// indirect, each inside guest memory.
+/// Reads a chain: its readable buffers, all before its writable ones, none
+/// indirect. The readable bytes are copied, at most [`MAX_PAYLOAD_LEN`] in
+/// all (the rest counted, not read), and a copied part outside guest memory
+/// refuses the chain. The writable buffers are only recorded: one outside
+/// guest memory is found when the reply is written ([`write_chain`] stops
+/// there; the used length is the bytes written before it, and
+/// `event_fails` counts it).
 fn walk(mem: &GuestMemoryMmap, head: DescriptorChain) -> Result<Walked, &'static str> {
     let mut w = Walked::default();
     for desc in head {

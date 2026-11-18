@@ -267,6 +267,9 @@ has used yet (the jailer's socket and the boot stages are next). The plan:
   start if any of that fails.
 - The jailer starts it next to Firecracker.
 - It is off by default (a cargo feature `fs`), with no DAX window and no snapshots in the first version.
+- In the first version a guest's reset of the device (the driver unbound and bound again, or a kexec) loses the
+  share for the rest of the VMM's life: every request fails with `-EIO` (`test_reset_loses_the_server`). Later: a new
+  server connection for each activation.
 - Every known risk is in the design with the fix planned for each host and the test meant to prove it. The Windows
   parts come from documentation and are to be measured on a Windows PC with WHP.
 

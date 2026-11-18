@@ -316,6 +316,7 @@ impl Link for Remote {
         }
         let (h, payload) = self.read_frame().expect("the server ended without a reply");
         assert_eq!((h.kind(), h.cookie()), (Kind::Reply, self.cookie));
+        super::check_reply(req, &payload);
         Some(payload)
     }
 }

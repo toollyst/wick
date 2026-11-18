@@ -343,22 +343,35 @@ lay them out); fuzz target `fs_proxy`. No guest has used it yet (commit 12's boo
   is 1 and one warning names the requests waiting, until a reply comes (no per-request deadline in v1: a slow host
   file system is not a hang).
 - **What the VMM reads of FUSE**: bytes 8..16 of each request (`fuse_in_header.unique`) and bytes 0..16 of each
-  reply (`fuse_out_header`: `len` and `unique`; `error` is copied, not read), nothing else: no opcode, no argument.
-  The reason: Linux's driver checked a reply itself only from v7.1 (`virtio_fs_verify_response`, commit
-  <https://git.kernel.org/torvalds/c/68b69fa0edb2>, "virtiofs: add FUSE protocol validation", 2026-02-27; not in v6.1, v6.12, v6.18, v6.19 or v7.0, read
-  in each [src]). Before it, the used length is ignored and `copy_args_from_argbuf` takes `fuse_out_header.len` as
-  given (fs/fuse/virtio_fs.c, v6.1 :520-545) [src], so a server taken over could hand an old guest kernel a "success"
-  with lengths the driver trusts. So each reply is checked before it is written into its chain: at least 16 bytes,
-  `len` equal to the reply's byte count and at most the chain's writable bytes, `unique` the request's
-  (`test_each_reply_header_mismatch_loses_the_server`, `test_hostile_replies`).
-- **What remains the guest's exposure to a hostile server on kernels before v7.1**, from the source (v6.1
-  fs/fuse/virtio_fs.c and dev.c) [src]: (a) a reply shorter than a request's fixed-size out arguments but with a
-  correct `len`: the driver copies each fixed argument whole from `argbuf`, which `virtio_fs_enqueue_req` allocated
-  with `kmalloc` and filled only with the in arguments (:505), so the guest kernel reads its own uninitialized heap
-  as attributes; (b) `error` outside -511..0: `fuse_simple_request` returns it as is (dev.c :512), where /dev/fuse
-  refuses it and v7.1 checks it; (c) what any FUSE server is trusted with (attributes, names, data). The VMM checks
-  neither (a) nor (b): either would read FUSE semantics (the opcode's argument sizes, the error's meaning). The host is
-  not exposed by them; the guest is, to its own kernel's handling.
+  reply (`fuse_out_header`: `len`, `error` and `unique`), nothing else: no opcode, no argument. Each reply is checked
+  before it is written into its chain, as Linux's driver checks it in its newest form (`virtio_fs_verify_response`,
+  fs/fuse/virtio_fs.c) [src]:
+  - at least 16 bytes, `len` equal to the reply's byte count and at most the chain's writable bytes, `unique` the
+    request's: the checks of commit <https://git.kernel.org/torvalds/c/68b69fa0edb2> ("virtiofs: add FUSE protocol
+    validation"), first released in v7.1; not in v6.1, v6.12, v6.18, v6.19 or v7.0 (read in each)
+    (`test_each_reply_header_mismatch_loses_the_server`, `test_hostile_replies`);
+  - `error` from -511 to 0, and an error reply the header alone (16 bytes): the checks commit
+    <https://git.kernel.org/torvalds/c/5364d081125a> ("virtiofs: validate fixed-output response length") added,
+    `if (oh->error <= -ERESTARTSYS || oh->error > 0)` and `if (oh->error) { if (len != sizeof(*oh))`
+    (`ERESTARTSYS` is 512). That commit is in 7.4-rc3 and in no release, as read on 2026-11-18: v7.1, v7.2 and v7.3
+    check no `error` (`test_the_error_range_and_an_error_reply_s_length`, each boundary; `test_hostile_replies`).
+    wick-fsd answers every error with the header alone and an errno from its own list, 1 to 122
+    (`fuse::encode::error`, the only builder of a reply with an error;
+    `test_every_error_reply_is_a_16_byte_header_in_the_device_s_range`), and every reply its tests get, in process
+    or from a confined server, is checked as the device checks it (`check_reply` in its tests' harness).
+
+  Before v7.1 the used length is ignored and `copy_args_from_argbuf` takes `fuse_out_header.len` as given (v6.1
+  :520-545) [src], so a server taken over could hand an old guest kernel a "success" with lengths the driver trusts;
+  and an `error` outside that range reaches the caller as is (`fuse_simple_request`, dev.c v6.1 :512) [src], where
+  /dev/fuse refuses it (`fuse_dev_do_write`, dev.c v7.1 :2226).
+- **What remains the guest's exposure to a hostile server**, on every kernel without Linux's `error` checks above (all released ones
+  as of 2026-11-18), from the source (v6.1 fs/fuse/virtio_fs.c) [src]: (a) a successful reply shorter than a
+  request's fixed-size out arguments but with a correct `len`: the driver copies each fixed argument whole from
+  `argbuf`, which `virtio_fs_enqueue_req` allocated with `kmalloc` and filled only with the in arguments (:505), so
+  the guest kernel reads its own uninitialized heap as, for one, STATFS's answer. The commit with the `error` checks closes it in the
+  kernel (the response's length against `fuse_len_args` of the out arguments); the VMM does not check it, since that
+  needs each opcode's argument sizes. (b) what any FUSE server is trusted with (attributes, names, data). The host is
+  not exposed by either; the guest is, to its own kernel's handling.
 - **The server is lost** when its connection ends (EOF, EPIPE, ECONNRESET), a write or read fails, or it sends a
   frame that breaks a rule (a header the format refuses, a kind other than reply, a cookie no chain waits for or
   waits no more, a reply longer than its chain, a header mismatch above). Then every waiting chain with 16 writable
@@ -371,10 +384,12 @@ lay them out); fuzz target `fs_proxy`. No guest has used it yet (commit 12's boo
   Upstream's transports set that status only when an activation fails (transport/mmio.rs, transport/pci/device.rs),
   and a device has no call to set it; Linux's driver has no config-change handler that would act on it. Setting it
   would take a transport patch; the `-EIO` answers are what the guest sees instead.
-- A guest's reset of the device (a driver unbound and bound again) loses the server too: the FUSE session the
-  server holds belongs to the connection, and the chains waiting are no longer the guest's to write. Nothing is
-  written; the connection closes at the device's next event, and after a new activation every request fails with
-  `-EIO` (`test_reset_loses_the_server`). A device never activated keeps its connection.
+- **Limit (v1): a guest's reset of the device loses the server for the rest of the VMM's life.** A guest that
+  unbinds and binds the driver again, or kexecs into another kernel, has no share after it: every request fails
+  with `-EIO` until the microVM is started again. The FUSE session the server holds belongs to the connection, and
+  the chains waiting are no longer the guest's to write; nothing is written, and the connection closes at the
+  device's next event (`test_reset_loses_the_server`). A device never activated keeps its connection. Lifting it
+  would take a new server connection per activation (ROADMAP M7).
 - Patches: `VirtioDeviceType::Fs` (26), the `fs` feature and the metrics hook (patch 0056); `Cargo.lock` for
   wick-ext's dependencies (patch 0057). Metrics: `fs_<id>` in the metrics line's `wick` object, atomics only, read
   without the device's lock (`test_write_metrics_takes_no_device_lock`): requests, request_bytes, replies,
@@ -1497,8 +1512,9 @@ it means layer 1 let the request through.
     pair): `test_a_request_and_its_reply`, `test_server_death_fails_inflight_with_eio`,
     `test_no_reconnect_after_loss`, `test_server_hang_never_blocks_the_loop`, `test_hostile_chains`,
     `test_hostile_replies`, `test_reset_loses_the_server`, `test_hello_refusals`,
-    `test_write_metrics_takes_no_device_lock`; the header checks one by one in `copy.rs`
-    (`test_each_reply_header_mismatch_loses_the_server`). In a guest, on 6.1 and 6.18: the server killed mid-request
+    `test_write_metrics_takes_no_device_lock`, `test_a_writable_buffer_outside_guest_memory`; the header checks one
+    by one in `copy.rs` (`test_each_reply_header_mismatch_loses_the_server`,
+    `test_the_error_range_and_an_error_reply_s_length`). In a guest, on 6.1 and 6.18: the server killed mid-request
     → the guest's system call returns `EIO`, no hang (planned, plan commit 12's boot stage).
 
 ---

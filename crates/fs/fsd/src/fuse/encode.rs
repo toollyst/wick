@@ -359,6 +359,26 @@ mod tests {
         assert_eq!(&bytes[8..16], &0x0102_0304_0506_0708u64.to_le_bytes());
     }
 
+    /// Every error wick-fsd can answer is what the VMM's device lets through
+    /// (crates/ext/src/fs/copy.rs, Linux's virtio_fs_verify_response at
+    /// 5364d081125a): the header alone, `error` from -511 to -1. [`error`] is
+    /// the only builder of a reply with an error (`out_header` is private and
+    /// [`reply`] writes 0), and an [`Errno`] is one of the named ones.
+    #[test]
+    fn test_every_error_reply_is_a_16_byte_header_in_the_device_s_range() {
+        let mut named = 0;
+        for value in 0..4096 {
+            let Some(errno) = Errno::from_linux(value) else { continue };
+            named += 1;
+            let r = error(9, errno);
+            assert_eq!(r.len(), 16);
+            assert_eq!(u32::from_le_bytes(r[0..4].try_into().unwrap()), 16, "{errno:?}");
+            let e = i32::from_le_bytes(r[4..8].try_into().unwrap());
+            assert!((-511..=-1).contains(&e), "{errno:?}: {e}");
+        }
+        assert!(named > 30, "{named} errnos");
+    }
+
     #[test]
     fn test_reply_length_and_its_cap() {
         let a = [1u8; 10];
