@@ -30,6 +30,8 @@
 //! `windows_*.rs`, the list checked against the source directory, so a new
 //! module is read too): the reclaim runs this crate's code only, and the
 //! crate's other modules are macOS's, not built on Windows.
+//! `tools/check-probed-locks.py` checks the same rule on any host (CI's
+//! patches job, before any Windows build), with the same cases.
 //!
 //! In tests a held lock's deepest use of the stack is recorded (STACKLOCK
 //! max) by painting the stack already committed below the caller (up to
@@ -496,6 +498,8 @@ mod tests {
             "static T: OnceLock<Mutex<HashMap<c_int, Entry>>> = OnceLock::new();",
             "    static L: std::sync::RwLock<u8> = std::sync::RwLock::new(0);",
             "pub(crate) static M: Mutex<()> = Mutex::new(());",
+            // Built with a feature too: not the tests' own.
+            "#[cfg(any(test, feature = \"wick-test-hooks\"))]\npub(crate) static MOVE_HOOK: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);",
         ] {
             assert_eq!(unprobed_locks("case", case).len(), 1, "{case}");
         }

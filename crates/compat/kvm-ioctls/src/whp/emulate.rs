@@ -212,11 +212,30 @@ pub(crate) fn mmio(
     };
     #[cfg(any(test, feature = "whp-trace"))]
     ffi::trace::note("WHvEmulatorTryMmioEmulation", vp, &[], None, before, hres);
-    Ok(interpret(&ctx, hres))
+    // SAFETY: the emulator's status, written by the call; a plain `u32` view.
+    let status = unsafe { status.AsUINT32 };
+    #[cfg(test)]
+    LAST_STATUS.store(status, std::sync::atomic::Ordering::SeqCst);
+    Ok(interpret(&ctx, hres, status))
+}
+
+/// Tests: the `WHV_EMULATOR_STATUS` of the last MMIO emulation.
+#[cfg(test)]
+pub(crate) static LAST_STATUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether the emulator finished the instruction: the call succeeded and
+/// its status says so (`WHV_EMULATOR_STATUS` bit 0, `EmulationSuccessful`).
+/// The call's `S_OK` alone is not that: an instruction whose translation
+/// callback failed (`TranslateGvaPageCallbackFailed`, bit 4) comes back
+/// `S_OK`, unfinished, its RIP where it was (Learn, "WHvEmulatorTryMmioEmulation":
+/// the status is the emulation's result). Taken for finished, the vCPU ran
+/// the instruction again in the guest and read its device a second time.
+fn finished(hres: i32, status: u32) -> bool {
+    hres == S_OK && status & 1 == 1
 }
 
 /// Turns the post-call context into an [`Outcome`].
-fn interpret(ctx: &EmuCtx, hres: i32) -> Outcome {
+fn interpret(ctx: &EmuCtx, hres: i32, status: u32) -> Outcome {
     if let Some(asked) = ctx.mismatch {
         // SAFETY: `next_read` < `reads_len` when a mismatch is recorded.
         let given = unsafe { &*ctx.reads.add(ctx.next_read) };
@@ -233,7 +252,7 @@ fn interpret(ctx: &EmuCtx, hres: i32) -> Outcome {
             len: ctx.exit_len as usize,
             mmio: ctx.exit_mmio,
         },
-        _ if hres == S_OK => Outcome::Completed,
+        _ if finished(hres, status) => Outcome::Completed,
         _ => Outcome::Failed,
     }
 }
@@ -393,3 +412,18 @@ unsafe extern "system" fn translate_cb(
 /// them or'd (`WHV_TRANSLATE_GVA_FLAGS`).
 #[cfg(test)]
 pub(crate) static TRANSLATE_FLAGS_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An emulation is finished only with its status's EmulationSuccessful:
+    // S_OK with a failed translation callback (bit 4) is not.
+    #[test]
+    fn test_an_emulation_is_finished_by_its_status() {
+        assert!(finished(S_OK, 1));
+        assert!(!finished(S_OK, 1 << 4));
+        assert!(!finished(S_OK, 0));
+        assert!(!finished(E_FAIL, 1));
+    }
+}

@@ -71,6 +71,14 @@ jobs:
         run: |
           python3 tools/check-claims.py --selftest
           python3 tools/check-claims.py --strict-windows
+      # libc's test_wicks_memory_locks_are_all_probed reads source text, but
+      # runs only where libc's Windows code builds: the same rule here fails
+      # a lock of another kind before any Windows build (run 44287648054's
+      # MOVE_HOOK reached the windows job first).
+      - name: Wick's Windows locks are all probed
+        run: |
+          python3 -I tools/check-probed-locks.py --selftest
+          python3 -I tools/check-probed-locks.py
       # The pushed commits' messages: a same-build claim ("Linux and macOS are
       # unchanged", "trees unchanged") names tools/check-unit-graph.py, and a
       # "not weaker" its evidence (e756d504's untrue "trees unchanged"). History

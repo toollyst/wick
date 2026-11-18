@@ -5804,9 +5804,18 @@ pub(crate) fn moves_refused() -> u64 {
 
 /// Called in the middle of a chunk's move, between the copy and the swap:
 /// for tests (`test_the_jailers_count_does_not_rise_during_a_move`; other
-/// crates' through `wick_uffd::test_hooks`).
+/// crates' through `wick_uffd::test_hooks`). An `fn()` in a `usize`, 0 for
+/// none, as [`ALIAS_HOOK`], and kept until set again: no lock, so the move
+/// takes none the stack reclaim does not cover (a `Mutex` here was one,
+/// `test_wicks_memory_locks_are_all_probed`).
 #[cfg(any(test, feature = "wick-test-hooks"))]
-pub(crate) static MOVE_HOOK: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);
+static MOVE_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Sets [`MOVE_HOOK`]; `None` takes it away.
+#[cfg(any(test, feature = "wick-test-hooks"))]
+pub(crate) fn set_move_hook(hook: Option<fn()>) {
+    MOVE_HOOK.store(hook.map_or(0, |f| f as usize), std::sync::atomic::Ordering::SeqCst);
+}
 
 /// The move slot ([`MOVE_SLOT`]) and the move budget ([`UFFD_BUDGET`]),
 /// 0 for none, for tests.
@@ -6044,8 +6053,12 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, (start, end
     #[cfg(test)]
     moverec(6, moverec_commit());
     #[cfg(any(test, feature = "wick-test-hooks"))]
-    if let Some(hook) = *MOVE_HOOK.lock().unwrap() {
-        hook();
+    {
+        let hook = MOVE_HOOK.load(std::sync::atomic::Ordering::SeqCst);
+        if hook != 0 {
+            // SAFETY: only `fn()` values are stored (`set_move_hook`).
+            unsafe { core::mem::transmute::<usize, fn()>(hook)() };
+        }
     }
     // The chunk's alias's first view, unmapped keeping its placeholder: a
     // refusal changes nothing. The guest's views keep the old section until

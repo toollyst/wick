@@ -9320,12 +9320,18 @@ mod fpu_tests {
     /// the closed tables (`settle::NOACCESS_SEEN` rises: asserted, so the
     /// case is met and not passed by). As before (`settle::SETTLE_OFF`):
     /// the emulator's translation failed, and after the answered read
-    /// `exit::mmio_step` stopped the vCPU with `KVM_EXIT_INTERNAL_ERROR`,
-    /// which ends a Firecracker VM. Now: the translation waits for the move
-    /// and the instruction completes with the device's value in RAM, RSI
-    /// and RDI past it, the device read once, and the program goes on to
-    /// its `out`. SETTLEDMMIO lines, with the flags the emulator asked its
-    /// translations with.
+    /// `exit::mmio_step` stops the vCPU with `KVM_EXIT_INTERNAL_ERROR`,
+    /// which ends a Firecracker VM. That needs the emulator's status read:
+    /// its call answers `S_OK` with the translation callback failed, and
+    /// taken for finished (CI run 44287648054, the first run) the vCPU ran
+    /// the instruction again in the guest, waited for the move, and read
+    /// the device a second time (`emulate::finished`). Now: the translation
+    /// waits for the move (`settle::SETTLED` rises: asserted, so the
+    /// settled path made the result) and the instruction completes with
+    /// the device's value in RAM, RSI and RDI past it, the device read
+    /// once, and the program goes on to its `out`. SETTLEDMMIO lines, with
+    /// the flags the emulator asked its translations with and the status
+    /// of its last emulation.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_an_mmio_read_finishes_while_the_reclaim_moves_its_page_tables() {
@@ -9369,11 +9375,15 @@ mod fpu_tests {
             let first = one_run(&mut vcpu, &answer, &mut reads);
             super::super::emulate::TRANSLATE_FLAGS_SEEN.store(0, Ordering::SeqCst);
             let seen = super::super::settle::NOACCESS_SEEN.load(Ordering::SeqCst);
+            let settled_before = super::super::settle::SETTLED.load(Ordering::SeqCst);
             let ((second, took), chunks) = settled_hold(|| {
                 let t = std::time::Instant::now();
                 (one_run(&mut vcpu, &answer, &mut reads), t.elapsed())
             });
-            let met = super::super::settle::NOACCESS_SEEN.load(Ordering::SeqCst) > seen;
+            let noaccess = super::super::settle::NOACCESS_SEEN.load(Ordering::SeqCst) - seen;
+            let met = noaccess > 0;
+            let settled_now = super::super::settle::SETTLED.load(Ordering::SeqCst) - settled_before;
+            let status = super::super::emulate::LAST_STATUS.load(Ordering::SeqCst);
             let flags = super::super::emulate::TRANSLATE_FLAGS_SEEN.load(Ordering::SeqCst);
             drop(watchdog);
             let r = vcpu.get_regs().unwrap();
@@ -9381,8 +9391,8 @@ mod fpu_tests {
             let case = if settle { "settled" } else { "as before" };
             eprintln!(
                 "SETTLEDMMIO {case}: first {first}; the reclaim held, {chunks} chunk moved, the second run {second} after {} ms; \
-                 ERROR_NOACCESS met {met}; the emulator's translation flags {flags:#x}; RAM at {DATA:#x} {data:02x?}, RSI {:#x}, \
-                 RDI {:#x}; device reads {reads}",
+                 ERROR_NOACCESS met {met} ({noaccess} answers, {settled_now} settled); the emulator's translation flags {flags:#x}, \
+                 its last status {status:#x}; RAM at {DATA:#x} {data:02x?}, RSI {:#x}, RDI {:#x}; device reads {reads}",
                 took.as_millis(),
                 r.rsi,
                 r.rdi
@@ -9390,11 +9400,15 @@ mod fpu_tests {
             if first != "read 0x600000 x4" || chunks != 1 || !met {
                 wrong.push(format!("{case}: the case was not met: first {first}, {chunks} chunks moved, ERROR_NOACCESS met {met}"));
             } else if settle {
-                if !second.starts_with("out 0x80") || data != answer || (r.rsi, r.rdi) != (0x60_0004, DATA + 4) || reads != 1 {
+                if settled_now == 0 {
+                    wrong.push(format!("settled: no ERROR_NOACCESS answer was settled ({noaccess} met): the settled path ran nothing"));
+                } else if !second.starts_with("out 0x80") || data != answer || (r.rsi, r.rdi) != (0x60_0004, DATA + 4) || reads != 1 {
                     wrong.push(format!("settled: {second}, RAM {data:02x?}, RSI {:#x}, RDI {:#x}, reads {reads}", r.rsi, r.rdi));
                 }
-            } else if second != "InternalError" {
-                wrong.push(format!("as before: {second}, where the emulator's failure after a read stopped the vCPU"));
+            } else if second != "InternalError" || reads != 1 {
+                wrong.push(format!(
+                    "as before: {second}, device reads {reads}, status {status:#x}, where the emulator's failure after a read stops the vCPU"
+                ));
             }
             drop(vcpu);
             drop(vm);

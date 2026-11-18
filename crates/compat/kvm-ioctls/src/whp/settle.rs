@@ -117,8 +117,19 @@ pub(crate) fn translate(
     if SETTLE_OFF.load(std::sync::atomic::Ordering::SeqCst) {
         return first;
     }
-    settled(part, vp, ram, gva, flags).unwrap_or(first)
+    let settled = settled(part, vp, ram, gva, flags);
+    #[cfg(test)]
+    if settled.is_some_and(|a| a.hres == windows_sys::Win32::Foundation::S_OK) {
+        SETTLED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    settled.unwrap_or(first)
 }
+
+/// Tests: the `ERROR_NOACCESS` answers [`translate`] settled into a
+/// translation, so that a test can tell that the settled path, and not a
+/// first answer, made its result.
+#[cfg(test)]
+pub(crate) static SETTLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Tests: set, [`translate`] answers as before it settled anything (WHP's
 /// first answer), so that a test shows what its case did then.

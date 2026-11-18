@@ -225,8 +225,12 @@ has the per-control details and results.
   release; fixed in the commit that adds this entry). WHP's `WHvTranslateGva` walks the guest's page tables through the
   host memory behind guest RAM and does not fault it in: a table page missing in userfaultfd guest RAM, or in a chunk
   the reclaim is moving, fails the walk with `ERROR_NOACCESS` (TRANSLATEREC, the CI WHP step's record). The
-  instruction emulator's walk failing after a device read had been answered stopped the vCPU with
-  `KVM_EXIT_INTERNAL_ERROR`, and string I/O's failed the run; Firecracker ends the VM on either. Who could cause it:
+  instruction emulator's walk failing after a device read had been answered left the instruction unfinished, and the
+  backend took it for finished: the emulator's call answers `S_OK` with its status saying the translation callback
+  failed, and only the call's result was read, so the vCPU ran the instruction again in the guest and read the device
+  a second time (measured by the test below, as before; a device whose read has an effect, a FIFO's, had it twice),
+  where this entry first said `KVM_EXIT_INTERNAL_ERROR`, from the code; string I/O's walk failing failed the run, and
+  Firecracker ends the VM then. Who could cause it:
   both need guest memory registered with a userfaultfd (a snapshot restored with `mem_backend: Uffd`). The reclaim runs
   only at the job's memory limit (`memory.max`), on such chunks holding discarded pages: the host's memory pressure
   racing a guest's MMIO, or a guest that inflates its balloon near its limit while it does MMIO in a loop; the string
@@ -240,9 +244,13 @@ has the per-control details and results.
   own access would (committed, filled by the userfaultfd's handler, or the move waited for), holding none of the
   backend's locks (asserted in debug builds), and asks `WHvTranslateGva` again under the userfaultfd's, region
   table's, released ranges' and lazy memory's locks, so that nothing moves between the look and the call; past 16
-  looks the first answer stands, with a line (kvm-ioctls `whp/settle.rs`). The tests run each case as before and now:
+  looks the first answer stands, with a line (kvm-ioctls `whp/settle.rs`). The emulator's status is read too
+  (`emulate::finished`, `test_an_emulation_is_finished_by_its_status`): an emulation it did not finish after a device
+  read stops the vCPU with `KVM_EXIT_INTERNAL_ERROR`, as KVM stops on an emulation failure, and is not run again. The
+  tests run each case as before and now:
   `test_an_mmio_read_finishes_while_the_reclaim_moves_its_page_tables` (wick's reclaim held between its copy and its
-  swap; before `KVM_EXIT_INTERNAL_ERROR`, now the device's value in RAM) and
+  swap; before, with the status read, `KVM_EXIT_INTERNAL_ERROR` and the device read once, now the device's value in
+  RAM, with the settled answers counted: none settled fails it as a path not run) and
   `test_string_io_reads_through_a_page_table_page_missing_in_userfaultfd_memory` (before the run failed, now the
   handler fills the page and the OUT carries the byte), each asserting that its case was met;
   `test_translate_gva_while_page_tables_move_or_are_missing_on_record` asserts the settled walk for every flag set

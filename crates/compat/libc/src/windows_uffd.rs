@@ -3980,7 +3980,7 @@ pub mod test_hooks {
     /// closed, `PAGE_NOACCESS`, its accesses waiting for the move), on the
     /// reclaimer's thread with the asker's lock held; `None` takes it away.
     pub fn set_move_hook(hook: Option<fn()>) {
-        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = hook;
+        crate::windows_mm::set_move_hook(hook);
     }
 
     /// Sets the `fn()` a register's move of its mapping calls once, after
@@ -7271,7 +7271,7 @@ mod tests {
     static DEEP_GO: AtomicBool = AtomicBool::new(false);
     static TOUCH_GO: AtomicBool = AtomicBool::new(false);
 
-    /// [`windows_mm::MOVE_HOOK`]'s: holds the move (on the reclaim's
+    /// `windows_mm::MOVE_HOOK`'s: holds the move (on the reclaim's
     /// thread) until [`MOVE_GO`], which may never come.
     fn hold_the_move() {
         MOVE_HELD.store(true, Ordering::SeqCst);
@@ -7280,7 +7280,7 @@ mod tests {
         }
     }
 
-    /// [`windows_mm::MOVE_HOOK`]'s: the reclaim's own thread goes 128 KiB
+    /// `windows_mm::MOVE_HOOK`'s: the reclaim's own thread goes 128 KiB
     /// deep in the move's middle, past the 64 KiB committed at its start.
     fn deep_on_the_reclaimer() {
         MOVE_HELD.store(true, Ordering::SeqCst);
@@ -7323,7 +7323,7 @@ mod tests {
             // SAFETY: registered memory of ours.
             assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
         }
-        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = Some(if mode == DuringMove::Reclaimer { deep_on_the_reclaimer } else { hold_the_move });
+        crate::windows_mm::set_move_hook(Some(if mode == DuringMove::Reclaimer { deep_on_the_reclaimer } else { hold_the_move }));
         crate::windows_mm::REFUSE_STACK_RETRY.store(mode == DuringMove::Again, Ordering::SeqCst);
         if mode == DuringMove::Late {
             crate::windows_mm::STACK_HANDLER_HOOK.store(let_the_reclaim_end as fn() as usize, Ordering::SeqCst);
@@ -7369,7 +7369,7 @@ mod tests {
         let r = toucher.join().expect("the toucher failed");
         let v = deep_one.join().expect("the deep thread failed");
         give_back_every_page(&mut held);
-        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = None;
+        crate::windows_mm::set_move_hook(None);
         std::println!(
             "DURINGMOVE {mode:?}: {} chunk moved; the deep thread came back ({v}); {} stack page(s) had on the retry",
             r.chunks,
@@ -11673,7 +11673,7 @@ mod tests {
         let data = std::vec![0x5au8; len as usize];
         // SAFETY: `data` holds `len` bytes.
         assert_eq!(unsafe { copy(ctx, data.as_ptr(), mem, len, true) }.unwrap(), len);
-        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = Some(count_during_the_move);
+        crate::windows_mm::set_move_hook(Some(count_during_the_move));
         let moved = |budget: bool| -> (u64, u64) {
             assert!(crate::windows_mm::uffd_budget_for_tests(budget), "no move budget was made");
             for p in (0..CHUNK).step_by(2 * PAGE as usize) {
@@ -11701,7 +11701,7 @@ mod tests {
         std::println!("without it: {before} before the move, {during} during it");
         assert!(during >= before + (512 << 10), "without the budget the count rose by {} KiB only", during.saturating_sub(before) >> 10);
         assert!(crate::windows_mm::uffd_budget_for_tests(true));
-        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = None;
+        crate::windows_mm::set_move_hook(None);
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };
     }
@@ -12426,7 +12426,7 @@ mod tests {
         unsafe { ws::closesocket(sock(user)) };
     }
 
-    /// [`windows_mm::MOVE_HOOK`]'s: lets the reader read the moving chunk
+    /// `windows_mm::MOVE_HOOK`'s: lets the reader read the moving chunk
     /// and waits until its fault's handler is held.
     fn read_during_the_move() {
         READ_NOW.store(true, Ordering::SeqCst);
@@ -12459,7 +12459,7 @@ mod tests {
             // SAFETY: registered memory of ours.
             assert_eq!(unsafe { crate::madvise((mem + p) as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
         }
-        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = Some(read_during_the_move);
+        crate::windows_mm::set_move_hook(Some(read_during_the_move));
         EXCEPTION_HOOK.store(hold_the_handler as fn() as usize, Ordering::SeqCst);
         let reader = std::thread::spawn(move || {
             wait_for(&READ_NOW, "the move");
@@ -12474,7 +12474,7 @@ mod tests {
         RELEASED.store(true, Ordering::SeqCst);
         let got = reader.join().expect("the reader failed");
         EXCEPTION_HOOK.store(0, Ordering::SeqCst);
-        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = None;
+        crate::windows_mm::set_move_hook(None);
         std::println!("read back {got:#x}");
         assert_eq!(got, 0x5a);
         // SAFETY: closes the user end.
@@ -14979,7 +14979,7 @@ mod tests {
     /// in its prefault, before its turn ([`crate::windows_fd::BEFORE_TURN`]),
     /// a fill's reclaim moving its chunk meanwhile (the read in its prefault
     /// does not hold it), and the read let go during the move (held by
-    /// [`crate::windows_mm::MOVE_HOOK`] until the read has waited, 20 s at
+    /// `windows_mm::MOVE_HOOK` until the read has waited, 20 s at
     /// most): the read's turn waits for the move, then it reads the file's
     /// bytes into the moved chunk. Its other order, a call in its copy and
     /// then the move, is [`test_a_fill_waits_for_a_call_in_its_copy_then_reclaims`].
@@ -14997,7 +14997,7 @@ mod tests {
         assert_eq!(code, Some(0), "{text}");
     }
 
-    /// [`crate::windows_mm::MOVE_HOOK`]'s for
+    /// `windows_mm::MOVE_HOOK`'s for
     /// [`test_a_call_turning_to_its_copy_waits_for_a_move`]: lets the parked
     /// read go, then holds the move until the read's turn has waited.
     fn hold_the_move_for_a_turn() {
@@ -15051,14 +15051,14 @@ mod tests {
                 unsafe { copy(ctx, page.as_ptr(), fresh, PAGE, true) }
             },
         );
-        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = Some(hold_the_move_for_a_turn);
+        crate::windows_mm::set_move_hook(Some(hold_the_move_for_a_turn));
         let mut held = at_the_limit(2);
         TURN.store(1, Ordering::SeqCst);
         assert!(until(|| IN_WINDOW.load(Ordering::SeqCst)), "the read did not reach its turn");
         TURN.store(2, Ordering::SeqCst);
         let came = until(|| READ_RETURNED.load(Ordering::SeqCst) != i64::MIN);
         give_back_every_page(&mut held);
-        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = None;
+        crate::windows_mm::set_move_hook(None);
         let filled = filler.join().unwrap();
         r.join().unwrap();
         let n = READ_RETURNED.load(Ordering::SeqCst);
