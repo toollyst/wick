@@ -70,7 +70,7 @@ documented or measured; **measure** = the fix is designed, a measurement on the 
 | 17 | Snapshot with a live FUSE session | v1: snapshot refused with an API error naming virtio-fs (`snapshot_blocker` hook exists). Later: server state saved as paths and re-resolved beneath the root on restore | Snapshot create with fs → API error | now |
 | 18 | Feature off still adds attack surface | Cargo feature `fs`, default off; `wick-fsd` separate binary; no device/process/socket without config | Default build has no fs symbols; a planned boot-test stage `fs-off` shows no virtio device 26 | now |
 | 19 | Older macOS releases lack `O_RESOLVE_BENEATH` | Require the first macOS release that has the flag and refuse loudly on older ones (the same layers on every host, no reduced mode). **Which release that is is unconfirmed:** the flag is in the macOS 27.2 SDK's `sys/fcntl.h` (read 2026-11-13); this research read it in XNU's `bsd/sys/fcntl.h` from xnu-11417 on, which it took to be macOS 15.4; a third-party rsync patch says macOS 15 ([patch](https://sources.suse.com/SUSE:SLFO:1.1:Build/rsync/c0c245c4f613433f762b3dee895547b4/rsync-hardening-0021-syscall-also-use-O_RESOLVE_BENEATH-on-FreeBSD-and-Ma.patch)). 15.4 is used below as that working assumption, not as a settled floor | macOS 15 CI job: fs starts where the flag works and refuses below | measure on macOS 15 |
-| 20 | Linux host with unprivileged user namespaces disabled (Ubuntu AppArmor) | Start wick-fsd from root, which confines and drops to an unprivileged uid with no capabilities, as the jailer does; otherwise refuse loudly | Run with userns disabled: refuses without root, confined with root. `test_userns_restricted_refused` (as a user where the host restricts user namespaces, as CI's Ubuntu does, run 44207018536); the root path is every confined test run as root (CI's fs job's sudo step); user-namespace path: Docker on the Mac only (§6.1), and the fs job's AppArmor-profile step, which no run has passed yet | now |
+| 20 | Linux host with unprivileged user namespaces disabled (Ubuntu AppArmor) | Start wick-fsd from root, which confines and drops to an unprivileged uid with no capabilities, as the jailer does, or as a user under an AppArmor profile that grants the wick-fsd binary `userns` alone (§6.1); otherwise refuse loudly, naming the sysctl and AppArmor profile the host reads | Run with userns disabled: refuses without root, confined with root. `test_userns_restricted_refused` (as a user where the host restricts user namespaces, as CI's Ubuntu does, run 44207018536); the root path is every confined test run as root (CI's fs job's sudo step); user-namespace path: the fs job's AppArmor-profile step, the confined tests as the runner's user under a profile granting wick-fsd `userns` (first full pass CI run 44238015541, both Ubuntu runners; §6.1 has the profile), and Docker on the Mac; the refusal names the sysctl and the AppArmor profile it reads (`test_the_refusal_names_the_restriction_it_reads`) | now |
 | 21 | Guest kernel lacks the driver | Upstream CI configs have `CONFIG_FUSE_FS=y`, `# CONFIG_VIRTIO_FS is not set`; wick's guest kernels add `CONFIG_VIRTIO_FS=y` (built: `tools/linux/guest-kernel.sh` with the fragment `tools/linux/guest-kernel-virtio-fs.config`, CI's `guest-kernels` job) | Guest boot with fs mounts the share | now |
 
 | 22 | Performance cost of the separate server | Measured 2026-11-13 on a MacBookPro18,3, macOS 27.2, **load average 53–79** (so upper bounds; re-measure idle with a concurrent control): AF_UNIX round trip 128 B ≈ 7.6–7.9 µs median; 1 MiB through the socket 267–409 µs (≈ 2.6–3.9 GB/s); host `fstatat` 0.8 µs, `openat`+`close` 7.2 µs, create+4 KiB write+close 64 µs; memcpy 41.7 GB/s (benchmark: a C program, not in the repository; AF_UNIX stream socketpair between two processes, medians of 20,000 round trips for 128 B and 4 KiB and of 2,000 for 128 KiB and 1 MiB, two runs; the busy machine also gave p99s from 0.4 to 5.4 ms). Small ops: the hop is about one host open; vhost-user on macOS/Windows also wakes the VMM (no in-kernel ioeventfd: wick's eventfds are pipes, docs/PORTING.md) [inf], so its round-trip cost is similar and the split's real extra is the data copy. Large I/O: replace the socket payload with a fixed-size shared ring between VMM and server (never guest memory; bounded and counted, since shared sections escape the Windows Job limit): one memcpy at ~40 GB/s ≈ 25 µs/MiB, socket only for notifications. Guest page cache and attr/entry timeouts keep repeated lookups in the guest | Benchmarks per host: fio seq 1 MiB read/write, untar of a kernel tree, `git status` on a large repo, `npm install`; split vs virtiofsd (Linux) and vs an in-VMM prototype; acceptance target set from the Linux virtiofsd number | measure |
@@ -818,19 +818,39 @@ it means layer 1 let the request through.
       ([V-257816](https://stigviewer.com/stig/red_hat_enterprise_linux_9/2023-12-01/finding/V-257816)) [doc].
 
     What an operator does: start wick-fsd as root with `--uid`/`--gid`, as the jailer will (decision 6): the
-    supported path, which every confined test runs as root on CI. An AppArmor profile that grants `userns` to the
-    wick-fsd binary alone (`flags=(unconfined)`, Ubuntu's way for a program that needs user namespaces) lets it start
-    unprivileged on Ubuntu: the CI fs job now loads one for the built wick-fsd and `confine_probe` by path, runs the
-    confined tests as the runner's user with `WICK_FS_TEST_USERNS_GRANTED=1`, and removes the profile whatever
-    happened. `tools/linux/fs-userns-check.py` gives the step's verdict from each binary's whole output: every binary
+    supported path, which every confined test runs as root on CI. The tested alternative on Ubuntu is an AppArmor
+    profile that grants `userns` to the wick-fsd binary alone, by its absolute path, and nothing else
+    (`flags=(unconfined)`, Ubuntu's way for a program that needs user namespaces); wick-fsd then starts as the
+    operator's user and confines itself in a user namespace of its own:
+
+    ```text
+    abi <abi/4.0>,
+    include <tunables/global>
+
+    profile wick-fsd /absolute/path/to/wick-fsd flags=(unconfined) {
+      userns,
+    }
+    ```
+
+    loaded with `sudo apparmor_parser -r FILE` (or as `/etc/apparmor.d/wick-fsd`, which loads at boot) and removed
+    with `sudo apparmor_parser -R FILE`. The CI fs job loads this profile for the built wick-fsd and `confine_probe`,
+    runs the confined tests as the runner's user with `WICK_FS_TEST_USERNS_GRANTED=1`, and removes it whatever
+    happened; `tools/linux/fs-userns-check.py` gives the step's verdict from each binary's whole output: every binary
     passed, none ran nothing confined, and each other "ran nothing" line is one it knows, printed with why it is not a
-    confined test left unconfined (a root-only read, the root-only id drop, the restricted host's refusal test). In CI
-    run 44233741878 the server's 23 tests passed under the profile as the runner's user on both Ubuntu runners, the
-    five `test_the_child_s_*` reaching the child's step; the step then failed on its own filter: no line of
-    confine_probe's output matched it, so `grep` exited 1 under `pipefail`, confine_probe's result was lost with its
-    output, and the corpus and link sequences never ran. Until a run has passed the whole step the path is not supported; then its profile text goes
-    here as the tested alternative. wick never asks an operator to turn a host-wide restriction off: it guards every
-    program on the host.
+    confined test left unconfined (a root-only read, the root-only id drop, the restricted host's refusal test). CI
+    run 44238015541 is its first full pass, on ubuntu-latest (Ubuntu 26.04) and ubuntu-24.04-arm: the server's 23
+    tests, `confine_probe`'s 18 cases, the corpus's 2 and the link sequences' 18, as the runner's user under the
+    profile (in 44233741878 the server's tests had passed and the step failed on its own output filter, since
+    replaced). Without such a grant, wick-fsd started as a user on a restricted host refuses at its user namespace's
+    first step that fails, and names what the host says restricts it, read, never guessed from the errno: each
+    sysctl that does (`kernel.apparmor_restrict_unprivileged_userns = 1`, `user.max_user_namespaces = 0`,
+    `kernel.unprivileged_userns_clone = 0`) and the AppArmor profile Ubuntu put the process in
+    (`/proc/self/attr/apparmor/current`, `unprivileged_userns (enforce)` on both runners after `unshare`, run
+    44233741878), then "start wick-fsd as root with --uid and --gid, or grant this binary user namespaces with an
+    AppArmor profile" (`userns_restriction`, `test_the_restriction_is_named_as_read`; one sysctl at a time, the
+    server started as 65534 with a stand-in for it bound over `/proc/sys` under the simulated restriction:
+    `test_the_refusal_names_the_restriction_it_reads`; the host's own in `test_userns_restricted_refused`). wick
+    never asks an operator to turn a host-wide restriction off: it guards every program on the host.
   - Landlock first appeared in Linux 5.13 [doc], and upstream supports 5.10 hosts (docs/kernel-policy.md) [src], so it
     is an added layer, never the only one.
   - **As built** (`crates/fs/fsd/src/confine/linux.rs`, the calls in `crates/fs/sys/src/unix/confine.rs`), after

@@ -994,6 +994,51 @@ pub mod nr {
     pub const CLOSE_RANGE: c_long = libc::SYS_close_range;
 }
 
+/// Has `cmd`'s child, started by root, run in a mount namespace of its own
+/// in which each `(from, onto)` is bind-mounted, then as `uid`/`gid` with no
+/// supplementary group: the tests' way to give wick-fsd a stand-in for a
+/// host file it reads (a sysctl beneath `/proc/sys`) without changing the
+/// host's.
+pub fn command_as_user_with_binds(cmd: &mut std::process::Command, uid: u32, gid: u32, binds: &[(&Path, &Path)]) {
+    use std::os::unix::process::CommandExt;
+    let binds: Vec<(CString, CString)> = binds
+        .iter()
+        .map(|(from, onto)| {
+            (
+                CString::new(from.as_os_str().as_bytes()).unwrap_or_default(),
+                CString::new(onto.as_os_str().as_bytes()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let closure = move || {
+        let fail = || Err(std::io::Error::last_os_error());
+        // SAFETY: async-signal-safe calls with NUL-terminated strings made
+        // before the fork, or null where the call takes none.
+        unsafe {
+            if libc::unshare(libc::CLONE_NEWNS) < 0
+                || libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null())
+                    < 0
+            {
+                return fail();
+            }
+            for (from, onto) in &binds {
+                if libc::mount(from.as_ptr(), onto.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) < 0 {
+                    return fail();
+                }
+            }
+            if libc::setgroups(0, std::ptr::null()) < 0 || libc::setresgid(gid, gid, gid) < 0 || libc::setresuid(uid, uid, uid) < 0 {
+                return fail();
+            }
+        }
+        Ok(())
+    };
+    // SAFETY: the closure makes only async-signal-safe system calls and
+    // allocates nothing (its strings were made before).
+    unsafe {
+        cmd.pre_exec(closure);
+    }
+}
+
 /// Has `cmd`'s child install `program` (after `no_new_privs`) before it
 /// runs its program: the tests' way to make one of wick-fsd's steps fail.
 pub fn command_with_filter(cmd: &mut std::process::Command, program: Vec<Insn>) {

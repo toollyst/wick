@@ -676,6 +676,68 @@ fn test_landlock_absent_is_logged() {
     assert!(err.contains("confined (namespaces, pivot_root, no capabilities, no_new_privs, seccomp)"), "{err}");
 }
 
+/// The refusal of a host that restricts user namespaces names what the
+/// host says (design-fs row 20), one sysctl at a time, and nothing where it
+/// says nothing: as root, the test gives the server a mount namespace in
+/// which `/proc/sys/kernel` and `/proc/sys/user` are stand-ins holding that
+/// sysctl alone, starts it as 65534 (so it makes a user namespace) under the
+/// simulated restriction (its setgroups write refused, EACCES), and reads
+/// the refusal.
+#[test]
+fn test_the_refusal_names_the_restriction_it_reads() {
+    if sys_euid() != 0 {
+        eprintln!("ran nothing: a stand-in for a sysctl is bound over /proc/sys as root (the sudo step runs it)");
+        return;
+    }
+    const NAMES: [&str; 3] =
+        ["kernel.apparmor_restrict_unprivileged_userns", "user.max_user_namespaces", "kernel.unprivileged_userns_clone"];
+    for (tag, file, value) in [
+        ("srv-names-apparmor", "kernel/apparmor_restrict_unprivileged_userns", "1"),
+        ("srv-names-max", "user/max_user_namespaces", "0"),
+        ("srv-names-clone", "kernel/unprivileged_userns_clone", "0"),
+        ("srv-names-none", "user/max_user_namespaces", "58304"),
+    ] {
+        let s = setup(tag);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&s.base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let stand_in = s.base.join("proc-sys");
+        for d in ["kernel", "user"] {
+            std::fs::create_dir_all(stand_in.join(d)).unwrap();
+        }
+        std::fs::write(stand_in.join(file), format!("{value}\n")).unwrap();
+        // The server is not root here: no --uid/--gid, and the test (root)
+        // is its peer.
+        let mut args = base_args(&s.share, &s.socket);
+        let at = args.iter().position(|a| a == "--uid").unwrap();
+        args.drain(at..at + 4);
+        args.extend(["--peer-uid", "0"].map(String::from));
+        let (kernel, user) = (stand_in.join("kernel"), stand_in.join("user"));
+        let server = Server::start(&args, |cmd| {
+            c::command_as_user_with_binds(
+                cmd,
+                65534,
+                65534,
+                &[(&kernel, std::path::Path::new("/proc/sys/kernel")), (&user, std::path::Path::new("/proc/sys/user"))],
+            );
+            c::command_with_filter(cmd, c::simulated_userns_restriction());
+        });
+        let Err((mut server, _)) = Remote::connect(server) else {
+            panic!("{tag}: served with its setgroups write refused");
+        };
+        let (status, err) = server.wait();
+        assert!(!status.success() && is_userns_refusal(&err), "{tag}: {err}");
+        let named = NAMES.iter().find(|n| file.replace('/', ".") == **n).unwrap();
+        if tag == "srv-names-none" {
+            // Nothing beneath /proc/sys says so; the AppArmor label may
+            // (a host whose restriction is real, as CI's sudo step's).
+            assert!(NAMES.iter().all(|n| !err.contains(n)), "{tag}: {err}");
+        } else {
+            assert!(err.contains(&format!("This host restricts unprivileged user namespaces ({named} = {value}")), "{tag}: {err}");
+            assert!(err.contains("start wick-fsd as root with --uid and --gid"), "{tag}: {err}");
+        }
+    }
+}
+
 /// A host that restricts user namespaces refuses a server that is not root,
 /// naming the restriction's settings (design-fs row 20).
 #[test]
@@ -692,4 +754,17 @@ fn test_userns_restricted_refused() {
     let (status, err) = server.wait();
     assert!(!status.success());
     assert!(is_userns_refusal(&err), "{restricted}: not a user namespace's refusal: {err}");
+    // What the host says is named in the refusal: here, as the test reads
+    // it, each sysctl that restricts (a simulated restriction has none).
+    for (file, name, restricted) in [
+        ("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "kernel.apparmor_restrict_unprivileged_userns", "1"),
+        ("/proc/sys/user/max_user_namespaces", "user.max_user_namespaces", "0"),
+        ("/proc/sys/kernel/unprivileged_userns_clone", "kernel.unprivileged_userns_clone", "0"),
+    ] {
+        if std::fs::read_to_string(file).is_ok_and(|v| v.trim() == restricted) {
+            assert!(err.contains(&format!("{name} = {restricted}")), "{restricted}: {err}");
+            assert!(err.contains("start wick-fsd as root with --uid and --gid"), "{err}");
+        }
+    }
+    eprintln!("refused as it must: {err}");
 }

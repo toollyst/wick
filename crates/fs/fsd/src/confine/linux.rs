@@ -69,6 +69,49 @@ fn refuse(step: &str, e: sys::HostErrno) -> Refusal {
     Refusal(format!("confinement: {step} failed ({e:?}); wick-fsd does not serve unconfined"))
 }
 
+/// A step of the user namespace of a server that is not root failed: the
+/// refusal, with what this host says restricts user namespaces where it
+/// says so ([`userns_restriction`], read, never guessed from the errno).
+fn userns_refused(step: &str, e: sys::HostErrno) -> Refusal {
+    let mut r = refuse(step, e);
+    let read = userns_restriction(Path::new("/proc/sys"), Path::new("/proc/self/attr/apparmor/current"));
+    if !read.is_empty() {
+        r.0.push_str(&format!(
+            ". This host restricts unprivileged user namespaces ({}): start wick-fsd as root with --uid and --gid, \
+             or grant this binary user namespaces with an AppArmor profile (docs/design-fs.md §6.1)",
+            read.join("; ")
+        ));
+    }
+    r
+}
+
+/// What this host says restricts unprivileged user namespaces, each as
+/// read: the sysctls beneath `proc_sys` (Ubuntu's
+/// `kernel.apparmor_restrict_unprivileged_userns` = 1, upstream's
+/// `user.max_user_namespaces` = 0, Debian's
+/// `kernel.unprivileged_userns_clone` = 0) and this process's AppArmor
+/// label at `label`, which Ubuntu sets to `unprivileged_userns` for a
+/// process whose new user namespace it restricts (read so after `unshare`
+/// on GitHub's Ubuntu runners: CI run 44233741878's fs jobs). A file that
+/// is not there or says otherwise names nothing.
+pub fn userns_restriction(proc_sys: &Path, label: &Path) -> Vec<String> {
+    let read = |p: &Path| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string());
+    let mut said = Vec::new();
+    for (file, name, restricted) in [
+        ("kernel/apparmor_restrict_unprivileged_userns", "kernel.apparmor_restrict_unprivileged_userns", "1"),
+        ("user/max_user_namespaces", "user.max_user_namespaces", "0"),
+        ("kernel/unprivileged_userns_clone", "kernel.unprivileged_userns_clone", "0"),
+    ] {
+        if read(&proc_sys.join(file)).as_deref() == Some(restricted) {
+            said.push(format!("{name} = {restricted}"));
+        }
+    }
+    if let Some(l) = read(label).filter(|l| l.starts_with("unprivileged_userns")) {
+        said.push(format!("this process is in AppArmor's profile {l}"));
+    }
+    said
+}
+
 /// The child's end of the pipe its parent holds: [`lock`] arms the
 /// parent-death signal again with it after the ids change.
 #[derive(Debug)]
@@ -102,19 +145,15 @@ pub fn enter<T>(
     }
     let (uid, gid) = (sys::euid(), sys::gid());
     c::unshare(!root_user).map_err(|e| {
-        let mut r = refuse("unshare of the namespaces", e);
-        if !root_user {
-            r.0.push_str(
-                ". Unprivileged user namespaces may be disabled on this host (user.max_user_namespaces, or \
-                 Ubuntu's kernel.apparmor_restrict_unprivileged_userns); run wick-fsd as root with --uid/--gid \
-                 instead",
-            );
+        if root_user {
+            refuse("unshare of the namespaces", e)
+        } else {
+            userns_refused("unshare of the namespaces", e)
         }
-        r
     })?;
     if !root_user {
         let write = |file: &str, what: String| {
-            std::fs::write(file, what).map_err(|e| refuse(file, sys::HostErrno(e.raw_os_error().unwrap_or(5))))
+            std::fs::write(file, what).map_err(|e| userns_refused(file, sys::HostErrno(e.raw_os_error().unwrap_or(5))))
         };
         write("/proc/self/setgroups", "deny".into())?;
         write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
@@ -394,6 +433,39 @@ mod tests {
         read_only: false,
         drop_to: None,
     };
+
+    #[test]
+    fn test_the_restriction_is_named_as_read() {
+        let base = std::env::temp_dir().join(format!("wick-fsd-userns-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sys = base.join("sys");
+        std::fs::create_dir_all(sys.join("kernel")).unwrap();
+        std::fs::create_dir_all(sys.join("user")).unwrap();
+        let label = base.join("current");
+        let none: Vec<String> = Vec::new();
+        assert_eq!(userns_restriction(&sys, &label), none, "nothing there");
+        let set = |f: &str, v: &str| std::fs::write(sys.join(f), format!("{v}\n")).unwrap();
+        set("kernel/apparmor_restrict_unprivileged_userns", "0");
+        set("user/max_user_namespaces", "58304");
+        set("kernel/unprivileged_userns_clone", "1");
+        std::fs::write(&label, "unconfined\n").unwrap();
+        assert_eq!(userns_restriction(&sys, &label), none, "each says it is not restricted");
+        for (f, v, named) in [
+            ("kernel/apparmor_restrict_unprivileged_userns", "1", "kernel.apparmor_restrict_unprivileged_userns = 1"),
+            ("user/max_user_namespaces", "0", "user.max_user_namespaces = 0"),
+            ("kernel/unprivileged_userns_clone", "0", "kernel.unprivileged_userns_clone = 0"),
+        ] {
+            let was = std::fs::read_to_string(sys.join(f)).unwrap();
+            set(f, v);
+            assert_eq!(userns_restriction(&sys, &label), [named]);
+            std::fs::write(sys.join(f), was).unwrap();
+        }
+        std::fs::write(&label, "unprivileged_userns (enforce)\n").unwrap();
+        assert_eq!(userns_restriction(&sys, &label), ["this process is in AppArmor's profile unprivileged_userns (enforce)"]);
+        set("kernel/apparmor_restrict_unprivileged_userns", "1");
+        assert_eq!(userns_restriction(&sys, &label).len(), 2);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn test_descriptors_held_exactly() {

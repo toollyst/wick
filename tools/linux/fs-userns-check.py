@@ -25,6 +25,11 @@ import sys
 # that are not a confined test left unconfined, each with why.
 KNOWN = [
     (
+        "ran nothing: a stand-in for a sysctl is bound over /proc/sys as root",
+        "test_the_refusal_names_the_restriction_it_reads binds a stand-in sysctl in a mount namespace and starts "
+        "the server as 65534, which needs root; it is a refusal test, and the sudo step runs it",
+    ),
+    (
         "ran nothing: /proc/<pid>/fd of a server that is not dumpable needs root",
         "test_descriptors_it_was_started_with_are_closed reads the server's descriptors from outside, which a "
         "server that is not dumpable shows to root only; the server served, so its own read-back of its "
