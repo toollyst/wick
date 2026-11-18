@@ -63,9 +63,11 @@
   the `srvsvc` pipe through `\Device\Mup`, the LanMan redirector and a UNC
   name, and the RDP client drives, opened in the jail with `--netns` first,
   then in the jail, then from `jail-probe low` (the operator's token at low
-  integrity, not restricted), then by the operator (the control, last), each
-  open's NTSTATUS or granted access recorded, with the SMB client's
-  connections before each run, the server's sessions and open files and the
+  integrity, not restricted), then by the operator (the control), then in
+  the jail again on the sessions those two left (a desktop with mapped
+  drives; with the share made, the stage fails if no connection to it is
+  there), each open's NTSTATUS or granted access recorded, with the SMB
+  client's connections before each run, the server's sessions and open files and the
   SMB server's and client's event-log entries after each; with
   `-ReachSmbShare` (elevated; CI passes it) also a share the stage makes for
   the run, read granted to Everyone over a directory holding only a canary,
@@ -126,7 +128,10 @@
   job's: `Grant-JailRead` gives a made-up jail SID, S-1-9 and four random
   sub-authorities, read alone, its DACL read back, and `Stop-Jailers` finds
   a jailed process a stand-in jailer starts after its first look and lets
-  the stand-in exit by itself; first run: CI); and a check that every
+  the stand-in exit by itself; with `-ReachSmbShare`, as CI passes it,
+  reach's share probe in the runs that need no jailer, `jail-probe medium`,
+  the UAC-filtered token at medium integrity, among them; it passed in CI
+  at 58c37ba2, before the medium run was added); and a check that every
   jail's drive letter was removed. It needs the boot test's guest files (`-Assets`,
   default `C:\wbt`) and the probe (`jail-probe.exe` from the kit, or
   `rustc` to build it):

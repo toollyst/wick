@@ -1077,8 +1077,13 @@ function Get-SmbAll([string[]]$ls, [string]$prefix, [string]$who, [string]$share
 # (docs/windows-jail-reach.md: what each outcome means). After each run
 # the server's sessions and open files (Get-SmbSession, Get-SmbOpenFile)
 # and the SMB server's and client's event-log entries of the run's window
-# are recorded. The share and its directory are removed when the stage
-# ends, and the stage fails if the share is still there.
+# are recorded. Last, the jail again, on the sessions and tree connects the
+# low-integrity run and the operator left behind (the jail's token shares
+# the operator's logon session, by which the SMB client keeps them): a
+# desktop with mapped drives, where the first jailed runs had nothing to
+# reuse; with the share made, the stage fails if no connection to it is
+# there for that run. The share and its directory are removed when the
+# stage ends, and the stage fails if the share is still there.
 # The records are kept as reach-record.txt and reach-objects.txt in the
 # work directory, which CI's upload takes. It asserts nothing of what is
 # reached, only that the record is whole: the list made, the jailed probe's
@@ -1114,7 +1119,7 @@ function Stage-Reach([string]$External = '8.8.8.8:53') {
         # First, the jail with a network of its own: --netns's filters are
         # the jail's token's, and a redirector's connection is the system's.
         # The record is kept in the order things happened.
-        $record = @("smb-order: the jailed run with --netns, the jailed run, the low-integrity run, the operator's control") + $shareLines
+        $record = @("smb-order: the jailed run with --netns, the jailed run, the low-integrity run, the operator's control, the jailed run on the user's sessions") + $shareLines
         $connLines = @()
         if ($elevated) {
             $connLines += Get-SmbConns 'before the --netns run'
@@ -1156,23 +1161,42 @@ function Stage-Reach([string]$External = '8.8.8.8:53') {
         $control = @(& $probe @(Get-SmbChecks $shareName @()) | Where-Object { $_ } | ForEach-Object { "operator: $_" })
         $record += @($head) + $control
         $record += Get-SmbServerRecord "the operator's control" $t0 (Get-Date)
-        $connLines += Get-SmbConns "after the operator's control"
+        $connLines += Get-SmbConns "after the operator's control, before the jailed run on the user's sessions"
+        $record += $connLines[-1]
+        # Then the jail again, on the sessions and tree connects the
+        # low-integrity run and the operator left (a desktop with mapped
+        # drives): the jail's token shares the operator's logon session, the
+        # key the SMB client keeps its sessions by. With the share made, a
+        # connection to it must be there, or the run would not be the
+        # measurement it is named; the same checks as the first jailed run's
+        # SMB ones, and the token's restricting SIDs.
+        $before = @(try { @(Get-SmbConnection -ErrorAction Stop) } catch { @() })
+        $toShare = @($before | Where-Object { $shareName -and $_.ShareName -eq $shareName })
+        $record += "smb-reuse: the jailed run on the user's sessions finds $($before.Count) connections, $(if ($toShare.Count) { "the share's among them" } else { 'none to the share' })"
+        $t0 = Get-Date
+        $u = Invoke-Jailer (@('--id', 'u', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', 'restricted:0') + (Get-SmbChecks $shareName @())) 300000
+        $reuseLines = @(@($u[1] -split "`r?`n" | Where-Object { $_ }) | ForEach-Object { "reuse: $_" })
+        $record += $reuseLines
+        $record += Get-SmbServerRecord 'the jailed run on the user''s sessions' $t0 (Get-Date)
+        $connLines += Get-SmbConns "after the jailed run on the user's sessions"
         $record += $connLines[-1]
         foreach ($l in $record) { Write-Host "     $l" }
         # Kept for CI's upload (the stage's own directory goes when it passes).
         Set-Content -Path (Join-Path $WorkDir 'reach-record.txt') -Value $record
         Copy-Item (Join-Path $root 'objects.txt') (Join-Path $WorkDir 'reach-objects.txt') -ErrorAction SilentlyContinue
+        if ($shareName) { Check ($toShare.Count -gt 0) "no connection to \\127.0.0.1\$shareName after the operator's control, so the jailed run on the user's sessions had none to run on: $($connLines[-2])" }
         $smbControl = Get-SmbAll $control 'operator: ' 'the operator' $shareName
         $smbJailed = Get-SmbAll $lines '' 'jailed' $shareName
         $smbLow = Get-SmbAll $lowLines 'low: ' 'the low-integrity run' $shareName
         $smbNet = if ($elevated) { Get-SmbAll $netLines 'netns: ' 'jailed with --netns' $shareName } else { 'not run, not elevated' }
+        $smbReuse = Get-SmbAll $reuseLines 'reuse: ' "jailed on the user's sessions" $shareName
         $done = $lines | Where-Object { $_ -match '^reach:\S+ done \d+ of \d+ names reached$' } | Select-Object -First 1
         Check ($r[0] -eq 0 -and $done) "the jailed record did not end: exit $($r[0]): $(($lines | Select-Object -Last 3) -join ' | ')"
         $summary = @($lines | Where-Object { $_.StartsWith('reach-summary ') } | ForEach-Object { $_.Substring('reach-summary '.Length) })
         Check ($summary.Count -gt 0) 'the jailed record has no reach-summary line'
         $checks = @($lines | Where-Object { $_.StartsWith('reach-check ') })
         $sids = $lines | Where-Object { $_.StartsWith('restricted:0 ') } | Select-Object -First 1
-        "a record, nothing asserted, under a token whose restricting SIDs are $($sids -replace '^restricted:0 allowed ', ''): the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks; SMB ($serverState; $shares; $($shareLines -join '; ')), in this order: jailed with --netns $smbNet; jailed $smbJailed; low integrity $smbLow; the operator $smbControl; $($connLines -join '; ')"
+        "a record, nothing asserted, under a token whose restricting SIDs are $($sids -replace '^restricted:0 allowed ', ''): the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks; SMB ($serverState; $shares; $($shareLines -join '; ')), in this order: jailed with --netns $smbNet; jailed $smbJailed; low integrity $smbLow; the operator $smbControl; jailed on the user's sessions ($($toShare.Count) to the share of $($before.Count) connections) $smbReuse; $($connLines -join '; ')"
     } finally {
         $listener.Stop()
         Stop-Jailed
@@ -3091,9 +3115,11 @@ $OwnConsole = @('pidns')
 # - With -ReachSmbShare (elevated; CI's windows job passes it), reach's
 #   share probe in the runs of it that need no jailer: the share made by
 #   New-ReachShare, its access and the canary's ACL checked to grant
-#   Everyone, the SMB client's connections, jail-probe low and the
-#   operator's jail-probe opening it and C$ by every form (each record must
-#   end; what opens is printed, not asserted), the operator's own read of
+#   Everyone, the SMB client's connections, jail-probe low, jail-probe
+#   medium (the UAC-filtered token at medium integrity, asserted to be
+#   that by its token:0 line) and the operator's jail-probe opening it and
+#   C$ by every form (each record must end; what opens is printed, not
+#   asserted), the operator's own read of
 #   the canary through \\127.0.0.1 (asserted: the share is served), the
 #   server's record of the window, and Remove-ReachShare. jail-probe is the
 #   kit's or built with rustc (Get-Probe).
@@ -3139,20 +3165,39 @@ function Stage-Helpers {
         $record += Get-SmbConns 'before the low-integrity run'
         $t0 = Get-Date
         $low = @(& $probe low @(Get-SmbChecks $name @()) | Where-Object { $_ } | ForEach-Object { "low: $_" })
+        $record += $low
+        $record += Get-SmbConns 'after the low-integrity run, before the medium-integrity run'
+        # jail-probe medium: this elevated token filtered as UAC filters an
+        # administrator's (CreateRestrictedToken with LUA_TOKEN and
+        # DISABLE_MAX_PRIVILEGE: the administrators for deny only, no
+        # privilege but SeChangeNotify) at medium integrity, not restricted;
+        # its token:0 line must say so. Made from this token, it keeps this
+        # logon session, where UAC's filtered token has a logon session of
+        # its own, so its opens go on the sessions the low-integrity run
+        # left and are granted as those sessions' user is: it tells whether
+        # the low run's 0xc0000201 is a rule of integrity below medium or
+        # not, not what a separate medium user is granted.
+        $m = Invoke-Medium (@($probe, 'token:0') + @(Get-SmbChecks $name @())) 120000
+        $medium = @(@($m[1] -split "`r?`n" | Where-Object { $_ }) | ForEach-Object { "medium: $_" })
+        $record += $medium
+        $record += Get-SmbConns "after the medium-integrity run, before the operator's"
         $op = @(& $probe @(Get-SmbChecks $name @()) | Where-Object { $_ } | ForEach-Object { "operator: $_" })
         $read = try { "$(Get-Content -LiteralPath "\\127.0.0.1\$name\canary.txt" -ErrorAction Stop)" } catch { "refused: $($_.Exception.Message)" }
-        $server = @(Get-SmbServerRecord 'the low-integrity run and the operator' $t0 (Get-Date))
-        $record += $low + $op + $server
+        $server = @(Get-SmbServerRecord 'the low- and medium-integrity runs and the operator' $t0 (Get-Date))
+        $record += $op + $server
         $record += Get-SmbConns 'after the operator'
         foreach ($l in $record) { Write-Host "     $l" }
         Check ($read -eq $SmbCanary) "the operator's read of \\127.0.0.1\$name\canary.txt: $read"
         Check ($server.Count -eq $SmbChannels.Count + 2) "Get-SmbServerRecord gave $($server.Count) lines, not $($SmbChannels.Count + 2): $($server -join ' | ')"
         $sumLow = Get-SmbAll $low 'low: ' 'the low-integrity run' $name
+        $token = $medium | Where-Object { $_.StartsWith('medium: token:0 ') } | Select-Object -First 1
+        Check ($token -match 'token:0 allowed integrity 8192 administrators no privileges 1') "jail-probe medium is not the UAC-filtered token at medium integrity: $token (exit $($m[0]))"
+        $sumMedium = Get-SmbAll $medium 'medium: ' 'the medium-integrity run' $name
         $sumOp = Get-SmbAll $op 'operator: ' 'the operator' $name
     } finally {
         Remove-ReachShare $name $dir
     }
-    "$msg; reach's share probe without a jailer, nothing asserted of what opens: $name made and removed, its access and the canary's ACL as reach makes them, the operator read the canary through \\127.0.0.1; jail-probe low $sumLow; the operator $sumOp"
+    "$msg; reach's share probe without a jailer, nothing asserted of what opens: $name made and removed, its access and the canary's ACL as reach makes them, the operator read the canary through \\127.0.0.1; jail-probe low $sumLow; jail-probe medium (the UAC-filtered token, on the low run's sessions) $sumMedium; the operator $sumOp"
 }
 
 # --- run ----------------------------------------------------------------------

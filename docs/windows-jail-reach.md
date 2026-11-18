@@ -135,10 +135,60 @@ In short:
     the PC test (a share on another machine, a medium-integrity user, an account that is not the runner's), unless
     the outcome locates the refusal at the client for every token.
   - The probe's parts that need no jailer (the share made and removed, its access and the canary's ACL, the
-    low-integrity run and the operator's, the operator's own read of the canary through `\\127.0.0.1`, the server's
-    record) also run in CI's windows job, before its build (`jailer-test.ps1 helpers -ReachSmbShare`), so that a
-    failure of the share's own is seen there first; that run asserts the operator's read and that each record ended,
-    nothing of what opens, and its record is not this record. First run: CI.
+    low-integrity run, the medium-integrity run below and the operator's, the operator's own read of the canary
+    through `\\127.0.0.1`, the server's record) also run in CI's windows job, before its build (`jailer-test.ps1
+    helpers -ReachSmbShare`), so that a failure of the share's own is seen there first; that run asserts the
+    operator's read and that each record ended, nothing of what opens, and its record is not this record. At
+    58c37ba2 it passed, its low-integrity run refused as in the record below.
+- **The share probe's first record, under the token as shipped.** In CI's windows-guest job at 58c37ba2 the share
+  (read granted to Everyone; the canary's DACL `(A;;FR;;;WD)` with SYSTEM's and the administrators') was served: the
+  operator opened all 5 of its forms and read the canary, and 9 of the 12 other forms as before. The jail, with
+  `--netns` and without, opened none: all 17 forms were refused with `0xc0000022`, and after each run the server
+  listed no session and no open file, and the client no connection. `jail-probe low` opened none either, but
+  differently: every Mup, LanMan redirector and UNC form was refused with `0xc0000201` (`STATUS_NETWORK_OPEN_RESTRICTION`,
+  "A remote open failed because the network open restrictions were not satisfied", MS-ERREF 2.3.1), and after it
+  the server listed three sessions (from 127.0.0.1, `[::1]` and the link-local address) as the runner's
+  administrator, SMB 3.1.1, and the client connections to `\\127.0.0.1\ADMIN$`, `C$`, `IPC$` and the share, none
+  with an open. The operator's control then used those same three sessions (the same session ids after it) and was
+  granted `0x1f01ff` on them, which a token at low integrity is not granted on `win.ini`. SMB authorizes a request
+  by its session, so the server would have granted the low run's opens had they reached it: `0xc0000201` was raised
+  on the client, after its session set-up and tree connects. Which component raises it, and on what rule, Microsoft
+  does not document. The event channels held nothing for any run, the operator's successful opens included, so they
+  say nothing either way. CI's windows job (`helpers`) refused the low run the same way.
+  - Read against the meanings above: the jail and the low-integrity run were both refused and the operator was not,
+    the third case, but at different places. The jail's restricted token was refused with no session, tree connect
+    or open on the server, on a share whose security its restricting SIDs pass. That points to the client refusing a
+    restricted token before it sets anything up; a session set-up the server refused would leave no session either,
+    so it is strongly indicated, not proven. `--netns` changed nothing.
+  - **Lowered integrity alone does not keep the redirector from authenticating as the user.** For a low-integrity
+    process of the user, the SMB client set up sessions with the logon session's credentials and tree-connected to
+    `ADMIN$` and `C$` as the administrator before it refused the process's open. Against another machine, that is
+    the user's authentication sent to a host the process named. The jail's protection there is the restricted
+    token's refusal, measured so far only when no session of the user's existed; what a remote host would see from a
+    jail is the PC test.
+- **The jailed run on the user's sessions, and the medium-integrity run: what each outcome means**, written before
+  the first result.
+  - `reach` runs the jail once more after the operator's control, on the sessions and tree connects the
+    low-integrity run and the operator left: a desktop with mapped drives. The jail's token shares the operator's
+    logon session, by which the SMB client keeps its sessions. The client's connections are listed before and after
+    it and the server's record after it, and with the share made the stage fails if no connection to it is there.
+    Under either token:
+    - The jail opens the canary, `C$` or any other form: the client sent a restricted caller's open on the user's
+      session and the server granted it as the user. That is an escape, whatever the first jailed runs showed.
+    - Every form refused with `0xc0000022` and no session or open added on the server: the client refuses the
+      restricted token whether or not a session of the user's exists, the refusal the jail relies on.
+    - Refused with another status, `0xc0000201` among them: the client went further for the restricted token than
+      with nothing to reuse, and the status says where it stopped; read against the low-integrity run's.
+  - `helpers` runs `jail-probe medium` between the low-integrity run and the operator's: the elevated token filtered
+    as UAC filters an administrator's (`CreateRestrictedToken` with `LUA_TOKEN` and `DISABLE_MAX_PRIVILEGE`: the
+    administrators for deny only, no privilege but `SeChangeNotify`) at medium integrity, not restricted, which its
+    `token:0` line must show. Made from the operator's token, it stays in the operator's logon session, where UAC's
+    own filtered token has a logon session of its own, so its opens go on the sessions the low-integrity run left and
+    are granted as their user is; it tells the rule apart, not what a separate medium-integrity user is granted.
+    - It opens the share's forms: `0xc0000201` is the client's rule for integrity below medium.
+    - It is refused with `0xc0000201` too: the rule is not integrity alone (loopback, or the filtered token); the
+      PC's medium-integrity user and a share on another machine decide it.
+  - First run: CI.
 
 ## What the jail reaches
 
