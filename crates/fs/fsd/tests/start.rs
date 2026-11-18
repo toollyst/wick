@@ -18,18 +18,24 @@ use std::time::Duration;
 use wick_fs_sys as sys;
 
 fn wick_fsd(dir: &std::path::Path, ready: Option<OwnedFd>) -> Command {
+    wick_fsd_at(dir, "40", ready)
+}
+
+/// wick-fsd over `dir/share` with `--ready-fd at`, `ready` (if any) left
+/// open there.
+fn wick_fsd_at(dir: &std::path::Path, at: &str, ready: Option<OwnedFd>) -> Command {
     std::fs::create_dir_all(dir.join("share")).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_wick-fsd"));
     cmd.arg("--share-dir")
         .arg(dir.join("share"))
         .arg("--socket")
         .arg(dir.join("fs.sock"))
-        .args(["--id", "t", "--ready-fd", "40"])
+        .args(["--id", "t", "--ready-fd", at])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(fd) = ready {
-        sys::command_with_inherited(&mut cmd, vec![(fd, 40)]);
+        sys::command_with_inherited(&mut cmd, vec![(fd, at.parse().unwrap())]);
     }
     cmd
 }
@@ -39,6 +45,61 @@ fn scratch(tag: &str) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// 0 to 2 are the standard streams: `--ready-fd` there would be closed
+/// after the ready byte and its number taken by the next open (the
+/// connection), where the log would then go. Refused by the parse, by name,
+/// as is a number below 0.
+#[test]
+fn test_ready_fd_is_never_a_standard_stream() {
+    let dir = scratch("std");
+    for n in ["0", "1", "2", "-1"] {
+        let out = wick_fsd_at(&dir, n, None).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{n}: {err}");
+        assert!(err.contains(&format!("--ready-fd {n}: 0 to 2 are the standard streams")), "{n}: {err}");
+        assert!(out.stdout.is_empty() && !dir.join("fs.sock").exists(), "{n}: started");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Started with its standard output and error closed (`>&-`), the server
+/// finds `/dev/null` at 1 and 2 (Rust's start opens it for any of 0 to 2
+/// that is closed, before main): its `ready` and its log go nowhere, never
+/// into the connection or the share's root, which take numbers of their
+/// own. Linux reads its descriptors while it waits for its connection
+/// (not yet confined, so a process of the same user may).
+#[cfg(target_os = "linux")]
+#[test]
+fn test_closed_standard_streams_are_dev_null_to_the_server() {
+    let dir = scratch("closed");
+    let (mut read_end, write_end) = std::io::pipe().unwrap();
+    let mut cmd = wick_fsd(&dir, Some(write_end.into()));
+    sys::command_with_closed(&mut cmd, &[1, 2]);
+    let mut child = cmd.spawn().unwrap();
+    drop(cmd);
+    // The byte, then the pipe's end: --ready-fd is closed.
+    let mut got = Vec::new();
+    read_end.read_to_end(&mut got).unwrap();
+    assert_eq!(got, b"R");
+    let mut fds: Vec<(i32, String)> = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (e.file_name().to_str().unwrap().parse().unwrap(), std::fs::read_link(e.path()).unwrap().display().to_string())
+        })
+        .collect();
+    fds.sort();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    for fd in 0..3 {
+        assert_eq!(fds[fd].1, "/dev/null", "{fds:?}");
+    }
+    // The share's root and the listener, at numbers of their own.
+    assert!(fds.iter().skip(3).all(|(fd, _)| *fd > 2) && fds.len() == 5, "{fds:?}");
+    assert!(fds.iter().any(|(_, what)| what.starts_with("socket:")), "{fds:?}");
 }
 
 #[test]

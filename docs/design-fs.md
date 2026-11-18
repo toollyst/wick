@@ -347,8 +347,13 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
     `proc_pidinfo(PROC_PIDLISTFDS)` lists, which has no bound to miss), then that list read back: a descriptor left
     open (a close that failed, or said done and was not) is a refusal naming each, by what it is, before the socket
     is bound; standard input made `/dev/null`, read-only
-    (wick-fsd reads none); `--ready-fd` required to be a pipe's write end or a socket, and closed once its one byte is
-    written. A launcher's descriptors survive `pivot_root` and a Seatbelt profile, and a read or write on one already
+    (wick-fsd reads none); `--ready-fd` required to be 3 or more (the parse refuses 0 to 2, the standard streams,
+    and anything below 0: closed after the ready byte, a standard stream's number would be taken by the next open, the
+    connection, and the log would go into it; `test_ready_fd_is_never_a_standard_stream`), a pipe's write end or a
+    socket, and closed once its one byte is written. Nothing else closes or re-takes 0 to 2 after the first step: only
+    `stdin_from_null`'s `dup2` onto 0 touches them, and a stream the launcher closed (`>&-`) is `/dev/null` before
+    `main` (`test_a_closed_standard_stream_is_dev_null_at_the_first_step` on Linux and macOS,
+    `test_closed_standard_streams_are_dev_null_to_the_server` on Linux). A launcher's descriptors survive `pivot_root` and a Seatbelt profile, and a read or write on one already
     open is checked by nothing of the confinement: in CI run 44233741878's fs jobs (the unit-test step's record) a
     step's shell held descriptors 142 and 145, two pipes' ends, on both Ubuntu runners, and 131 and 140, two
     `com.apple.netsrc` control sockets, and 143 and 146, pipes, on macos-latest, which every process it starts
@@ -368,7 +373,7 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
     Windows an LPAC process cannot open the VMM);
   - only then set up the confinement (§6), with the connected socket and the share root its only handles.
 - Built for Linux (`crates/fs/fsd/src/main.rs`): `wick-fsd --share-dir DIR --socket PATH --id ID [--read-only]
-  [--cache auto|never|always] [--cache-timeout-ms N] [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD]
+  [--cache auto|never|always] [--cache-timeout-ms N] [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD (3 or more)]
   [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]`. It refuses a socket path that exists
   (it never removes what it did not make), says it is ready (a byte on `--ready-fd`, else a `ready` line), accepts
   one connection, closes and unlinks the listener at once, and serves only a peer of `--peer-uid` (default: its own

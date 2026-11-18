@@ -8,7 +8,7 @@
 //! ```text
 //! wick-fsd --share-dir DIR --socket PATH --id ID [--read-only]
 //!          [--cache auto|never|always] [--cache-timeout-ms N]
-//!          [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD]
+//!          [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD (3 or more)]
 //!          [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]
 //! ```
 //!
@@ -49,7 +49,7 @@ struct Args {
 }
 
 const USAGE: &str = "usage: wick-fsd --share-dir DIR --socket PATH --id ID [--read-only] [--cache auto|never|always] \
-                     [--cache-timeout-ms N] [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD] \
+                     [--cache-timeout-ms N] [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD (3 or more)] \
                      [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]";
 
 fn number<T: std::str::FromStr>(flag: &str, v: Option<String>) -> Result<T, String> {
@@ -83,6 +83,14 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--help" | "-h" => return Err(USAGE.into()),
             other => return Err(format!("unknown option {other}\n{USAGE}")),
         }
+    }
+    // A descriptor of its own: 0 to 2 are the standard streams, which the
+    // ready byte's close would free for the next open (the connection or
+    // the share's root) to take, and the log would then go there.
+    if let Some(fd) = ready_fd
+        && fd < 3
+    {
+        return Err(format!("--ready-fd {fd}: 0 to 2 are the standard streams and below 0 is none; give 3 or more"));
     }
     if timeout > MAX_TIMEOUT_MS {
         return Err(format!("--cache-timeout-ms: at most {MAX_TIMEOUT_MS}"));

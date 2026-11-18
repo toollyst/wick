@@ -1478,6 +1478,25 @@ pub fn is_write_channel(fd: BorrowedFd<'_>) -> Result<bool> {
     Ok(kind == u32::from(libc::S_IFSOCK) || (kind == u32::from(libc::S_IFIFO) && flags & libc::O_ACCMODE == libc::O_WRONLY))
 }
 
+/// Has `cmd`'s child start with each of `fds` closed, as a launcher that
+/// runs it with `>&-` does: for the tests of what a process that finds a
+/// standard stream closed is given.
+pub fn command_with_closed(cmd: &mut std::process::Command, fds: &'static [c_int]) {
+    use std::os::unix::process::CommandExt;
+    let closure = move || {
+        for &fd in fds {
+            // SAFETY: async-signal-safe; closes a descriptor of the child.
+            unsafe { libc::close(fd) };
+        }
+        Ok(())
+    };
+    // SAFETY: the closure makes only async-signal-safe system calls and
+    // allocates nothing.
+    unsafe {
+        cmd.pre_exec(closure);
+    }
+}
+
 /// Has `cmd`'s child start with each of `fds` at its number (not
 /// close-on-exec), as a launcher that leaves descriptors open does: for the
 /// tests of a server that must not keep what it was started with.
@@ -1588,6 +1607,29 @@ mod tests {
         assert!(descriptor_described(0).ends_with(" /dev/null"), "{}", descriptor_described(0));
         close_inherited(None).unwrap();
         assert_eq!(open_descriptors().unwrap(), [0, 1, 2]);
+    }
+
+    /// A process started with its standard output closed (`>&-`) finds
+    /// `/dev/null` there at its first step: Rust's start opens it for any
+    /// of 0 to 2 that is closed, before `main`, on Linux and macOS alike.
+    #[test]
+    fn test_a_closed_standard_stream_is_dev_null_at_the_first_step() {
+        const ALONE: &str = "WICK_FS_SYS_TEST_CLOSED_STDOUT";
+        const NAME: &str = "unix::tests::test_a_closed_standard_stream_is_dev_null_at_the_first_step";
+        if std::env::var_os(ALONE).is_none() {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([NAME, "--exact", "--test-threads=1", "--nocapture"]).env(ALONE, "1");
+            command_with_closed(&mut cmd, &[1]);
+            let out = cmd.output().unwrap();
+            // Its stdout is /dev/null: what it says is on stderr only.
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success() && out.stdout.is_empty(), "in a process of its own: {err}");
+            assert!(err.contains("1: character device /dev/null"), "{err}");
+            return;
+        }
+        let one = descriptor_described(1);
+        eprintln!("{one}");
+        assert!(one.ends_with(" /dev/null") && one.starts_with("1: character device"), "{one}");
     }
 
     #[test]
