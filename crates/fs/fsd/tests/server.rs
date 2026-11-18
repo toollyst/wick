@@ -1,9 +1,9 @@
 // Copyright 2026 toollyst contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The wick-fsd binary on Linux (docs/design-fs.md §4.2, §6.1): stage 0's
-//! one connection and peer check, the confined process's state as the
-//! kernel reports it, and one refusal per confinement step. Each refusal is
+//! The wick-fsd binary on Linux (docs/design-fs.md §4.2, §6.1): the
+//! confined process's state as the kernel reports it (stage 0's one
+//! connection and peer check: connection.rs, on macOS too), and one refusal per confinement step. Each refusal is
 //! real: the server runs under a seccomp filter (installed by the test
 //! before the exec) that makes that step's system call fail, and must then
 //! refuse to serve, naming the step. wick-fsd has no switch that skips a
@@ -335,32 +335,6 @@ fn test_outside_open_fails() {
     std::fs::symlink_metadata(root.join("..").join("etc/passwd")).unwrap_err();
     let (status, err) = r.finish();
     assert!(status.success(), "{status:?}: {err}");
-}
-
-#[test]
-fn test_second_connection_refused() {
-    let s = setup("srv-second");
-    let Some(mut r) = confined(&s, &[]) else { return };
-    assert!(!s.socket.exists(), "the listener is unlinked after the one accept");
-    UnixStream::connect(&s.socket).unwrap_err();
-    let (status, err) = r.finish();
-    assert!(status.success(), "{status:?}: {err}");
-}
-
-#[test]
-fn test_wrong_peer_refused() {
-    let s = setup("srv-peer");
-    let mut args = base_args(&s.share, &s.socket);
-    let other = (sys_euid() + 1).to_string();
-    args.extend(["--peer-uid".to_string(), other]);
-    let server = Server::start(&args, |_| {});
-    let Err((mut server, _)) = Remote::connect(server) else {
-        panic!("a peer of another uid was served");
-    };
-    let (status, err) = server.wait();
-    assert!(!status.success(), "{status:?}");
-    assert!(err.contains("not --peer-uid"), "{err}");
-    assert!(!s.socket.exists());
 }
 
 /// Runs a server whose `deny` system calls fail with `errno` and checks it
