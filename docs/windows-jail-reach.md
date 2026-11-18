@@ -469,6 +469,39 @@ to when the partition is made. What it brings, and what the next record (`jail-v
   (`lpac-cap-win32k-at-create`), and the policy as each process has it before it is set; an AppContainer of another
   profile against the first's directory and socket (`appcontainer-other`).
 
+**The fourth record, and the decision** (`whp-token` and `jail-variants`, Windows Server 2025 build 26100):
+- **Option P runs.** `jail-own-sid-p`'s guest exits by its `OUT`. After the revert every call a running VM makes
+  returned `S_OK`: registers, XSAVE and interrupt-controller state, `WHvRequestInterrupt`, suspending and resuming
+  partition time, cancelling a run, `WHvTranslateGva`, the dirty bitmap, `WHvAdviseGpaRange` and unmapping. All 17
+  capability codes read the same as before the revert. The partition used again ran: its memory unmapped and mapped
+  again, a new vCPU, a run to the `OUT`. A second partition made after the revert is refused at
+  `WHvSetupPartition` (`0x80070005`; `WHvCreatePartition` returns `S_OK`). Its control, `jail-as-now-p` (the jail's
+  token as now), matched it line for line but there: its second partition was set up.
+- What the partition costs, made before the revert: the register probe about 4.4 ms and the partition 1.4 ms (4.7
+  and 1.4 in the control); the process's private memory 8 KiB more; the Job's peak 192 KiB more for a moment (the
+  probe's partition); 64 MiB of guest memory charged to the Job as before (66796 KiB).
+- **The jail's SID alone reaches 9 devices** on this host, each by a name beneath it and none with
+  `FILE_DEVICE_SECURE_OPEN`: `\Ntfs`, `\Fat`, `\FatCdrom`, `RawDisk`, `RawCdRom`, `RawTape`, `MQAC`,
+  `LanmanDatagramReceiver` and `Afd`; no ALPC port, pipe, section, event or key. Under P it holds besides the
+  partition's handles to `\Device\VidExo` (`0x120089`), opened under the initial token; neither device opens again
+  after the revert (`0xC0000022`). Which of VID's I/O controls that handle reaches beyond WHP's calls is not measured,
+  as for an LPAC holding `VidExo`.
+- `lpac-cap-preload` printed no line before `0xC00000A5`: an LPAC cannot be given the jailer's initial token, so it
+  cannot run the preload (the reading of the record; Microsoft does not document it).
+- The 1314 of `jail-labelled-dir-create` comes from the directory's label: the jail's directory carries
+  `S:AI(ML;OICI;NWNRNX;;;S-1-16-6144)`, and a low-integrity AppContainer making a file there would give it an
+  inherited label above its own level, which needs `SeRelabelPrivilege` (Microsoft Learn, Mandatory Integrity
+  Control). Under Q the jail's directory would have to be labelled low.
+- `appcontainer-other` is refused the first AppContainer's directory and socket (5, 10013); it reaches 6 devices,
+  137 ALPC ports and 97 sections.
+- **Decision: option P for Firecracker, and the jail's SID alone, with the preload, for the API process.** P reaches
+  the least (no ALPC port, pipe or section), keeps the jail's 0x1800 label and the `low` stage, needs no
+  AppContainer profile, and its preload is measured to work. The LPAC reaches 4 devices, but needs 46 to 48 ALPC
+  ports for Winsock (with `registryRead` and `lpacCom`; with neither it has no Winsock at all, 10093), a jail
+  labelled low, and cannot take the initial token, so not the preload: the Q table above is kept as the measured
+  reason it is closed. TCP still connects through `Afd` under P; `--netns` stays the control for IP (the
+  AppContainer-network item of Phase 4, open).
+
 **What does not work.**
 - `CreateRestrictedToken` refuses ALL APPLICATION PACKAGES (`S-1-15-2-1`), ALL RESTRICTED APPLICATION PACKAGES
   (`S-1-15-2-2`) and the `hypervisorPlatform` capability SID as restricting SIDs with `ERROR_INVALID_PARAMETER` (87)
@@ -478,7 +511,8 @@ to when the partition is made. What it brings, and what the next record (`jail-v
   device security descriptors are the host's, not wick's to change.
 
 **What stays after the fix.**
-- The 13 device namespaces above, with `\Device\Afd` carrying IP when `--netns` is not given.
+- The 13 device namespaces above (9 on Windows Server 2025 build 26100, the fourth record), with `\Device\Afd`
+  carrying IP when `--netns` is not given.
 - WHP, the counterpart of `/dev/kvm`: under option P the partition's handle to `\Device\VidExo` only (neither
   device opens after the revert); under option Q `\Device\VidExo` through the capability, with what an
   AppContainer is granted besides.

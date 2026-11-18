@@ -1384,10 +1384,12 @@ upstream Firecracker and its jailer.
     Users and Everyone both open and WHP still reports no hypervisor; with Authenticated Users and Users
     `\Device\HvService` is denied and WHP runs. Two ways work: a partition made and set up before `RevertToSelf` runs after
     it under the jail's SID alone (option P), and an AppContainer with the `hypervisorPlatform` capability runs WHP
-    fully (option Q), as does an LPAC with it, which reaches four devices (`fs-probe jail-variants`). Option P's
-    record did not settle it: its vCPU's run did not return under the emulated local APIC. Which one, and what each
-    leaves reachable, is measured next (`fs-probe whp-token`,
-    `fs-probe jail-variants`; docs/windows-jail-reach.md).
+    fully (option Q), as does an LPAC with it, which reaches four devices (`fs-probe jail-variants`). The fourth
+    record settled it: under P every call a running VM makes works after the revert and a partition used again
+    runs, while a second one cannot be set up (`fs-probe whp-token`'s `jail-own-sid-p`). **Decided: option P** for
+    Firecracker, and the jail's SID alone with the preload for the API process; the LPAC is closed, as it needs 46
+    to 48 ALPC ports for Winsock, a jail labelled low, and cannot take the initial token for the preload
+    (`fs-probe jail-variants`; docs/windows-jail-reach.md, the fourth record).
   - **Option P's partition, kept for a start tried again.** kvm-ioctls can park the partition made before the
     revert and give it back when a VM is dropped, for the process's next VM (upstream lets a failed
     `InstanceStart` be tried again in one process). Before it is used again, everything WHP lets be read is read
