@@ -23,7 +23,7 @@
 //! (docs/design-fs.md §4.2). Then the confinement, and only then the hellos
 //! and the requests, until the VMM closes the connection. Every step is
 //! required: there is no option that serves unconfined. On a host without
-//! confinement yet (macOS until its commit, Windows until its port) the
+//! confinement yet (Windows, until its port) the
 //! server refuses to start.
 
 use std::path::PathBuf;
@@ -126,7 +126,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
 #[derive(Debug, Default)]
 struct Start {
     #[cfg(unix)]
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "a host without confinement says no ready"))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code, reason = "a host without confinement says no ready"))]
     ready: Option<std::os::fd::OwnedFd>,
 }
 
@@ -205,25 +205,24 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run(_: &Args, _: Start) -> Result<(), String> {
-    Err("this host has no confinement for wick-fsd yet (Linux has; macOS comes with its own commit, Windows with \
-         its port), and wick-fsd does not serve unconfined"
+    Err("this host has no confinement for wick-fsd yet (Linux and macOS have; Windows comes with its port), and \
+         wick-fsd does not serve unconfined"
         .into())
 }
 
-#[cfg(target_os = "linux")]
-fn run(args: &Args, start: Start) -> Result<(), String> {
+/// Stage 0 on a Unix host: the share checked, the soft RLIMIT_NOFILE set,
+/// the socket bound, ready said, one connection accepted, the listener
+/// unlinked, and the peer checked.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn accept_one(args: &Args, start: Start) -> Result<(wick_fsd::stage0::Checked, std::os::unix::net::UnixStream), String> {
     use std::io::Write;
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::AsFd;
     use std::os::unix::net::UnixListener;
 
     use wick_fs_sys as sys;
-    use wick_fsd::confine::linux::{self as confine, Plan};
-    use wick_fsd::host::unix::{HostDir, Options};
-    use wick_fsd::session::{Config, Session};
     use wick_fsd::stage0::{self, Share};
-    use wick_fsd::serve;
 
     let share = Share {
         dir: args.share_dir.clone(),
@@ -235,7 +234,7 @@ fn run(args: &Args, start: Start) -> Result<(), String> {
     let checked = stage0::check(&share, home.as_deref()).map_err(|r| r.0)?;
     // The soft RLIMIT_NOFILE set to exactly what the limits may hold open
     // (stage 0 checked the hard one allows it): no more for the server,
-    // and the bound of the read-back's walk over its descriptors (lock).
+    // and the bound of the Linux read-back's walk over its descriptors.
     let need = wick_fsd::limits::descriptors(&args.limits);
     sys::set_nofile(need).map_err(|e| format!("RLIMIT_NOFILE to {need}: {e:?}"))?;
     let (soft, _) = sys::nofile().map_err(|e| format!("RLIMIT_NOFILE: {e:?}"))?;
@@ -257,19 +256,25 @@ fn run(args: &Args, start: Start) -> Result<(), String> {
     let _ = std::fs::remove_file(&args.socket);
     let (conn, _) = accepted.map_err(|e| format!("accept: {e}"))?;
     let peer_uid = args.peer_uid.unwrap_or_else(sys::euid);
+    #[cfg(target_os = "linux")]
     let (uid, pid) = sys::confine::peer(conn.as_fd()).map_err(|e| format!("SO_PEERCRED: {e:?}"))?;
+    #[cfg(target_os = "macos")]
+    let (uid, pid) = sys::seatbelt::peer(conn.as_fd()).map_err(|e| format!("LOCAL_PEERCRED: {e:?}"))?;
     if uid != peer_uid {
         return Err(format!("the peer (pid {pid}) is uid {uid}, not --peer-uid {peer_uid}: connection refused"));
     }
-    let plan = Plan {
-        read_only: args.read_only,
-        drop_to: args.drop_to,
-    };
-    // The waiting parent drops the connection; only the confined child
-    // serves it.
-    let conn_fd = conn.as_raw_fd();
-    let (root, mut conn, watch) = confine::enter(checked, plan, conn, &[conn_fd]).map_err(|r| r.0)?;
-    let root_fd = root.as_raw_fd();
+    Ok((checked, conn))
+}
+
+/// The backend and the session over the confined root.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn session_over(
+    args: &Args,
+    root: std::os::fd::OwnedFd,
+) -> Result<wick_fsd::session::Session<wick_fsd::host::unix::HostDir>, String> {
+    use wick_fsd::host::unix::{HostDir, Options};
+    use wick_fsd::session::{Config, Session};
+
     let dir = HostDir::new(
         root,
         Options {
@@ -284,18 +289,20 @@ fn run(args: &Args, start: Start) -> Result<(), String> {
         limits: args.limits,
         ..Config::default()
     };
-    let mut session = Session::new(dir, config).map_err(|e| format!("the share's root: {e:?}"))?;
-    // What it holds when it serves: the connection and the share's root,
-    // which the backend keeps (it holds no other descriptor before a
-    // request).
-    let locked = confine::lock(plan, watch, &[conn_fd, root_fd]).map_err(|r| r.0)?;
-    eprintln!(
-        "wick-fsd: {}: confined (namespaces, pivot_root, no capabilities, no_new_privs, seccomp{})",
-        args.id,
-        locked.landlock.map_or_else(String::new, |abi| format!(", Landlock ABI {abi}"))
-    );
-    serve::hello(&mut conn, &args.id).map_err(|e| e.to_string())?;
-    let end = serve::serve(&mut conn, &mut session);
+    Session::new(dir, config).map_err(|e| format!("the share's root: {e:?}"))
+}
+
+/// The hellos and the requests until the VMM closes the connection.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn serve_all(
+    args: &Args,
+    conn: &mut std::os::unix::net::UnixStream,
+    session: &mut wick_fsd::session::Session<wick_fsd::host::unix::HostDir>,
+) -> Result<(), String> {
+    use wick_fsd::serve;
+
+    serve::hello(conn, &args.id).map_err(|e| e.to_string())?;
+    let end = serve::serve(conn, session);
     let c = session.counters();
     eprintln!(
         "wick-fsd: {}: {end}; counters: requests refused {}, nodes refused {}, handles refused {}, bytes refused \
@@ -317,4 +324,55 @@ fn run(args: &Args, start: Start) -> Result<(), String> {
         serve::End::Closed => Ok(()),
         other => Err(other.to_string()),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run(args: &Args, start: Start) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+
+    use wick_fsd::confine::linux::{self as confine, Plan};
+
+    let (checked, conn) = accept_one(args, start)?;
+    let plan = Plan {
+        read_only: args.read_only,
+        drop_to: args.drop_to,
+    };
+    // The waiting parent drops the connection; only the confined child
+    // serves it.
+    let conn_fd = conn.as_raw_fd();
+    let (root, mut conn, watch) = confine::enter(checked, plan, conn, &[conn_fd]).map_err(|r| r.0)?;
+    let root_fd = root.as_raw_fd();
+    let mut session = session_over(args, root)?;
+    // What it holds when it serves: the connection and the share's root,
+    // which the backend keeps (it holds no other descriptor before a
+    // request).
+    let locked = confine::lock(plan, watch, &[conn_fd, root_fd]).map_err(|r| r.0)?;
+    eprintln!(
+        "wick-fsd: {}: confined (namespaces, pivot_root, no capabilities, no_new_privs, seccomp{})",
+        args.id,
+        locked.landlock.map_or_else(String::new, |abi| format!(", Landlock ABI {abi}"))
+    );
+    serve_all(args, &mut conn, &mut session)
+}
+
+#[cfg(target_os = "macos")]
+fn run(args: &Args, start: Start) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+
+    use wick_fsd::confine::macos::{self as confine, Plan};
+
+    let (checked, mut conn) = accept_one(args, start)?;
+    let plan = Plan {
+        read_only: args.read_only,
+        drop_to: args.drop_to,
+    };
+    let canonical = checked.canonical.clone();
+    let conn_fd = conn.as_raw_fd();
+    let root_fd = checked.root.as_raw_fd();
+    let mut session = session_over(args, checked.root)?;
+    // What it holds when it serves, as on Linux: the connection and the
+    // share's root (the backend holds no other descriptor before a request).
+    confine::confine(plan, &canonical, &[conn_fd, root_fd]).map_err(|r| r.0)?;
+    eprintln!("wick-fsd: {}: confined (Seatbelt profile of the share, ids dropped)", args.id);
+    serve_all(args, &mut conn, &mut session)
 }

@@ -356,9 +356,11 @@ has the per-control details and results.
   other (`test_descriptors_it_was_started_with_are_closed`: a file, a directory and a socket left open, gone from the
   confined process and its waiting parent as root reads them, with and without `close_range`;
   `test_refused_when_a_descriptor_it_was_started_with_survives`: a `close_range` that said it was done and was not;
-  `test_descriptors_held_exactly`; docs/design-fs.md §4.2 and §6.1, steps 3 and 10). On macOS wick-fsd refuses to
-  start on every version so far (its confinement is not built yet) and served nothing with what it was started with;
-  the first step closes them there too, by the file table's list (`proc_pidinfo`), before the refusal.
+  `test_descriptors_held_exactly`; docs/design-fs.md §4.2 and §6.1, steps 3 and 10). On macOS wick-fsd refused to
+  start until its confinement was built and served nothing with what it was started with; the first step closes
+  them there too, by the file table's list (`proc_pidinfo`), and the confined server requires its descriptors to be
+  exactly the ones it keeps, from that list before its profile and by number under it (docs/design-fs.md §6.2,
+  steps 3 and 4).
 - **Linux: wick-fsd started as root: its confined server did not die with wick-fsd, and was dumpable again where
   `fs.suid_dumpable` is 1** (from 62067d47, which added the confined server, to the commit that adds this entry;
   never reachable from a guest: nothing in the VMM serves wick-fsd yet, virtio-fs staging 8 and 9). The server set
@@ -1794,6 +1796,21 @@ upstream Firecracker and its jailer.
 - **Side channels** between VMs on the same host follow upstream's
   [production host setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md)
   guidance on Linux; the equivalent guidance for macOS and Windows hosts is not written yet.
+
+## Host folder sharing (being built)
+
+wick-fsd, the virtio-fs file server, is not reachable from a guest yet: nothing in the VMM serves it (the virtio-fs
+item of roadmap M7). It confines itself on Linux and macOS before it reads a request, and refuses to start on
+Windows, whose confinement is not built ([docs/design-fs.md](docs/design-fs.md) §6.1, §6.2). What a guest will learn
+of the host through it besides the share's files: the share volume's size and free space, exactly, from STATFS, on
+both hosts (macOS's profile allows `system-info` `vfs.disk-space` for that alone; without it Seatbelt rounds the
+free blocks, which would make the hosts differ; `test_every_request_confined_answered_as_unconfined` requires STATFS
+confined to equal STATFS in process). Special mode bits, on both hosts: a guest's set-user-id, set-group-id and sticky
+bits are kept in wick-fsd's metadata record and never given to a host object (`fchmod` in `crates/fs/sys` refuses any
+bit above the permission bits; confined, Linux's filter would kill such a call and macOS's profile would drop the bit
+without an error). A share object the host made with such bits is served as stored, its contents readable as any other
+file, and shown to the guest with its permission bits alone (a set-user-id file of mode 06755 shows 0755; the same test
+checks both, confined and in process).
 
 ## Planned: GPU access (no code yet)
 

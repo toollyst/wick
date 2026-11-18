@@ -21,6 +21,8 @@ impl fmt::Debug for HostErrno {
 
 #[cfg(target_os = "linux")]
 pub mod confine;
+#[cfg(target_os = "macos")]
+pub mod seatbelt;
 
 /// What every call here returns.
 pub type Result<T> = std::result::Result<T, HostErrno>;
@@ -442,8 +444,16 @@ pub fn mkfifoat(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> Result<()> {
     check(unsafe { libc::mkfifoat(dir.as_raw_fd(), name.as_ptr(), mode) }).map(drop)
 }
 
-/// `fchmod(fd, mode)`.
+/// `fchmod(fd, mode)`, permission bits only: a mode with set-user-id,
+/// set-group-id or sticky is refused (EINVAL) before the call. The server
+/// keeps a guest's special bits in its record and never gives them to a
+/// host object; confined, Linux's filter kills such an `fchmod` and macOS's
+/// profile (`file-write-setugid`) drops the bit without an error, so a call
+/// that relied on it would differ by host, silently on one.
 pub fn fchmod(fd: BorrowedFd<'_>, mode: u32) -> Result<()> {
+    if mode & !0o777 != 0 {
+        return Err(HostErrno(libc::EINVAL));
+    }
     let mode = libc::mode_t::try_from(mode).map_err(|_| HostErrno(libc::EINVAL))?;
     // SAFETY: a valid descriptor.
     check(unsafe { libc::fchmod(fd.as_raw_fd(), mode) }).map(drop)
@@ -1687,6 +1697,20 @@ mod tests {
         assert!(only == dense && only.len() <= 6, "{only:?}");
         assert!(descriptor_described(0).starts_with("0: "));
         assert!(descriptor_described(-1).contains(&format!("{}", libc::EBADF)), "{}", descriptor_described(-1));
+    }
+
+    /// Permission bits only: the special bits and anything above are
+    /// refused before the call, the file's mode unchanged.
+    #[test]
+    fn test_fchmod_takes_permission_bits_only() {
+        let d = tmp("fchmod");
+        let f = std::fs::File::create(d.join("f")).unwrap();
+        fchmod(f.as_fd(), 0o640).unwrap();
+        for mode in [0o4640, 0o2640, 0o1640, 0o10_0640] {
+            assert_eq!(fchmod(f.as_fd(), mode), Err(HostErrno(libc::EINVAL)), "{mode:o}");
+        }
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&f.metadata().unwrap().permissions()) & 0o7777, 0o640);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     fn tmp(tag: &str) -> std::path::PathBuf {

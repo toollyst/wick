@@ -47,6 +47,8 @@
 //! skips one.
 
 use std::os::fd::{AsFd, AsRawFd, RawFd};
+
+pub use super::held_exactly;
 use std::path::Path;
 
 use wick_fs_sys as sys;
@@ -354,26 +356,6 @@ pub fn check(plan: Plan, state: &c::State, filtered: bool) -> Result<(), Refusal
     )))
 }
 
-/// The descriptors `open` are exactly the standard streams and `expected`:
-/// one refusal naming each other one (what it is, `descriptor_described`)
-/// and each expected one not open, `when`.
-pub fn held_exactly(when: &str, open: &[RawFd], expected: &[RawFd]) -> Result<(), Refusal> {
-    let expected: Vec<RawFd> = [0, 1, 2].iter().chain(expected).copied().collect();
-    let other: Vec<String> = open.iter().filter(|fd| !expected.contains(fd)).map(|&fd| sys::descriptor_described(fd)).collect();
-    let missing: Vec<RawFd> = expected.iter().filter(|fd| !open.contains(fd)).copied().collect();
-    let mut not = Vec::new();
-    if !other.is_empty() {
-        not.push(format!("descriptors open that wick-fsd did not open or keep: {}", other.join(", ")));
-    }
-    if !missing.is_empty() {
-        not.push(format!("descriptors it holds that are not open: {missing:?}"));
-    }
-    if not.is_empty() {
-        return Ok(());
-    }
-    Err(Refusal(format!("confinement: {when}, {}; wick-fsd does not serve unconfined", not.join("; "))))
-}
-
 /// Landlock's file rights for `abi`: (handled, allowed beneath the root).
 /// Never allowed: execute, and making devices, sockets, FIFOs and symlinks
 /// (the server emulates those as regular files; design-fs row 12).
@@ -465,18 +447,6 @@ mod tests {
         set("kernel/apparmor_restrict_unprivileged_userns", "1");
         assert_eq!(userns_restriction(&sys, &label).len(), 2);
         std::fs::remove_dir_all(&base).unwrap();
-    }
-
-    #[test]
-    fn test_descriptors_held_exactly() {
-        held_exactly("t", &[0, 1, 2, 5, 9], &[9, 5]).unwrap();
-        let r = held_exactly("before pivot_root", &[0, 1, 2, 5, 9, 131], &[5, 9]).unwrap_err().0;
-        assert!(r.contains("before pivot_root, descriptors open that wick-fsd did not open or keep: 131: "), "{r}");
-        assert!(r.contains("does not serve unconfined") && !r.contains("not open: ["), "{r}");
-        let r = held_exactly("t", &[0, 1, 2, 7], &[5]).unwrap_err().0;
-        assert!(r.contains("7: ") && r.contains("descriptors it holds that are not open: [5]"), "{r}");
-        let r = held_exactly("t", &[0, 2, 5], &[5]).unwrap_err().0;
-        assert!(r.contains("not open: [1]"), "{r}");
     }
 
     #[test]

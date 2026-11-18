@@ -1256,7 +1256,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15, windows-latest]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     defaults:
@@ -1327,7 +1327,7 @@ jobs:
           # wick-fsd confined as root (namespaces without a user namespace,
           # then the drop to 65534): the runner's user may have no user
           # namespaces, and these tests then check only the refusal.
-          for test in server confine_probe corpus links; do
+          for test in server confine_probe corpus links requests; do
             bin="$(cargo test --locked --test "$test" --no-run 2>&1 | grep -o "target/debug/deps/$test-[0-9a-f]*" | head -1)"
             sudo "$bin"
           done
@@ -1369,7 +1369,7 @@ jobs:
           # verdict: every binary passed, none ran nothing confined, and each
           # other "ran nothing" line is one it knows, said with why.
           logs=()
-          for test in server confine_probe corpus links; do
+          for test in server confine_probe corpus links requests; do
             bin="$(cargo test --locked --test "$test" --no-run 2>&1 | grep -o "target/debug/deps/$test-[0-9a-f]*" | head -1)"
             log="$RUNNER_TEMP/userns-$test.log"
             logs+=("$log")
@@ -1383,6 +1383,17 @@ jobs:
         run: |
           p="$RUNNER_TEMP/wick-fsd-userns.apparmor"
           if [ -f "$p" ]; then sudo apparmor_parser -R "$p"; else echo "no profile was written"; fi
+      # wick-fsd confined as root on macOS: the drop to --uid/--gid 65534
+      # before the profile (docs/design-fs.md §6.2), then the confined tests
+      # the Unit tests step ran as the runner's user (server.rs is Linux's).
+      - name: Confined tests as root (macOS, sudo)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          for test in confine_probe corpus links requests refusals; do
+            bin="$(cargo test --locked --test "$test" --no-run 2>&1 | grep -o "target/debug/deps/$test-[0-9a-f]*" | head -1)"
+            sudo "$bin"
+          done
       # On record (libtest keeps a passing test's output): what this macOS's
       # msdos does with renameatx_np(RENAME_SWAP), and the backend's
       # exchange there, for design-fs §4.3.

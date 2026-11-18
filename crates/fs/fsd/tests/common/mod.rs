@@ -8,7 +8,6 @@
 #![allow(dead_code)]
 
 pub mod drive;
-#[cfg(target_os = "linux")]
 pub mod remote;
 
 use std::collections::BTreeMap;

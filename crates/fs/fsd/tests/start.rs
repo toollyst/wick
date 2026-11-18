@@ -125,10 +125,10 @@ fn test_ready_fd_must_be_a_pipe_s_write_end_or_a_socket() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A pipe's write end is taken: on Linux the ready byte, then the end
-/// closed (the reader sees the pipe's end while the server still waits for
-/// its connection); elsewhere the refusal of a host without confinement,
-/// after the check, with nothing written.
+/// A pipe's write end is taken: on Linux and macOS the ready byte, then the
+/// end closed (the reader sees the pipe's end while the server still waits
+/// for its connection); elsewhere the refusal of a host without
+/// confinement, after the check, with nothing written.
 #[test]
 fn test_ready_fd_gets_one_byte_and_is_closed() {
     let dir = scratch("byte");
@@ -145,7 +145,7 @@ fn test_ready_fd_gets_one_byte_and_is_closed() {
     });
     let (r, got) = rx.recv_timeout(Duration::from_secs(30)).expect("the pipe's end, within 30 s");
     r.unwrap();
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         assert_eq!(got, b"R");
         assert!(child.try_wait().unwrap().is_none(), "the server ended instead of waiting for its connection");
         child.kill().unwrap();

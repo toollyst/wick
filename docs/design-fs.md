@@ -9,11 +9,11 @@ and its tables, limits, record and cache modes, the `ConfinedDir` interface of t
 backend; its unit tests and the `fs_session` fuzz target), **its Linux and macOS host directory** (`crates/fs/fsd/src/host`
 and `crates/fs/sys`, the backend of §4.3 with nodes that cost memory only and a cache of held descriptors, and stage
 0's share checks, `stage0.rs`; their unit tests and the host-directory tests in `crates/fs/fsd/tests`), **the
-`wick-fsd` binary on Linux**: stage 0's one connection and peer check, the serving loop and Linux's confinement
-of §6.1 (`crates/fs/fsd/src/{main,serve}.rs`, `confine/linux.rs`,
-`crates/fs/sys/src/unix/confine.rs`; tests `server.rs` and `confine_probe.rs`, and the corpus and link sequences
-against a confined server; macOS's confinement is not built, so there wick-fsd refuses to start,
-`test_refuses_without_confinement`), and the guest
+`wick-fsd` binary on Linux and macOS**: stage 0's one connection and peer check, the serving loop, Linux's
+confinement of §6.1 and macOS's of §6.2 (`crates/fs/fsd/src/{main,serve}.rs`, `confine/linux.rs`,
+`confine/macos.rs`, `crates/fs/sys/src/unix/confine.rs`, `crates/fs/sys/src/unix/seatbelt.rs`; tests `server.rs`
+(Linux), `confine_probe.rs`, and the corpus, link and request sequences against a confined server; on Windows,
+whose confinement is not built, wick-fsd refuses to start, `test_refuses_without_confinement`), and the guest
 kernels of row 21: CI's `guest-kernels` job builds upstream's CI kernel
 (6.1, 6.18) with `CONFIG_VIRTIO_FS=y` (`tools/linux/guest-kernel.sh`), though nothing boots them yet. Nothing a guest
 can use exists yet, and nothing here describes what wick does today:
@@ -54,11 +54,11 @@ documented or measured; **measure** = the fix is designed, a measurement on the 
 | 1 | Guest name escapes the share: `..`, `/`, absolute name in SYMLINK/RENAME/LINK (Kata CVE-2026-47243; virtiofsd name checks only 2026-11-06) | Layer 1, same code on all hosts: every guest name must be one component, not `.`/`..`, no `/` or NUL, at most 255 bytes of UTF-8, and none of the code points the Windows escape writes (U+F001–U+F01F, U+F022, U+F02A, U+F02F, U+F03A, U+F03C, U+F03E, U+F03F, U+F05C, U+F07C; `crates/fs/fsd/src/fuse/name.rs`, `test_every_name_taking_opcode_refuses_what_is_not_a_name`, `test_name_refuses_every_escape_image`), and every operation is relative to a held directory handle. Layer 2: L `openat2 RESOLVE_BENEATH\|NO_SYMLINKS\|NO_MAGICLINKS\|NO_XDEV` / M `O_RESOLVE_BENEATH` + `O_NOFOLLOW_ANY` (on macOS 27.2, 2026-11-13, a test program's `openat(dirfd, name, O_RESOLVE_BENEATH)` returned ENOTCAPABLE for `..`, `/etc/hosts` and `../etc/hosts` and opened `.`; the program is not in the repository) / W `NtCreateFile(RootDirectory, one component, OBJ_DONT_REPARSE)`, rename via `FILE_RENAME_INFORMATION.RootDirectory`. Layer 3: the OS sandbox (row 4) | Traversal corpus over every name-taking opcode, on every CI host, no VM; canaries outside the share untouched; **any refusal from layer 2 or 3 fails the test** (layer 1 must stop it); raw-virtqueue guest replay as in the Kata PoC. Host side: `test_traversal_corpus` (38 names × every name-taking opcode, Linux and macOS) | now (L, M); measure `OBJ_DONT_REPARSE` on W |
 | 2 | Symlink/junction swapped in mid-operation (TOCTOU; CVE-2016-9602) | Never follow links: L `RESOLVE_NO_SYMLINKS` / M `O_NOFOLLOW_ANY` / W `OBJ_DONT_REPARSE` + `FileAttributeTagInformation` after open, so any reparse point is shown as a link object and never traversed. Guest-made symlinks are emulated (regular file + record), so the host never has a real link the guest made | Race suite: host threads swap dirs ↔ symlinks/junctions/mount points for 10⁶ iterations while the harness operates; same assertions as 1. Host side: `test_swap_race` (a directory ↔ a symlink to outside, swapped atomically without pause, 10⁵ rounds of about ten requests) | now (L, M); measure on W |
 | 3 | Aliases: case folding, Unicode normalisation, 8.3 names (`PROGRA~1`), `/.vol`, ADS `file:stream` | Identity by (dev, ino) / FileId, never by name. M: compare the stored name (`fgetattrlist ATTR_CMN_NAME`) with the request, mismatch = ENOENT/EEXIST; never build `/.vol` paths. W: reject `:`; compare `FileNormalizedNameInformation` with the request (catches 8.3) | Corpus entries for each alias form; case/NFD variants (`test_alias_names_refused`, `test_case_collision_is_eexist`) | now (M); measure 8.3 check on W |
-| 4 | The file server itself is taken over (parser bug) | Confine it so a takeover reaches only the share: L user/mount/pid/net namespaces + `pivot_root` into the share + seccomp (crosvm's fs list minus mknod/setresuid/capset) + `no_new_privs` + Landlock when present / M Seatbelt `(deny default)` with `file-read*`/`file-write*` only `(subpath share)`, no network/exec/fork/IOKit / W LPAC token (per-share AppContainer SID) + ACE on the share only + Job (memory, CPU, 1 process, kill on close) + wick's mitigation profile. **If any control cannot be set, wick-fsd does not start** | Per-host sandbox checks (`Seccomp: 2`, `CapEff: 0`; profile test; `TokenIsLessPrivilegedAppContainer`); an outside open from inside the server fails; one test per control proving refusal to start. L: `test_confined_status` (`Seccomp: 2`, `NoNewPrivs: 1`, every capability set empty, other namespaces, `/` = the share), `test_outside_open_fails`, `confine_probe` (inside the confined process: `openat`, `socket`, `execve`, `ptrace` and an executable `mmap` killed by SIGSYS; the host's paths not there), and `test_refused_without_unshare`, `_fork`, `_mount`, `_pivot_root`, `_id_drop`, `_capability_drop`, `_no_new_privs`, `_seccomp`, `test_refused_when_landlock_fails`, each under a filter that makes that step's call fail | now (L, M); measure LPAC + AF_UNIX + inherited handles on W |
+| 4 | The file server itself is taken over (parser bug) | Confine it so a takeover reaches only the share: L user/mount/pid/net namespaces + `pivot_root` into the share + seccomp (crosvm's fs list minus mknod/setresuid/capset) + `no_new_privs` + Landlock when present / M Seatbelt `(deny default (with send-signal SIGKILL))`, each file operation the server makes allowed only `(subpath share)`, the system calls, Mach traps and MIG routines it makes listed and every other killed, no network/exec/fork/IOKit, as root the drop to `--uid`/`--gid` (§6.2) / W LPAC token (per-share AppContainer SID) + ACE on the share only + Job (memory, CPU, 1 process, kill on close) + wick's mitigation profile. **If any control cannot be set, wick-fsd does not start** | Per-host sandbox checks (`Seccomp: 2`, `CapEff: 0`; profile test; `TokenIsLessPrivilegedAppContainer`); an outside open from inside the server fails; one test per control proving refusal to start. L: `test_confined_status` (`Seccomp: 2`, `NoNewPrivs: 1`, every capability set empty, other namespaces, `/` = the share), `test_outside_open_fails`, `confine_probe` (inside the confined process: `openat`, `socket`, `execve`, `ptrace` and an executable `mmap` killed by SIGSYS; the host's paths not there), and `test_refused_without_unshare`, `_fork`, `_mount`, `_pivot_root`, `_id_drop`, `_capability_drop`, `_no_new_privs`, `_seccomp`, `test_refused_when_landlock_fails`, each under a filter that makes that step's call fail. M: `confine_probe` (inside the confined process: the outside canary by its path, metadata, `/.vol` and firmlink alias, `/etc/passwd`, exec, fork, a TCP connection, ptrace, `MAP_JIT`, executable mappings, a sysctl and the host's privileged port killed; the share's refused operations of §6.2 refused), `test_every_request_confined_answered_as_unconfined`, and one refusal test per step (`test_refused_when_the_profile_is_not_applied`, `test_refused_when_the_id_drop_fails`, `test_refused_when_a_descriptor_survives_its_close`, `test_refused_when_a_saved_id_is_left`, `test_refused_under_another_profile`, §6.2) | now (L, M); measure LPAC + AF_UNIX + inherited handles on W |
 | 5 | Taken-over server attacks the VMM | It never gets guest memory (unlike vhost-user) and no handle to the VMM; the VMM validates every reply length/unique and caps frames | `fs_proxy` fuzz target: hostile descriptor chains **and** hostile replies | now |
 | 6 | FUSE parser bugs from guest-controlled lengths | Bounded decoder in its own crate; fuzzed like wick's existing targets | `fs_decode`, `fs_session` fuzz targets on CI (1 min) + nightly | now |
 | 7 | Host device nodes, FIFOs, sockets, setuid files (CVE-2020-35517, CVE-2023-2861, CVE-2022-0358) | Only regular files and directories are ever opened for I/O (`fstat` on the handle first); `mknod` never called; ownership, modes, setuid, devices, FIFOs live in a wick-private metadata record; server has no capabilities | Corpus: host FIFO/device/socket in the share; setuid bit never reaches the host (`test_special_files_never_opened`, `test_host_device_node_never_opened`, `test_setuid_never_reaches_host`) | now |
-| 8 | Open by handle/id escapes (`open_by_handle_at` "shocker", `/.vol`, `FILE_OPEN_BY_FILE_ID`) | Never used; no `CAP_DAC_READ_SEARCH`; OS sandbox still applies | Open-by-id of an outside file from inside the server → denied. L: `confine_probe`'s `open_by_handle_at` case, killed by the seccomp filter (no capabilities either, `test_confined_status`) | now (L); measure M `/.vol`, W open-by-id under LPAC |
+| 8 | Open by handle/id escapes (`open_by_handle_at` "shocker", `/.vol`, `FILE_OPEN_BY_FILE_ID`) | Never used; no `CAP_DAC_READ_SEARCH`; OS sandbox still applies | Open-by-id of an outside file from inside the server → denied. L: `confine_probe`'s `open_by_handle_at` case, killed by the seccomp filter (no capabilities either, `test_confined_status`). M: `confine_probe`'s `/.vol/<dev>/<ino>` read of the outside canary, killed by the profile's file rule (the path read before the profile) | now (L, M); measure W open-by-id under LPAC |
 | 9 | Guest exhausts handles, inodes, CPU, disk | Server caps inode table, open handles, queue depth and READDIR page size (same numbers on all hosts; Windows has no per-process handle limit, so the cap is the server's own); VMM rate limiter = upstream's block-device `RateLimiter`; CPU/memory via cgroup / jetsam + jailer CPU limit / Job; disk: a server byte budget (same on all hosts) | Limit tests: ENFILE/EMFILE/backpressure at the same numbers on every host; queue flood keeps VMM in-flight bytes under the cap | now |
 | 10 | DAX: host truncates a file mapped into the guest → fault in the VMM | Not offered in v1 (ENOSYS) on any host | Guest mount with `dax` fails cleanly | now |
 | 11 | Socket between VMM and server hijacked | Accept once, check the peer (`SO_PEERCRED` / `LOCAL_PEERCRED` / `SIO_AF_UNIX_GETPEERPID` → SID), then unlink | Second connection refused; wrong peer refused | now |
@@ -763,7 +763,7 @@ share root with the server user's rights".
 | 7 | **setuid/setgid/file capabilities** on host objects | server unprivileged, no caps; host modes masked; emulated KILLPRIV semantics in the record (virtiofsd's fallocate/copy_file_range lesson, fc18227) [src] | same | same (no such bits on NTFS) | CVE-2022-0358 |
 | 8 | **xattrs/ACLs** | guest xattrs prefixed into `user.`; `security.capability` emulated in the record; POSIX ACLs EOPNOTSUPP | prefixed; `com.apple.*` (quarantine, provenance, ResourceFork, FinderInfo) not guest-settable | EAs are case-insensitive ASCII names, so guest xattrs go into one EA blob; host DACLs are never changed by guest chmod | virtiofsd `--xattrmap` doc [doc] |
 | 9 | **Ownership mapping** abused for privilege | emulated only; the server never calls `setresuid`/`fchown` with guest ids | same | same; not WSL's `$LX*` EAs (§3.1) | |
-| 10 | **Open by handle/id escapes** (`open_by_handle_at`, `/.vol`, `FILE_OPEN_BY_FILE_ID`) | never use; no `CAP_DAC_READ_SEARCH` (the "shocker" container escape) | never use `/.vol`; Seatbelt subpath still applies [inf: test] | not used with guest-influenced ids; ACL confinement still applies [inf: test] | virtiofsd README on DAC_READ_SEARCH [doc] |
+| 10 | **Open by handle/id escapes** (`open_by_handle_at`, `/.vol`, `FILE_OPEN_BY_FILE_ID`) | never use; no `CAP_DAC_READ_SEARCH` (the "shocker" container escape) | never use `/.vol`; the profile kills a `/.vol/<dev>/<ino>` read of an outside file (`confine_probe`) | not used with guest-influenced ids; ACL confinement still applies [inf: test] | virtiofsd README on DAC_READ_SEARCH [doc] |
 | 11 | **Inode/handle exhaustion**; never-forgotten lookups | inode-table and handle caps (virtiofsd's `GuestFdSemaphore` idea, `guest_fd_limit.rs`) [src]; `RLIMIT_NOFILE` too | caps; `RLIMIT_NOFILE` | caps (no OS handle limit [meas: `jailer-test.ps1 nofile`]) | |
 | 12 | **DoS**: huge directories, slow host fs, disk fill, CPU | bounded READDIR pages, bounded worker pool, queue cap; VMM rate limiter; CPU/memory via cgroup | same; jetsam + CPU limit (wick's jailer mechanisms) | same; Job memory/CPU/1-process | disk fill: host quotas only (§10) |
 | 13 | **DAX window**: host truncation → fault in the VMM; host page cache mapped into the guest | not offered (ENOSYS) | not offered | not offered (NTFS also refuses to truncate a file with a mapped section, so semantics would differ) [inf] | virtiofsd `setupmapping` [src]; Cloud Hypervisor removed DAX [doc] |
@@ -974,17 +974,180 @@ it means layer 1 let the request through.
 
 ### 6.2 macOS (Apple silicon; wick supports macOS 15, 26, 27)
 
-- **Confinement:** stage 0 resolves the share with `realpath` and checks it. Seatbelt subpaths match the
-  canonical path; the firmlink forms `/System/Volumes/Data/...` vs `/Users/...` are an open question, and wick has
-  hit Seatbelt path pitfalls before.
+- **Confinement:** stage 0 resolves the share with `realpath` and checks it; Seatbelt matches the canonical path at
+  each access. The share reached by its firmlink form (`/System/Volumes/Data/...` vs `/Users/...`) is an open
+  question; an outside file by its firmlink alias or by `/.vol/<dev>/<ino>` is killed (`confine_probe`).
+  - **As built** (`crates/fs/fsd/src/confine/macos.rs`, the calls in `crates/fs/sys/src/unix/seatbelt.rs`), after
+    stage 0 has accepted the one connection, checked its peer, and the backend holds the share's root. There is no
+    fork: the process that accepted the connection serves it.
+    1. the profile below built for the canonical path and compiled (`sandbox_compile_string`), with the operator's
+       rights;
+    2. as root, `--uid`/`--gid` (required, never 0), its one group the gid's; not root, no `--uid`;
+    3. the ids read back; its descriptors, the file table's whole list (`proc_pidinfo`), required to be exactly the
+       standard streams, the connection and the backend's root (`held_exactly`, as on Linux); the soft
+       `RLIMIT_NOFILE`; and that no profile is in force yet (`sandbox_check` with no operation). Each of these is a
+       call the profile kills, so it is read before it. Then the compiled profile applied (`sandbox_apply`);
+    4. under the profile, its descriptors by number (`fcntl(F_GETFD)` below the soft limit) exactly those again,
+       then one read-back (`confine::macos::check`): the real and effective uids and gids, the one group as root,
+       no saved id of 0 to go back to (`seteuid(0)` and `setegid(0)` refused), and no profile before this one. A
+       second profile cannot replace it: a second apply is a Sandbox mac-syscall, which the profile kills
+       (Seatbelt itself refuses a second profile over one with any denial, EPERM; over `(allow default)` alone it
+       takes it, so such a profile counts as none: measured on macOS 27.2, and `confine_probe` keeps the first
+       on record).
 
-  Then `sandbox_init` with a profile built like wick's (`overlay/vmm/ext/sandbox.rs`):
-  - `(deny default)`;
-  - `file-read*`/`file-write*` only `(subpath "<share>")` (read-only shares: `file-read*` only);
-  - the inherited socket's read/write;
-  - no network, `process-exec`, `process-fork`, IOKit or `mach-lookup` beyond what discovery shows libsystem needs.
+    Only then are the hellos exchanged and a frame read. Each step is required and a failure is a refusal naming
+    it; there is no flag that skips one (`test_what_held_is_served_and_what_did_not_is_named`).
 
-  Root drops to the invoking uid. The memory limit is jetsam; the CPU limit uses the jailer's mechanism.
+    **Refusal tests** (`crates/fs/fsd/tests/refusals.rs`, as the user and, on CI, as root). The server runs with a
+    library the test builds and inserts (`DYLD_INSERT_LIBRARIES`), macOS's stand-in for Linux's test filter, and must
+    refuse naming the step: the profile not compiled (`test_refused_when_the_profile_does_not_compile`), not applied
+    (`test_refused_when_the_profile_is_not_applied`), the id drop refused at `setgroups`
+    (`test_refused_when_the_id_drop_fails`; a server that is not root is taken for root so that it drops), the
+    listener's close said done and not done, so a descriptor it did not keep is open before the profile
+    (`test_refused_when_a_descriptor_survives_its_close`), `seteuid(0)` said done at the read-back
+    (`test_refused_when_a_saved_id_is_left`), and another profile with a denial applied before `main`
+    (`test_refused_under_another_profile`). With the library inserted and doing nothing the server serves
+    (`test_the_inserted_library_alone_changes_nothing`). Not made to fail: the descriptor walk under the profile
+    (`fcntl(F_GETFD)` below the soft limit), which cannot lie for one call without lying for every `fcntl` the
+    server makes; the equality it checks is tested before the profile.
+  - **The profile** (`BASE` and `profile`): `(deny default (with send-signal SIGKILL))`, so whatever no rule
+    allows ends the process inside the call; a denial means the server's own checks let a request through, and it
+    dies loudly (the VMM sees the connection close). System calls, Mach traps, MIG routines and Sandbox
+    mac-syscalls are killed unless listed, and so are generated code (`dynamic-code-generation`) and the issue of
+    sandbox extensions. The lists are by number or name, each entry with why (table below): `SYSCALLS`,
+    `MACH_TRAPS` (libmalloc's `_kernelrpc_mach_vm_map_trap` and `mach_msg2_trap`, for a frame of up to 2 MiB and
+    the node tables), and `mach_vm_reallocate` where the kernel defines it (`(when (defined? ...))`: macOS 15's
+    libsandbox does not compile the name). Seatbelt does not check the number of some calls at all (Firecracker's
+    `UNFILTERED_SYSCALLS` in `overlay/vmm/ext/sandbox.rs`: `openat`, `close`, `write`, `pwrite`, `fchmod`,
+    `fsetxattr`, `fremovexattr`, `linkat`, `unlinkat` among those wick-fsd makes); for those the file rules decide.
+
+    What the listed calls still allow, since Seatbelt filters a call by its number and not its arguments:
+    - `fcntl` (92) and `fcntl_nocancel` (406) with any command. The server uses `F_GETFL` (OPEN), `F_FULLFSYNC`
+      (FSYNC), `F_PREALLOCATE` and `F_PUNCHHOLE` (FALLOCATE), `F_GETFD` (step 4's walk), and libc's `fdopendir`
+      sets `FD_CLOEXEC`. A server taken over could use the rest on the descriptors it holds (the connection, the
+      share's root, held directories and open files of the share): `F_GETPATH` gives the host path of the share
+      and what is in it; `F_SETFL` changes its own descriptors' flags; `F_DUPFD` makes more descriptors to the
+      same objects, up to the soft `RLIMIT_NOFILE` (`limits::descriptors`); `F_NOCACHE` and `F_RDADVISE` change
+      caching. Each acts on an object it already holds; none opens another. A lock by `F_SETLK`, which host
+      processes would see, is checked as `file-lock`, which the share refuses (`confine_probe`'s "an fcntl lock on
+      a file of the share").
+    - `sendto` (133) and `recvfrom` (29) on the one connection only: `socket`, `connect`, `socketpair` and
+      `accept` are not listed, so no other socket can be made, and `sendmsg`/`recvmsg` are not either, so no
+      descriptor passes over the connection.
+    - `mach_msg2_trap` (47), which libmalloc needs, sends any Mach message to a port the process holds (its task
+      port, the bootstrap port). Behind it, a kernel MIG routine not listed is killed by the `syscall-mig` rule
+      (`mach_vm_reallocate` alone is listed): `task_info` of its own task, `deny(1) syscall-mig 195` in the crash
+      report of a C program under the same profile (macOS 27.2). A bootstrap lookup through libxpc is killed before
+      any message, at `mach_port_mod_refs` (`deny(1) syscall-mach 19`, the same program). Both are `confine_probe`
+      cases, killed confined and working unconfined. Not measured: a lookup message built by hand and sent with
+      `mach_msg2_trap` alone, which reaches launchd; launchd asks Seatbelt `mach-lookup` for its sender, which the
+      default denies, and answers with an error (that denial is launchd's own check of the sender, not a kill).
+
+    The share's file operations, each named, inside `(subpath "<share>")` only:
+    - allowed: `file-read-data`, `file-read-metadata`, `file-read-xattr`, `file-test-existence`, and, read-write,
+      `file-write-create`, `-data`, `-mode`, `-times`, `-unlink`, `-xattr` and `file-link`, each with the requests
+      that make it (`FILE_READ_OPS`, `FILE_WRITE_OPS`), with the composite `file-read*` and `file-write*` (a call
+      can be checked as one: `futimens`'s `fsetattrlist` asks `file-write*`). A rule on one operation decides over
+      a rule on a composite whatever their order (measured), so no composite rule widens a leaf one. Read-only
+      shares: every write operation and `file-write*` killed in the share;
+    - killed: `file-mount`, `file-mount-update`, `file-unmount` (`KILLED_IN_SHARE`);
+    - refused with an error (EPERM), not killed: `ERROR_IN_SHARE`, the next paragraph.
+
+    Outside the share every file operation is the default's kill, `file-map-executable` and the rest included.
+
+    Two rules of `BASE` are not kills:
+    - `(deny mach-priv-host-port)`: libsandbox asks for the host's privileged port inside `sandbox_apply`, once the
+      profile is in force; with the kill the process ends in the apply (bisect on macOS 27.2: `BASE` alone 137,
+      each kill class over `(allow default)` 0, `(deny default (with send-signal SIGKILL))` with `mach-priv*`
+      allowed 0, with this plain deny 0). Firecracker's own profile has the same rule for the same reason. A
+      process asking for the port afterwards is killed before the rule is consulted: the ask
+      (`host_get_special_port`) is Mach trap 47 (`deny(1) syscall-mach 47`) and, with traps unfiltered, MIG
+      routine 33, neither allowed (`confine_probe`'s "the host's privileged port");
+    - `(allow system-info (info-type "vfs.disk-space"))`, which `fstatfs` asks: denied, the free blocks are rounded
+      (measured: 5945470 shown as 5940000), where Linux's STATFS answers exactly. The guest learns the share
+      volume's free space, as on Linux; `requests.rs` requires STATFS confined to equal STATFS in process on both
+      hosts.
+
+  - **Why the share's other operations are refused with an error and not killed.** Seatbelt evaluates, for both
+    names of a hard link (`linkat`), the share's whole set of file operations, the composites `file*`,
+    `file-read*`, `file-write*`, `fs-snapshot*` and `network*`, and `process-exec` and `system-automount`; a kill
+    action on any of them ends the process after the link is made (measured on macOS 27.2 with a C program,
+    `c15/sbx/link.c`, one operation at a time: each one killed in the share alone ends `linkat`, and the
+    composites need a rule of their own). The crash report of such a kill carries termination code 1 and no
+    "details", where a system call filter's kill carries code 221 and names the call. A denial stays a denial:
+    moving these from kill to error changes what happens to a server that makes them, not what it reaches. Each
+    one, with what shows it still refused under the profile (`confine_probe`; unconfined, the same calls are on
+    record in its output):
+
+    | In the share | Refused by | `confine_probe` case (confined; unconfined) |
+    |---|---|---|
+    | `file-write-flags` | the rule: EPERM | `fchflags(UF_NODUMP)`: EPERM; done |
+    | `file-write-owner` | the rule: EPERM | `fchown(-1, -1)`: EPERM; done |
+    | `file-write-setugid` | the rule: the call returns 0 and the bit is not kept, silently | `fchmod(fd, 04644)` on a regular file of the share the probe made and opened: 0, and `fstat` after shows no set-user-id bit; unconfined the bit is kept. No guest request asks it: the backend makes files 0o600 and directories 0o700, and `set_perm` passes the permission bits alone with its own access, so a guest's special bits are kept in the record only (`requests.rs`: MKDIR 07777, CREATE 06755, SETATTR 06777, 04700 and 01755, each answered in full, confined as in process, and the host's objects with none of them) |
+    | `file-clone` | the rule: EPERM | `clonefileat`: EPERM; done |
+    | `file-ioctl` | the rule: EPERM | `ioctl(DKIOCGETBLOCKSIZE)`: EPERM; ENOTTY (`FIONREAD` is answered by the descriptor layer and never asks `file-ioctl`: done both ways) |
+    | `file-write-finderinfo` | the rule: EPERM | `fsetattrlist(ATTR_CMN_FNDRINFO)` (a listed call): EPERM; done |
+    | `fs-snapshot*` | the call, unlisted: killed | `fs_snapshot_create`: killed; EPERM |
+    | `file-chroot` | the call, unlisted: killed | `chroot`: killed; EPERM |
+    | `file-revoke` | the call, unlisted: killed | `revoke`: killed; ENOTSUP |
+    | `file-lock` | the call, unlisted: killed | `flock`: killed; done |
+    | `file-mknod` | the call, unlisted: killed | `mkfifoat`: killed; done |
+    | `file-map-executable` | the call, unlisted (`mmap`, 197): killed | a share file mapped executable: killed |
+    | `process-exec` | the call, unlisted: killed | exec of a file of the share: killed |
+    | `network*` | the call, unlisted: killed | a TCP connection: killed |
+    | `file-graft`, `file-ungraft` | the call, unlisted (`graftdmg`): killed, or the rule's EPERM if Seatbelt does not check its number (not probed) | none |
+    | `file-search` | the call, unlisted (`searchfs`): as the row above | none |
+    | `file-write-acl` | the call, unlisted (`chmod_extended`, `fchmod_extended`): as the row above | none |
+    | `file-issue-extension` | `sandbox_issue_extension` is a Sandbox mac-syscall: killed | none |
+    | `system-automount` | no call of the server's asks it; nothing is mounted in the share | none |
+    | `file*` | the composite: every file operation of the share has its own rule above, so none falls to it | none |
+
+  - **Each request's host calls**, from the code (`crates/fs/fsd/src/host/unix.rs`, `crates/fs/sys`), every one in
+    `SYSCALLS`, the unfiltered set or the traps; `requests.rs` makes every request kind against a confined server
+    and requires each reply to equal the in-process backend's. Each call was reported unlisted by a discovery run
+    but `fsync` and `readlinkat`, as their rows say:
+
+    | Request | Host calls |
+    |---|---|
+    | every frame | `recvfrom` (29), `sendto` (133); a large frame and the node tables: traps 15 and 47, `mach_vm_reallocate` |
+    | at exit | `sigaltstack` (53), `munmap` (73): std's stack-overflow handler; the counters' line: `write` (unchecked) |
+    | INIT, DESTROY, FLUSH, FSYNCDIR, the ENOSYS group | none |
+    | ACCESS | a node lookup (LOOKUP's) |
+    | LOOKUP | `fstatat64` (470), `getattrlistat` (476, the stored name), `openat` (unchecked), `fstat64` (339) |
+    | GETATTR | `fstat64` or `fstatat64` |
+    | SETATTR | size: `openat`, `ftruncate` (201); mode: `fchmod` (unchecked); times: `fsetattrlist` (229, libc's `futimens`); ids: the record by `fsetxattr` (unchecked) |
+    | READLINK | a symlink the host made: `readlinkat` (473; never reported by a discovery run, measured by a run of `requests.rs` without it: killed, `deny(1) syscall-unix 473`), `fstatat64`; the guest's own (kept as files): `pread` (153) |
+    | CREATE, MKNOD, SYMLINK | `openat`, `fsetxattr`, `fstat64`, `fstatat64` |
+    | MKDIR | `mkdirat` (475) |
+    | UNLINK, RMDIR | `unlinkat` (unchecked) |
+    | RENAME | `renameatx_np` (488) |
+    | LINK | `linkat` (unchecked), `unlinkat` to undo a link it cannot keep |
+    | OPEN | `openat`, `fcntl(F_GETFL)` (92), `fstat64` |
+    | READ, WRITE | `pread` (153), `pwrite` (unchecked) |
+    | STATFS | `fstatfs64` (346), with `vfs.disk-space` |
+    | RELEASE, RELEASEDIR | `close` (unchecked) |
+    | FSYNC | `fcntl(F_FULLFSYNC)`, `fsync` (95) where the file system has no `F_FULLFSYNC` (from the code, never run: the volumes the tests make, APFS, have it) |
+    | GETXATTR, LISTXATTR, SETXATTR, REMOVEXATTR | `fgetxattr` (235), `flistxattr` (241), `fsetxattr`, `fremovexattr` (unchecked) |
+    | OPENDIR, READDIR, READDIRPLUS | `fcntl_nocancel` (406, libc's `fdopendir`), `getdirentries64` (344), `lseek` (199), `fstatat64`, `close` |
+    | FALLOCATE | `fstat64`, `lseek`, `pwrite`, `fcntl(F_PREALLOCATE, F_PUNCHHOLE)`, `ftruncate`, `fstatfs64` |
+    | step 4's read-back | `fcntl(F_GETFD)` |
+
+  - **How the lists were made, and the limit of that.** A discovery build (`--cfg wick_fsd_discovery`, never
+    released) ends the profile with `(allow default (with report))` and allows unlisted calls with a report;
+    the confined tests are run under it and each `Sandbox:` report line read (`/usr/bin/log show`). What that
+    rule covers: a call no list names and an operation no rule names. It does not report a listed call (the
+    list's rule, which has a filter, decides over the discovery rule whatever their order) or an operation the
+    share's rules or the plain denials name, and Seatbelt never sees the number of an unfiltered call. And the
+    reports are lossy: a process making N distinct reported accesses gave 100 report lines for N = 100, 922 for
+    1000 and 3210 for 5000 (macOS 27.2, `c15/sbx/many.c`, `stat` of N files under one report rule; no fixed cap,
+    lines dropped as the rate grows). So discovery shows what a run reached and cannot prove a list complete.
+    The lists are completed from the code, each request kind's calls named in the table above, and checked by
+    `requests.rs`, which makes every request kind confined (a missing entry is a kill, which the test sees as the
+    connection closing); a kill's crash report names a system call filter's denial (`deny(1) syscall-unix N`),
+    and a file rule's kill leaves a report with no details. Crash reports are lossy too: of `confine_probe`'s 23
+    kills in one run macOS wrote reports for the first five only (19:00:18 on 2026-11-18), and in some runs none,
+    so a missing report shows nothing.
+  - The memory limit is jetsam; the CPU limit uses the jailer's mechanism.
 - **Resolution:**
   - `openat(dirfd, name, O_NOFOLLOW_ANY|O_RESOLVE_BENEATH|O_CLOEXEC)` (§4.3; `O_NOFOLLOW` as well is EINVAL), with
     `O_RESOLVE_BENEATH` on 15.4+ (unconfirmed, §0 row 19);
@@ -1143,8 +1306,9 @@ it means layer 1 let the request through.
    - LPAC + AF_UNIX + inherited handles;
    - `FILE_OPEN_BY_FILE_ID` under LPAC for an outside file.
 3. **macOS:**
-   - Seatbelt `subpath` vs `/.vol` and firmlink aliases, and very deep paths;
-   - whether a `sandbox_init`ed (non-App-Sandbox) process's files get `com.apple.quarantine`/`com.apple.provenance`;
+   - Seatbelt `subpath` vs the share reached by its firmlink alias, and very deep paths (an outside file by `/.vol`
+     or its firmlink alias is killed: `confine_probe`);
+   - whether a sandboxed (non-App-Sandbox) process's files get `com.apple.quarantine`/`com.apple.provenance`;
    - which macOS release first has `O_RESOLVE_BENEATH` (decision 5 in §0 needs it);
 4. **Linux:** where unprivileged userns is disabled, a root launcher that drops (§0, decision 6). Open: how
    non-UTF-8 host names are presented under the parity rule.
@@ -1185,8 +1349,8 @@ it means layer 1 let the request through.
      stage `fs-off` on each host).
 2. **Traversal corpus (host-side harness, no VM, every CI host).** Exists for Linux and macOS as
    `test_traversal_corpus` (`crates/fs/fsd/tests/corpus.rs`), over the session and the host backend without the
-   frame layer, and on Linux as `test_traversal_corpus_confined`, against a confined wick-fsd over its socket, which
-   must end normally with no layer-2 or layer-3 refusal; macOS's confined re-run comes with its confinement. A Rust harness speaks wick-fsd's frame protocol
+   frame layer, and on Linux and macOS as `test_traversal_corpus_confined`, against a confined wick-fsd over its
+   socket, which must end normally with no layer-2 or layer-3 refusal. A Rust harness speaks wick-fsd's frame protocol
    and sends every name-taking opcode (LOOKUP, MKNOD, MKDIR, SYMLINK (name *and* target), UNLINK, RMDIR, RENAME,
    RENAME2, LINK, CREATE, TMPFILE, SETXATTR/GETXATTR names). Names:
    - `..`, `.`, `a/b`, `/etc/x`, `../../x`;
@@ -1218,7 +1382,10 @@ it means layer 1 let the request through.
 7. **Sandbox checks of wick-fsd:**
    - Linux: `/proc/<pid>/status` (`Seccomp: 2`, `NoNewPrivs: 1`, `CapEff: 0`), `/` = the share, an open of an outside
      path fails (exist: `test_confined_status`, `test_outside_open_fails`, `confine_probe`);
-   - macOS: a profile test like `test_unlisted_syscalls_are_denials`, plus `/.vol` and firmlink-alias opens denied;
+   - macOS: `confine_probe` (the outside canary by its path, its metadata, `/.vol` and its firmlink alias, exec, fork,
+     a TCP connection, the host's privileged port and the share's refused operations of §6.2, each killed or
+     refused) and `test_every_request_confined_answered_as_unconfined` (every request kind confined, each reply
+     equal to the in-process backend's, no kill); one test per step failing (`refusals.rs`, §6.2);
    - Windows: `TokenIsLessPrivilegedAppContainer`, Job limits, `GetProcessMitigationPolicy`, outside open and
      open-by-id → `ACCESS_DENIED`;
    - all hosts: the server refuses to start when any control cannot be installed (one test per control; Linux's exist,

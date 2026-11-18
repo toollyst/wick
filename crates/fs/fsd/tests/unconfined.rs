@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! wick-fsd has no unconfined mode: on a host whose confinement is not built
-//! yet (macOS until its commit, Windows until its port) it refuses to start,
+//! yet (Windows, until its port) it refuses to start,
 //! with a valid command line, and serves nothing (docs/design-fs.md §4.2).
 
-#![cfg(not(target_os = "linux"))]
+#![cfg(not(any(target_os = "linux", target_os = "macos")))]
 // An integration test file is itself the test crate.
 #![allow(clippy::tests_outside_test_module)]
 

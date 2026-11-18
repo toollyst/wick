@@ -247,7 +247,10 @@ memory only and a cache of held descriptors, `held.rs`, `stale.rs`, `memory.rs`)
 binary confined on Linux (namespaces, `pivot_root` into the share, the id and capability drop, `no_new_privs`, Landlock
 where present and a seccomp allow-list, its waiting parent confined too, and everything read back before serving;
 `test_confined_status`, `confine_probe`, one refusal test per step in each process that takes it, and the corpus
-against the confined server), and guest kernels with
+against the confined server) and on macOS (a Seatbelt profile that kills whatever it does not allow: each file
+operation the server makes allowed in the share alone, the system calls, Mach traps and MIG routines it makes
+listed, as root the drop to `--uid`/`--gid`, read back before serving; `confine_probe`, and every request kind, the
+corpus and the link sequences against the confined server), and guest kernels with
 `CONFIG_VIRTIO_FS` built by CI's `guest-kernels` job (`tools/linux/guest-kernel.sh`); nothing a guest can use yet. The plan:
 
 - The device in Firecracker only copies bounded, unparsed requests between the virtqueues and one socket.

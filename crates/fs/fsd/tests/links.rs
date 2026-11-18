@@ -57,14 +57,13 @@ macro_rules! both {
                 super::$name(&mut h.g);
             }
 
-            /// A confined wick-fsd over its socket (Linux).
-            #[cfg(target_os = "linux")]
+            /// A confined wick-fsd over its socket.
             #[test]
             fn confined() {
                 let base = super::scratch(concat!("links-c-", stringify!($name)));
                 let share = base.join("share");
                 std::fs::create_dir(&share).unwrap();
-                if let Some(r) = super::remote::confined_over(&share, &base.join("fs.sock")) {
+                if let Some(r) = super::remote::confined_over(&share, &super::remote::socket_in(&base)) {
                     let mut g = super::G::over(r);
                     super::$name(&mut g);
                     super::remote::finish_clean(&mut g.s);

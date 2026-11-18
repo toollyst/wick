@@ -77,15 +77,15 @@ fn test_traversal_corpus() {
     traversal_corpus(&mut H::new("corpus"));
 }
 
-/// The corpus against a confined wick-fsd over its socket (Linux): the same
-/// answers, the server never killed, and no layer-2 or layer-3 refusal in
-/// the counters it reports at the end.
-#[cfg(target_os = "linux")]
+/// The corpus against a confined wick-fsd over its socket: the same
+/// answers, the server never killed (on macOS a denial of its profile would
+/// kill it), and no layer-2 or layer-3 refusal in the counters it reports at
+/// the end.
 #[test]
 fn test_traversal_corpus_confined() {
     let (base, share, outside) = share_and_outside("corpus-confined", |_| {});
     let canaries = snapshot(&outside);
-    let Some(r) = remote::confined_over(&share, &base.join("fs.sock")) else {
+    let Some(r) = remote::confined_over(&share, &remote::socket_in(&base)) else {
         remove(&base);
         return;
     };

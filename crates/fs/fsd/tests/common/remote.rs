@@ -44,6 +44,19 @@ pub fn base_args(share: &Path, socket: &Path) -> Vec<String> {
     a
 }
 
+/// A socket path for a test beneath `base`: `base/fs.sock`, or, where that
+/// is longer than a Unix socket's path may be (macOS's temporary directory
+/// is deep), one in `/tmp` named for this process and a counter.
+pub fn socket_in(base: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let p = base.join("fs.sock");
+    if p.as_os_str().len() < 100 {
+        return p;
+    }
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PathBuf::from(format!("/tmp/wick-fsd-{}-{n}.sock", std::process::id()))
+}
+
 /// As root the server drops to 65534: the share must be its.
 pub fn give_share(share: &Path) {
     if sys::euid() == 0 {
@@ -85,7 +98,7 @@ pub fn userns_restricted() -> Option<String> {
 /// Whether the tests stand in for a host that restricts user namespaces
 /// ([`userns_restricted`]).
 fn simulated_restriction() -> bool {
-    sys::euid() != 0 && std::env::var_os("WICK_FS_TEST_SIMULATE_USERNS_RESTRICTED").is_some_and(|v| v == "1")
+    cfg!(target_os = "linux") && sys::euid() != 0 && std::env::var_os("WICK_FS_TEST_SIMULATE_USERNS_RESTRICTED").is_some_and(|v| v == "1")
 }
 
 /// Whether `err` is the refusal of a host that restricts user namespaces:
@@ -165,6 +178,7 @@ impl Server {
     pub fn spawn_from(program: &Path, args: &[String], prepare: impl FnOnce(&mut Command)) -> Server {
         let mut cmd = Command::new(program);
         cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(target_os = "linux")]
         if simulated_restriction() {
             sys::confine::command_with_filter(&mut cmd, sys::confine::simulated_userns_restriction());
         }
@@ -209,6 +223,7 @@ impl Server {
     }
 
     /// The pid of the confined process: the child the server forked.
+    #[cfg(target_os = "linux")]
     pub fn confined_pid(&self) -> Option<i32> {
         let parent = i32::try_from(self.child.id()).unwrap();
         for e in std::fs::read_dir("/proc").ok()? {
