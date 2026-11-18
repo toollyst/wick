@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use wick_fsd::cache::{CacheMode, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS};
-use wick_fsd::limits::Limits;
+use wick_fsd::limits::{Limits, MAX_NODES_LIMIT};
 
 /// The command line.
 #[derive(Debug)]
@@ -97,6 +97,13 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         && fd < 3
     {
         return Err(format!("--ready-fd {fd}: 0 to 2 are the standard streams and below 0 is none; give 3 or more"));
+    }
+    if limits.max_nodes > MAX_NODES_LIMIT {
+        return Err(format!(
+            "--max-nodes {}: at most {MAX_NODES_LIMIT} (2^28), the bound under which a node's chain of ancestors \
+             keeps its index's buffer under 2 MiB (wick_fsd::limits::MAX_NODES_LIMIT)",
+            limits.max_nodes
+        ));
     }
     if timeout > MAX_TIMEOUT_MS {
         return Err(format!("--cache-timeout-ms: at most {MAX_TIMEOUT_MS}"));
@@ -406,4 +413,23 @@ fn run(args: &Args, start: Start) -> Result<(), String> {
     eprintln!("wick-fsd: {}: confined (Seatbelt profile of the share, ids dropped)", args.id);
     discovery_control();
     serve_all(args, &mut conn, &mut session)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_nodes(n: &str) -> Result<Args, String> {
+        let argv = ["--share-dir", "/s", "--socket", "/s.sock", "--id", "t", "--max-nodes", n];
+        parse(argv.iter().map(|a| (*a).to_string()))
+    }
+
+    // --max-nodes up to 2^28 is taken; one more is refused at the start,
+    // naming the limit, on every host.
+    #[test]
+    fn test_max_nodes_is_at_most_two_to_the_28th() {
+        assert_eq!(with_nodes("268435456").unwrap().limits.max_nodes, 1 << 28);
+        let err = with_nodes("268435457").unwrap_err();
+        assert!(err.starts_with("--max-nodes 268435457: at most 268435456 (2^28)"), "{err}");
+    }
 }

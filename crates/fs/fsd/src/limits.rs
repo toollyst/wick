@@ -17,6 +17,14 @@
 /// (docs/design-fs.md §4.2, Limits); `--max-nodes` sets it per share.
 pub const DEFAULT_MAX_NODES: usize = 1 << 18;
 
+/// The most `--max-nodes` may be: 2^28. A node's chain of ancestors without
+/// descriptors (host::unix's walk) is at most the share's nodes, and its
+/// list of chunks of pointers, grown by realloc, stays at or under 1.5 MiB
+/// up to 2^28 entries; past 2 MiB libmalloc would move it with a VM copy
+/// that wick-fsd's macOS profile does not allow (confine::macos's pin). The
+/// same limit on every host.
+pub const MAX_NODES_LIMIT: usize = 1 << 28;
+
 /// Descriptors the nodes may hold at once, the root's included: the host
 /// backend's cache of held directories and of leaves' widest opens, the
 /// least recently used let go first. With [`DEFAULT_MAX_HANDLES`] and

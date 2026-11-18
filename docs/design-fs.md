@@ -473,7 +473,9 @@ lay them out); fuzz target `fs_proxy`. No guest has used it yet (commit 12's boo
     or a leaf (the names it is known by), each re-verified against the identity at use (§4.3); on Windows a handle
     opened by id.
 - **Limits, identical on every host:**
-  - inode entries: 2^18 (262144) by default (`DEFAULT_MAX_NODES`; `--max-nodes` sets it per share). On Linux and
+  - inode entries: 2^18 (262144) by default (`DEFAULT_MAX_NODES`; `--max-nodes` sets it per share, at most 2^28,
+    `MAX_NODES_LIMIT`, a larger value refused at the start on every host: a node's chain of ancestors keeps its
+    index's buffer at or under 1.5 MiB up to that many, under the 2 MiB of §6.2's realloc pin). On Linux and
     macOS a node costs memory, not a descriptor (§10, question 11): at most 4096 bytes (`NODE_BYTES_MAX`: its
     node-table entry, and a leaf with 8 names of 255 bytes, the most it keeps, or a directory node with its name,
     allocator rounding and the tables' spare capacity included). Measured as the growth of the process's resident

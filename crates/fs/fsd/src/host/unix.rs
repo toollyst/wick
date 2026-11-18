@@ -322,9 +322,9 @@ const SEARCH_BATCH: usize = 256;
 /// (1.5 MiB) for a chain of up to 2^28 (268,435,456) directories, and only
 /// a longer one takes it to 3 MiB. A chain is at most the guest's nodes:
 /// 64 chunks (1,536 bytes) at the default `--max-nodes`
-/// ([`crate::limits::DEFAULT_MAX_NODES`], 2^18); `--max-nodes` is the
-/// operator's, and a share past the bound needs more than 2^28 directories
-/// each inside the last.
+/// ([`crate::limits::DEFAULT_MAX_NODES`], 2^18), and at most 2^28 at the
+/// largest `--max-nodes` the server takes
+/// ([`crate::limits::MAX_NODES_LIMIT`]).
 struct Chunked<T>(Vec<Vec<T>>);
 
 /// Entries of a [`Chunked`] buffer.
@@ -360,7 +360,7 @@ impl<T> Chunked<T> {
 /// The largest buffer each list this backend grows by realloc can reach,
 /// for confine::macos's pin: a leaf's names (at most [`NAMES_MAX`], the
 /// oldest dropped first), a chunk of a chain and its list of chunks at the
-/// default node limit ([`Chunked`], which gives the bound past it), a
+/// largest node limit ([`Chunked`], [`crate::limits::MAX_NODES_LIMIT`]), a
 /// search's batch ([`SEARCH_BATCH`] entries, `DirReader::read` stopping at
 /// its `max`).
 /// What else the backend collects is allocated once at its full length
@@ -373,8 +373,8 @@ pub(crate) fn grown_bounds() -> [(&'static str, usize); 4] {
         ("a leaf's names: NAMES_MAX entries", NAMES_MAX * std::mem::size_of::<(Weak<DirNode>, HostId, Box<[u8]>)>()),
         ("a chain's chunk: CHAIN_CHUNK pointers", CHAIN_CHUNK * std::mem::size_of::<Arc<DirNode>>()),
         (
-            "a chain's list of chunks at the default --max-nodes, its capacity doubled",
-            crate::limits::DEFAULT_MAX_NODES.div_ceil(CHAIN_CHUNK).next_power_of_two()
+            "a chain's list of chunks at the largest --max-nodes, its capacity doubled",
+            crate::limits::MAX_NODES_LIMIT.div_ceil(CHAIN_CHUNK).next_power_of_two()
                 * std::mem::size_of::<Vec<Arc<DirNode>>>(),
         ),
         ("a search's batch: SEARCH_BATCH entries", SEARCH_BATCH * std::mem::size_of::<sys::RawEntry>()),

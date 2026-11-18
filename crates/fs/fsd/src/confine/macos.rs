@@ -559,8 +559,8 @@ mod tests {
     //   backend; the host's `read_dir` stops at that `max`, as its raw list);
     // - the host backend's own (host::unix `grown_bounds`): a leaf's names,
     //   a chunk of a node's chain of ancestors and the list of chunks at the
-    //   default node limit (the list stays at or under 1.5 MiB for chains of
-    //   up to 2^28 directories, host::unix `Chunked`), a search's batch;
+    //   largest node limit (--max-nodes is at most 2^28, MAX_NODES_LIMIT, and
+    //   a chain at most the nodes: 1.5 MiB), a search's batch;
     // - a name escaped for the host (fuse::name `escape`: at most three
     //   bytes for each of a name's NAME_MAX).
     // Lists whose length is the guest's or the host's to choose are
