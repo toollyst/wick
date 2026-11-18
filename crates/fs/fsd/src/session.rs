@@ -96,7 +96,7 @@ const DT_DIR: u32 = 4;
 const DT_LNK: u32 = 10;
 
 /// Entries asked of the backend per READDIR round.
-const READDIR_BATCH: usize = 64;
+pub(crate) const READDIR_BATCH: usize = 64;
 
 /// One share's settings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1400,7 +1400,9 @@ impl<D: ConfinedDir> Session<D> {
         }
         let r = self.dir.list_xattr(&node);
         let list = r.map_err(|e| self.dir_err(e))?;
-        let mut names = Vec::new();
+        // One allocation of the answer's length, never grown (the names'
+        // count is the host's; see sys::xattr::list).
+        let mut names = Vec::with_capacity(list.iter().map(|(n, _)| n.len() + 1).sum());
         for (n, _) in list {
             names.extend_from_slice(&n);
             names.push(0);

@@ -309,6 +309,65 @@ pub const NAMES_MAX: usize = 8;
 /// before the answer is ENOENT.
 pub const SEARCH_MAX: usize = 1 << 16;
 
+/// How many entries a search reads from the host at a time.
+const SEARCH_BATCH: usize = 256;
+
+/// A stack of up to [`CHAIN_CHUNK`] entries per buffer: the ancestors of a
+/// node up to one whose descriptor is held, as many as the guest's nodes
+/// (`--max-nodes`), are never one buffer grown by realloc. libmalloc moves
+/// a buffer grown past 2 MiB with a VM copy (`mach_vm_copy`, `vm_copy`),
+/// which wick-fsd's macOS profile does not allow (confine::macos's pin);
+/// a chunk is at most `CHAIN_CHUNK` pointers, and the list of chunks would
+/// need more than 87,000 of them, hundreds of millions of nodes, to reach it.
+struct Chunked<T>(Vec<Vec<T>>);
+
+/// Entries of a [`Chunked`] buffer.
+const CHAIN_CHUNK: usize = 4096;
+
+impl<T> Chunked<T> {
+    fn new(first: T) -> Chunked<T> {
+        Chunked(vec![vec![first]])
+    }
+
+    fn push(&mut self, v: T) {
+        if self.0.last().is_none_or(|c| c.len() == CHAIN_CHUNK) {
+            self.0.push(Vec::new());
+        }
+        if let Some(c) = self.0.last_mut() {
+            c.push(v);
+        }
+    }
+
+    fn last(&self) -> Option<&T> {
+        self.0.last().and_then(|c| c.last())
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        let v = self.0.last_mut()?.pop();
+        if self.0.last().is_some_and(Vec::is_empty) {
+            self.0.pop();
+        }
+        v
+    }
+}
+
+/// The largest buffer each list this backend grows by realloc can reach,
+/// for confine::macos's pin: a leaf's names (at most [`NAMES_MAX`], the
+/// oldest dropped first), a chunk of a chain ([`Chunked`]), a search's batch
+/// ([`SEARCH_BATCH`] entries, `DirReader::read` stopping at its `max`).
+/// What else the backend collects is allocated once at its full length
+/// (the live nodes, the attribute names) or is one evicted holder per
+/// insertion (`Held::admit`: one entry in, so at most one out). macOS only:
+/// the VM copy it guards is libmalloc's.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn grown_bounds() -> [(&'static str, usize); 3] {
+    [
+        ("a leaf's names: NAMES_MAX entries", NAMES_MAX * std::mem::size_of::<(Weak<DirNode>, HostId, Box<[u8]>)>()),
+        ("a chain's chunk: CHAIN_CHUNK pointers", CHAIN_CHUNK * std::mem::size_of::<Arc<DirNode>>()),
+        ("a search's batch: SEARCH_BATCH entries", SEARCH_BATCH * std::mem::size_of::<sys::RawEntry>()),
+    ]
+}
+
 /// A non-directory: its identity, where it is known, and the descriptor of
 /// the guest's widest open of it.
 #[derive(Debug)]
@@ -411,8 +470,12 @@ impl<T> Registry<T> {
         self.map.insert(id, Arc::downgrade(v));
     }
 
+    /// The live values, in one allocation of the map's length (as many as
+    /// the guest's nodes, `--max-nodes`, never grown by realloc).
     fn live(&self) -> Vec<Arc<T>> {
-        self.map.values().filter_map(Weak::upgrade).collect()
+        let mut out = Vec::with_capacity(self.map.len());
+        out.extend(self.map.values().filter_map(Weak::upgrade));
+        out
     }
 }
 
@@ -587,7 +650,7 @@ impl HostDir {
             return Ok(fd);
         }
         // The nodes without a descriptor, from `node` up.
-        let mut chain = vec![node.clone()];
+        let mut chain = Chunked::new(node.clone());
         let mut top = loop {
             let last = chain.last().map(|n| lock(&n.place).clone());
             let Some(Some((parent, _))) = last else {
@@ -649,7 +712,7 @@ impl HostDir {
             let mut after = 0;
             loop {
                 let mut batch = Vec::new();
-                r.read(after, 256, &mut batch).map_err(err)?;
+                r.read(after, SEARCH_BATCH, &mut batch).map_err(err)?;
                 let Some(last) = batch.last() else {
                     return Err(enoent());
                 };
@@ -812,7 +875,7 @@ impl HostDir {
             let mut after = 0;
             loop {
                 let mut batch = Vec::new();
-                if r.read(after, 256, &mut batch).is_err() {
+                if r.read(after, SEARCH_BATCH, &mut batch).is_err() {
                     break;
                 }
                 let Some(last) = batch.last() else {
@@ -1470,7 +1533,9 @@ impl ConfinedDir for HostDir {
             Err(e) if e.0 == sys::errno::ENOTSUP || e.0 == sys::errno::EOPNOTSUPP => Vec::new(),
             Err(e) => return Err(err(e)),
         };
-        let mut out = Vec::new();
+        // At most one entry per host name, allocated once (the count is the
+        // host's; see sys::xattr::list).
+        let mut out = Vec::with_capacity(names.len());
         for n in names {
             // Only the guest's own; the host's others are not shown.
             let Some(guest) = n.strip_prefix(GUEST_XATTR_PREFIX) else {

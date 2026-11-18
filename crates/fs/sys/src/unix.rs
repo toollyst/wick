@@ -799,11 +799,14 @@ pub mod xattr {
             match usize::try_from(n) {
                 Ok(n) => {
                     buf.truncate(n);
-                    return Ok(buf
-                        .split(|&b| b == 0)
-                        .filter(|n| !n.is_empty())
-                        .map(<[u8]>::to_vec)
-                        .collect());
+                    // One allocation of the names' count, never grown: the
+                    // count is the host's, and a list grown by realloc past
+                    // 2 MiB is moved with a VM copy wick-fsd's macOS profile
+                    // does not allow (confine::macos's pin).
+                    let names = buf.split(|&b| b == 0).filter(|n| !n.is_empty());
+                    let mut out = Vec::with_capacity(names.clone().count());
+                    out.extend(names.map(<[u8]>::to_vec));
+                    return Ok(out);
                 }
                 Err(_) if last().0 == libc::ERANGE => continue,
                 Err(_) => return Err(last()),

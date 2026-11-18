@@ -555,12 +555,20 @@ mod tests {
     // - a READDIR reply, made with its whole capacity (`Vec::with_capacity`
     //   of at most MAX_READ, never grown past it), and each dirent's
     //   encoding (fuse::encode `Out`), one entry's;
-    // - a LISTXATTR answer (session.rs `listxattr`, grown name by name):
-    //   the guest's names, at most the node's budget
-    //   (limits::DEFAULT_XATTR_BUDGET);
-    // - a READDIR batch (READDIR_BATCH entries) and a directory's names
-    //   (host::unix::NAMES_MAX).
-    // The node and handle tables are hash tables, which grow by a new
+    // - a READDIR batch (session.rs, READDIR_BATCH entries asked of the
+    //   backend; the host's `read_dir` stops at that `max`, as its raw list);
+    // - the host backend's own (host::unix `grown_bounds`): a leaf's names,
+    //   a chunk of a node's chain of ancestors, a search's batch;
+    // - a name escaped for the host (fuse::name `escape`: at most three
+    //   bytes for each of a name's NAME_MAX).
+    // Lists whose length is the guest's or the host's to choose are
+    // allocated once at their full length and never grown: the attribute
+    // names (sys::xattr::list, host::unix `list_xattr`, session.rs
+    // `listxattr`), the live nodes (host::unix `live`), each chain chunked.
+    // Found by a grep of crates/fs/{fsd,sys,frame}/src outside tests for
+    // `.push(`, `.extend(`, `.extend_from_slice(`, `.collect(`,
+    // `.insert(0`, `.resize(`, `Vec::new()` and `String::new()`, each hit
+    // read. The node and handle tables are hash tables, which grow by a new
     // allocation, never by realloc. The READ buffer (`vec![0; want]`, then
     // truncated) is never grown.
     #[test]
@@ -572,8 +580,23 @@ mod tests {
             ("wick_fs_frame::MAX_FRAME_LEN", wick_fs_frame::MAX_FRAME_LEN),
             ("wick_fs_frame::MAX_PAYLOAD_LEN", wick_fs_frame::MAX_PAYLOAD_LEN),
             ("limits::MAX_READ + OUT_HEADER_LEN", crate::limits::MAX_READ + crate::fuse::OUT_HEADER_LEN),
-            ("limits::DEFAULT_XATTR_BUDGET", crate::limits::DEFAULT_XATTR_BUDGET),
-        ] {
+            (
+                "a dirent's encoding: ENTRY_OUT_LEN + 24 + NAME_MAX, padded",
+                crate::fuse::encode::ENTRY_OUT_LEN + 24 + crate::fuse::name::NAME_MAX + 7,
+            ),
+            (
+                "a READDIR batch: READDIR_BATCH × DirEntry",
+                crate::session::READDIR_BATCH * std::mem::size_of::<crate::dir::DirEntry>(),
+            ),
+            (
+                "the host's raw READDIR batch: READDIR_BATCH × RawEntry",
+                crate::session::READDIR_BATCH * std::mem::size_of::<sys::RawEntry>(),
+            ),
+            ("an escaped name: 3 × NAME_MAX", 3 * crate::fuse::name::NAME_MAX),
+        ]
+        .into_iter()
+        .chain(crate::host::unix::grown_bounds())
+        {
             assert!(size <= VM_COPY_PAST, "{name} is {size} bytes, over 2 MiB: {need}");
         }
     }
