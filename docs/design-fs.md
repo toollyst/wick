@@ -1100,10 +1100,35 @@ it means layer 1 let the request through.
     sandbox extensions. The lists are by number or name, each entry with why (table below): `SYSCALLS`,
     `MACH_TRAPS` (libmalloc's `_kernelrpc_mach_vm_map_trap` and `mach_msg2_trap`, for a frame of up to 2 MiB and
     the node tables), and `mach_vm_reallocate` where the kernel defines it (`(when (defined? ...))`: the routine is in
-    xnu from xnu-12377.101.15, so macOS 15 and the macOS 26 releases before it do not compile the name; there a large
-    realloc copies instead, `vm_copy` beyond 2 MiB in macOS 15's libmalloc-715.140.5, which confine_probe's "a realloc
-    of a block past 2 MiB" measures on each major; `test_every_name_of_the_profile_is_defined_on_this_macos` checks
-    each such name bound exactly from its first xnu). Seatbelt does not check the number of some calls at all (Firecracker's
+    xnu from xnu-12377.101.15, so macOS 15 and the macOS 26 releases before it do not compile the name;
+    `test_every_name_of_the_profile_is_defined_on_this_macos` checks each such name bound exactly from its first
+    xnu). Those traps were measured on macOS 27.2, whose allocator for wick-fsd is xzone (the zone's version is 10,
+    not the magazine's 16, and `MallocReportConfig` reports no magazine). macOS 15's libmalloc-715.140.5 picks the
+    magazine allocator for a binary that is not the platform's unless its `SecureAllocator` feature flags say
+    otherwise (malloc.c :700 to :727), and there a block is large past 32 KiB (8 MiB with the medium allocator,
+    engaged at 32 GiB of memory or more; thresholds.h, magazine_zone.h :750), mapped with
+    `_kernelrpc_mach_vm_map_trap` (15). Its other paths make calls the profile does not list (magazine_large.c):
+    a large block grows in place with `vm_allocate` at the address after it (`_kernelrpc_mach_vm_allocate_trap`, 10;
+    `large_try_realloc_in_place`, libsyscall mach_vm.c); a freed one is marked with `madvise(MADV_CAN_REUSE)`
+    (system call 75) and kept in a cache of 16 entries (64 at 32 GiB or more), whose oldest is given back with
+    `mach_vm_deallocate` (12) when it is full (`free_large`); the table of large blocks grows by a new mapping and
+    gives the old one back with `mach_vm_deallocate` (`large_entries_grow_no_lock`); and a realloc that moves a
+    block copies with `vm_copy` past 2 MiB of data (magazine_malloc.c :592). CI run 44347657778's macos-15 job
+    killed a confined realloc of 3 MiB to 8 MiB at trap 12 (`deny(1) syscall-mach 12`; no crash report of that
+    process was kept, so not which path). confine_probe now checks the server's own shapes, each done confined:
+    a block of the largest frame (1 MiB + 4 KiB) allocated and freed, a buffer grown by appends to it (the last
+    growth to 2 MiB), a realloc of 256 KiB to it, the node tables grown entry by entry to their cap (2^18 nodes,
+    each growth a new table and the old one freed: the largest, the node map, is 2^19 buckets of its entry), and
+    96 large blocks of the server's sizes held and freed (past the cache); each runs again under the profile with
+    every unlisted call allowed and reported, and the probe prints Seatbelt's reports by the case's pid, with the
+    allocator on record (the zone of a 3 MiB block, its version, `MallocReportConfig`'s lines, the memory size).
+    The realloc of 3 MiB to 8 MiB is on record only. On macOS 27.2 (xzone) a block of the largest frame allocated
+    and freed is killed at `madvise` (`deny(1) syscall-unix 75`) in 7 of 8 runs, and its reporting run reports
+    `allow syscall-unix 75`; the other shapes are done and report nothing, and the control (`task_info`, an unlisted
+    MIG routine) reports `allow syscall-mig 195`. The server makes that shape for each reply of a 1 MiB READ
+    (serve.rs: the reply's buffer, `Vec::with_capacity(HEADER_LEN + reply.len())`, freed once written), so until
+    the profile allows what the allocator calls, a guest can end its own share's server there. macOS 15's answer is
+    CI's next run; the calls go into the profile only with that evidence. Seatbelt does not check the number of some calls at all (Firecracker's
     `UNFILTERED_SYSCALLS` in `overlay/vmm/ext/sandbox.rs`: `openat`, `close`, `write`, `pwrite`, `fchmod`,
     `fsetxattr`, `fremovexattr`, `linkat`, `unlinkat` among those wick-fsd makes); for those the file rules decide.
     `fcntl`'s command is checked too (`system-fcntl`, below).

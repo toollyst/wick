@@ -639,11 +639,14 @@ mod macos {
         "thread_policy_set",
     ];
 
-    /// MIG routines of the setup phase that macOS 26 added (measured on
-    /// macOS 27: a guest's memory is reallocated by libmalloc through them;
-    /// on macOS 15 the names are unbound and a profile naming them does not
-    /// compile, measured by CI's macos-15 job), allowed where the kernel
-    /// defines them. An explicit list, so that a misspelt name in
+    /// MIG routines of the setup phase that xnu-12377.101.15 (a macOS 26
+    /// release) added: osfmk/mach/mach_vm.defs and vm_map.defs have them
+    /// from that release, not in xnu-12377.81.4 or earlier
+    /// (apple-oss-distributions/xnu). Measured on macOS 27: a guest's memory
+    /// is reallocated by libmalloc through them; on macOS 15 the names are
+    /// unbound and a profile naming them does not compile, measured by CI's
+    /// macos-15 job, as on a macOS 26 kernel before that release. Allowed
+    /// where the kernel defines them. An explicit list, so that a misspelt name in
     /// [`SETUP_MIG_ROUTINES`] or [`MIG_ROUTINES`] still fails to compile.
     pub const SETUP_MIG_ROUTINES_IF_DEFINED: &[&str] = &["mach_vm_reallocate", "vm_reallocate"];
 

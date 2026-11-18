@@ -1336,7 +1336,10 @@ jobs:
               unshare -U sh -c 'cat /proc/self/attr/apparmor/current 2>/dev/null || cat /proc/self/attr/current; echo deny > /proc/self/setgroups && echo "setgroups written"' || true
               ;;
           esac
-          cargo test --locked 2>&1 | tee "$RUNNER_TEMP/tests.log"
+          # Every test binary runs whatever one before it gave (the step still
+          # fails on any): a failing confine_probe on one macOS major must not
+          # hide what the connection, requests and refusals tests say there.
+          cargo test --locked --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/tests.log"
           # On record: the refusal a server that is not root gets from this
           # host's restriction, in wick-fsd's words (the sysctl and the
           # AppArmor label it read); libtest keeps a passing test's output.

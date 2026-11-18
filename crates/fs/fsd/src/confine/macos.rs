@@ -146,10 +146,16 @@ pub const MIG_ROUTINES: &[(&str, &str)] = &[];
 /// is in xnu's osfmk/mach/mach_vm.defs from xnu-12377.101.15 (a macOS 26
 /// release) on, and a profile naming it does not compile on an older kernel
 /// (macOS 15, as Firecracker's profile found, and macOS 26 before that
-/// release). Where it is not defined libmalloc cannot call it; there a large
-/// realloc copies instead (libmalloc-715.140.5, macOS 15: `memcpy` up to
-/// 2 MiB, `vm_copy` beyond, magazine_malloc.c :592), which confine_probe's
-/// "a realloc of a block past 2 MiB" measures on each major.
+/// release). Where it is not defined libmalloc cannot call it; there
+/// (libmalloc-715.140.5, macOS 15) a large block grows in place with
+/// `vm_allocate` at a fixed address (magazine_large.c
+/// `large_try_realloc_in_place`) or moves with `memcpy` (`vm_copy` only past
+/// 2 MiB of data, magazine_malloc.c :592, which no buffer of the server
+/// holds: a frame is at most 1 MiB + 4 KiB, and the node and handle tables
+/// are hash tables that grow by a new allocation, never by realloc).
+/// confine_probe's allocator shapes (a frame's block, a buffer grown to it,
+/// a realloc to it, the node tables at their cap, many large blocks freed)
+/// check each major's way, and report on record what each calls.
 pub const MIG_ROUTINES_IF_DEFINED: &[(&str, &str)] =
     &[("mach_vm_reallocate", "libmalloc grows a large block (realloc), measured as the traps are")];
 
