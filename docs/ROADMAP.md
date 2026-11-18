@@ -147,8 +147,10 @@ dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `
 - Measured on that machine: WHP honours the host protection of guest RAM as `VirtualProtect` sets it (a guest access
   to a page made `PAGE_NOACCESS` by `VirtualProtect`, as the Uffd backend then closed its missing pages, exits at the
   instruction and re-runs once the page is accessible), which the Uffd backend relies on. A page committed with
-  `PAGE_NOACCESS` through the guest's view, as a fill now commits it before its content, was not measured; a guest
-  read such a page with no exit (SECURITY.md, "Not at parity yet": the userfaultfd fill's known defect); WHP is
+  `PAGE_NOACCESS` through the guest's view, as a fill now commits it before its content, was measured later and
+  holds too: the guest exits at it, and an access made while a fill is held there waits for the content
+  (`test_a_page_committed_closed_through_the_guests_view_on_record`,
+  `test_an_access_during_a_fill_waits_for_the_pages_content`, at 2cfbe3ec); WHP is
   refused inside an AppContainer without the `hypervisorPlatform` capability (`E_ACCESSDENIED`; with the capability it
   runs: `fs-probe whp-token`, docs/windows-jail-reach.md) and works for a process on a restricted token below medium integrity
   that has no access to the user's files ([M5](#m5-security-parity-the-jailer-on-every-host)).
