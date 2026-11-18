@@ -301,3 +301,34 @@ fn test_every_request_confined_answered_as_unconfined() {
     }
     remove(&base);
 }
+
+/// A confined server answering READs of 1 MiB, again and again, stays up
+/// and answers each with the file's bytes (docs/design-fs.md §6.2). Each
+/// READ's reply is a zeroed block of the size read (session.rs, `read`),
+/// and each reply frame one more block of that size (serve.rs), both freed
+/// once written: on macOS 27.2 libmalloc (xzone) hands such a block out
+/// again from one it freed, clearing it with `madvise`, a call the profile
+/// killed until it listed it. 64 reads, at offsets that move through a
+/// file of 2 MiB.
+#[test]
+fn test_a_confined_server_answers_large_reads_again_and_again() {
+    let base = scratch("large-reads");
+    let share = base.join("share");
+    std::fs::create_dir(&share).unwrap();
+    let data: Vec<u8> = (0..2usize << 20).map(|i| u8::try_from(i % 251).unwrap()).collect();
+    std::fs::write(share.join("big"), &data).unwrap();
+    if let Some(r) = remote::confined_over(&share, &remote::socket_in(&base)) {
+        let mut g = G::over(r);
+        let node = g.lookup(1, b"big").unwrap();
+        let fh = g.open(node, 0).unwrap();
+        for i in 0..64u64 {
+            let offset = (i * 4096) % (1 << 20);
+            let got = g.read(node, fh, offset, 1 << 20).unwrap_or_else(|e| panic!("READ {i}: {e:?}"));
+            let at = usize::try_from(offset).unwrap();
+            assert!(got == data[at..at + (1 << 20)], "READ {i} at {offset}: not the file's bytes");
+        }
+        g.release(node, fh);
+        remote::finish_clean(&mut g.s);
+    }
+    remove(&base);
+}

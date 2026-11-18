@@ -204,25 +204,41 @@ mod macos {
         i32::from(done)
     }
 
-    /// A block of `len` written at both ends, read back, freed: 1.
+    /// How many times a shape repeats in one child: from the second time on
+    /// the allocator hands out a block the child itself freed, so what it
+    /// does with one (macOS 27.2's xzone clears a zeroed one with `madvise`)
+    /// happens whatever heap the child inherited from this process, where
+    /// once each it was chance (1 run of 8 done without it).
+    const REPEAT: usize = 16;
+
+    /// A zeroed block of `len` (`calloc`, as READ's reply buffer is), written
+    /// at both ends, read back, freed, [`REPEAT`] times: 1.
     fn alloc_then_free(len: usize) -> i32 {
-        let mut v = vec![0u8; len];
-        v[0] = 1;
-        v[len - 1] = 2;
-        let v = std::hint::black_box(v);
-        i32::from(v[0] == 1 && v[len - 1] == 2)
+        let mut done = true;
+        for _ in 0..REPEAT {
+            let mut v = vec![0u8; len];
+            v[0] = 1;
+            v[len - 1] = 2;
+            let v = std::hint::black_box(v);
+            done &= v[0] == 1 && v[len - 1] == 2 && v[len / 2] == 0;
+        }
+        i32::from(done)
     }
 
     /// A buffer grown by appends of 4 KiB to the largest frame, as a
     /// growing `Vec` does (each growth a realloc to twice the capacity, the
-    /// last to 2 MiB), then freed: 1.
+    /// last to 2 MiB), then freed, [`REPEAT`] times: 1.
     fn grown_by_appends() -> i32 {
-        let mut v = Vec::new();
-        while v.len() < wick_fs_frame::MAX_FRAME_LEN {
-            v.extend_from_slice(&[3u8; 4096]);
+        let mut done = true;
+        for _ in 0..REPEAT {
+            let mut v = Vec::new();
+            while v.len() < wick_fs_frame::MAX_FRAME_LEN {
+                v.extend_from_slice(&[3u8; 4096]);
+            }
+            let v = std::hint::black_box(v);
+            done &= v[v.len() - 1] == 3;
         }
-        let v = std::hint::black_box(v);
-        i32::from(v[v.len() - 1] == 3)
+        i32::from(done)
     }
 
     /// The size of a node table's value (`inodes::Entry` of the host
@@ -232,41 +248,55 @@ mod macos {
     /// The node table's two maps grown entry by entry to the cap of
     /// `max_nodes` (`DEFAULT_MAX_NODES`, 2^18), as `Inodes` grows them (each
     /// growth a new table, the entries moved, the old one freed), then
-    /// dropped: 1. The values are the size of the real ones; the identity
-    /// is the size of a `HostId` (a device and an inode number).
+    /// dropped, twice: 1. The values are the size of the real ones; the
+    /// identity is the size of a `HostId` (a device and an inode number).
     fn node_tables_to_the_cap() -> i32 {
         use std::collections::HashMap;
         let cap = wick_fsd::limits::DEFAULT_MAX_NODES;
-        let mut map: HashMap<u64, [u8; ENTRY_LEN]> = HashMap::new();
-        let mut by_id: HashMap<(u64, u64), u64> = HashMap::new();
-        for n in 0..cap as u64 {
-            map.insert(n, [0; ENTRY_LEN]);
-            by_id.insert((n, n), n);
+        let mut done = true;
+        for _ in 0..2 {
+            let mut map: HashMap<u64, [u8; ENTRY_LEN]> = HashMap::new();
+            let mut by_id: HashMap<(u64, u64), u64> = HashMap::new();
+            for n in 0..cap as u64 {
+                map.insert(n, [0; ENTRY_LEN]);
+                by_id.insert((n, n), n);
+            }
+            done &= map.len() == cap && by_id.len() == cap;
+            drop(std::hint::black_box(map));
+            drop(std::hint::black_box(by_id));
         }
-        let done = map.len() == cap && by_id.len() == cap;
-        drop(std::hint::black_box(map));
-        drop(std::hint::black_box(by_id));
         i32::from(done)
     }
 
     /// Many blocks of the server's large sizes held at once, then freed
     /// (frames of every length, READDIR buffers): more than libmalloc's
     /// large cache keeps (16 entries, or 64 with 32 GiB of memory or more,
-    /// libmalloc-715 thresholds.h), so it gives its oldest back: 1.
+    /// libmalloc-715 thresholds.h), so it gives its oldest back, [`REPEAT`] / 4
+    /// times: 1.
     fn many_large_blocks() -> i32 {
         let span = wick_fs_frame::MAX_FRAME_LEN - (40 << 10);
-        let held: Vec<Vec<u8>> = (0..96).map(|i| vec![4u8; (40 << 10) + i * span / 95]).collect();
-        let done = held.iter().all(|v| v[v.len() - 1] == 4);
-        drop(std::hint::black_box(held));
+        let mut done = true;
+        for _ in 0..REPEAT / 4 {
+            let held: Vec<Vec<u8>> = (0..96).map(|i| vec![4u8; (40 << 10) + i * span / 95]).collect();
+            done &= held.iter().all(|v| v[v.len() - 1] == 4);
+            drop(std::hint::black_box(held));
+        }
         i32::from(done)
     }
+
+    /// How many times each shape runs under the reporting profile: what an
+    /// allocator calls depends on its state, so the calls on record are the
+    /// union of these runs.
+    const REPORTED_RUNS: usize = 4;
 
     /// The allocator shapes of the server, each checked confined (done,
     /// never killed) and, on record, run again reporting what it calls.
     const SHAPES: &[(&str, Act)] = &[
-        ("a block of the largest frame, allocated and freed", |_| alloc_then_free(wick_fs_frame::MAX_FRAME_LEN)),
+        ("a zeroed block of the largest frame, allocated and freed", |_| alloc_then_free(wick_fs_frame::MAX_FRAME_LEN)),
         ("a buffer grown by appends to the largest frame", |_| grown_by_appends()),
-        ("a realloc to the largest frame, then free", |_| realloc_then_free(256 << 10, wick_fs_frame::MAX_FRAME_LEN)),
+        ("a realloc to the largest frame, then free", |_| {
+            i32::from((0..REPEAT).all(|_| realloc_then_free(256 << 10, wick_fs_frame::MAX_FRAME_LEN) == 1))
+        }),
         ("the node tables grown to their cap", |_| node_tables_to_the_cap()),
         ("many large blocks of the server's sizes", |_| many_large_blocks()),
     ];
@@ -323,11 +353,31 @@ mod macos {
         if !text.contains(&last) {
             println!("reported: the control's report is not in the unified log after 30 s; nothing below is evidence");
         }
-        for (name, pid) in pids {
+        // Per name, in the order first run: each call reported, with how
+        // many of that name's runs reported it.
+        let mut names: Vec<&str> = Vec::new();
+        let mut union: std::collections::BTreeMap<&str, std::collections::BTreeMap<String, usize>> = Default::default();
+        let mut runs: std::collections::BTreeMap<&str, usize> = Default::default();
+        for &(name, pid) in pids {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+            *runs.entry(name).or_default() += 1;
             let tag = format!("({pid})");
-            let calls: Vec<&str> = text.lines().filter_map(|l| l.split(&tag).nth(1).map(str::trim)).collect();
-            let said = if calls.is_empty() { "nothing".to_string() } else { calls.join("; ") };
-            println!("reported, {name} (pid {pid}): {said}");
+            let mut seen = std::collections::BTreeSet::new();
+            for call in text.lines().filter_map(|l| l.split(&tag).nth(1).map(str::trim)) {
+                seen.insert(call.trim_start_matches("allow ").to_string());
+            }
+            for call in seen {
+                *union.entry(name).or_default().entry(call).or_default() += 1;
+            }
+        }
+        for name in names {
+            let n = runs[name];
+            let said = union.get(name).map_or("nothing".to_string(), |calls| {
+                calls.iter().map(|(c, k)| format!("{c} ({k} of {n})")).collect::<Vec<_>>().join("; ")
+            });
+            println!("reported, {name}, {n} runs: {said}");
         }
     }
 
@@ -515,11 +565,15 @@ mod macos {
             if got != 1 {
                 failed.push(format!("{name}: {got}, expected 1"));
             }
-            reported.push((name, case_as(name, &share, &outside, act, How::Reported).1));
+            for _ in 0..REPORTED_RUNS {
+                reported.push((name, case_as(name, &share, &outside, act, How::Reported).1));
+            }
         }
         let (name, act) = PAST_2_MIB;
         case(name, &share, &outside, act);
-        reported.push((name, case_as(name, &share, &outside, act, How::Reported).1));
+        for _ in 0..REPORTED_RUNS {
+            reported.push((name, case_as(name, &share, &outside, act, How::Reported).1));
+        }
         // The reports' control: a call the profile does not list, so
         // reported (a kernel MIG routine), where "nothing" above means none.
         let control = "control: task_info, a MIG routine not listed";

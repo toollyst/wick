@@ -83,6 +83,16 @@ pub const SYSCALLS: &[(u16, &str, &str)] = &[
     (29, "recvfrom", "frames from the VMM (std's read of a stream socket)"),
     (53, "sigaltstack", "at exit: std takes down the main thread's stack-overflow handler"),
     (73, "munmap", "at exit: std unmaps that handler's stack"),
+    (
+        75,
+        "madvise",
+        "libmalloc clears a large block it hands out again zeroed (READ's reply buffer, `vec![0; n]`: xzone's \
+         `_xzm_segment_group_clear_chunk`, MADV_ZERO) and gives a freed one's pages back (MADV_FREE_REUSABLE; \
+         macOS 15's magazine MADV_CAN_REUSE): measured on macOS 27.2, killed `deny(1) syscall-unix 75` in \
+         `Session::read` (requests.rs `test_a_confined_server_answers_large_reads_again_and_again`, crash report) and \
+         reported by confine_probe's allocator shapes; the advice cannot be filtered (no such Seatbelt filter), and \
+         xnu's madvise acts on the caller's own map only (bsd/kern/kern_mman.c, `current_map()`)",
+    ),
     (92, "fcntl", "the commands of FCNTL_COMMANDS, each checked (`system-fcntl`)"),
     (
         95,
@@ -581,7 +591,7 @@ mod tests {
 (allow file-read* file-read-data file-read-metadata file-read-xattr file-test-existence (subpath "/private/tmp/share"))
 (allow file-write* file-write-create file-write-data file-write-mode file-write-times file-write-unlink file-write-xattr file-link (subpath "/private/tmp/share"))
 (deny file-mount file-mount-update file-unmount (subpath "/private/tmp/share") (with send-signal SIGKILL))
-(allow syscall-unix (syscall-number 29 53 73 92 95 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
+(allow syscall-unix (syscall-number 29 53 73 75 92 95 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
 (allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
 (when (defined? 'mach_vm_reallocate) (allow syscall-mig (kernel-mig-routine mach_vm_reallocate)))
 (deny system-fcntl (with send-signal SIGKILL))
@@ -603,7 +613,7 @@ mod tests {
 (when (defined? 'file-ungraft) (deny file-ungraft (subpath "/private/tmp/share")))
 (allow file-read* file-read-data file-read-metadata file-read-xattr file-test-existence (subpath "/private/tmp/share"))
 (deny file-mount file-mount-update file-unmount file-write* file-write-create file-write-data file-write-mode file-write-times file-write-unlink file-write-xattr file-link (subpath "/private/tmp/share") (with send-signal SIGKILL))
-(allow syscall-unix (syscall-number 29 53 73 92 95 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
+(allow syscall-unix (syscall-number 29 53 73 75 92 95 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
 (allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
 (when (defined? 'mach_vm_reallocate) (allow syscall-mig (kernel-mig-routine mach_vm_reallocate)))
 (deny system-fcntl (with send-signal SIGKILL))

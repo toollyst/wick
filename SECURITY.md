@@ -1830,12 +1830,10 @@ wick-fsd, the virtio-fs file server, is not reachable from a guest yet: the VMM'
 and macOS, only in a build with Firecracker's `fs` feature (a default build holds none of its code,
 `tools/check-fs-off.sh`), but no guest has mounted a share and the jailer does not yet place its socket (the
 virtio-fs item of roadmap M7). wick-fsd confines itself on Linux and macOS before it reads a request, and refuses to
-start on Windows, whose confinement is not built ([docs/design-fs.md](docs/design-fs.md) §6.1, §6.2). Known: **on macOS
-the confined server can be killed by its own allocator** (Seatbelt's kill at a call its profile does not list:
-`madvise`, which libmalloc makes on macOS 27.2 when it frees a block of the largest frame, as the server does for each
-reply of a 1 MiB READ; macOS 15's allocator gives freed blocks back with further calls), which ends that share's
-server and nothing else; confine_probe checks the server's allocation shapes and reports what each calls, and the
-calls go into the profile with that evidence (design-fs.md §6.2).
+start on Windows, whose confinement is not built ([docs/design-fs.md](docs/design-fs.md) §6.1, §6.2). Until the commit that lists `madvise`
+in its profile, a guest could end its own share's server on macOS by a large read (each READ's zeroed reply buffer is
+a large block the allocator clears with `madvise`; never in a release: the device is behind a feature); the profile
+now allows `madvise`, which acts on the server's own memory only (design-fs.md §6.2).
 
 The device adds no rule or system call to the VMM's sandbox, connects to its server before the sandbox narrows and
 never again, and never blocks the event loop on the server (`test_server_hang_never_blocks_the_loop`); the reply

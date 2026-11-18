@@ -1107,7 +1107,7 @@ it means layer 1 let the request through.
     magazine allocator for a binary that is not the platform's unless its `SecureAllocator` feature flags say
     otherwise (malloc.c :700 to :727), and there a block is large past 32 KiB (8 MiB with the medium allocator,
     engaged at 32 GiB of memory or more; thresholds.h, magazine_zone.h :750), mapped with
-    `_kernelrpc_mach_vm_map_trap` (15). Its other paths make calls the profile does not list (magazine_large.c):
+    `_kernelrpc_mach_vm_map_trap` (15). Its other paths make further calls (magazine_large.c):
     a large block grows in place with `vm_allocate` at the address after it (`_kernelrpc_mach_vm_allocate_trap`, 10;
     `large_try_realloc_in_place`, libsyscall mach_vm.c); a freed one is marked with `madvise(MADV_CAN_REUSE)`
     (system call 75) and kept in a cache of 16 entries (64 at 32 GiB or more), whose oldest is given back with
@@ -1116,19 +1116,32 @@ it means layer 1 let the request through.
     block copies with `vm_copy` past 2 MiB of data (magazine_malloc.c :592). CI run 44347657778's macos-15 job
     killed a confined realloc of 3 MiB to 8 MiB at trap 12 (`deny(1) syscall-mach 12`; no crash report of that
     process was kept, so not which path). confine_probe now checks the server's own shapes, each done confined:
-    a block of the largest frame (1 MiB + 4 KiB) allocated and freed, a buffer grown by appends to it (the last
+    a zeroed block of the largest frame (1 MiB + 4 KiB) allocated and freed, a buffer grown by appends to it (the last
     growth to 2 MiB), a realloc of 256 KiB to it, the node tables grown entry by entry to their cap (2^18 nodes,
     each growth a new table and the old one freed: the largest, the node map, is 2^19 buckets of its entry), and
     96 large blocks of the server's sizes held and freed (past the cache); each runs again under the profile with
     every unlisted call allowed and reported, and the probe prints Seatbelt's reports by the case's pid, with the
     allocator on record (the zone of a 3 MiB block, its version, `MallocReportConfig`'s lines, the memory size).
-    The realloc of 3 MiB to 8 MiB is on record only. On macOS 27.2 (xzone) a block of the largest frame allocated
-    and freed is killed at `madvise` (`deny(1) syscall-unix 75`) in 7 of 8 runs, and its reporting run reports
-    `allow syscall-unix 75`; the other shapes are done and report nothing, and the control (`task_info`, an unlisted
-    MIG routine) reports `allow syscall-mig 195`. The server makes that shape for each reply of a 1 MiB READ
-    (serve.rs: the reply's buffer, `Vec::with_capacity(HEADER_LEN + reply.len())`, freed once written), so until
-    the profile allows what the allocator calls, a guest can end its own share's server there. macOS 15's answer is
-    CI's next run; the calls go into the profile only with that evidence. Seatbelt does not check the number of some calls at all (Firecracker's
+    The realloc of 3 MiB to 8 MiB is on record only. On macOS 27.2 (xzone) a zeroed block of the largest frame was
+    killed at `madvise` (`deny(1) syscall-unix 75`) in 7 of 8 runs, and its reporting run reported `allow
+    syscall-unix 75`; the control (`task_info`, an unlisted MIG routine) reports `allow syscall-mig 195`. What
+    decides it: xzone hands out a large block it had freed (not pristine) after clearing it when the caller asked
+    for zeroes (`calloc`, Rust's `vec![0; n]`), with `madvise(MADV_ZERO)` (libmalloc-812.100.31 xzone_segment.c,
+    `_xzm_segment_group_clear_chunk`), and a fresh one without; a case's child inherits its parent's heap, so whether
+    its first block was fresh was chance. It also gives a freed large chunk's pages back with `madvise` where the
+    kernel's deferred reclamation is not in use (`_xzm_segment_group_uses_deferred_reclamation`). The server makes
+    that shape on every READ: its reply buffer is `vec![0u8; want]` (session.rs, `read`), and the crash report of a
+    confined server killed there shows `madvise` ← `_xzm_segment_group_clear_chunk` ← `xzm_segment_group_alloc_chunk`
+    ← `_xzm_malloc_large_huge` ← `Session::read`. So `madvise` (75) is in `SYSCALLS`: it acts on the caller's own
+    map only (xnu bsd/kern/kern_mman.c, `user_map = current_map()`), and Seatbelt has no filter on its advice
+    (libsandbox's filters on a call's argument are `fcntl-command`, `ioctl-command`, `fsctl-command` and the like;
+    none for `madvise`), as Firecracker's own profile allows it. Each shape now repeats its allocation 16 times in
+    one child, so a block freed earlier in it is handed out again whatever the child inherited, and each runs four
+    times under the reporting profile, the union of what they report printed.
+    `test_a_confined_server_answers_large_reads_again_and_again` (requests.rs) reads 1 MiB 64 times from a confined
+    server, which must stay up and answer each with the file's bytes; without the entry it was killed at its second
+    READ. macOS 15's report (its magazine also calls `vm_allocate` and `mach_vm_deallocate`, traps 10 and 12) comes
+    from CI, and those traps go into the profile only with it. Seatbelt does not check the number of some calls at all (Firecracker's
     `UNFILTERED_SYSCALLS` in `overlay/vmm/ext/sandbox.rs`: `openat`, `close`, `write`, `pwrite`, `fchmod`,
     `fsetxattr`, `fremovexattr`, `linkat`, `unlinkat` among those wick-fsd makes); for those the file rules decide.
     `fcntl`'s command is checked too (`system-fcntl`, below).
@@ -1245,7 +1258,7 @@ it means layer 1 let the request through.
 
     | Request | Host calls |
     |---|---|
-    | every frame | `recvfrom` (29), `sendto` (133); a large frame and the node tables: traps 15 and 47, `mach_vm_reallocate` |
+    | every frame | `recvfrom` (29), `sendto` (133); a large frame and the node tables: traps 15 and 47, `mach_vm_reallocate`; a large block handed out again zeroed or given back: `madvise` (75) |
     | at exit | `sigaltstack` (53), `munmap` (73): std's stack-overflow handler; the counters' line: `write` (unchecked) |
     | INIT, DESTROY, FLUSH, FSYNCDIR, the ENOSYS group | none |
     | ACCESS | a node lookup (LOOKUP's) |
