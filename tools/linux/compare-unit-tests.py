@@ -14,7 +14,8 @@ their line numbers, which the patches move). It fails when:
 - an upstream test is missing from wick,
 - a test fails on upstream too but is not in tools/linux/unit-test-exclusions.txt
   (an environment failure nobody has explained yet),
-- an exclusion names no upstream test,
+- an exclusion names no upstream test, or a wick-only exclusion
+  (`<arch>-wick`) names a test upstream has or wick does not,
 - a test only wick has (overlay modules, compatibility crates) fails,
 - a cargo test run failed without a failing test to show for it,
 - a crate upstream's build compiles is not compiled by wick's at the same
@@ -235,17 +236,29 @@ def parse_run(path, exes, problems=None):
     return results, summaries
 
 
-def exclusions(arch):
+def exclusion_entries():
+    """(arch, wick_only, name) of each entry: `<arch> <name>` for an upstream
+    test, `<arch>-wick <name>` for a test only wick has (arch: x86_64,
+    aarch64 or all)."""
     path = Path(__file__).with_name("unit-test-exclusions.txt")
-    names = set()
+    entries = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.split("#", 1)[0].strip()
         if not line:
             continue
         a, name = line.split(None, 1)
+        wick_only = a.endswith("-wick")
+        entries.append((a[: -len("-wick")] if wick_only else a, wick_only, name.strip()))
+    return entries
+
+
+def exclusions(arch):
+    """The names skipped on `arch`: (upstream tests, wick-only tests)."""
+    upstream, wick_only = set(), set()
+    for a, only, name in exclusion_entries():
         if a in ("all", arch):
-            names.add(name.strip())
-    return names
+            (wick_only if only else upstream).add(name)
+    return upstream, wick_only
 
 
 def load(out, excluded):
@@ -300,7 +313,8 @@ def main():
     up_arch = (args.upstream / "arch").read_text().strip()
     if arch != up_arch:
         sys.exit(f"upstream ran on {up_arch}, wick on {arch}: not comparable")
-    excluded = exclusions(arch)
+    excluded, excluded_wick = exclusions(arch)
+    excluded = excluded | excluded_wick
     up, up_codes, up_mismatches = load(args.upstream, excluded)
     wk, wk_codes, wk_mismatches = load(args.wick, excluded)
 
@@ -356,8 +370,20 @@ def main():
             if ws in ("fail", "notrun"):
                 problems.append(f"{binary}: {t} (wick only): {ws}")
 
-    for name in sorted(excluded - up_names):
+    wick_names = {t: ws for tests in wk.values() for t, ws in tests.items()}
+    for name in sorted(excluded - excluded_wick - up_names):
         problems.append(f"exclusion '{name}' ({arch}) names no upstream test")
+    for name in sorted(excluded_wick):
+        if name in up_names:
+            problems.append(f"wick-only exclusion '{name}' ({arch}) names an upstream test: list it as {arch}")
+        elif name not in wick_names:
+            problems.append(f"wick-only exclusion '{name}' ({arch}) names no test of wick's")
+    # Where each wick-only test excluded somewhere runs: said in the summary
+    # of every arch, with this run's result for it.
+    for a, only, name in exclusion_entries():
+        if only:
+            here = "excluded here" if a in ("all", arch) else f"ran here: {wick_names.get(name, 'not found')}"
+            notes.append(f"wick-only test excluded on {a}: {name} ({here})")
 
     def explain(codes, statuses, who):
         for run, code in codes.items():

@@ -9,6 +9,11 @@
 #
 # Format: <arch> <full test name>, arch is x86_64, aarch64 or all; each entry
 # below a comment that says why upstream fails it there.
+#
+# A test only wick has (an overlay module's) that needs what a runner lacks
+# is listed as <arch>-wick, skipped the same way; compare-unit-tests.py
+# checks that it names a test of wick's and none of upstream's, and every
+# arch's summary says where it is skipped and the result where it ran.
 
 # --- aarch64 (ubuntu-24.04-arm) ----------------------------------------------
 #
@@ -184,3 +189,12 @@ aarch64 test_snapshot_load_sanity_checks
 # (size, level, type, shared_cpu_map, coherency_line_size, number_of_sets).
 # The runner's VM exposes five of them, so upstream fails it there too.
 aarch64 env::tests::test_copy_cache_info
+
+# --- wick only ----------------------------------------------------------------
+#
+# vmm: the microVM with a virtio-fs device that is not snapshotted
+# (overlay/vmm/ext/fs_snapshot_tests.rs) is built with builder::tests'
+# default_vmm, which creates a VM: "Cannot create Kvm: Kvm(Error(2))" on the
+# arm runner, as upstream's builder tests above. It runs, and passes, on the
+# x86_64 runner (CI run 44333428364's linux-unit-tests (ubuntu-latest)).
+aarch64-wick ext::fs_snapshot_tests::test_fs_snapshot_refused

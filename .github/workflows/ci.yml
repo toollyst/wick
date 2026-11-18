@@ -205,8 +205,9 @@ jobs:
   # first for plain upstream at patches/base and then for wick, on the same
   # machine. wick must match upstream test by test; tests that fail on plain
   # upstream there are listed with the reason in
-  # tools/linux/unit-test-exclusions.txt. The x86_64 runner has KVM, the arm
-  # one does not.
+  # tools/linux/unit-test-exclusions.txt, and so are wick's own tests that
+  # need a VM, as <arch>-wick. The x86_64 runner has KVM, the arm one does
+  # not.
   linux-unit-tests:
     strategy:
       fail-fast: false

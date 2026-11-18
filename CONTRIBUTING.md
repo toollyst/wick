@@ -338,7 +338,11 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   that passes on upstream and fails on wick is a wick bug: fix it, never
   exclude it. Tests that fail on plain upstream on the CI runner are listed,
   with the reason, in `tools/linux/unit-test-exclusions.txt` and
-  `tools/linux/integration-test-exclusions.txt`. An informational step of
+  `tools/linux/integration-test-exclusions.txt`. A test only wick has that
+  needs what a runner lacks (a VM on the arm runner, which has no KVM) is
+  listed there as `<arch>-wick`: checked to name a test of wick's and none
+  of upstream's, and each arch's summary says where it is skipped and its
+  result where it ran. An informational step of
   the same job (never counted, never failing it) runs the vsock and balloon
   tests whose memory macOS compares with Linux's, and `test_cpuid` (1, 2 and
   16 vCPUs) and `test_all_vcpus_online`, whose memory Windows compares, with

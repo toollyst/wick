@@ -45,6 +45,9 @@ if [[ "${1:-}" == "--in-container" ]]; then
 
     skips=()
     while read -r a name; do
+        # `<arch>-wick`: a test only wick has (compare-unit-tests.py checks
+        # it is one), skipped the same way.
+        a="${a%-wick}"
         [[ "$a" == all || "$a" == "$arch" ]] && skips+=(--skip "$name")
     done < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$exclusions")
     echo "excluded on $arch: $((${#skips[@]} / 2)) test(s)"
