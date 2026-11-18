@@ -22,7 +22,9 @@ What it cannot check: whether the C# runs (a P/Invoke's DLL, entry point and
 marshalling are Windows' own: Mono compiles a `DllImport` it never loads);
 .NET Framework APIs Mono's class library lacks or has differently; the
 PowerShell itself (its syntax, a command's or parameter's name, a variable
-used before it is set: no PowerShell parser here); an Add-Type whose source
+used before it is set: no PowerShell parser here; CI's windows job parses
+every script with Windows PowerShell 5.1's parser first, its "PowerShell
+scripts parse" step); an Add-Type whose source
 is made at run time, except the one listed in DYNAMIC; and what a double-quoted
 here-string expands (refused when it has `$` or a backtick).
 

@@ -1452,6 +1452,28 @@ jobs:
             "HypervisorPlatform: not read ($($_.Exception.Message))"
           }
           if (Test-Path "$env:SystemRoot\System32\WinHvPlatform.dll") { "WinHvPlatform.dll: present" } else { "WinHvPlatform.dll: absent" }
+      # Every PowerShell script of the repository parsed by Windows
+      # PowerShell 5.1's own parser, as users run them, before anything is
+      # built: a syntax error fails here in a minute, not in the stage that
+      # runs the script after the build (windows-guest's jailer-test.ps1 and
+      # boot-test.ps1). tools/windows/check-ps.py, on any host, compiles
+      # their C# but has no PowerShell parser.
+      - name: PowerShell scripts parse
+        shell: powershell
+        run: |
+          $bad = 0
+          $files = @(git ls-files '*.ps1' '*.psm1')
+          if ($files.Count -eq 0) { Write-Host "::error::no PowerShell script found to parse"; exit 1 }
+          foreach ($f in $files) {
+            $tokens = $null; $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$tokens, [ref]$errors)
+            foreach ($e in $errors) {
+              Write-Host "::error file=$f,line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              $bad++
+            }
+          }
+          Write-Host "PowerShell $($PSVersionTable.PSVersion) parsed $($files.Count) scripts: $bad errors ($($files -join ', '))"
+          if ($bad) { exit 1 }
       # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
       - uses: ./.github/actions/upstream
       # A failed fetch of upstream is said as what it is, in one line, by the
