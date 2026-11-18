@@ -798,11 +798,16 @@ it means layer 1 let the request through.
     supported path, which every confined test runs as root on CI. An AppArmor profile that grants `userns` to the
     wick-fsd binary alone (`flags=(unconfined)`, Ubuntu's way for a program that needs user namespaces) lets it start
     unprivileged on Ubuntu: the CI fs job now loads one for the built wick-fsd and `confine_probe` by path, runs the
-    confined tests as the runner's user with `WICK_FS_TEST_USERNS_GRANTED=1` and fails if any ran nothing confined, and
-    removes the profile whatever happened. Until a run has passed it the path is not supported; then its profile text
-    goes here as the tested alternative. wick never asks an operator to turn a host-wide restriction off: it guards
-    every program on the host. The user-namespace path itself has run only in Docker on this Mac (linuxkit 7.0.14,
-    aarch64, the tests as uid 65534) so far.
+    confined tests as the runner's user with `WICK_FS_TEST_USERNS_GRANTED=1`, and removes the profile whatever
+    happened. `tools/linux/fs-userns-check.py` gives the step's verdict from each binary's whole output: every binary
+    passed, none ran nothing confined, and each other "ran nothing" line is one it knows, printed with why it is not a
+    confined test left unconfined (a root-only read, the root-only id drop, the restricted host's refusal test). In CI
+    run 44233741878 the server's 23 tests passed under the profile as the runner's user on both Ubuntu runners, the
+    five `test_the_child_s_*` reaching the child's step; the step then failed on its own filter: no line of
+    confine_probe's output matched it, so `grep` exited 1 under `pipefail`, confine_probe's result was lost with its
+    output, and the corpus and link sequences never ran. Until a run has passed the whole step the path is not supported; then its profile text goes
+    here as the tested alternative. wick never asks an operator to turn a host-wide restriction off: it guards every
+    program on the host.
   - Landlock first appeared in Linux 5.13 [doc], and upstream supports 5.10 hosts (docs/kernel-policy.md) [src], so it
     is an added layer, never the only one.
   - **As built** (`crates/fs/fsd/src/confine/linux.rs`, the calls in `crates/fs/sys/src/unix/confine.rs`), after

@@ -95,6 +95,7 @@ jobs:
           python3 -I -B tools/libtest-results.py --selftest
           python3 -I tools/ci-results.py --selftest
           python3 -I -B tools/macos/check-unit-tests.py --selftest
+          python3 -I -B tools/linux/fs-userns-check.py --selftest
       - name: Numbers derived from the tree are current
         run: |
           python3 -I -B tools/check-derived.py --selftest
@@ -1350,14 +1351,20 @@ jobs:
           echo "The profile loaded:"
           cat "$p"
           sudo apparmor_parser -r "$p"
+          # Each binary's whole output is kept (a non-zero exit as a line of
+          # its own) and shown; tools/linux/fs-userns-check.py gives the
+          # verdict: every binary passed, none ran nothing confined, and each
+          # other "ran nothing" line is one it knows, said with why.
+          logs=()
           for test in server confine_probe corpus links; do
             bin="$(cargo test --locked --test "$test" --no-run 2>&1 | grep -o "target/debug/deps/$test-[0-9a-f]*" | head -1)"
-            WICK_FS_TEST_USERNS_GRANTED=1 "$bin" --nocapture 2>&1 | tee "$RUNNER_TEMP/userns-$test.log" | grep -E "^test |test result|panicked|ran nothing"
+            log="$RUNNER_TEMP/userns-$test.log"
+            logs+=("$log")
+            WICK_FS_TEST_USERNS_GRANTED=1 "$bin" --nocapture > "$log" 2>&1 || echo "exit status $?" >> "$log"
+            echo "--- $test"
+            cat "$log"
           done
-          if grep -h "ran nothing confined" "$RUNNER_TEMP"/userns-*.log; then
-            echo "a test ran nothing confined under the profile"
-            exit 1
-          fi
+          python3 -I -B ../../tools/linux/fs-userns-check.py "${logs[@]}"
       - name: Remove the AppArmor profile (Linux)
         if: always() && runner.os == 'Linux'
         run: |
