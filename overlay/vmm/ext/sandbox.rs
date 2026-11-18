@@ -285,7 +285,16 @@ mod macos {
         /// No rule allows what it asks for, and the default rule denies it;
         /// no single operation's rule lifts it (measured for `link`: with
         /// files, and every other class of operation, allowed, it is still
-        /// denied; only `(allow default)` lets it run).
+        /// denied). Rules at the link's two paths do: Seatbelt evaluates,
+        /// for both names, every file operation, the composites `file*`,
+        /// `file-read*`, `file-write*`, `fs-snapshot*` and `network*`, and
+        /// `process-exec` and `system-automount`; with each of those allowed
+        /// or denied without a kill there, `linkat` runs under
+        /// `(deny default (with send-signal SIGKILL))` (wick-fsd's
+        /// measurement on macOS 27.2, a C program and its profile, the
+        /// shape of crates/fs/fsd/src/confine/macos.rs; docs/design-fs.md
+        /// §6.2). With `file-link` allowed there, a kill on any of them ends
+        /// the process after the link is made.
         Default,
         /// Allowed after narrowing, as the rule of upstream's filters named
         /// allows it, with no argument checked there (descriptors are opened
