@@ -1579,6 +1579,17 @@ jobs:
           }
           Write-Host "PowerShell $($PSVersionTable.PSVersion) parsed $($files.Count) scripts: $bad errors ($($files -join ', '))"
           if ($bad) { exit 1 }
+      # The test harness's own helpers, without a jailer, a probe or a guest
+      # (jailer-test.ps1 helpers: Grant-JailRead with a made-up jail SID,
+      # Stop-Jailers against a jailed process started after its first look),
+      # so that a helper's first run is a few seconds here and not the
+      # windows-guest job: B's grant through icacls failed there first (CI at
+      # de8805f4).
+      - name: jailer-test.ps1 helpers
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir "$env:RUNNER_TEMP\wjt-helpers" -Stage helpers
+          exit $LASTEXITCODE
       # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
       - uses: ./.github/actions/upstream
       # A failed fetch of upstream is said as what it is, in one line, by the

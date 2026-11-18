@@ -14,9 +14,14 @@ here-string (a script the script writes and runs, as mitigation-audit.ps1's
 control) is a session of its own. A compile error names the `.ps1` line.
 
 It also refuses, per script: a function (or filter) defined twice in one
-scope, which PowerShell takes silently, the later replacing the earlier; and
-a `.ps1` with a byte outside ASCII and no UTF-8 byte order mark, which
-Windows PowerShell 5.1 reads in the ANSI code page.
+scope, which PowerShell takes silently, the later replacing the earlier; a
+`.ps1` with a byte outside ASCII and no UTF-8 byte order mark, which
+Windows PowerShell 5.1 reads in the ANSI code page; and an `icacls` given a
+SID from a variable (`*$sid`, `*${sid}`): icacls looks a `*SID` up and
+refuses one no account has ("No mapping between account names and security
+IDs was done"), as a jail's S-1-9 SID is (CI at de8805f4: links and
+isolation); a SID known only at run time goes through .NET as it is
+(jailer-test.ps1's Grant-JailRead).
 
 What it cannot check: whether the C# runs (a P/Invoke's DLL, entry point and
 marshalling are Windows' own: Mono compiles a `DllImport` it never loads);
@@ -371,6 +376,10 @@ def check_script(path, text, scripts):
     if not raw.startswith(b"\xef\xbb\xbf") and any(b > 0x7f for b in raw):
         k = next(i for i, b in enumerate(raw) if b > 0x7f)
         problems.append(f"{path}:{raw[:k].count(b'\n') + 1}: a byte outside ASCII and no UTF-8 byte order mark: Windows PowerShell 5.1 reads it in the ANSI code page")
+    for n, l in enumerate(text.split("\n"), 1):
+        code = l.split("#", 1)[0] if not l.lstrip().startswith("#") else ""
+        if re.search(r"\bicacls\b", code, re.I) and re.search(r"\*\$\{?\w", code):
+            problems.append(f"{path}:{n}: icacls given a SID from a variable: icacls refuses a *SID no account has, as a jail's S-1-9 SID is; set the DACL through .NET with the SID as it is (jailer-test.ps1's Grant-JailRead)")
     lexed = lex(text)
     seen = {}
     for name, line, sc in lexed.functions:
@@ -441,6 +450,9 @@ def selftest():
         ("a function twice in one scope", "function One { }\nif ($x) { function one { } }\n", ["t.ps1:2: function one defined again"]),
         ("a function twice in one function", "function Outer {\n  function In { }\n  foreach ($a in $b) { function In { } }\n}\n", ["t.ps1:3: function In defined again"]),
         ("a byte outside ASCII", "# café\n", ["t.ps1:1: a byte outside ASCII"]),
+        ("icacls with a SID from a variable", "$r = icacls $f /grant:r '*S-1-5-18:(F)' \"*${sid}:(R)\"\n", ["t.ps1:1: icacls given a SID from a variable"]),
+        ("icacls with well-known SIDs, and one from a variable in a comment",
+         "& icacls $d /grant:r '*S-1-1-0:(OI)(CI)R' '*S-1-5-18:F'\n# icacls $f \"*$sid:(R)\"\n", []),
         ("a source made at run time", "Add-Type -TypeDefinition $src\n", ["a source made at run time"]),
         ("a double-quoted here-string with $", "Add-Type -TypeDefinition @\"\nnamespace T { class A { string s = \"$x\"; } }\n\"@\n", ["PowerShell expands it"]),
         ("a brace in a string, a comment and a here-string", "function One { '{' ; \"}\" # {\n<# } #> @'\n}\n'@\n}\nfunction One { }\n",

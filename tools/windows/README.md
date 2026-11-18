@@ -109,7 +109,13 @@
   second jailed VM's 1 kHz loop rate; five runs, X2STORMSUM the medians; it
   fails on an unanswered request, a loop that did not run, writes not held,
   or the VM past its `cpu.max`; N/A on a host whose partitions are xAPICs,
-  exit code 3 if no stage failed; not run yet); and a check that every
+  exit code 3 if no stage failed; not run yet) and `helpers` (the harness's
+  own helpers with no jailer, probe or guest, run by CI's windows job
+  before its build so that a helper's first run is not the windows-guest
+  job's: `Grant-JailRead` gives a made-up jail SID, S-1-9 and four random
+  sub-authorities, read alone, its DACL read back, and `Stop-Jailers` finds
+  a jailed process a stand-in jailer starts after its first look and lets
+  the stand-in exit by itself; first run: CI); and a check that every
   jail's drive letter was removed. It needs the boot test's guest files (`-Assets`,
   default `C:\wbt`) and the probe (`jail-probe.exe` from the kit, or
   `rustc` to build it):

@@ -9,7 +9,9 @@
 #       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,reach,boot,restart,shared,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user|x2storm] [-Bin <dir>] [-X2ApicFirecracker <exe>]
 #
 # `refuse`, `freeze`, `cpuset`, `parent`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`,
-# `api` and `reach` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
+# `api` and `reach` need no WHP; the others boot a guest. `helpers` (not in
+# the default list; CI's windows job runs it) needs no jailer, probe or WHP:
+# it runs the harness's own helpers (Stage-Helpers). `pidns` needs a console (it types into it
 # and reads it): run with other stages, it is run alone in a console of
 # its own, as CI's step runs it (<WorkDir>-pidns); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
 # Platform filters). `hugepages` needs the account to hold "Lock pages in memory" (it
@@ -801,6 +803,36 @@ function Test-Probe([string[]]$prefix, $expect) {
     $bad
 }
 
+# Gives the operator's file `f` a protected DACL that grants the jail's SID
+# `sid` read (FILE_GENERIC_READ) and no group of the jail's token anything:
+# the user, SYSTEM and the administrators full access besides. Fails unless
+# the DACL read back by SID is exactly that. jailer-test.ps1 helpers runs it
+# with a made-up jail SID, without a jailer.
+function Grant-JailRead([string]$f, [string]$sid) {
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    # The DACL as SDDL, set through .NET with the SIDs as they are:
+    # icacls looks a `*SID` up and refuses one no account has, as
+    # the jail's (S-1-9, the resource manager authority) is ("No
+    # mapping between account names and security IDs was done",
+    # ERROR_NONE_MAPPED: CI's links and isolation at de8805f4).
+    # Protected, so nothing is inherited; FR is FILE_GENERIC_READ,
+    # icacls's (R).
+    $fs = New-Object System.Security.AccessControl.FileSecurity
+    $fs.SetSecurityDescriptorSddlForm("D:P(A;;FA;;;$user)(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;$sid)", [System.Security.AccessControl.AccessControlSections]::Access)
+    (Get-Item -LiteralPath $f).SetAccessControl($fs)
+    # Read back by SID: exactly these entries, allowed, not
+    # inherited, the jail's FILE_GENERIC_READ (0x120089) and nothing
+    # more.
+    $back = (Get-Item -LiteralPath $f).GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
+    $rules = @($back.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    $seen = @($rules | ForEach-Object { "$($_.IdentityReference.Value)=$($_.AccessControlType)/$(if ($_.IsInherited) { 'inherited' } else { 'own' })/0x$('{0:x}' -f [int]$_.FileSystemRights)" })
+    $jail = @($rules | Where-Object { $_.IdentityReference.Value -eq $sid })
+    $want = @($user, 'S-1-5-18', 'S-1-5-32-544', $sid | Select-Object -Unique).Count
+    Check ($back.AreAccessRulesProtected -and $rules.Count -eq $want -and $jail.Count -eq 1 -and $jail[0].AccessControlType -eq 'Allow' -and -not $jail[0].IsInherited -and [int]$jail[0].FileSystemRights -eq 0x120089) "giving $f a read entry for the jail's SID ${sid}: the DACL reads $($seen -join ', ')"
+    $kept = (Get-Acl $f).Sddl
+    Check ($kept -notmatch ';;;(WD|BU|AU|IU|S-1-1-0|S-1-5-32-545|S-1-5-11|S-1-5-4)\)') "$f still grants a group of the jail's token: $kept"
+}
+
 # Runs the jailed probe (`--id id` under `base`) with `checks`, after the
 # operator gave each file of `grant`, outside the jail, a read entry for that
 # jail's SID and a protected DACL with no other entry a jail's token is
@@ -828,30 +860,7 @@ function Invoke-JailedWithGrant([string]$base, [string]$id, [string[]]$grant, [s
             if ($sddl -match ';;;(S-1-9-\d+-\d+-\d+-\d+)\)') { $sid = $Matches[1] }
         }
         Check ($null -ne $sid) "the jail's SID did not appear on ${root}: $((Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join '')"
-        $user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        foreach ($f in $grant) {
-            # The DACL as SDDL, set through .NET with the SIDs as they are:
-            # icacls looks a `*SID` up and refuses one no account has, as
-            # the jail's (S-1-9, the resource manager authority) is ("No
-            # mapping between account names and security IDs was done",
-            # ERROR_NONE_MAPPED: CI's links and isolation at de8805f4).
-            # Protected, so nothing is inherited; FR is FILE_GENERIC_READ,
-            # icacls's (R).
-            $fs = New-Object System.Security.AccessControl.FileSecurity
-            $fs.SetSecurityDescriptorSddlForm("D:P(A;;FA;;;$user)(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;$sid)", [System.Security.AccessControl.AccessControlSections]::Access)
-            (Get-Item -LiteralPath $f).SetAccessControl($fs)
-            # Read back by SID: exactly these entries, allowed, not
-            # inherited, the jail's FILE_GENERIC_READ (0x120089) and nothing
-            # more.
-            $back = (Get-Item -LiteralPath $f).GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
-            $rules = @($back.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-            $seen = @($rules | ForEach-Object { "$($_.IdentityReference.Value)=$($_.AccessControlType)/$(if ($_.IsInherited) { 'inherited' } else { 'own' })/0x$('{0:x}' -f [int]$_.FileSystemRights)" })
-            $jail = @($rules | Where-Object { $_.IdentityReference.Value -eq $sid })
-            $want = @($user, 'S-1-5-18', 'S-1-5-32-544', $sid | Select-Object -Unique).Count
-            Check ($back.AreAccessRulesProtected -and $rules.Count -eq $want -and $jail.Count -eq 1 -and $jail[0].AccessControlType -eq 'Allow' -and -not $jail[0].IsInherited -and [int]$jail[0].FileSystemRights -eq 0x120089) "giving $f a read entry for the jail's SID ${sid}: the DACL reads $($seen -join ', ')"
-            $kept = (Get-Acl $f).Sddl
-            Check ($kept -notmatch ';;;(WD|BU|AU|IU|S-1-1-0|S-1-5-32-545|S-1-5-11|S-1-5-4)\)') "$f still grants a group of the jail's token: $kept"
-        }
+        foreach ($f in $grant) { Grant-JailRead $f $sid }
         Set-Content (Join-Path $root 'go') 'go'
         if (-not $p.WaitForExit($ms)) { throw [Failure]::new("jailer did not exit: $line") }
     } finally {
@@ -2907,6 +2916,47 @@ function Invoke-InOwnConsole([string]$s) {
     return "$($mine[0].Substring("PASS  ${s}: ".Length)) (in a console of its own, $dir)"
 }
 $OwnConsole = @('pidns')
+
+# The harness's own helpers, on their first run without a jailer, a probe
+# or a guest, so that a helper changed without a run is not first run by
+# the hour-long windows-guest job (CI's windows job runs this stage):
+# - Grant-JailRead with a made-up jail SID (S-1-9 and four random
+#   sub-authorities, as the jailer's vm_sid makes them, which no account
+#   has): the DACL it sets is read back by Grant-JailRead itself and here,
+#   apart, from the file's SDDL.
+# - Stop-Jailers against the race that left isolation's drive mapped: a
+#   stand-in jailer (a PowerShell) that starts its jailed process (a copy of
+#   ping.exe named jail-probe.exe) 1.5 s after it starts, after
+#   Stop-Jailers' first look, and exits when that process ends. Stop-Jailers
+#   must find the late process and the stand-in exit by itself, not be
+#   killed at the 10 s.
+function Stage-Helpers {
+    $base = New-Base 'helpers'
+    $rnd = [Security.Cryptography.RandomNumberGenerator]::Create()
+    $word = { $b = New-Object byte[] 4; $rnd.GetBytes($b); [BitConverter]::ToUInt32($b, 0) }
+    $sid = "S-1-9-$(& $word)-$(& $word)-$(& $word)-$(& $word)"
+    $f = Join-Path $base 'granted.txt'
+    Set-Content $f 'granted'
+    Grant-JailRead $f $sid
+    $sddl = (Get-Acl $f).Sddl
+    Check ($sddl.Contains('D:P') -and $sddl.Contains("(A;;FR;;;$sid)") -and $sddl -notmatch ';ID;') "Grant-JailRead's DACL read apart: $sddl"
+
+    $stand = Join-Path $base 'jail-probe.exe'
+    Copy-Item (Join-Path $env:SystemRoot 'System32\PING.EXE') $stand
+    $script = "Start-Sleep -Milliseconds 1500; `$c = Start-Process -FilePath '$stand' -ArgumentList '-n', '60', '127.0.0.1' -PassThru -WindowStyle Hidden; `$c.WaitForExit(); exit 0"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+    $j = Start-Process powershell -ArgumentList '-NoProfile', '-EncodedCommand', $encoded -PassThru -WindowStyle Hidden
+    $null = $j.Handle
+    $standIn = "$($j.ProcessName) pid $($j.Id)"
+    $before = $KilledAlive.Count
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    Stop-Jailers @($j)
+    $took = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+    $killed = @($KilledAlive | Select-Object -Skip $before)
+    Check ($j.HasExited -and $killed -notcontains $standIn) "Stop-Jailers: the stand-in jailer was killed or still runs after $took s (killed: $($killed -join ', '))"
+    Check (@($killed | Where-Object { $_ -like 'jail-probe pid *' }).Count -eq 1) "Stop-Jailers: the late jailed process was not found and killed once (killed: $($killed -join ', '))"
+    "Grant-JailRead gave $sid read alone ($sddl); Stop-Jailers found the jailed process started after its first look and the stand-in jailer exited by itself, in $took s"
+}
 
 # --- run ----------------------------------------------------------------------
 
