@@ -6484,46 +6484,72 @@ mod tests {
     }
 
     /// Each thread of a process has the stack guarantee
-    /// (`windows_mm::at_thread_start`, `windows_mm::stack_guarantee`): this
-    /// test's own thread, a Rust thread, a `CreateThread` thread and a
-    /// thread of the process's pool, each read from its TEB, each with a
-    /// guard region at least the guarantee below its stack at its start
-    /// (the region the callback makes at once: committed, so its cost); and
-    /// every thread of the process, listed (STACKGUARANTEE: its ID, its
-    /// guarantee read through its TEB, whether it was made before the
-    /// loader's callback for the process ran, the module it starts in). A
-    /// thread made after that callback without the guarantee fails the test
-    /// by name, and so does one without it that starts anywhere but ntdll
-    /// (whose loader workers run before the program's callbacks and run no
-    /// code of wick's). Recorded per kind: the guard region at the start and
-    /// after the stack grew 64 KiB.
+    /// (`windows_mm::at_thread_start`, `windows_mm::stack_guarantee`) and,
+    /// below its committed stack, the room a stack overflow's dispatch and
+    /// handler need already committed as guard pages: this test's own
+    /// thread, a Rust thread, a `CreateThread` thread and a thread of the
+    /// process's pool, each read from its TEB. The room is what the system
+    /// runs the overflow on when the stack cannot grow, a commit the memory
+    /// limit refused or the reserve's end (`windows_mm::guard_region_for`),
+    /// so committed, it does not hang on a commit at the limit: the guard
+    /// pages walked down from StackLimit (`windows_mm::guard_below`; one
+    /// `VirtualQuery` at StackLimit less a page says one page whatever lies
+    /// below, as CI run 44233741878 read it) are at least the exception's
+    /// context, the dispatcher's and the handler's (the guarantee before
+    /// its rounding), at the thread's start and after its stack grew
+    /// 64 KiB (the system's own region then, moved down by the growth).
+    /// Recorded per kind (STACKGUARANTEE, said on every run): what the
+    /// callback found below StackLimit and left there
+    /// (`windows_mm::make_the_guard_region`), and the walk at the start and
+    /// after the growth. Every thread of the
+    /// process listed too: its ID, its guarantee and its guard pages read
+    /// through its TEB, whether it was made before the loader's callback
+    /// for the process ran, the module it starts in. A thread made after
+    /// that callback without the guarantee fails the test by name, and so
+    /// does one without it that starts anywhere but ntdll (whose loader
+    /// workers run before the program's callbacks and run no code of
+    /// wick's).
     #[test]
     fn test_every_thread_has_the_stack_guarantee() {
         let want = crate::windows_mm::stack_guarantee();
+        let need = crate::windows_mm::exception_context_bytes()
+            + crate::windows_mm::simulated_xsave_extra()
+            + crate::windows_mm::DISPATCH_OVERHEAD
+            + crate::windows_mm::HANDLER_STACK_BUDGET;
+        let region = crate::windows_mm::guard_region_for(want);
         std::eprintln!(
-            "STACKGUARANTEE the guarantee {want} B: the exception's context {} B, the dispatcher's {} B, the handler's {} B",
+            "STACKGUARANTEE the guarantee {want} B: the exception's context {} B, the dispatcher's {} B, the handler's {} B ({need} B before \
+             its rounding); the guard region it sizes {region} B",
             crate::windows_mm::exception_context_bytes(),
             crate::windows_mm::DISPATCH_OVERHEAD,
             crate::windows_mm::HANDLER_STACK_BUDGET
         );
         let mut wrong = std::vec::Vec::new();
         for kind in [Kind::Rust, Kind::CreateThread, Kind::Pool] {
-            let (done, came_back) = std::sync::mpsc::channel::<(u32, usize, usize)>();
+            let (done, came_back) = std::sync::mpsc::channel::<(u32, (usize, usize, u32), usize, usize)>();
             on_a_thread_of(
                 kind,
                 std::boxed::Box::new(move || {
                     let (_, _, _, guarantee) = stack_of_this_thread();
+                    let callback = crate::windows_mm::GUARD_AT_START.get();
                     let at_start = guard_pages_below_the_stack();
                     grow_by(64 << 10);
-                    let _ = done.send((guarantee, at_start, guard_pages_below_the_stack()));
+                    let _ = done.send((guarantee, callback, at_start, guard_pages_below_the_stack()));
                 }),
             );
-            let (guarantee, at_start, guard) = came_back.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
-            std::eprintln!(
-                "STACKGUARANTEE {kind:?} thread: its guarantee {guarantee} B; {at_start} B of guard pages below its stack at its start, {guard} B after it grew 64 KiB"
-            );
-            if at_start < want {
-                wrong.push(std::format!("a {kind:?} thread's guard region at its start {at_start} B, under its guarantee {want} B"));
+            let (guarantee, (found, left, err), at_start, grown) = came_back.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+            // On every run, past the test's capture (one `WriteFile`).
+            crate::windows_mm::say_at_the_limit(format_args!(
+                "STACKGUARANTEE {kind:?} thread: its guarantee {guarantee} B; the callback found {found} B of guard pages below StackLimit \
+                 and left {left} B (error {err}); {at_start} B at the thread's own start, {grown} B after it grew 64 KiB; {need} B needed"
+            ));
+            if err != 0 {
+                wrong.push(std::format!("a {kind:?} thread's guard region refused at its start, error {err}"));
+            }
+            for (when, bytes) in [("at its start", at_start), ("after it grew 64 KiB", grown)] {
+                if bytes < need {
+                    wrong.push(std::format!("a {kind:?} thread's guard pages {when} {bytes} B, under the {need} B an overflow needs"));
+                }
             }
             if (guarantee as usize) < want {
                 wrong.push(std::format!("a {kind:?} thread's guarantee {guarantee} B, under {want} B"));
@@ -6536,9 +6562,11 @@ mod tests {
         let attached = crate::windows_mm::PROCESS_ATTACHED_AT.load(Ordering::Relaxed);
         for t in threads_of_this_process() {
             std::eprintln!(
-                "STACKGUARANTEE thread {}: its guarantee {:?} B, made {} the loader's callback for the process, its start in {}",
+                "STACKGUARANTEE thread {}: its guarantee {:?} B, {:?} B of guard pages below its StackLimit, made {} the loader's callback \
+                 for the process, its start in {}",
                 t.id,
                 t.guarantee,
+                t.guard,
                 if t.created < attached { "before" } else { "after" },
                 t.start
             );
@@ -6556,6 +6584,145 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// A guard region the system refuses at a thread's start (here refused
+    /// as at the memory limit, `windows_mm::REFUSE_GUARD_REGION`) is said
+    /// by the thread's ID, and the thread runs on: never a thread left
+    /// without it silently.
+    #[test]
+    fn test_a_guard_region_that_cannot_be_committed_is_said() {
+        let (code, text) = run_child("guard_region_refused_child", None);
+        let id = text.lines().find_map(|l| l.strip_prefix("GUARDCHILD thread ")).unwrap_or("none");
+        assert!(
+            text.contains(&std::format!("wick: thread {id}'s stack guard region of ")) && text.contains("could not be committed at its start (error 1455;"),
+            "{code:?}: {text}"
+        );
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_guard_region_that_cannot_be_committed_is_said"]
+    fn guard_region_refused_child() {
+        unsafe extern "system" fn start(_: *mut c_void) -> u32 {
+            // SAFETY: plain call.
+            std::println!("GUARDCHILD thread {}", unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() });
+            0
+        }
+        // SAFETY: a thread of ours with the default stack, made suspended
+        // (its callback runs once it is resumed), its ID set for the
+        // refusal before, waited for.
+        unsafe {
+            let mut id = 0u32;
+            let t = windows_sys::Win32::System::Threading::CreateThread(
+                ptr::null(),
+                0,
+                Some(start),
+                ptr::null(),
+                windows_sys::Win32::System::Threading::CREATE_SUSPENDED,
+                &mut id,
+            );
+            assert!(!t.is_null());
+            crate::windows_mm::REFUSE_GUARD_REGION.store(id, Ordering::SeqCst);
+            assert_ne!(windows_sys::Win32::System::Threading::ResumeThread(t), u32::MAX);
+            windows_sys::Win32::System::Threading::WaitForSingleObject(t, 30_000);
+            windows_sys::Win32::Foundation::CloseHandle(t);
+        }
+    }
+
+    /// A thread's guard region is charged to the process's commit at the
+    /// thread's start, which a job's memory limit counts (Learn,
+    /// `PROCESS_MEMORY_COUNTERS_EX`: PrivateUsage is "the Commit Charge
+    /// value in bytes for this process"; `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`:
+    /// the limit "for the virtual memory that can be committed"): a child's
+    /// commit grows by a thread whose region is committed
+    /// (`windows_mm::make_the_guard_region`) by what the callback
+    /// committed more than by the same thread whose region was refused, a
+    /// page either way. GUARDCHARGE, said on every run.
+    #[test]
+    fn test_the_guard_region_is_charged_at_the_threads_start() {
+        let (code, text) = run_child("guard_region_charge_child", None);
+        assert_eq!(code, Some(0), "{text}");
+        let line = text.lines().find(|l| l.starts_with("GUARDCHARGE ")).unwrap_or_default();
+        // On every run, past the test's capture (one `WriteFile`).
+        crate::windows_mm::say_at_the_limit(format_args!("{line}"));
+        let number = |after: &str| -> Option<isize> { line.split_once(after)?.1.split(' ').next()?.parse().ok() };
+        let (Some(committed), Some(more)) = (number("the callback committed "), number("the commit grew by ")) else {
+            panic!("no GUARDCHARGE line: {text}");
+        };
+        assert!(committed > 0, "{line}");
+        assert!((more - committed).abs() <= 4096, "{line}");
+    }
+
+    #[test]
+    #[ignore = "run by test_the_guard_region_is_charged_at_the_threads_start"]
+    fn guard_region_charge_child() {
+        use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, CreateEventW, CreateThread, ResumeThread, SetEvent, WaitForSingleObject};
+        static COMMITTED: AtomicUsize = AtomicUsize::new(0);
+        /// The thread's two events: it sets the first once started, and
+        /// ends once the second is set.
+        unsafe extern "system" fn start(events: *mut c_void) -> u32 {
+            let (had, left, _) = crate::windows_mm::GUARD_AT_START.get();
+            COMMITTED.store(left.saturating_sub(had), Ordering::SeqCst);
+            // SAFETY: the two events the parent made, alive until it joins.
+            unsafe {
+                let e = events.cast::<[windows_sys::Win32::Foundation::HANDLE; 2]>();
+                SetEvent((*e)[0]);
+                WaitForSingleObject((*e)[1], 30_000);
+            }
+            0
+        }
+        // A thread started and waiting, its guard region refused or not;
+        // its handle and its events.
+        let started = |refused: bool| {
+            // SAFETY: new events, a thread of ours with the default stack,
+            // made suspended so that its ID is set for the refusal before
+            // its callback runs.
+            unsafe {
+                let events = std::boxed::Box::into_raw(std::boxed::Box::new([
+                    CreateEventW(ptr::null(), 1, 0, ptr::null()),
+                    CreateEventW(ptr::null(), 1, 0, ptr::null()),
+                ]));
+                let mut id = 0u32;
+                let t = CreateThread(ptr::null(), 0, Some(start), events.cast(), CREATE_SUSPENDED, &mut id);
+                assert!(!t.is_null());
+                if refused {
+                    crate::windows_mm::REFUSE_GUARD_REGION.store(id, Ordering::SeqCst);
+                }
+                assert_ne!(ResumeThread(t), u32::MAX);
+                WaitForSingleObject((*events)[0], 30_000);
+                (t, events)
+            }
+        };
+        let done = |(t, events): (windows_sys::Win32::Foundation::HANDLE, *mut [windows_sys::Win32::Foundation::HANDLE; 2])| {
+            // SAFETY: the thread and events `started` made.
+            unsafe {
+                SetEvent((*events)[1]);
+                WaitForSingleObject(t, 30_000);
+                windows_sys::Win32::Foundation::CloseHandle(t);
+                let e = std::boxed::Box::from_raw(events);
+                windows_sys::Win32::Foundation::CloseHandle(e[0]);
+                windows_sys::Win32::Foundation::CloseHandle(e[1]);
+            }
+        };
+        // A first thread, so that what the process makes once for its
+        // threads is not counted.
+        done(started(false));
+        let before = crate::windows_mm::moverec_commit();
+        let refused = started(true);
+        let between = crate::windows_mm::moverec_commit();
+        let given = started(false);
+        let after = crate::windows_mm::moverec_commit();
+        let committed = COMMITTED.load(Ordering::SeqCst);
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "GUARDCHARGE a thread with its guard region refused: the commit grew {} B; with it: {} B, the callback committed {committed} B; \
+             the commit grew by {} B more",
+            between.cast_signed() - before.cast_signed(),
+            after.cast_signed() - between.cast_signed(),
+            (after.cast_signed() - between.cast_signed()) - (between.cast_signed() - before.cast_signed()),
+        ));
+        done(refused);
+        done(given);
+    }
+
     /// Goes `bytes` deeper in the stack than here, writing it.
     #[inline(never)]
     fn grow_by(bytes: usize) {
@@ -6567,18 +6734,10 @@ mod tests {
     }
 
     /// The bytes of guard pages (committed, `PAGE_GUARD`) right below the
-    /// calling thread's committed stack.
+    /// calling thread's committed stack, walked down to its reserve.
     fn guard_pages_below_the_stack() -> usize {
-        let (_, limit, _, _) = stack_of_this_thread();
-        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
-        let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: as above.
-        unsafe { windows_sys::Win32::System::Memory::VirtualQuery((limit - 1) as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) };
-        if mbi.State == windows_sys::Win32::System::Memory::MEM_COMMIT && mbi.Protect & windows_sys::Win32::System::Memory::PAGE_GUARD != 0 {
-            mbi.RegionSize
-        } else {
-            0
-        }
+        let (_, limit, reserve, _) = stack_of_this_thread();
+        crate::windows_mm::guard_below(limit, limit - reserve)
     }
 
     /// A thread of this process, as [`threads_of_this_process`] lists it.
@@ -6588,6 +6747,8 @@ mod tests {
         start: std::string::String,
         /// Its TEB's GuaranteedStackBytes, if it could be read.
         guarantee: Option<u32>,
+        /// The guard pages below its TEB's StackLimit, if it could be read.
+        guard: Option<usize>,
         /// When it was made (`FILETIME`).
         created: u64,
     }
@@ -6663,6 +6824,26 @@ mod tests {
                             )
                         } != 0;
                     let guarantee = read.then_some(g);
+                    // Its StackLimit and DeallocationStack, read the same
+                    // way, and the guard pages below the one, walked to the
+                    // other (a record: the thread may be growing its stack).
+                    let mut stack = [0usize; 2];
+                    let guard = (read
+                        && [0x10usize, 0x1478].iter().zip(stack.iter_mut()).all(|(&at, out)| {
+                            // SAFETY: this process; a buffer of the size passed.
+                            let ok = unsafe {
+                                windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                                    (info.teb + at) as *const c_void,
+                                    ptr::from_mut(out).cast(),
+                                    std::mem::size_of::<usize>(),
+                                    ptr::null_mut(),
+                                )
+                            };
+                            ok != 0
+                        })
+                        && stack[0] > stack[1])
+                        .then(|| crate::windows_mm::guard_below(stack[0], stack[0] - stack[1]));
                     let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
                     let (mut c, mut x, mut k, mut u) = (zero, zero, zero, zero);
                     // SAFETY: the thread's handle and four out-pointers.
@@ -6675,6 +6856,7 @@ mod tests {
                         id: e.thread,
                         start: module_name_of(start_address),
                         guarantee,
+                        guard,
                         created: (u64::from(c.dwHighDateTime) << 32) | u64::from(c.dwLowDateTime),
                     });
                     // SAFETY: our handle.
@@ -7955,28 +8137,66 @@ mod tests {
     /// dispatched as any other,
     /// Rust's "has overflowed its stack" line, the stack filter's
     /// line (the reserve's end) and 0xC00000FD. A
-    /// child per case: a thread recurses until 64, 63, ... 4 KiB are left
+    /// child per case: a thread recurses until a number of KiB are left
     /// above its reserve's low end (DeallocationStack), then reads a lazy
-    /// page; a Rust thread (a 20 KiB guarantee) and a `CreateThread` thread
-    /// (none; a pool thread's stack is the same, and its overflow's end is
+    /// page; a Rust thread and a `CreateThread` thread (both with the
+    /// guarantee, `windows_mm::at_thread_start`; a pool thread's stack is
+    /// the same, and its overflow's end is
     /// `test_a_stack_overflow_at_the_reserves_end_is_still_one`'s). Asserted
     /// per case:
     /// the read served and the child ended 0, or the overflow said, as
     /// above; and for each kind, that some case met the reserve's end in
     /// the handler's commit (STACKASK says where the overflow was raised),
     /// so that the window is tested, not only its edges.
+    ///
+    /// Where the window lies: a read at `left` KiB is served when the
+    /// handler's commit, under the dispatcher's frames (the context and the
+    /// simulated area) and the handler's own, stays above the guard region
+    /// the guarantee sizes, so the window rises with the guarantee and the
+    /// context, the simulated area counted in both. Measured, CI run
+    /// 44233741878 (a context of 3247 B): at 0 B simulated (a guarantee of
+    /// 24 KiB) the commit met the reserve's end at 38 to 42 KiB left and
+    /// the read was served from 43; at 8256 B (32 KiB) at 55 to 59, served
+    /// from 60; at 16384 B (40 KiB) not at all in 31 to 64, every case an
+    /// overflow before the commit. Why there: the stack overflows at the
+    /// reserve's end when it reaches the guarantee and two pages above the
+    /// reserve's low end (STACKASK in the window, all three sizes: the
+    /// faulting rsp 28.4 to 28.7 KiB, 36.4 to 36.9, 44.5 to 45.0 above
+    /// StackLimit, which is the low end and a page: the guarantee and
+    /// 8 KiB), and the read's handler commits that far below the read: the
+    /// exception's context and the simulated area, the dispatcher's own
+    /// frames past them (STACKASK: 2.4 KiB at 0 simulated, 3.2 with an area
+    /// simulated), then the handler's frames to and through its commit
+    /// (about 4 KiB to its deepest, 5 KiB wide: the window's width). So
+    /// the window is 8 + 2.4 to 3.2 + 0 to 5 KiB, 11 to 16, above the
+    /// guarantee, the context and the simulated area together, as measured
+    /// (14.8 and 15.8 at its top), and at 16384 B it lies at 70 to 75 KiB,
+    /// past the 64 the cases reached. The cases run 8 KiB past each edge,
+    /// from 3 to 24 KiB above that sum (and from 4 to 64 KiB with nothing
+    /// simulated, the whole stack's end); where the window was is said on
+    /// every run (LAZYWINDOW).
     #[test]
     fn test_a_lazy_touch_at_the_reserves_end_is_a_loud_overflow() {
         let context = crate::windows_mm::exception_context_bytes();
         for extra in XSAVE_EXTRAS {
-            // The window where the handler's commit meets the reserve's
-            // end lies above the thread's guarantee: from 4 KiB to the
-            // guarantee with a larger area simulated and 24 KiB more.
-            let guarantee = (context + extra.parse::<usize>().unwrap() + crate::windows_mm::DISPATCH_OVERHEAD + crate::windows_mm::HANDLER_STACK_BUDGET) >> 10;
-            let lowest = if extra == "0" { 4 } else { guarantee.saturating_sub(8).max(4) };
+            // The window lies 11 to 16 KiB above the guarantee, the context
+            // and the simulated area together (above: the floor's two
+            // pages, the dispatcher's frames past the context, the
+            // handler's own to and through its commit); the cases run
+            // 8 KiB past each of its edges.
+            let simulated = extra.parse::<usize>().unwrap();
+            let guarantee = (context + simulated + crate::windows_mm::DISPATCH_OVERHEAD + crate::windows_mm::HANDLER_STACK_BUDGET)
+                .next_multiple_of(4096);
+            let sum = (guarantee + context + simulated) >> 10;
+            let (lowest, highest) = if simulated == 0 { (4, (sum + 24).max(64)) } else { (sum + 3, sum + 24) };
+            std::eprintln!("LAZYEND {extra} B simulated: the guarantee {guarantee} B, the cases {lowest} to {highest} KiB left");
             let mut in_the_handler = [false; 2];
+            // Per kind: the lowest and highest case met in the commit, and
+            // the lowest served.
+            let mut met = [(usize::MAX, 0usize); 2];
+            let mut served_from = [usize::MAX; 2];
             for (k, kind) in ["rust", "createthread"].into_iter().enumerate() {
-                for left in (lowest..=(guarantee + 24).max(64)).rev() {
+                for left in (lowest..=highest).rev() {
                     let left_kib = std::format!("{left}");
                     let child = std::format!("lazy_at_the_reserves_end_{kind}_child");
                     let env = [("WICK_TEST_LEFT_KIB", left_kib.as_str()), ("WICK_TEST_XSAVE_EXTRA", extra)];
@@ -7991,8 +8211,25 @@ mod tests {
                         let room = stack_room_problems(&text, extra);
                         assert!(room.is_empty(), "{kind} at {left} KiB left, {extra} B: {room:#?}\n{text}");
                     }
-                    in_the_handler[k] |= loud && text.contains("raised in the lazy handler's commit");
+                    let in_it = loud && text.contains("raised in the lazy handler's commit");
+                    in_the_handler[k] |= in_it;
+                    if in_it {
+                        met[k] = (met[k].0.min(left), met[k].1.max(left));
+                    }
+                    if served {
+                        served_from[k] = served_from[k].min(left);
+                    }
                 }
+            }
+            // On every run, past the test's capture (one `WriteFile` to
+            // standard error): where the window was, against the sum.
+            for (k, kind) in ["rust", "createthread"].into_iter().enumerate() {
+                crate::windows_mm::say_at_the_limit(format_args!(
+                    "LAZYWINDOW {kind}, {extra} B simulated, the guarantee {guarantee} B, the context {context} B: the commit met \
+                     the reserve's end at {} KiB left, served from {} KiB; the sum {sum} KiB, the cases {lowest} to {highest}",
+                    if met[k].1 == 0 { "no case".into() } else { std::format!("{} to {}", met[k].0, met[k].1) },
+                    if served_from[k] == usize::MAX { "none".into() } else { std::format!("{}", served_from[k]) },
+                ));
             }
             assert!(
                 in_the_handler.iter().all(|&b| b),

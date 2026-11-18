@@ -222,17 +222,26 @@ has the per-control details and results.
   stack guarantee when it starts (a TLS callback, `windows_mm::at_thread_start`, for the main thread, Rust's,
   `CreateThread`'s, the pool's and the system's alike): the exception's context as this host sizes it
   (`InitializeContext2` for every XSAVE feature the system enables), the dispatcher's own 4 KiB, and 16 KiB for the
-  handler (`windows_mm::HANDLER_STACK_BUDGET`), with its guard region made at once; a thread the system cannot give
-  it to is said by its ID at its start. The stack filter writes its line and the frames of a VMM that ends only with
-  room for them, so it cannot fault before its exit with 137. The tests hold the room on every runner and kind of
+  handler (`windows_mm::HANDLER_STACK_BUDGET`), and the guard region that guarantee sizes (the guarantee and a page) is
+  committed below its stack at once, as guard pages (`windows_mm::make_the_guard_region`): the system raises only the
+  thread's GuaranteedStackBytes and makes the region at the stack's next growth, which for a thread that first grows
+  at the memory limit would be refused, leaving one guard page to run the overflow on (edea8e38 touched the guard page
+  instead and took that touch to size the region; its test's reading could not show it, and the touch, a growth, could
+  itself be refused at the limit inside the loader's callback); a thread the system cannot give the guarantee or its
+  region to is said by its ID at its start, and runs on with the guard pages it has, which the line counts: its start
+  does not fail. The stack filter writes its line and the frames
+  of a VMM that ends only with room for them, so it cannot fault before its exit with 137. The tests hold the room on every runner and kind of
   thread (STACKASK: at least the budget left under the handler; STACKUSE: at most the budget used), also with a
   larger XSAVE area simulated on a runner without AMX (8256 bytes, as AMX adds, and 16384:
   `WICK_TEST_XSAVE_EXTRA`); a runner with AMX remains the measured record, and GitHub assigns the windows job's
-  runner at random (`test_every_thread_has_the_stack_guarantee`,
-  `test_a_stack_guarantee_that_cannot_be_set_is_said`). What it costs: each thread has the guarantee and one page
-  more committed below its stack from its start, untouched, as guard pages: by the sizes, 28 KiB a thread on a host
+  runner at random (`test_every_thread_has_the_stack_guarantee`: the guard pages walked down from each kind of
+  thread's StackLimit at its start and after it grew 64 KiB, at least the context, the dispatcher's and the handler's
+  bytes; `test_a_stack_guarantee_that_cannot_be_set_is_said`, `test_a_guard_region_that_cannot_be_committed_is_said`).
+  What it costs: each thread has the guarantee and one page more committed below its stack from its start, untouched,
+  as guard pages: by the sizes, 28 KiB a thread on a host
   without AMX and 40 KiB with it (Rust's threads had 20 KiB of it before, Rust's own guarantee, made at their first
-  guard-page hit), charged to the job's commit and so to `memory.max`. A Firecracker has 5 threads and one a vCPU
+  guard-page hit), charged to the job's commit and so to `memory.max`
+  (`test_the_guard_region_is_charged_at_the_threads_start`: the process's commit grows by what the callback committed). A Firecracker has 5 threads and one a vCPU
   (the event loop, the API thread, the PIT's timer, the TSC-deadline timer, the irqfd watcher), 2 in its API process,
   and one each, when they run, for the userfaultfd server and the reclaimer (a registration), the fifo relay, and an
   epoll's pipe or nested epoll: 224, 252 and 644 KiB with 1, 2 and 16 vCPUs without AMX, 320, 360 and 920 KiB with

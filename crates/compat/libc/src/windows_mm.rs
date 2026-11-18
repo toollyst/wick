@@ -2045,15 +2045,16 @@ pub(crate) fn stack_guarantee() -> usize {
 /// 0xC00000FD and wick's line (CI run 44225041771, an Intel Xeon Platinum
 /// 8573C with AMX; SECURITY.md, Fixed defects).
 ///
-/// What it costs: the guarantee is the size of the guard region the
-/// system keeps below a thread's committed stack, committed as guard
-/// pages (charged to the process and its job) and taken from the thread's
-/// reserve; the callback grows the stack by its guard page at once, so
-/// that the region is made at the thread's start and not first at the
-/// memory limit: one page and the guarantee committed per thread
-/// (`test_every_thread_has_the_stack_guarantee` records it per kind of
-/// thread). A guarantee that cannot be set (a
-/// reserve too small for it) is said, with the thread, and the thread runs
+/// What it costs: the guarantee sizes the guard region the system keeps
+/// below a thread's committed stack ([`guard_region_for`]: the guarantee
+/// and a page), committed as guard pages (charged to the process and its
+/// job) and taken from the thread's reserve; the callback commits the
+/// region at once ([`make_the_guard_region`]), so that it is charged at
+/// the thread's start and not first at the memory limit
+/// (`test_every_thread_has_the_stack_guarantee` walks it down from
+/// StackLimit per kind of thread, at its start and after it grew). A
+/// guarantee that cannot be set (a reserve too small for it), or a region
+/// that cannot be committed, is said, with the thread, and the thread runs
 /// without it.
 #[cfg(target_arch = "x86_64")]
 #[used]
@@ -2094,22 +2095,7 @@ fn set_the_stack_guarantee() {
     let err = if set { 0 } else { unsafe { GetLastError() } };
     let (limit, reserve, now) = this_threads_stack();
     if set && now >= want {
-        // The system sizes the guard region below the committed stack by
-        // the guarantee when the stack next grows past its guard page; a
-        // thread whose stack must first grow at the memory limit would
-        // find only its old guard page there. So the guard page is
-        // touched now, once: the system commits it and makes the guard
-        // region the guarantee sizes below it (charged now, not at the
-        // limit). Only where it is a guard page.
-        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
-        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: as above.
-        let queried = unsafe { VirtualQuery((limit - PAGE) as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } != 0;
-        if queried && mbi.State == MEM_COMMIT && mbi.Protect & PAGE_GUARD != 0 {
-            // SAFETY: this thread's own guard page, below every frame: the
-            // access is the stack's growth by one page.
-            unsafe { core::ptr::read_volatile((limit - PAGE) as *const u8) };
-        }
+        make_the_guard_region(limit, reserve, now);
         return;
     }
     let base: usize;
@@ -2125,6 +2111,146 @@ fn set_the_stack_guarantee() {
         base.saturating_sub(reserve) >> 10,
     ));
 }
+
+/// The guard region wick makes below a thread's committed stack for
+/// `guarantee`: the guarantee rounded up to a page and one page more, two
+/// pages at least, as the UCRT's `_resetstkoflw` makes it again after an
+/// overflow (misc/resetstk.cpp, Windows Kits 10.0.26100.0), at a thread's
+/// start ([`make_the_guard_region`]) and after a refused commit
+/// ([`stack_page_after_the_reclaim`]). A guard-page hit moves the region
+/// down by the page hit (Learn, `_resetstkoflw`: the system "allocates a
+/// new guard page that is located one page below the last one"); the
+/// size the system keeps it at as the stack grows is recorded, not
+/// documented (`test_every_thread_has_the_stack_guarantee`, after the
+/// stack grew 64 KiB). Its pages are committed, so charged, before the
+/// stack needs them, and a stack that cannot grow (a refused commit, or
+/// the reserve's end) runs its exception's dispatch and handler on them:
+/// STACKASK on a refused commit, a Rust thread with Rust's 20 KiB
+/// guarantee that had grown before the limit: 20480 B committed below the
+/// faulting address, the page below StackLimit reserved (CI run
+/// 44225041771).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn guard_region_for(guarantee: usize) -> usize {
+    let mut guard = guarantee.next_multiple_of(PAGE);
+    if guard != 0 {
+        guard += PAGE;
+    }
+    guard.max(2 * PAGE)
+}
+
+/// The bytes of guard pages (committed, `PAGE_GUARD`) right below `limit`
+/// (a thread's StackLimit), walked down a page at a time to at most
+/// `most`: one `VirtualQuery` cannot say it, as the region it describes
+/// runs up from the page asked about (Learn, `MEMORY_BASIC_INFORMATION`:
+/// "the region beginning at the base address in which all pages have
+/// identical attributes"), so asked at `limit - PAGE` it ends at `limit`
+/// and says one page whatever lies below (CI run 44233741878's
+/// STACKGUARANTEE: "4096 B of guard pages" on every kind of thread).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn guard_below(limit: usize, most: usize) -> usize {
+    let mut n = 0;
+    while n < most && limit >= n + 2 * PAGE {
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery((limit - n - PAGE) as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } == 0
+            || mbi.State != MEM_COMMIT
+            || mbi.Protect & PAGE_GUARD == 0
+        {
+            break;
+        }
+        n += PAGE;
+    }
+    n
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Tests: what [`make_the_guard_region`] found and did on this thread
+    /// at its start: the guard bytes below StackLimit before, after, and
+    /// the error of a refused commit (0 for none).
+    pub(crate) static GUARD_AT_START: core::cell::Cell<(usize, usize, u32)> = const { core::cell::Cell::new((0, 0, 0)) };
+}
+
+/// Tests: the thread (by its ID, 0 for none) whose [`make_the_guard_region`]
+/// is refused as at the memory limit (`ERROR_COMMITMENT_LIMIT`), for its
+/// line.
+#[cfg(test)]
+pub(crate) static REFUSE_GUARD_REGION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Commits the calling thread's guard region ([`guard_region_for`] its
+/// guarantee) below its committed stack, the part not there yet, with one
+/// `VirtualAlloc2` of `PAGE_READWRITE | PAGE_GUARD` (Learn, "Creating Guard
+/// Pages": the modifier "can be specified ... in the VirtualAlloc ...
+/// functions"), at the thread's start, so that it is charged there and not
+/// first at the memory limit. Why: `SetThreadStackGuarantee` only raises
+/// the TEB's GuaranteedStackBytes, and the system sizes the region by it
+/// as the stack next grows past its guard page; a thread whose first
+/// growth after its start came at the memory limit would find one guard
+/// page there and run the overflow's dispatch, with its context, on it:
+/// the access violation and no line this guarantee is for (SECURITY.md,
+/// the AMX entry). Committed here and not by touching the guard page: the
+/// touch is a growth, and one refused at the limit raises
+/// `STATUS_STACK_OVERFLOW` in the loader's callback; a refused
+/// `VirtualAlloc2` is a return, said by the thread's ID, and the thread
+/// runs on, its region made at its first growth with room (the reclaim is
+/// not asked: this runs under the loader's lock, which a reclaim's
+/// thread may wait for). Never into the reserve's last page, which the
+/// system keeps.
+#[cfg(target_arch = "x86_64")]
+fn make_the_guard_region(limit: usize, reserve: usize, guarantee: usize) {
+    let region = guard_region_for(guarantee);
+    let had = guard_below(limit, region);
+    let mut err = 0u32;
+    if had < region {
+        let at = limit - region;
+        #[cfg(test)]
+        // SAFETY: plain call.
+        let refuse = REFUSE_GUARD_REGION
+            .compare_exchange(
+                unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok();
+        #[cfg(not(test))]
+        let refuse = false;
+        if at < reserve + PAGE {
+            err = ERROR_INVALID_ADDRESS;
+        } else if refuse {
+            err = ERROR_COMMITMENT_LIMIT;
+        } else {
+            // SAFETY: reserved pages of this thread's own stack below its
+            // guard pages: below every frame, above the reserve's last page.
+            let p = unsafe {
+                VirtualAlloc2(proc(), at as *const c_void, region - had, MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD, std::ptr::null_mut(), 0)
+            };
+            if p.is_null() {
+                // SAFETY: plain call.
+                err = unsafe { GetLastError() };
+            }
+        }
+    }
+    #[cfg(test)]
+    GUARD_AT_START.set((had, guard_below(limit, region + 4 * PAGE), err));
+    if err != 0 {
+        say_at_the_limit(format_args!(
+            "wick: thread {}'s stack guard region of {region} bytes (its guarantee {guarantee} bytes) could not be committed \
+             at its start (error {err}; {had} bytes of it there): a stack overflow on it, or a stack that cannot grow at \
+             the memory limit, before its first growth with room may end the process with an access violation \
+             (0xC0000005) and no line of wick's",
+            // SAFETY: plain call.
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+        ));
+    }
+}
+
+/// `ERROR_INVALID_ADDRESS`, `ERROR_COMMITMENT_LIMIT`.
+#[cfg(target_arch = "x86_64")]
+const ERROR_INVALID_ADDRESS: u32 = 487;
+#[cfg(target_arch = "x86_64")]
+const ERROR_COMMITMENT_LIMIT: u32 = 1455;
 
 /// How [`set_the_stack_guarantee`]'s line says what the call did.
 struct GuaranteeCall(bool, u32);
@@ -2424,11 +2550,7 @@ fn stack_page_after_the_reclaim() -> bool {
         }
         _ => None,
     };
-    let mut guard = guarantee.next_multiple_of(PAGE);
-    if guard != 0 {
-        guard += PAGE;
-    }
-    let guard = guard.max(2 * PAGE);
+    let guard = guard_region_for(guarantee);
     let at = limit - guard;
     #[cfg(test)]
     let refuse = REFUSE_STACK_RETRY.swap(false, std::sync::atomic::Ordering::SeqCst);
@@ -5390,7 +5512,7 @@ pub(crate) fn charge_page_of(at: usize) -> Option<usize> {
 
 /// MOVEREC: the process's private commit, allocating nothing.
 #[cfg(test)]
-fn moverec_commit() -> usize {
+pub(crate) fn moverec_commit() -> usize {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
     // SAFETY: an all-zero counters structure is valid.
     let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
