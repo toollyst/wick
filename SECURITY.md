@@ -203,6 +203,46 @@ has the per-control details and results.
 
 ## Fixed defects
 
+- **Windows, on a host with AMX: a stack overflow, or a stack that could not grow at the memory limit, on a thread
+  with no stack guarantee ended the process with an access violation (0xC0000005) and no line of wick's** (every
+  Windows release so far; found by the first CI windows job that ran on an Intel Xeon Platinum 8573C with AMX
+  enabled, docs/COMPATIBILITY.md's `memory.max` row; fixed in the commit that adds this entry). The system dispatches a stack overflow on the thread's own
+  stack, and what it puts there first is the exception's context with the thread's whole XSAVE area: 8256 bytes more
+  with AMX's tile configuration and data than with AVX-512 (STACKASK: the dispatcher's frames 13.8 KiB against
+  5.6 KiB on an Ice Lake Xeon). A thread made by `CreateThread` or a thread pool has no stack
+  guarantee, and was left 4.9 KiB under the exception handler where it had 7.6 to 9.1 KiB; the handler or the stack
+  filter then overflowed again, and the process ended with the access violation instead of 137 (the memory limit)
+  or 0xC00000FD (the reserve's end) after wick's line. Five tests failed so
+  (`test_a_stack_that_must_grow_at_the_limit_ends_with_137`, `test_a_stack_overflow_at_the_reserves_end_is_still_one`,
+  `test_a_job_nested_in_one_that_dies_on_unhandled_exceptions_ends_by_its_own_limits`,
+  `test_a_lazy_touch_at_the_reserves_end_is_a_loud_overflow`, `test_the_reclaimers_own_stack_page_is_not_waited_for`).
+  The process ended either way, so nothing ran on that was meant to stop, and the jailer's accounting does not read
+  the exit code (its count of sections ends the jail with 137 by itself); what was wrong is what the operator was
+  told: an end at the memory limit read as a crash, with no line naming the thread. Now every thread is given a
+  stack guarantee when it starts (a TLS callback, `windows_mm::at_thread_start`, for the main thread, Rust's,
+  `CreateThread`'s, the pool's and the system's alike): the exception's context as this host sizes it
+  (`InitializeContext2` for every XSAVE feature the system enables), the dispatcher's own 4 KiB, and 16 KiB for the
+  handler (`windows_mm::HANDLER_STACK_BUDGET`), with its guard region made at once; a thread the system cannot give
+  it to is said by its ID at its start. The stack filter writes its line and the frames of a VMM that ends only with
+  room for them, so it cannot fault before its exit with 137. The tests hold the room on every runner and kind of
+  thread (STACKASK: at least the budget left under the handler; STACKUSE: at most the budget used), also with a
+  larger XSAVE area simulated on a runner without AMX (8256 bytes, as AMX adds, and 16384:
+  `WICK_TEST_XSAVE_EXTRA`); a runner with AMX remains the measured record, and GitHub assigns the windows job's
+  runner at random (`test_every_thread_has_the_stack_guarantee`,
+  `test_a_stack_guarantee_that_cannot_be_set_is_said`). What it costs: each thread has the guarantee and one page
+  more committed below its stack from its start, untouched, as guard pages: by the sizes, 28 KiB a thread on a host
+  without AMX and 40 KiB with it (Rust's threads had 20 KiB of it before, Rust's own guarantee, made at their first
+  guard-page hit), charged to the job's commit and so to `memory.max`. A Firecracker has 5 threads and one a vCPU
+  (the event loop, the API thread, the PIT's timer, the TSC-deadline timer, the irqfd watcher), 2 in its API process,
+  and one each, when they run, for the userfaultfd server and the reclaimer (a registration), the fifo relay, and an
+  epoll's pipe or nested epoll: 224, 252 and 644 KiB with 1, 2 and 16 vCPUs without AMX, 320, 360 and 920 KiB with
+  it, against the 128 MiB `memory.max` of jailer-test's limits stage (2 vCPUs) and a VMM's 3.3 to 6.2 MiB working
+  set; the working set (docs/COMPATIBILITY.md's VMMMEM) gains at most the one page a thread, to be re-measured: first
+  run CI. Threads the callback does not reach: those made before the process's callback runs (ntdll's parallel
+  loader's workers, which map the DLLs the program imports and run nothing of wick's or Firecracker's) and those made
+  with `THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH` (none of wick's or Firecracker's); the test lists every thread with
+  the module it starts in, and fails on one without the guarantee that starts anywhere but ntdll; an overflow on one
+  of those it lists ends as before this fix. First run: CI.
 - **Windows: a write into memory that a userfaultfd register was moving could be lost, and an access to it at the
   wrong moment could end the process** (since the register moves the memory into sections,
   `windows_mm::uffd_alias`; fixed in the commit that adds this entry). The register copies the mapping's resident

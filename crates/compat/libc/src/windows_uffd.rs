@@ -5683,6 +5683,11 @@ mod tests {
     /// given (set before the child registers anything: it sleeps 300 ms
     /// first): its exit status and output.
     fn run_child(child: &str, limit: Option<usize>) -> (Option<i32>, std::string::String) {
+        run_child_with(child, limit, &[])
+    }
+
+    /// [`run_child`] with `env` added to the child's environment.
+    fn run_child_with(child: &str, limit: Option<usize>, env: &[(&str, &str)]) -> (Option<i32>, std::string::String) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -5691,6 +5696,7 @@ mod tests {
         let name = std::format!("{}::{child}", module_path!().split_once("::").unwrap().1);
         let process = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name.as_str(), "--ignored", "--nocapture"])
+            .envs(env.iter().copied())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -6413,11 +6419,322 @@ mod tests {
     /// cannot be charged with its out-of-memory kill.
     #[test]
     fn test_a_stack_that_must_grow_at_the_limit_ends_with_137() {
-        for child in ["stack_at_the_limit_rust_child", "stack_at_the_limit_createthread_child", "stack_at_the_limit_pool_child"] {
-            let (code, text) = run_child(child, Some(96 << 20));
-            std::eprintln!("STACK137 {child}: {code:?}; {}", text.trim().replace('\n', " | "));
-            assert!(text.contains("wick: a thread's stack could not grow"), "{child}: {text}");
-            assert_eq!(code, Some(137), "{child}: {text}");
+        for extra in XSAVE_EXTRAS {
+            for child in ["stack_at_the_limit_rust_child", "stack_at_the_limit_createthread_child", "stack_at_the_limit_pool_child"] {
+                let (code, text) = run_child_with(child, Some(96 << 20), &[("WICK_TEST_XSAVE_EXTRA", extra)]);
+                std::eprintln!("STACK137 {child}, XSAVE area {extra} B larger: {code:?}; {}", text.trim().replace('\n', " | "));
+                assert!(text.contains("wick: a thread's stack could not grow"), "{child}, {extra}: {text}");
+                assert_eq!(code, Some(137), "{child}, {extra}: {text}");
+                assert!(text.contains("STACK137FRAMES 0 "), "{child}, {extra}: no frames: {text}");
+                let room = stack_room_problems(&text, extra);
+                assert!(room.is_empty(), "{child}, {extra}: {room:#?}\n{text}");
+            }
+        }
+    }
+
+    /// The larger XSAVE areas the overflow tests simulate on top of the
+    /// runner's own (`windows_mm::simulated_xsave_extra`): none, AMX's tile
+    /// configuration and data (64 + 8192 bytes, as an Intel Xeon with AMX
+    /// adds: CI run 44225041771), and twice that, rounded.
+    const XSAVE_EXTRAS: [&str; 3] = ["0", "8256", "16384"];
+
+    /// What a child's STACKASK and STACKUSE lines say against the stack the
+    /// handler is given (`windows_mm::HANDLER_STACK_BUDGET`,
+    /// `windows_mm::DISPATCH_OVERHEAD`): at least the budget left under the
+    /// handler, at most the budget used there by the handler and the
+    /// filters, the dispatcher's frames at most the exception's context,
+    /// the simulated area and the overhead; and the simulated area named
+    /// as asked. Each line out of bounds, said.
+    fn stack_room_problems(text: &str, extra: &str) -> std::vec::Vec<std::string::String> {
+        let budget = crate::windows_mm::HANDLER_STACK_BUDGET;
+        let overhead = crate::windows_mm::DISPATCH_OVERHEAD;
+        let number = |l: &str, after: &str| -> Option<usize> { l.split_once(after)?.1.split(' ').next()?.parse().ok() };
+        let mut wrong = std::vec::Vec::new();
+        for l in text.lines() {
+            if l.starts_with("STACKASK ") {
+                let (Some(frames), Some(left), Some(context), Some(simulated)) = (
+                    number(l, "the dispatcher's frames "),
+                    number(l, "left under the handler "),
+                    number(l, "the exception's context "),
+                    number(l, "a larger XSAVE area simulated "),
+                ) else {
+                    wrong.push(std::format!("unread: {l}"));
+                    continue;
+                };
+                if left < budget {
+                    wrong.push(std::format!("{left} B left under the handler, under the budget of {budget} B: {l}"));
+                }
+                if frames > context + simulated + overhead {
+                    wrong.push(std::format!("the dispatcher's frames {frames} B over the context {context} B, {simulated} B simulated and {overhead} B: {l}"));
+                }
+                if extra.parse::<usize>() != Ok(simulated) {
+                    wrong.push(std::format!("simulated {simulated} B where {extra} B was asked: {l}"));
+                }
+            } else if l.starts_with("STACKUSE ") {
+                match number(l, "the filters used ") {
+                    Some(used) if used <= budget => {}
+                    _ => wrong.push(std::format!("over the budget of {budget} B: {l}")),
+                }
+            }
+        }
+        if !text.contains("STACKASK ") {
+            wrong.push("no STACKASK line".into());
+        }
+        wrong
+    }
+
+    /// Each thread of a process has the stack guarantee
+    /// (`windows_mm::at_thread_start`, `windows_mm::stack_guarantee`): this
+    /// test's own thread, a Rust thread, a `CreateThread` thread and a
+    /// thread of the process's pool, each read from its TEB, each with a
+    /// guard region at least the guarantee below its stack at its start
+    /// (the region the callback makes at once: committed, so its cost); and
+    /// every thread of the process, listed (STACKGUARANTEE: its ID, its
+    /// guarantee read through its TEB, whether it was made before the
+    /// loader's callback for the process ran, the module it starts in). A
+    /// thread made after that callback without the guarantee fails the test
+    /// by name, and so does one without it that starts anywhere but ntdll
+    /// (whose loader workers run before the program's callbacks and run no
+    /// code of wick's). Recorded per kind: the guard region at the start and
+    /// after the stack grew 64 KiB.
+    #[test]
+    fn test_every_thread_has_the_stack_guarantee() {
+        let want = crate::windows_mm::stack_guarantee();
+        std::eprintln!(
+            "STACKGUARANTEE the guarantee {want} B: the exception's context {} B, the dispatcher's {} B, the handler's {} B",
+            crate::windows_mm::exception_context_bytes(),
+            crate::windows_mm::DISPATCH_OVERHEAD,
+            crate::windows_mm::HANDLER_STACK_BUDGET
+        );
+        let mut wrong = std::vec::Vec::new();
+        for kind in [Kind::Rust, Kind::CreateThread, Kind::Pool] {
+            let (done, came_back) = std::sync::mpsc::channel::<(u32, usize, usize)>();
+            on_a_thread_of(
+                kind,
+                std::boxed::Box::new(move || {
+                    let (_, _, _, guarantee) = stack_of_this_thread();
+                    let at_start = guard_pages_below_the_stack();
+                    grow_by(64 << 10);
+                    let _ = done.send((guarantee, at_start, guard_pages_below_the_stack()));
+                }),
+            );
+            let (guarantee, at_start, guard) = came_back.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+            std::eprintln!(
+                "STACKGUARANTEE {kind:?} thread: its guarantee {guarantee} B; {at_start} B of guard pages below its stack at its start, {guard} B after it grew 64 KiB"
+            );
+            if at_start < want {
+                wrong.push(std::format!("a {kind:?} thread's guard region at its start {at_start} B, under its guarantee {want} B"));
+            }
+            if (guarantee as usize) < want {
+                wrong.push(std::format!("a {kind:?} thread's guarantee {guarantee} B, under {want} B"));
+            }
+        }
+        let (_, _, _, here) = stack_of_this_thread();
+        if (here as usize) < want {
+            wrong.push(std::format!("this test's thread's guarantee {here} B, under {want} B"));
+        }
+        let attached = crate::windows_mm::PROCESS_ATTACHED_AT.load(Ordering::Relaxed);
+        for t in threads_of_this_process() {
+            std::eprintln!(
+                "STACKGUARANTEE thread {}: its guarantee {:?} B, made {} the loader's callback for the process, its start in {}",
+                t.id,
+                t.guarantee,
+                if t.created < attached { "before" } else { "after" },
+                t.start
+            );
+            let short = t.guarantee.is_some_and(|g| (g as usize) < want);
+            if t.created >= attached && short {
+                wrong.push(std::format!("thread {} made after the process's callback, its guarantee {:?} B", t.id, t.guarantee));
+            }
+            // A thread without the guarantee that runs anything but the
+            // system loader's work (its start outside ntdll) is a thread
+            // wick or Firecracker code may run on: a gap, not a listing.
+            if short && t.start != "ntdll.dll" {
+                wrong.push(std::format!("thread {} without the guarantee starts in {}, not ntdll's loader", t.id, t.start));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Goes `bytes` deeper in the stack than here, writing it.
+    #[inline(never)]
+    fn grow_by(bytes: usize) {
+        let pad = core::hint::black_box([1u8; 4096]);
+        if bytes > 4096 {
+            grow_by(bytes - 4096);
+        }
+        core::hint::black_box(&pad);
+    }
+
+    /// The bytes of guard pages (committed, `PAGE_GUARD`) right below the
+    /// calling thread's committed stack.
+    fn guard_pages_below_the_stack() -> usize {
+        let (_, limit, _, _) = stack_of_this_thread();
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        unsafe { windows_sys::Win32::System::Memory::VirtualQuery((limit - 1) as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) };
+        if mbi.State == windows_sys::Win32::System::Memory::MEM_COMMIT && mbi.Protect & windows_sys::Win32::System::Memory::PAGE_GUARD != 0 {
+            mbi.RegionSize
+        } else {
+            0
+        }
+    }
+
+    /// A thread of this process, as [`threads_of_this_process`] lists it.
+    struct ThreadSeen {
+        id: u32,
+        /// The module its start address lies in (`ThreadQuerySetWin32StartAddress`).
+        start: std::string::String,
+        /// Its TEB's GuaranteedStackBytes, if it could be read.
+        guarantee: Option<u32>,
+        /// When it was made (`FILETIME`).
+        created: u64,
+    }
+
+    /// Every thread of this process (a ToolHelp snapshot), with its stack
+    /// guarantee read from its TEB (`NtQueryInformationThread`,
+    /// ThreadBasicInformation) and when it was made (`GetThreadTimes`).
+    fn threads_of_this_process() -> std::vec::Vec<ThreadSeen> {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+        use windows_sys::Win32::System::Threading::{GetThreadTimes, OpenThread, THREAD_QUERY_INFORMATION};
+        #[repr(C)]
+        struct ThreadEntry32 {
+            size: u32,
+            usage: u32,
+            thread: u32,
+            owner: u32,
+            base_priority: i32,
+            delta_priority: i32,
+            flags: u32,
+        }
+        #[repr(C)]
+        struct ThreadBasicInformation {
+            exit_status: i32,
+            teb: usize,
+            client_id: [usize; 2],
+            affinity: usize,
+            priority: i32,
+            base_priority: i32,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateToolhelp32Snapshot(flags: u32, process: u32) -> HANDLE;
+            fn Thread32First(snapshot: HANDLE, entry: *mut ThreadEntry32) -> i32;
+            fn Thread32Next(snapshot: HANDLE, entry: *mut ThreadEntry32) -> i32;
+        }
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryInformationThread(thread: HANDLE, class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+        }
+        const TH32CS_SNAPTHREAD: u32 = 4;
+        let me = std::process::id();
+        let mut out = std::vec::Vec::new();
+        // SAFETY: a snapshot of every thread of the system.
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        assert!(!snap.is_null() && snap as isize != -1);
+        #[allow(clippy::cast_possible_truncation)]
+        let mut e = ThreadEntry32 { size: std::mem::size_of::<ThreadEntry32>() as u32, usage: 0, thread: 0, owner: 0, base_priority: 0, delta_priority: 0, flags: 0 };
+        // SAFETY: the snapshot and an entry of the size it says.
+        let mut more = unsafe { Thread32First(snap, &mut e) } != 0;
+        while more {
+            if e.owner == me {
+                // SAFETY: a thread of this process, opened to query it.
+                let h = unsafe { OpenThread(THREAD_QUERY_INFORMATION, 0, e.thread) };
+                if !h.is_null() {
+                    // SAFETY: plain data; zero is valid.
+                    let mut info: ThreadBasicInformation = unsafe { std::mem::zeroed() };
+                    // SAFETY: the thread's handle and a buffer of the size passed.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let st = unsafe { NtQueryInformationThread(h, 0, (&raw mut info).cast(), std::mem::size_of_val(&info) as u32, ptr::null_mut()) };
+                    // Read as another process's memory is: a thread that
+                    // ended meanwhile has no TEB, and the read fails.
+                    let mut g = 0u32;
+                    // SAFETY: this process; a buffer of the size passed.
+                    let read = st >= 0
+                        && info.teb != 0
+                        && unsafe {
+                            windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                                (info.teb + 0x1748) as *const c_void,
+                                (&raw mut g).cast(),
+                                4,
+                                ptr::null_mut(),
+                            )
+                        } != 0;
+                    let guarantee = read.then_some(g);
+                    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+                    let (mut c, mut x, mut k, mut u) = (zero, zero, zero, zero);
+                    // SAFETY: the thread's handle and four out-pointers.
+                    unsafe { GetThreadTimes(h, &mut c, &mut x, &mut k, &mut u) };
+                    let mut start_address = 0usize;
+                    // SAFETY: as above; class 9, ThreadQuerySetWin32StartAddress, a pointer.
+                    #[allow(clippy::cast_possible_truncation)]
+                    unsafe { NtQueryInformationThread(h, 9, (&raw mut start_address).cast(), std::mem::size_of::<usize>() as u32, ptr::null_mut()) };
+                    out.push(ThreadSeen {
+                        id: e.thread,
+                        start: module_name_of(start_address),
+                        guarantee,
+                        created: (u64::from(c.dwHighDateTime) << 32) | u64::from(c.dwLowDateTime),
+                    });
+                    // SAFETY: our handle.
+                    unsafe { CloseHandle(h) };
+                }
+            }
+            // SAFETY: as above.
+            more = unsafe { Thread32Next(snap, &mut e) } != 0;
+        }
+        // SAFETY: our snapshot.
+        unsafe { CloseHandle(snap) };
+        out
+    }
+
+    /// The file name of the module `address` lies in, or "?".
+    fn module_name_of(address: usize) -> std::string::String {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
+            fn GetModuleFileNameW(module: *mut c_void, name: *mut u16, size: u32) -> u32;
+        }
+        const FROM_ADDRESS: u32 = 4;
+        const UNCHANGED_REFCOUNT: u32 = 2;
+        let mut module = ptr::null_mut();
+        // SAFETY: an address, looked up without a reference taken.
+        if address == 0 || unsafe { GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, address as *const u16, &mut module) } == 0 {
+            return "?".into();
+        }
+        let mut name = [0u16; 260];
+        // SAFETY: the module and a buffer of the size given.
+        let n = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), 260) } as usize;
+        let full = std::string::String::from_utf16_lossy(&name[..n.min(260)]);
+        full.rsplit('\\').next().unwrap_or("?").to_ascii_lowercase()
+    }
+
+    /// A guarantee the system cannot give (here a simulated XSAVE area of
+    /// 8 MiB, past any thread's reserve) is said at the thread's start, by
+    /// the thread's ID: never a thread left without one silently.
+    #[test]
+    fn test_a_stack_guarantee_that_cannot_be_set_is_said() {
+        let (code, text) = run_child_with("guarantee_not_set_child", None, &[("WICK_TEST_XSAVE_EXTRA", "8388608")]);
+        let id = text.lines().find_map(|l| l.strip_prefix("GUARANTEECHILD thread ")).unwrap_or("none");
+        assert!(text.contains(&std::format!("wick: thread {id} could not be given a stack guarantee of ")), "{code:?}: {text}");
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_stack_guarantee_that_cannot_be_set_is_said"]
+    fn guarantee_not_set_child() {
+        unsafe extern "system" fn start(_: *mut c_void) -> u32 {
+            // SAFETY: plain call.
+            std::println!("GUARANTEECHILD thread {}", unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() });
+            0
+        }
+        // SAFETY: a thread of ours with the default stack, waited for.
+        unsafe {
+            let t = windows_sys::Win32::System::Threading::CreateThread(ptr::null(), 0, Some(start), ptr::null(), 0, ptr::null_mut());
+            assert!(!t.is_null());
+            windows_sys::Win32::System::Threading::WaitForSingleObject(t, 30_000);
+            windows_sys::Win32::Foundation::CloseHandle(t);
         }
     }
 
@@ -6888,12 +7205,16 @@ mod tests {
     /// and ends the child with 137 (CI run 43947438431).
     #[test]
     fn test_the_reclaimers_own_stack_page_is_not_waited_for() {
-        let (code, text) = run_child("stack_during_a_move_reclaimer_child", Some(96 << 20));
-        std::eprintln!("STACKWAIT reclaimer: {code:?}; {}", during_move_lines(&text));
-        let line = text.lines().find(|l| l.starts_with("wick: a thread's stack could not grow")).unwrap_or_default();
-        assert!(line.contains("a reclaim was under way and was not waited for: the thread is the reclaim's own"), "{text}");
-        assert!(!text.contains("STACKWAIT the wait"), "{text}");
-        assert_eq!(code, Some(137), "{text}");
+        for extra in XSAVE_EXTRAS {
+            let (code, text) = run_child_with("stack_during_a_move_reclaimer_child", Some(96 << 20), &[("WICK_TEST_XSAVE_EXTRA", extra)]);
+            std::eprintln!("STACKWAIT reclaimer, XSAVE area {extra} B larger: {code:?}; {}", during_move_lines(&text));
+            let line = text.lines().find(|l| l.starts_with("wick: a thread's stack could not grow")).unwrap_or_default();
+            assert!(line.contains("a reclaim was under way and was not waited for: the thread is the reclaim's own"), "{extra}: {text}");
+            assert!(!text.contains("STACKWAIT the wait"), "{extra}: {text}");
+            assert_eq!(code, Some(137), "{extra}: {text}");
+            let room = stack_room_problems(&text, extra);
+            assert!(room.is_empty(), "{extra}: {room:#?}\n{text}");
+        }
     }
 
     #[test]
@@ -6943,16 +7264,23 @@ mod tests {
     fn test_a_stack_overflow_at_the_reserves_end_is_still_one() {
         stack_end_host_record();
         let mut not_ended = std::vec::Vec::new();
-        for child in ["stack_overflow_rust_child", "stack_overflow_createthread_child", "stack_overflow_pool_child"] {
-            for jailed in [false, true] {
-                for mode in ["0", "3"] {
-                    let (code, text, ended) = run_child_watched(child, &[("WICK_TEST_ERROR_MODE", mode)], jailed);
-                    let how = if jailed { "in a job as the jailer's" } else { "alone" };
-                    std::eprintln!("STACKEND {child} {how}, error mode {mode}: {code:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
-                    let said = text.contains("wick: a thread's stack overflowed at its reserve's end")
-                        && text.contains(if jailed { ENDS_JAILED_OVERFLOW } else { ENDS_OVERFLOW });
-                    if !said || code != Some(0xC000_00FD_u32.cast_signed()) || text.contains(NEXT_RAN) {
-                        not_ended.push(std::format!("{child} {how}, error mode {mode} ({code:?}): {text}"));
+        for extra in XSAVE_EXTRAS {
+            for child in ["stack_overflow_rust_child", "stack_overflow_createthread_child", "stack_overflow_pool_child"] {
+                for jailed in [false, true] {
+                    for mode in ["0", "3"] {
+                        let env = [("WICK_TEST_ERROR_MODE", mode), ("WICK_TEST_XSAVE_EXTRA", extra)];
+                        let (code, text, ended) = run_child_watched(child, &env, jailed);
+                        let how = if jailed { "in a job as the jailer's" } else { "alone" };
+                        std::eprintln!(
+                            "STACKEND {child} {how}, error mode {mode}, XSAVE area {extra} B larger: {code:?} after {ended:?}; {}",
+                            text.trim().replace('\n', " | ")
+                        );
+                        let said = text.contains("wick: a thread's stack overflowed at its reserve's end")
+                            && text.contains(if jailed { ENDS_JAILED_OVERFLOW } else { ENDS_OVERFLOW });
+                        let room = stack_room_problems(&text, extra);
+                        if !said || code != Some(0xC000_00FD_u32.cast_signed()) || text.contains(NEXT_RAN) || !room.is_empty() {
+                            not_ended.push(std::format!("{child} {how}, error mode {mode}, {extra} B ({code:?}): {room:?}: {text}"));
+                        }
                     }
                 }
             }
@@ -7375,16 +7703,23 @@ mod tests {
         ] {
             let code: u32 = if child.starts_with("stack") { 0xC000_00FD } else { 0xC000_0005 };
             let ends = if child.starts_with("stack") { ENDS_OVERFLOW } else { ENDS };
-            for nested in [false, true] {
-                for mode in ["0", "3"] {
-                    let mut e = env.to_vec();
-                    e.push(("WICK_TEST_ERROR_MODE", mode));
-                    let (got, text, ended) = run_child_in_jobs(child, &e, if nested { &jobs[..] } else { &jobs[1..] });
-                    let how = if nested { "inner job (no flag) in an outer one with the flag" } else { "one job, no flag" };
-                    std::eprintln!("NESTJOB {child} {how}, error mode {mode}: {got:?} after {ended:?}; {}", text.trim().replace('\n', " | "));
-                    let flags = std::format!("the child's immediate job: query 1, limit flags {JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:#x}");
-                    if !text.contains(&flags) || !text.contains(ends) || got != Some(code.cast_signed()) || text.contains(NEXT_RAN) {
-                        wrong.push(std::format!("{child} {how}, error mode {mode} ({got:?}): {text}"));
+            for extra in XSAVE_EXTRAS {
+                for nested in [false, true] {
+                    for mode in ["0", "3"] {
+                        let mut e = env.to_vec();
+                        e.push(("WICK_TEST_ERROR_MODE", mode));
+                        e.push(("WICK_TEST_XSAVE_EXTRA", extra));
+                        let (got, text, ended) = run_child_in_jobs(child, &e, if nested { &jobs[..] } else { &jobs[1..] });
+                        let how = if nested { "inner job (no flag) in an outer one with the flag" } else { "one job, no flag" };
+                        std::eprintln!(
+                            "NESTJOB {child} {how}, error mode {mode}, XSAVE area {extra} B larger: {got:?} after {ended:?}; {}",
+                            text.trim().replace('\n', " | ")
+                        );
+                        let flags = std::format!("the child's immediate job: query 1, limit flags {JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:#x}");
+                        let room = if child.starts_with("stack") { stack_room_problems(&text, extra) } else { std::vec::Vec::new() };
+                        if !text.contains(&flags) || !text.contains(ends) || got != Some(code.cast_signed()) || text.contains(NEXT_RAN) || !room.is_empty() {
+                            wrong.push(std::format!("{child} {how}, error mode {mode}, {extra} B ({got:?}): {room:?}: {text}"));
+                        }
                     }
                 }
             }
@@ -7632,22 +7967,38 @@ mod tests {
     /// so that the window is tested, not only its edges.
     #[test]
     fn test_a_lazy_touch_at_the_reserves_end_is_a_loud_overflow() {
-        let mut in_the_handler = [false; 2];
-        for (k, kind) in ["rust", "createthread"].into_iter().enumerate() {
-            for left in (4..=64).rev() {
-                let left_kib = std::format!("{left}");
-                let child = std::format!("lazy_at_the_reserves_end_{kind}_child");
-                let (code, text, _) = run_child_watched(&child, &[("WICK_TEST_LEFT_KIB", left_kib.as_str())], false);
-                std::eprintln!("LAZYEND {kind} at {left} KiB left: {code:?}; {}", text.trim().replace('\n', " | "));
-                let served = code == Some(0) && text.contains("LAZYEND the read gave 0");
-                let loud = code == Some(0xC000_00FD_u32.cast_signed())
-                    && text.contains("has overflowed its stack")
-                    && text.contains("wick: a thread's stack overflowed at its reserve's end");
-                assert!(served || loud, "{kind} at {left} KiB left: neither served nor an overflow said as one ({code:?}): {text}");
-                in_the_handler[k] |= loud && text.contains("raised in the lazy handler's commit");
+        let context = crate::windows_mm::exception_context_bytes();
+        for extra in XSAVE_EXTRAS {
+            // The window where the handler's commit meets the reserve's
+            // end lies above the thread's guarantee: from 4 KiB to the
+            // guarantee with a larger area simulated and 24 KiB more.
+            let guarantee = (context + extra.parse::<usize>().unwrap() + crate::windows_mm::DISPATCH_OVERHEAD + crate::windows_mm::HANDLER_STACK_BUDGET) >> 10;
+            let lowest = if extra == "0" { 4 } else { guarantee.saturating_sub(8).max(4) };
+            let mut in_the_handler = [false; 2];
+            for (k, kind) in ["rust", "createthread"].into_iter().enumerate() {
+                for left in (lowest..=(guarantee + 24).max(64)).rev() {
+                    let left_kib = std::format!("{left}");
+                    let child = std::format!("lazy_at_the_reserves_end_{kind}_child");
+                    let env = [("WICK_TEST_LEFT_KIB", left_kib.as_str()), ("WICK_TEST_XSAVE_EXTRA", extra)];
+                    let (code, text, _) = run_child_watched(&child, &env, false);
+                    std::eprintln!("LAZYEND {kind} at {left} KiB left, XSAVE area {extra} B larger: {code:?}; {}", text.trim().replace('\n', " | "));
+                    let served = code == Some(0) && text.contains("LAZYEND the read gave 0");
+                    let loud = code == Some(0xC000_00FD_u32.cast_signed())
+                        && text.contains("has overflowed its stack")
+                        && text.contains("wick: a thread's stack overflowed at its reserve's end");
+                    assert!(served || loud, "{kind} at {left} KiB left, {extra} B: neither served nor an overflow said as one ({code:?}): {text}");
+                    if loud {
+                        let room = stack_room_problems(&text, extra);
+                        assert!(room.is_empty(), "{kind} at {left} KiB left, {extra} B: {room:#?}\n{text}");
+                    }
+                    in_the_handler[k] |= loud && text.contains("raised in the lazy handler's commit");
+                }
             }
+            assert!(
+                in_the_handler.iter().all(|&b| b),
+                "{extra} B: no case met the reserve's end in the lazy handler's commit (rust, createthread): {in_the_handler:?}"
+            );
         }
-        assert!(in_the_handler.iter().all(|&b| b), "no case met the reserve's end in the lazy handler's commit (rust, createthread): {in_the_handler:?}");
     }
 
     /// Recurses until `left` bytes are left above `reserve`, then reads the

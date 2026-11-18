@@ -1724,6 +1724,11 @@ unsafe extern "system" fn on_exception(
     info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
 ) -> i32 {
     const ACCESS_VIOLATION: i32 = 0xC000_0005_u32 as i32;
+    #[cfg(test)]
+    if !DEEPER_ALREADY.replace(false) && simulated_xsave_extra() != 0 {
+        // SAFETY: the system's exception pointers, passed on.
+        return as_if_the_dispatch_were_deeper(&mut || unsafe { on_exception(info) });
+    }
     let _in_the_handler = InTheHandler::new();
     // SAFETY: the system passes valid exception pointers.
     let rec = unsafe { &*(*info).ExceptionRecord };
@@ -1732,6 +1737,7 @@ unsafe extern "system" fn on_exception(
         // SAFETY: as above; the faulting thread's context.
         let addr = if rec.NumberParameters >= 2 { rec.ExceptionInformation[1] } else { 0 };
         stack_ask_record(unsafe { (*(*info).ContextRecord).Rsp } as usize, addr);
+        stack_use_paint();
     }
     #[cfg(target_arch = "x86_64")]
     if rec.ExceptionCode == STACK_OVERFLOW && stack_page_after_the_reclaim() {
@@ -1846,7 +1852,7 @@ fn stack_ask_record(fault_rsp: usize, fault_addr: usize) {
     say_at_the_limit(format_args!(
         "STACKASK committed below the faulting rsp {} B, below the faulting address {} B, the dispatcher's frames {} B, left under the handler {} B, \
          guarantee {guarantee} B, reserve left {} KiB; the page at StackLimit {:#x}/{:#x}, below it {:#x}/{:#x} \
-         (state/protection; {} B committed there){}",
+         (state/protection; {} B committed there); the exception's context {} B, a larger XSAVE area simulated {} B{}",
         fault_rsp.saturating_sub(limit),
         fault_addr.saturating_sub(limit),
         fault_rsp.saturating_sub(here),
@@ -1857,7 +1863,59 @@ fn stack_ask_record(fault_rsp: usize, fault_addr: usize) {
         below.State,
         below.Protect,
         if below.State == MEM_COMMIT { below.RegionSize } else { 0 },
+        exception_context_bytes(),
+        simulated_xsave_extra(),
         if IN_THE_LAZY_HANDLER.get() { "; raised in the lazy handler's commit" } else { "" },
+    ));
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+std::thread_local! {
+    /// STACKUSE (tests): the low end of the stack [`stack_use_paint`]
+    /// painted on this thread, and the frame it measures from; 0 for none.
+    static STACK_USE: core::cell::Cell<(usize, usize)> = const { core::cell::Cell::new((0, 0)) };
+}
+
+/// STACKUSE (tests): at a stack overflow, in [`on_exception`] after
+/// STACKASK, paints this thread's committed stack from StackLimit to 512
+/// bytes under this frame (0xc3, as STACKWAIT paints), so that
+/// [`stack_use_record`] can say how deep the handler and the filters went
+/// under it before the process ends.
+#[cfg(all(test, target_arch = "x86_64"))]
+#[inline(never)]
+fn stack_use_paint() {
+    let marker = core::hint::black_box(0u8);
+    let here = core::ptr::addr_of!(marker) as usize;
+    let (limit, _, _) = this_threads_stack();
+    let top = here.saturating_sub(512);
+    if top > limit {
+        // SAFETY: committed stack of this thread below every live frame.
+        unsafe { core::ptr::write_bytes(limit as *mut u8, 0xc3, top - limit) };
+        STACK_USE.set((limit, here));
+    }
+}
+
+/// STACKUSE (tests): the stack the handler and the filters used under the
+/// frame [`stack_use_paint`] measured from (the lowest byte no longer
+/// painted), of what was left there; `at` says where. Written without
+/// allocating.
+#[cfg(all(test, target_arch = "x86_64"))]
+#[inline(never)]
+fn stack_use_record(at: &str) {
+    let (low, here) = STACK_USE.get();
+    if low == 0 {
+        return;
+    }
+    let top = here - 512;
+    let mut a = low;
+    // SAFETY: the painted range; reads only.
+    while a < top && unsafe { core::ptr::read_volatile(a as *const u8) } == 0xc3 {
+        a += 1;
+    }
+    say_at_the_limit(format_args!(
+        "STACKUSE {at}: the handler and the filters used {} B under the handler's frame, of {} B left there",
+        here - a,
+        here - low
     ));
 }
 
@@ -1881,6 +1939,280 @@ pub(crate) fn exception_handler() -> bool {
         !unsafe { windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(on_exception)) }
             .is_null()
     })
+}
+
+/// What the exception handler ([`on_exception`]) and the filters
+/// ([`stack_filter`], [`last_filter`]) may use of a thread's stack under
+/// the exception dispatcher's frames, at most, on any of their paths at a
+/// stack's end: the stack page's wait and retry, the lazy commit, the
+/// lines and the frames of a VMM that ends. Each thread's stack guarantee
+/// ([`stack_guarantee`]) keeps it free below the dispatcher's frames when
+/// a stack overflows, and the tests hold both sides: what is left under the
+/// handler (STACKASK) is at least this, and what the handler and the
+/// filters used there (STACKUSE) is at most this, on each runner and each
+/// kind of thread, also with a larger XSAVE area simulated
+/// (`WICK_TEST_XSAVE_EXTRA`). Before the guarantee was sized, a thread with
+/// none had 7.6 to 9.1 KiB left there where the XSAVE area was AVX-512's
+/// (CI run 44177456759) and 4.9 KiB where it was AMX's (CI run 44225041771,
+/// whose five stack tests ended with an access violation in the handler).
+pub(crate) const HANDLER_STACK_BUDGET: usize = 16 << 10;
+
+/// What the exception dispatcher puts on the faulting thread's stack above
+/// the handler besides the exception's context ([`exception_context_bytes`]),
+/// at most: the exception record, the dispatcher's own frames and the
+/// handler's frame down to where STACKASK measures. Measured 1.6 to 1.9 KiB
+/// (STACKASK's dispatcher's frames less the context; held by the tests).
+pub(crate) const DISPATCH_OVERHEAD: usize = 4 << 10;
+
+/// The bytes of the exception's context the dispatcher puts on the
+/// faulting thread's stack: a `CONTEXT` with the XSAVE state of every
+/// feature the system enables (`GetEnabledXStateFeatures`: AVX-512's, AMX's
+/// 8 KiB tile data, CET's user state where enabled), as
+/// `InitializeContext2` sizes it for `CONTEXT_ALL | CONTEXT_XSTATE`, the
+/// documented size of the context `KiUserExceptionDispatcher` hands the
+/// handlers (`EXCEPTION_POINTERS::ContextRecord` with its `CONTEXT_EX`).
+/// The larger of the compacted form (the given features' mask, as the
+/// system saves with `XSAVEC`/`XSAVES`) and the standard one (a mask of 0),
+/// so that it holds whichever the system writes. Read once; a host where
+/// neither answers is said once and taken as 64 KiB, more than any XSAVE
+/// area there is (CPUID leaf 0xD).
+pub(crate) fn exception_context_bytes() -> usize {
+    static BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let known = BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    if known != 0 {
+        return known;
+    }
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CONTEXT_ALL_AMD64, CONTEXT_XSTATE_AMD64, GetEnabledXStateFeatures, InitializeContext2,
+    };
+    // SAFETY: plain call.
+    let features = unsafe { GetEnabledXStateFeatures() };
+    let size_of = |mask: u64| {
+        let mut len = 0u32;
+        // SAFETY: no buffer: the call only says the length it needs.
+        unsafe {
+            InitializeContext2(std::ptr::null_mut(), CONTEXT_ALL_AMD64 | CONTEXT_XSTATE_AMD64, std::ptr::null_mut(), &mut len, mask)
+        };
+        len as usize
+    };
+    let bytes = size_of(features).max(size_of(0));
+    let bytes = if bytes == 0 {
+        say_at_the_limit(format_args!(
+            "wick: the size of an exception's context could not be read (InitializeContext2, XSAVE features {features:#x}); \
+             64 KiB is taken for it in each thread's stack guarantee"
+        ));
+        64 << 10
+    } else {
+        bytes
+    };
+    BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    bytes
+}
+
+/// The stack guarantee each thread is given at its start
+/// ([`at_thread_start`], `SetThreadStackGuarantee`): what a stack overflow
+/// leaves the thread is first the dispatcher's (the exception's context and
+/// [`DISPATCH_OVERHEAD`]), then the handler's ([`HANDLER_STACK_BUDGET`]),
+/// rounded up to a page. By the sizes (a 1232-byte CONTEXT, its
+/// CONTEXT_EX, the compacted XSAVE area), 24 KiB on a host without AMX and
+/// 36 KiB with it, whose area is 10752 bytes (Rust's own is 20 KiB, `std`'s
+/// `stack_overflow`); the STACKASK lines print this host's context. In the
+/// tests, with a simulated larger area added.
+pub(crate) fn stack_guarantee() -> usize {
+    (exception_context_bytes() + simulated_xsave_extra() + DISPATCH_OVERHEAD + HANDLER_STACK_BUDGET).next_multiple_of(PAGE)
+}
+
+/// Gives each thread of the process its stack guarantee ([`stack_guarantee`])
+/// as it starts: a TLS callback, which the loader calls on the main thread
+/// before the program's entry (`DLL_PROCESS_ATTACH`) and on every thread
+/// made after (`DLL_THREAD_ATTACH`), the threads of the process's thread
+/// pool, the system's (WHP's, the runtime's) and Rust's alike, in the
+/// thread before its own start routine (PE format, "The TLS Section",
+/// TLS callback functions). Not reached: a thread made with
+/// `THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH`, and the loader's own workers
+/// that run before the program's callbacks (ntdll's parallel loader); the
+/// tests list every thread of a process and its guarantee
+/// (`test_every_thread_has_the_stack_guarantee`).
+///
+/// Why: when a stack overflows, the system dispatches the exception on the
+/// thread's own stack, below the faulting frame, and what it puts there is
+/// the exception's context with the thread's whole XSAVE area: about 4 KiB
+/// with AVX-512, about 12 KiB with AMX's tile data, which leaves a thread
+/// with no guarantee (one made by `CreateThread`, a pool's) too little for
+/// the handler's line, its wait for the reclaim or the frames of a VMM that
+/// ends at the memory limit: it faulted again in the handler and the
+/// process ended with an access violation (0xC0000005) instead of 137 or
+/// 0xC00000FD and wick's line (CI run 44225041771, an Intel Xeon Platinum
+/// 8573C with AMX; SECURITY.md, Fixed defects).
+///
+/// What it costs: the guarantee is the size of the guard region the
+/// system keeps below a thread's committed stack, committed as guard
+/// pages (charged to the process and its job) and taken from the thread's
+/// reserve; the callback grows the stack by its guard page at once, so
+/// that the region is made at the thread's start and not first at the
+/// memory limit: one page and the guarantee committed per thread
+/// (`test_every_thread_has_the_stack_guarantee` records it per kind of
+/// thread). A guarantee that cannot be set (a
+/// reserve too small for it) is said, with the thread, and the thread runs
+/// without it.
+#[cfg(target_arch = "x86_64")]
+#[used]
+#[link_section = ".CRT$XLW"]
+static AT_THREAD_START: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = at_thread_start;
+
+/// [`AT_THREAD_START`]'s callback.
+#[cfg(target_arch = "x86_64")]
+unsafe extern "system" fn at_thread_start(_module: *mut c_void, reason: u32, _reserved: *mut c_void) {
+    const DLL_PROCESS_ATTACH: u32 = 1;
+    const DLL_THREAD_ATTACH: u32 = 2;
+    if reason == DLL_PROCESS_ATTACH {
+        #[cfg(test)]
+        read_simulated_xsave_extra();
+        #[cfg(test)]
+        // SAFETY: an out-pointer.
+        unsafe {
+            let mut now = 0u64;
+            windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime((&raw mut now).cast());
+            PROCESS_ATTACHED_AT.store(now, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if reason == DLL_PROCESS_ATTACH || reason == DLL_THREAD_ATTACH {
+        set_the_stack_guarantee();
+    }
+}
+
+/// Sets the calling thread's stack guarantee to [`stack_guarantee`] (a
+/// larger one already set stays: the system only raises it), and says so
+/// if it could not be set, or reads back smaller.
+#[cfg(target_arch = "x86_64")]
+fn set_the_stack_guarantee() {
+    let want = stack_guarantee();
+    let mut size = u32::try_from(want).unwrap_or(u32::MAX);
+    // SAFETY: an in/out pointer to the size.
+    let set = unsafe { windows_sys::Win32::System::Threading::SetThreadStackGuarantee(&mut size) } != 0;
+    // SAFETY: plain call.
+    let err = if set { 0 } else { unsafe { GetLastError() } };
+    let (limit, reserve, now) = this_threads_stack();
+    if set && now >= want {
+        // The system sizes the guard region below the committed stack by
+        // the guarantee when the stack next grows past its guard page; a
+        // thread whose stack must first grow at the memory limit would
+        // find only its old guard page there. So the guard page is
+        // touched now, once: the system commits it and makes the guard
+        // region the guarantee sizes below it (charged now, not at the
+        // limit). Only where it is a guard page.
+        // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        let queried = unsafe { VirtualQuery((limit - PAGE) as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) } != 0;
+        if queried && mbi.State == MEM_COMMIT && mbi.Protect & PAGE_GUARD != 0 {
+            // SAFETY: this thread's own guard page, below every frame: the
+            // access is the stack's growth by one page.
+            unsafe { core::ptr::read_volatile((limit - PAGE) as *const u8) };
+        }
+        return;
+    }
+    let base: usize;
+    // SAFETY: a read of the thread's own TEB (StackBase).
+    unsafe { core::arch::asm!("mov {0}, gs:[0x8]", out(reg) base, options(nostack, readonly, preserves_flags)) };
+    say_at_the_limit(format_args!(
+        "wick: thread {} could not be given a stack guarantee of {want} bytes ({}; its stack reserve {} KiB, its guarantee \
+         {now} bytes): a stack overflow on it, or a stack that cannot grow at the memory limit, may end the process with an \
+         access violation (0xC0000005) and no line of wick's",
+        // SAFETY: plain call.
+        unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+        GuaranteeCall(set, err),
+        base.saturating_sub(reserve) >> 10,
+    ));
+}
+
+/// How [`set_the_stack_guarantee`]'s line says what the call did.
+struct GuaranteeCall(bool, u32);
+
+impl core::fmt::Display for GuaranteeCall {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 { f.write_str("set, but read back smaller") } else { write!(f, "SetThreadStackGuarantee failed, error {}", self.1) }
+    }
+}
+
+/// Tests: the system time (`FILETIME`) when the loader called
+/// [`at_thread_start`] for the process: a thread made before it was not
+/// given the guarantee.
+#[cfg(test)]
+pub(crate) static PROCESS_ATTACHED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tests: bytes by which the handler behaves as if the exception's context
+/// were larger (`WICK_TEST_XSAVE_EXTRA`, read once at the process's start):
+/// the guarantee grows by them, and [`on_exception`] and [`stack_filter`]
+/// run that much deeper ([`as_if_the_dispatch_were_deeper`]), so that a
+/// runner whose XSAVE area is AVX-512's runs the overflow paths as one with
+/// AMX's (8256 bytes more) or a larger one would.
+#[cfg(test)]
+static SIMULATED_XSAVE_EXTRA: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn simulated_xsave_extra() -> usize {
+    SIMULATED_XSAVE_EXTRA.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+const fn simulated_xsave_extra() -> usize {
+    0
+}
+
+/// Reads `WICK_TEST_XSAVE_EXTRA` (decimal bytes) without allocating, in
+/// the loader's callback.
+#[cfg(test)]
+fn read_simulated_xsave_extra() {
+    let name: [u16; 22] = {
+        let mut n = [0u16; 22];
+        for (i, b) in b"WICK_TEST_XSAVE_EXTRA".iter().enumerate() {
+            n[i] = u16::from(*b);
+        }
+        n
+    };
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetEnvironmentVariableW(name: *const u16, buffer: *mut u16, size: u32) -> u32;
+    }
+    let mut value = [0u16; 32];
+    // SAFETY: a NUL-terminated name and a buffer of the length given.
+    let len = unsafe { GetEnvironmentVariableW(name.as_ptr(), value.as_mut_ptr(), 32) } as usize;
+    let extra = value[..len.min(32)].iter().take_while(|c| (u16::from(b'0')..=u16::from(b'9')).contains(c)).fold(0usize, |n, &c| {
+        n.saturating_mul(10).saturating_add(usize::from(c - u16::from(b'0')))
+    });
+    SIMULATED_XSAVE_EXTRA.store(extra, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Tests: the next handler or filter call on this thread is the one
+    /// [`as_if_the_dispatch_were_deeper`] made, already deeper.
+    static DEEPER_ALREADY: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Tests: runs `f` [`simulated_xsave_extra`] bytes deeper in the stack
+/// than here, the stack between written (so committed) as a dispatcher's
+/// frames would be.
+#[cfg(test)]
+#[inline(never)]
+fn as_if_the_dispatch_were_deeper(f: &mut dyn FnMut() -> i32) -> i32 {
+    let here = core::ptr::addr_of!(f) as usize;
+    deeper_to(here.saturating_sub(simulated_xsave_extra()), f)
+}
+
+#[cfg(test)]
+#[inline(never)]
+fn deeper_to(target: usize, f: &mut dyn FnMut() -> i32) -> i32 {
+    let pad = core::hint::black_box([0x5au8; 256]);
+    let r = if core::ptr::addr_of!(pad) as usize > target {
+        deeper_to(target, f)
+    } else {
+        DEEPER_ALREADY.set(true);
+        f()
+    };
+    core::hint::black_box(&pad);
+    r
 }
 
 /// The unhandled-exception filter [`stack_filter`] replaced, called for
@@ -1912,9 +2244,25 @@ pub(crate) const STACK_WAIT_BOUND: std::time::Duration = std::time::Duration::fr
 /// The stack a wait for the reclaim needs under the exception handler's
 /// frame: the wait and the retry use STACKWAIT's measured bytes of it
 /// (`test_a_stack_page_refused_during_a_move_is_had_once_it_ends`); a
-/// thread with less left (no stack guarantee: about 2.7 KiB under the
-/// handler, STACKASK) is not made to wait and ends as before.
+/// thread with less left (one the stack guarantee could not be given,
+/// [`at_thread_start`]; before every thread had one, a thread with none had
+/// about 2.7 KiB under the handler, STACKASK) is not made to wait and ends
+/// as before.
 const STACK_WAIT_ROOM: usize = 4096;
+
+/// The stack [`stack_filter`]'s line of a stack that could not grow takes
+/// under the filter's frame (the thread's description, a 512-byte line
+/// formatted in place, one `WriteFile`), with a margin: with less, the
+/// filter ends the process with 137 before it, so that it cannot fault
+/// first.
+const STACK137_LINE_ROOM: usize = 4096;
+
+/// The stack STACK137FRAMES takes under the filter's frame
+/// (`RtlCaptureStackBackTrace`'s unwind, 32 addresses, a line per frame
+/// with its module's name), with a margin: with less, the line says they
+/// were not taken, and the exit with 137 follows. STACKUSE measures the
+/// whole path with them (`test_a_stack_that_must_grow_at_the_limit_ends_with_137`).
+const STACK137_FRAMES_ROOM: usize = 8192;
 
 /// Why a refused stack page was not had: for [`stack_filter`]'s line, set on
 /// the thread by [`stack_page_after_the_reclaim`].
@@ -2549,6 +2897,11 @@ impl core::fmt::Display for Utf16<'_> {
 /// resume (`EXCEPTION_CONTINUE_EXECUTION`) to [`last_filter`], which ends
 /// the process.
 unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+    #[cfg(test)]
+    if !DEEPER_ALREADY.replace(false) && simulated_xsave_extra() != 0 {
+        // SAFETY: the system's exception pointers, passed on.
+        return as_if_the_dispatch_were_deeper(&mut || unsafe { stack_filter(info) });
+    }
     // SAFETY: the system passes valid exception pointers.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
     #[cfg(target_arch = "x86_64")]
@@ -2556,6 +2909,18 @@ unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::
         let (limit, reserve, guarantee) = this_threads_stack();
         let left = limit.saturating_sub(reserve);
         if left > reserve_at_its_end(guarantee) {
+            // The stack under this frame, read first: the line and the
+            // frames are written only with room for them, so that nothing
+            // here faults before the exit with 137. A thread with the
+            // stack guarantee always has it (`at_thread_start`); one
+            // without (one the guarantee could not be given, said at its
+            // start) may not: it ends with 137 and no line.
+            let room = (core::ptr::addr_of!(left) as usize).saturating_sub(limit);
+            if room < STACK137_LINE_ROOM {
+                // SAFETY: ends this process at once, as SIGKILL does.
+                unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), OOM_EXIT) };
+                std::process::abort();
+            }
             let rescue = RESCUE.swap(0, std::sync::atomic::Ordering::SeqCst);
             if rescue != 0 {
                 // SAFETY: frees the block set aside for this.
@@ -2573,7 +2938,15 @@ unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::
                 Utf16(&name[..len]),
                 WhyNotHad(STACK_WAIT.get()),
             ));
-            stack_137_frames();
+            if room >= STACK137_FRAMES_ROOM {
+                stack_137_frames();
+            } else {
+                say_at_the_limit(format_args!(
+                    "STACK137FRAMES not taken: {room} B of stack under the filter, under the {STACK137_FRAMES_ROOM} B they take"
+                ));
+            }
+            #[cfg(all(test, target_arch = "x86_64"))]
+            stack_use_record("at the exit with 137");
             // SAFETY: ends this process at once, as SIGKILL does.
             unsafe { windows_sys::Win32::System::Threading::TerminateProcess(GetCurrentProcess(), OOM_EXIT) };
             std::process::abort();
@@ -2597,6 +2970,8 @@ unsafe extern "system" fn stack_filter(info: *const windows_sys::Win32::System::
         }
         #[cfg(test)]
         filter_frames("stack_filter, a stack overflow at the reserve's end");
+        #[cfg(all(test, target_arch = "x86_64"))]
+        stack_use_record("at the end of an overflow");
         #[cfg(test)]
         fail_fast_for_the_record(info);
         #[cfg(test)]
