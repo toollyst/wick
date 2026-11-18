@@ -239,6 +239,12 @@ pub mod wick_mm {
         super::settled_access(addr, write)
     }
 
+    /// Runs `f` with the pages it asks about kept as they are, given
+    /// whether each allows an access now: [`super::with_pages_still`].
+    pub fn with_pages_still<T>(f: impl FnOnce(&dyn Fn(usize, bool) -> bool) -> T) -> T {
+        super::with_pages_still(f)
+    }
+
     /// This thread's own accesses to lazy memory that the exception
     /// handler committed (each an access violation the system dispatched
     /// on the thread's stack), and the most of the thread's stack that was
@@ -1451,6 +1457,32 @@ pub(crate) fn settled_access(addr: usize, write: bool) -> Settled {
             return Settled::Resolvable;
         }
         if accessible(addr, 1, write) { Settled::Allowed } else { Settled::Refused }
+    })
+}
+
+/// A look at several pages, and what is done on it, with none of them
+/// changing meanwhile: `f` runs under the userfaultfd's lock
+/// (`wick_uffd::with_lock_held`), then the region table's, then
+/// [`RELEASED`]'s and [`LAZY`]'s, the order every other path takes them in
+/// (as [`settled_access`] takes them), and is given `allowed(addr, write)`:
+/// whether the page of `addr` allows the access now (not in a chunk being
+/// moved, not a missing registered page, committed, not a guard page, with
+/// a protection that allows it). While `f` runs no fill, discard, move,
+/// register, release, `mprotect`, unmapping or mapping changes a page, so
+/// one `allowed` said yes to may be read by `f` and stays as it is until
+/// `f` returns. `f` takes none of these locks and touches no page `allowed`
+/// did not allow (an exception there would need them); it may make a call
+/// that reads the memory without an exception of this process's (WHP's
+/// walk of the guest's page tables, kvm-ioctls `whp/settle.rs`, for which
+/// this is). Called holding none of wick's locks.
+pub(crate) fn with_pages_still<T>(f: impl FnOnce(&dyn Fn(usize, bool) -> bool) -> T) -> T {
+    crate::wick_uffd::with_lock_held(|| {
+        let _t = table().lock().unwrap();
+        let _r = RELEASED.lock().unwrap();
+        let _l = LAZY.lock().unwrap();
+        f(&|addr, write| {
+            !crate::wick_uffd::is_moving(addr as u64) && !crate::wick_uffd::is_missing(addr as u64) && accessible(addr, 1, write)
+        })
     })
 }
 
@@ -4653,20 +4685,20 @@ pub(crate) static PAGES_READ_AT_A_MOVE: std::sync::atomic::AtomicUsize = std::sy
 /// copied and before the private allocation is given back (a write landing
 /// in a private page there would be lost with it), as an `fn()` in a
 /// `usize`, 0 for none; taken as it runs.
-#[cfg(test)]
+#[cfg(any(test, feature = "wick-test-hooks"))]
 pub(crate) static ALIAS_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Tests: as [`ALIAS_HOOK`], run inside [`uffd_alias`] right before the
 /// mapping is closed for the move (and its residency read).
 #[cfg(test)]
 pub(crate) static NARROW_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "wick-test-hooks"))]
 fn alias_hook() {
     run_hook(&ALIAS_HOOK);
 }
 
 /// Runs the `fn()` in `hook`, if any, and takes it.
-#[cfg(test)]
+#[cfg(any(test, feature = "wick-test-hooks"))]
 fn run_hook(hook: &std::sync::atomic::AtomicUsize) {
     let hook = hook.swap(0, std::sync::atomic::Ordering::SeqCst);
     if hook != 0 {
@@ -4820,7 +4852,7 @@ fn uffd_alias_closed(t: &mut Table, start: usize, len: usize, resident: &[u8]) -
         // SAFETY: resident pages of the mapping, into the alias.
         unsafe { std::ptr::copy_nonoverlapping((start + off) as *const u8, (alias + off) as *mut u8, n) };
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "wick-test-hooks"))]
     alias_hook();
     if !release_for_the_move(start, len) {
         if reserved {
@@ -5215,7 +5247,7 @@ fn uffd_alias_chunked(t: &mut Table, start: usize, len: usize, resident: &[u8]) 
         // SAFETY: resident pages of the mapping, into the alias.
         unsafe { std::ptr::copy_nonoverlapping((start + off) as *const u8, (alias + off) as *mut u8, n) };
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "wick-test-hooks"))]
     alias_hook();
     if !release_for_the_move(start, len) {
         undo(mapped, charges.len());
@@ -5771,9 +5803,10 @@ pub(crate) fn moves_refused() -> u64 {
 }
 
 /// Called in the middle of a chunk's move, between the copy and the swap:
-/// for tests (`test_the_jailers_count_does_not_rise_during_a_move`).
-#[cfg(test)]
-pub(crate) static MOVE_HOOK: Mutex<Option<fn()>> = Mutex::new(None);
+/// for tests (`test_the_jailers_count_does_not_rise_during_a_move`; other
+/// crates' through `wick_uffd::test_hooks`).
+#[cfg(any(test, feature = "wick-test-hooks"))]
+pub(crate) static MOVE_HOOK: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);
 
 /// The move slot ([`MOVE_SLOT`]) and the move budget ([`UFFD_BUDGET`]),
 /// 0 for none, for tests.
@@ -6010,7 +6043,7 @@ pub(crate) fn uffd_move_chunk(view: usize, len: usize, alias: usize, (start, end
     });
     #[cfg(test)]
     moverec(6, moverec_commit());
-    #[cfg(test)]
+    #[cfg(any(test, feature = "wick-test-hooks"))]
     if let Some(hook) = *MOVE_HOOK.lock().unwrap() {
         hook();
     }

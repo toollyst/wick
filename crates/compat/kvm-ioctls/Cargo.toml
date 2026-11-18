@@ -64,3 +64,7 @@ windows-sys = { version = "0.61.2", features = [
 [target.'cfg(windows)'.dev-dependencies]
 # The tests' children in a job with a memory limit (whp/vcpu.rs, run_child).
 windows-sys = { version = "0.61.2", features = ["Win32_System_JobObjects"] }
+# A reclaim's move held in its middle, and the reclaim on call
+# (`libc::wick_uffd::test_hooks`: whp/vcpu.rs, the settled translations'
+# tests); never in a product build (tools/check-record-features.sh).
+libc = { version = "0.2.186", features = ["wick-test-hooks"] }

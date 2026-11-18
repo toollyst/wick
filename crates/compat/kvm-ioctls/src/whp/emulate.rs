@@ -54,7 +54,7 @@ use windows_sys::Win32::Foundation::{E_FAIL, S_OK};
 use super::whv::{
     self as whv, WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO,
     WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME,
-    WHV_REGISTER_VALUE, WHV_TRANSLATE_GVA_RESULT, WHV_VP_EXIT_CONTEXT,
+    WHV_REGISTER_VALUE, WHV_VP_EXIT_CONTEXT,
 };
 
 use super::ffi;
@@ -370,16 +370,26 @@ unsafe extern "system" fn translate_cb(
 ) -> i32 {
     // SAFETY: context is the EmuCtx; out-pointers are valid.
     let ctx = unsafe { &*(context as *const EmuCtx) };
-    let mut result: WHV_TRANSLATE_GVA_RESULT = unsafe { std::mem::zeroed() };
-    #[cfg(any(test, feature = "whp-trace"))]
-    let before = super::ffi::trace::stack();
-    let hres = unsafe {
-        whv::WHvTranslateGva(ctx.part, ctx.vp, gva, flags, &mut result, gpa)
-    };
-    #[cfg(any(test, feature = "whp-trace"))]
-    super::ffi::trace::note("the emulator's WHvTranslateGva", ctx.vp, &[], None, before, hres);
-    if hres == S_OK {
-        unsafe { *result_code = result.ResultCode };
+    #[cfg(test)]
+    TRANSLATE_FLAGS_SEEN.fetch_or(flags.cast_unsigned(), std::sync::atomic::Ordering::Relaxed);
+    // With the guest's page tables settled in the host where WHP could not
+    // reach one (a page missing in userfaultfd guest RAM, a chunk in a
+    // move): before, its ERROR_NOACCESS went back to the emulator, which
+    // failed the instruction, and after a device read was answered that
+    // stopped the vCPU with KVM_EXIT_INTERNAL_ERROR (`exit::mmio_step`).
+    // SAFETY: the slot table the caller of `mmio` holds for the call.
+    let a = super::settle::translate(ctx.part, ctx.vp, unsafe { &*ctx.ram }, gva, flags);
+    if a.hres == S_OK {
+        // SAFETY: the emulator's out-pointers.
+        unsafe {
+            *result_code = a.code;
+            *gpa = a.gpa;
+        }
     }
-    hres
+    a.hres
 }
+
+/// Tests: the flags the emulator has asked its translations with, all of
+/// them or'd (`WHV_TRANSLATE_GVA_FLAGS`).
+#[cfg(test)]
+pub(crate) static TRANSLATE_FLAGS_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

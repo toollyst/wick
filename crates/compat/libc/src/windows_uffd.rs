@@ -1417,6 +1417,15 @@ pub(crate) fn with_registrations_still<T>(addr: u64, write: bool, f: impl FnOnce
     f(resolvable)
 }
 
+/// Runs `f` with [`LOCK`] held, for a look at several pages that is to be
+/// decided on whole and acted on before anything changes them
+/// (`windows_mm::with_pages_still`). Takes no lock the caller may hold:
+/// called with none of wick's memory locks held, [`LOCK`] first.
+pub(crate) fn with_lock_held<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = lock();
+    f()
+}
+
 /// Whether `addr` is in a registered range (the handler's last check:
 /// memory that is ours).
 pub(crate) fn registered(addr: u64) -> bool {
@@ -3960,6 +3969,35 @@ pub(crate) fn reclaim_at_touch(need: usize) -> Reclaimed {
     }
     r.skipped = 0;
     r
+}
+
+/// Hooks for other crates' tests (kvm-ioctls' WHP tests), with the
+/// `wick-test-hooks` feature, which only a dev-dependency turns on.
+#[cfg(feature = "wick-test-hooks")]
+pub mod test_hooks {
+    /// Sets the `fn()` a reclaim's move of a chunk calls between its copy
+    /// and its swap (`windows_mm::uffd_move_chunk`: the chunk's live pages
+    /// closed, `PAGE_NOACCESS`, its accesses waiting for the move), on the
+    /// reclaimer's thread with the asker's lock held; `None` takes it away.
+    pub fn set_move_hook(hook: Option<fn()>) {
+        *crate::windows_mm::MOVE_HOOK.lock().unwrap() = hook;
+    }
+
+    /// Sets the `fn()` a register's move of its mapping calls once, after
+    /// the copy of its resident pages and before the private allocation is
+    /// given back (`windows_mm::uffd_alias`: the mapping read-only, its
+    /// accesses waiting for the register), with the register's lock held.
+    pub fn set_register_hook(hook: fn()) {
+        crate::windows_mm::ALIAS_HOOK.store(hook as usize, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The reclaim a commit refused at the memory limit runs
+    /// ([`super::reclaim_at_touch`]), for at least `need` bytes: the chunks
+    /// moved and the bytes given back. Called holding none of wick's locks.
+    pub fn reclaim(need: usize) -> (usize, usize) {
+        let r = super::reclaim_at_touch(need);
+        (r.chunks, r.freed)
+    }
 }
 
 /// The moves made so far (RECLAIMREC): each one's live pages copied and its
@@ -12160,9 +12198,16 @@ mod tests {
     #[ignore = "run by test_a_page_changed_between_a_vcpus_looks_is_settled_as_it_is_now in a process of its own"]
     fn settled_looks_child() {
         use crate::windows_mm::{settled_access as settled, Access, Settled};
-        let look = |what: &str, got: Settled, want: Settled| {
-            std::println!("SETTLED {what}: {got:?}");
+        // The settled look, and `with_pages_still`'s `allowed` for the same
+        // page (kvm-ioctls whp/settle.rs's look): yes for Allowed alone.
+        let look = |what: &str, at: u64, write: bool, want: Settled| {
+            #[allow(clippy::cast_possible_truncation)]
+            let at = at as usize;
+            let got = settled(at, write);
+            let still = crate::windows_mm::with_pages_still(|allowed| allowed(at, write));
+            std::println!("SETTLED {what}: {got:?}, allowed while still {still}");
             assert_eq!(got, want, "{what}");
+            assert_eq!(still, want == Settled::Allowed, "{what}: with_pages_still's allowed");
         };
         let commit = |at: u64, write: bool| crate::windows_mm::wick_mm::commit_on_access(at as usize, write);
         let (ctx, user) = create(0, false, true).unwrap();
@@ -12176,32 +12221,32 @@ mod tests {
         // SAFETY: `data` holds a page.
         assert_eq!(unsafe { copy(ctx, data.as_ptr(), page, PAGE, true) }.unwrap(), PAGE);
         assert!(!fault(page, true), "a filled page is not fault()'s");
-        look("filled after the commit's look", settled(page as usize, true), Settled::Allowed);
+        look("filled after the commit's look", page, true, Settled::Allowed);
         // A discard between fault()'s look and the settled one.
         assert!(!fault(page, true));
         // SAFETY: registered memory of ours.
         assert_eq!(unsafe { crate::madvise(page as *mut c_void, PAGE as usize, crate::MADV_DONTNEED) }, 0);
         assert!(is_missing(page));
-        look("discarded after fault()'s look", settled(page as usize, true), Settled::Resolvable);
+        look("discarded after fault()'s look", page, true, Settled::Resolvable);
         // Filled again and made PROT_READ: a write refused, a read allowed.
         // SAFETY: as above.
         assert_eq!(unsafe { copy(ctx, data.as_ptr(), page, PAGE, true) }.unwrap(), PAGE);
         // SAFETY: as above.
         assert_eq!(unsafe { crate::mprotect(page as *mut c_void, PAGE as usize, crate::PROT_READ) }, 0);
         assert!(!fault(page, true));
-        look("a filled page PROT_READ, written", settled(page as usize, true), Settled::Refused);
-        look("the same page, read", settled(page as usize, false), Settled::Allowed);
+        look("a filled page PROT_READ, written", page, true, Settled::Refused);
+        look("the same page, read", page, false, Settled::Allowed);
         // A missing page PROT_NONE asked: no userfault, refused.
         let none = mem + 3 * PAGE;
         // SAFETY: as above.
         assert_eq!(unsafe { crate::mprotect(none as *mut c_void, PAGE as usize, crate::PROT_NONE) }, 0);
         assert!(is_missing(none) && !fault(none, false));
-        look("a missing page PROT_NONE, read", settled(none as usize, false), Settled::Refused);
+        look("a missing page PROT_NONE, read", none, false, Settled::Refused);
         // A released range's pending page: resolvable.
         let pending = mem + 5 * PAGE;
         unregister(ctx, mem + 4 * PAGE, 4 * PAGE).unwrap();
         assert!(!fault(pending, true));
-        look("a released range's pending page, written", settled(pending as usize, true), Settled::Resolvable);
+        look("a released range's pending page, written", pending, true, Settled::Resolvable);
         // Lazy memory made PROT_READ: a write refused, a read resolvable.
         // SAFETY: a new anonymous mapping, committed at first touch.
         let lazy = unsafe {
@@ -12210,12 +12255,12 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { crate::mprotect(lazy as *mut c_void, 1 << 20, crate::PROT_READ) }, 0);
         assert_eq!(commit(lazy, true), Access::NotLazy);
-        look("lazy memory PROT_READ, written", settled(lazy as usize, true), Settled::Refused);
-        look("lazy memory PROT_READ, read before its commit", settled(lazy as usize, false), Settled::Resolvable);
+        look("lazy memory PROT_READ, written", lazy, true, Settled::Refused);
+        look("lazy memory PROT_READ, read before its commit", lazy, false, Settled::Resolvable);
         // Unmapped memory.
         // SAFETY: our mapping.
         assert_eq!(unsafe { crate::munmap(lazy as *mut c_void, 1 << 20) }, 0);
-        look("unmapped memory, read", settled(lazy as usize, false), Settled::Refused);
+        look("unmapped memory, read", lazy, false, Settled::Refused);
         std::println!("SETTLED done");
         // SAFETY: closes the user end.
         unsafe { ws::closesocket(sock(user)) };

@@ -2154,13 +2154,27 @@ jobs:
           # the first run committed it, the child ended with 137, the
           # thread's stack refused inside WHP's run call at the limit.
           alone whp::vcpu::fpu_tests::test_a_chunk_moved_under_a_vcpu_keeps_its_memory_and_dirty_pages
-          # WHvTranslateGva (the emulator's walk, ungated) while the guest's
-          # page tables are moved as a register's move and the reclaim's
-          # move make them read-only, a placeholder, then a view, and while
-          # a page-table page is missing in userfaultfd guest RAM
+          # WHvTranslateGva as WHP answers it while the guest's page tables
+          # are moved as a register's move and the reclaim's move make them
+          # read-only (or closed), a placeholder, then a view, and while a
+          # page-table page is missing in userfaultfd guest RAM
           # (TRANSLATEREC lines: each stage's result code for five flag
-          # sets; a stage stuck 30 s in the call fails the test).
+          # sets; a stage stuck 30 s in the call fails the test); and the
+          # backend's settled walk (settle.rs), asserted: result 0 for each
+          # flag set while wick's own register and reclaim are held in their
+          # middle (it waits for them) and with the page missing (its fault
+          # filled by the handler).
           alone whp::vcpu::fpu_tests::test_translate_gva_while_page_tables_move_or_are_missing_on_record
+          # The two ways a translation's ERROR_NOACCESS ended a VM, each run
+          # as before (settle::SETTLE_OFF) and now: an MMIO read's
+          # instruction finished at the next run while the reclaim moves the
+          # chunk of its page tables (before: KVM_EXIT_INTERNAL_ERROR; now
+          # the device's value lands, SETTLEDMMIO lines), and string I/O
+          # through a page-table page missing in userfaultfd memory (before:
+          # the run failed; now the handler fills it and the OUT has the
+          # byte, SETTLEDSTRING lines). Each asserts that its case was met.
+          alone whp::vcpu::fpu_tests::test_an_mmio_read_finishes_while_the_reclaim_moves_its_page_tables
+          alone whp::vcpu::fpu_tests::test_string_io_reads_through_a_page_table_page_missing_in_userfaultfd_memory
           # A vCPU thread's first run commits its stack 112 KiB below the
           # frame that called it (RUNSTACK line).
           alone whp::vcpu::fpu_tests::test_a_vcpu_threads_stack_is_committed_before_its_first_run

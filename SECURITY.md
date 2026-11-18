@@ -203,6 +203,34 @@ has the per-control details and results.
 
 ## Fixed defects
 
+- **Windows: a guest's MMIO read could end its own VM while the reclaim moved the chunk holding its page tables, and
+  string port I/O through a page-table page still missing after a userfaultfd restore failed the run** (the first
+  since b81d58ae, the reclaim at the memory limit, and the second since c56eb138, string I/O done in the VMM; in no
+  release; fixed in the commit that adds this entry). WHP's `WHvTranslateGva` walks the guest's page tables through the
+  host memory behind guest RAM and does not fault it in: a table page missing in userfaultfd guest RAM, or in a chunk
+  the reclaim is moving, fails the walk with `ERROR_NOACCESS` (TRANSLATEREC, the CI WHP step's record). The
+  instruction emulator's walk failing after a device read had been answered stopped the vCPU with
+  `KVM_EXIT_INTERNAL_ERROR`, and string I/O's failed the run; Firecracker ends the VM on either. Who could cause it:
+  both need guest memory registered with a userfaultfd (a snapshot restored with `mem_backend: Uffd`). The reclaim runs
+  only at the job's memory limit (`memory.max`), on such chunks holding discarded pages: the host's memory pressure
+  racing a guest's MMIO, or a guest that inflates its balloon near its limit while it does MMIO in a loop; the string
+  I/O case needs string I/O through a table page the guest has not touched since the restore. Either
+  way only that guest's VM ended: no other VM, nor the host, nor anything read or written that should not be (a guest's
+  denial of service of itself). KVM's walk faults the page in (Linux v6.1 arch/x86/kvm/mmu/paging_tmpl.h,
+  `FNAME(walk_addr_generic)`) and never fails for it. Now every translation (the emulator's, string I/O's,
+  `KVM_TRANSLATE`'s), on `ERROR_NOACCESS`, walks the guest's tables itself as the hardware does in the vCPU's paging
+  mode (32-bit, PAE, 4- and 5-level, large pages, CR3's PCID masked; every entry's address checked against the memory
+  slots before it is read, at most five reads a look), brings in the first table page that is not there as the guest's
+  own access would (committed, filled by the userfaultfd's handler, or the move waited for), holding none of the
+  backend's locks (asserted in debug builds), and asks `WHvTranslateGva` again under the userfaultfd's, region
+  table's, released ranges' and lazy memory's locks, so that nothing moves between the look and the call; past 16
+  looks the first answer stands, with a line (kvm-ioctls `whp/settle.rs`). The tests run each case as before and now:
+  `test_an_mmio_read_finishes_while_the_reclaim_moves_its_page_tables` (wick's reclaim held between its copy and its
+  swap; before `KVM_EXIT_INTERNAL_ERROR`, now the device's value in RAM) and
+  `test_string_io_reads_through_a_page_table_page_missing_in_userfaultfd_memory` (before the run failed, now the
+  handler fills the page and the OUT carries the byte), each asserting that its case was met;
+  `test_translate_gva_while_page_tables_move_or_are_missing_on_record` asserts the settled walk for every flag set
+  while wick's own register and reclaim are held in their middle and with the page missing. First run: CI.
 - **Windows: a page written and then trimmed from the working set before a userfaultfd register was taken as
   missing, and its data lost** (since the register took residency from the working set, `mincore`; fixed in the
   commit that adds this entry). The register took a page out of the working set (moved to the modified list or the

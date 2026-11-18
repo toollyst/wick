@@ -180,7 +180,7 @@ pub(crate) struct VmInner {
     pub(crate) part: WHV_PARTITION_HANDLE,
     /// The partition's local APIC ([`host_local_apic`]).
     pub(crate) apic: super::apicmode::LocalApic,
-    memory: Mutex<HashMap<u32, Slot>>,
+    memory: super::held::Tracked<HashMap<u32, Slot>>,
     ioevents: RwLock<Vec<IoEvent>>,
     irqfds: Mutex<Vec<IrqFd>>,
     /// Unregistered irqfds whose eventfd the watcher may still have in its
@@ -193,7 +193,7 @@ pub(crate) struct VmInner {
     /// without a lock the vCPUs take for the I/O APIC and the PIT; it only
     /// tries it ([`VmInner::inject_irqfd_in_place`]). Taken alone.
     msi_routes: RwLock<MsiRoutes>,
-    pub(crate) irqchip: Mutex<Irqchip>,
+    pub(crate) irqchip: super::held::Tracked<Irqchip>,
     /// kvm-clock: the VM-wide reference and the wall clock MSR.
     pub(crate) pvclock: Mutex<super::pvclock::State>,
     /// The vCPUs' TSC-deadline timers (`tscdeadline`).
@@ -1211,12 +1211,12 @@ impl VmInner {
         Ok(VmInner {
             part,
             apic,
-            memory: Mutex::new(HashMap::new()),
+            memory: super::held::Tracked::new(super::held::RAM, HashMap::new()),
             ioevents: RwLock::new(Vec::new()),
             irqfds: Mutex::new(Vec::new()),
             retired_irqfds: Mutex::new(Vec::new()),
             msi_routes: RwLock::new(MsiRoutes::default()),
-            irqchip: Mutex::new(Irqchip::new()),
+            irqchip: super::held::Tracked::new(super::held::IRQCHIP, Irqchip::new()),
             pvclock: Mutex::new(super::pvclock::State::default()),
             deadlines: super::tscdeadline::Timers::new().map_err(io_err)?,
             tsc_sync: Mutex::new(super::tscsync::TscSync::new()),

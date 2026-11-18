@@ -15,6 +15,10 @@
 # 1. No Cargo.toml of wick's tree or of lib/firecracker (its patches applied)
 #    names one of them but kvm-ioctls', where each is defined, and that one
 #    has no `default` set: so a plain `cargo build` cannot turn one on.
+#    libc's test-hooks feature (wick-test-hooks: a hook in a reclaim's move,
+#    the reclaim on call, for kvm-ioctls' WHP tests) is named by no manifest
+#    but libc's, where it is defined, and kvm-ioctls' dev-dependencies, so
+#    that only a test build has it.
 # 2. No binary given holds the line only a build with one of them has. A
 #    binary given with `--has <feature>` must hold that feature's line, and
 #    no other's: CI's x2APIC record build, which shows that the line is
@@ -75,6 +79,28 @@ done < <(manifests)
 if grep -n -E '^[[:space:]]*default[[:space:]]*=' "$ROOT/$DEFINED" >/dev/null; then
     fail "$DEFINED has a default feature set: a record-only feature must never be in one"
 fi
+
+# 1b. libc's test-hooks feature: its definition, and kvm-ioctls'
+# dev-dependencies (a table whose name has `dev-dependencies`).
+HOOKS=wick-test-hooks
+while IFS= read -r file; do
+    [[ -f "$ROOT/$file" ]] || continue
+    n=0
+    table=""
+    while IFS= read -r text; do
+        n=$((n + 1))
+        if [[ "$text" =~ ^[[:space:]]*\[(.*)\][[:space:]]*$ ]]; then
+            table=${BASH_REMATCH[1]}
+        fi
+        [[ "$text" == *"$HOOKS"* ]] || continue
+        [[ "$text" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$file" == crates/compat/libc/Cargo.toml && "$text" =~ ^${HOOKS}[[:space:]]*=[[:space:]]*\[\][[:space:]]*$ ]]; then
+            continue
+        fi
+        [[ "$file" == crates/compat/kvm-ioctls/Cargo.toml && "$table" == *dev-dependencies* ]] && continue
+        fail "$file:$n turns on libc's $HOOKS outside kvm-ioctls' dev-dependencies (tests only, never a release): $text"
+    done <"$ROOT/$file"
+done < <(manifests)
 
 # 2. The binaries: each with the features it must have (none but those).
 bins=()

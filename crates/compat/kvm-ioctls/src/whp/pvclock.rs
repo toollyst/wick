@@ -49,7 +49,7 @@ use super::guest_mem::{self, Slot};
 use super::{ffi, whv};
 
 /// The VM's guest RAM slots, which the structures are written into.
-pub(crate) type Ram = Mutex<HashMap<u32, Slot>>;
+pub(crate) type Ram = super::held::Tracked<HashMap<u32, Slot>>;
 
 /// `MSR_KVM_WALL_CLOCK_NEW`.
 pub(crate) const MSR_WALL_CLOCK: u32 = 0x4b56_4d00;
@@ -417,7 +417,7 @@ mod tests {
         let mut t = HashMap::new();
         t.insert(0, Slot::new(0x10000, PAGE, host, false, true));
         t.insert(1, Slot::new(0x10000 + PAGE, PAGE, host + PAGE, readonly1, true));
-        Mutex::new(t)
+        super::super::held::Tracked::new(super::super::held::RAM, t)
     }
 
     fn info_at(mem: &[u8], off: usize) -> VcpuTimeInfo {

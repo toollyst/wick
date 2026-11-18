@@ -342,7 +342,7 @@ pub(crate) struct VcpuShared {
     /// Device writes of an emulated instruction after its first
     /// (`emulate::mmio`), handed to Firecracker one run each before the
     /// guest is entered again.
-    device_writes: Mutex<Vec<emulate::DeviceWrite>>,
+    device_writes: super::held::Tracked<Vec<emulate::DeviceWrite>>,
     tsc_khz: AtomicU64,
     /// Linux's image of the x87 and SSE state until the first `KVM_RUN`
     /// (`regs::BeforeRun`); `None` from then on.
@@ -667,7 +667,7 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         lapic_before_the_mark: AtomicBool::new(false),
         pending: Mutex::new(None),
         string_data: Box::new(UnsafeCell::new([0; STRING_DATA])),
-        device_writes: Mutex::new(Vec::new()),
+        device_writes: super::held::Tracked::new(super::held::DEVICE_WRITES, Vec::new()),
         tsc_khz: AtomicU64::new(0),
         system_time_msr: AtomicU64::new(0),
         clock_gen: AtomicU64::new(0),
@@ -779,14 +779,22 @@ impl VcpuFd {
         Ok(super::debug::translation(gva, Some(walk)))
     }
 
-    /// One `WHvTranslateGva` walk with `flags`: its result code and address.
+    /// One `WHvTranslateGva` walk with `flags`, the guest's page tables
+    /// settled in the host first where WHP could not reach one
+    /// ([`super::settle::translate`]): its result code and address.
     pub(crate) fn translate_walk(&self, gva: u64, flags: whv::WHV_TRANSLATE_GVA_FLAGS) -> Result<(i32, u64)> {
-        // SAFETY: plain data; zero is a valid value.
-        let mut result: whv::WHV_TRANSLATE_GVA_RESULT = unsafe { std::mem::zeroed() };
-        let mut gpa = 0u64;
-        // SAFETY: out-pointers valid for the call.
-        super::ffi::hr(unsafe { whv::WHvTranslateGva(self.part(), self.vp(), gva, flags, &mut result, &mut gpa) })?;
-        Ok((result.ResultCode, gpa))
+        let a = super::settle::translate(self.part(), self.vp(), self.shared.inner.ram(), gva, flags);
+        super::ffi::hr(a.hres)?;
+        Ok((a.code, a.gpa))
+    }
+
+    /// Tests: one `WHvTranslateGva` call as WHP answers it, nothing settled
+    /// (TRANSLATEREC's record of WHP itself).
+    #[cfg(test)]
+    pub(crate) fn translate_raw(&self, gva: u64, flags: whv::WHV_TRANSLATE_GVA_FLAGS) -> Result<(i32, u64)> {
+        let a = super::settle::raw(self.part(), self.vp(), gva, flags);
+        super::ffi::hr(a.hres)?;
+        Ok((a.code, a.gpa))
     }
 
     /// `KVM_SET_GUEST_DEBUG` ([`super::debug`]): the partition's exception
@@ -9234,10 +9242,245 @@ mod fpu_tests {
         assert!(wrong.is_empty(), "{wrong:?}");
     }
 
+    /// [`settled_hold`]'s hook: reached, then held until released (30 s at
+    /// most).
+    static HOLD_ENTERED: AtomicBool = AtomicBool::new(false);
+    static HOLD_RELEASE: AtomicBool = AtomicBool::new(false);
+
+    fn hold_the_move() {
+        HOLD_ENTERED.store(true, Ordering::SeqCst);
+        let t = std::time::Instant::now();
+        while !HOLD_RELEASE.load(Ordering::SeqCst) && t.elapsed() < std::time::Duration::from_secs(30) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Runs `during` while wick's reclaim moves a chunk with dead pages, held
+    /// between its copy and its swap (`libc::wick_uffd::test_hooks`: the
+    /// chunk's live pages closed, its accesses waiting for the move), and
+    /// released 300 ms after `during` begins: `during`'s value and the
+    /// reclaim's chunks moved.
+    fn settled_hold<T>(during: impl FnOnce() -> T) -> (T, usize) {
+        HOLD_ENTERED.store(false, Ordering::SeqCst);
+        HOLD_RELEASE.store(false, Ordering::SeqCst);
+        libc::wick_uffd::test_hooks::set_move_hook(Some(hold_the_move));
+        let reclaiming = std::thread::spawn(|| libc::wick_uffd::test_hooks::reclaim(2 << 20));
+        let t = std::time::Instant::now();
+        while !HOLD_ENTERED.load(Ordering::SeqCst) {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "no reclaim's move reached its hook in 10 s");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let releaser = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            HOLD_RELEASE.store(true, Ordering::SeqCst);
+        });
+        let out = during();
+        releaser.join().unwrap();
+        let (chunks, _) = reclaiming.join().unwrap();
+        libc::wick_uffd::test_hooks::set_move_hook(None);
+        (out, chunks)
+    }
+
+    /// A userfaultfd handler for `user` on its own thread: each page fault
+    /// filled with a page from `page_of(address)`; the faults' pages, in
+    /// order, when `user` is closed.
+    fn fill_faults(ctx: usize, user: i32, page_of: impl Fn(u64) -> Vec<u8> + Send + 'static) -> std::thread::JoinHandle<Vec<u64>> {
+        std::thread::spawn(move || {
+            let mut faults = Vec::new();
+            let mut rec = [0u8; libc::wick_uffd::proto::RECORD];
+            loop {
+                let mut got = 0;
+                while got < rec.len() {
+                    // SAFETY: a buffer of the length given.
+                    let n = unsafe { libc::read(user, rec[got..].as_mut_ptr().cast(), rec.len() - got) };
+                    if n <= 0 {
+                        return faults;
+                    }
+                    got += n.unsigned_abs();
+                }
+                let word = |i: usize| u64::from_le_bytes(rec[i * 8..i * 8 + 8].try_into().unwrap());
+                if word(0) != libc::wick_uffd::proto::EVENT_PAGEFAULT2 {
+                    continue;
+                }
+                let page = word(1) & !0xfff;
+                faults.push(page);
+                let data = page_of(page);
+                // SAFETY: `data` holds a page.
+                let _ = unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), page, 4096, true) };
+            }
+        })
+    }
+
+    /// An MMIO read's instruction finished in the host at the next run
+    /// while the reclaim moves the chunk of the guest's page tables
+    /// (`settle::translate`): MOVSD from a device to RAM, its device read
+    /// answered by the first run's exit; then wick's reclaim of the tables'
+    /// chunk (a page of it discarded, so dead) held between its copy and
+    /// its swap, and the second run. The instruction's translations meet
+    /// the closed tables (`settle::NOACCESS_SEEN` rises: asserted, so the
+    /// case is met and not passed by). As before (`settle::SETTLE_OFF`):
+    /// the emulator's translation failed, and after the answered read
+    /// `exit::mmio_step` stopped the vCPU with `KVM_EXIT_INTERNAL_ERROR`,
+    /// which ends a Firecracker VM. Now: the translation waits for the move
+    /// and the instruction completes with the device's value in RAM, RSI
+    /// and RDI past it, the device read once, and the program goes on to
+    /// its `out`. SETTLEDMMIO lines, with the flags the emulator asked its
+    /// translations with.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_an_mmio_read_finishes_while_the_reclaim_moves_its_page_tables() {
+        // The tables in chunk 1 (CR3's for the run): PML4, PDPT, PD with the
+        // 2 MiB pages from 0 to 8 MiB (the device's at 6 MiB), and the
+        // APIC's directory from chunk 0's tables.
+        const TABLES: u64 = 0x20_1000;
+        const DATA: u64 = 0x8800;
+        const DEAD: u64 = 0x3F_F000;
+        // mov rsi, 0x600000; mov rdi, DATA; movsd; out PORT, al; jmp $
+        let program = [
+            0x48, 0xC7, 0xC6, 0x00, 0x00, 0x60, 0x00, 0x48, 0xC7, 0xC7, 0x00, 0x88, 0x00, 0x00, 0xA5, 0xE6, PORT as u8, 0xEB, 0xFE,
+        ];
+        let answer = [0x44, 0x33, 0x22, 0x11];
+        let mut wrong = Vec::new();
+        for settle in [false, true] {
+            super::super::settle::SETTLE_OFF.store(!settle, Ordering::SeqCst);
+            let mut uffd = None;
+            let (vm, mut vcpu, m) = mmio_guest_with(&program, |m| {
+                let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
+                q(TABLES, (TABLES + 0x1000) | 3);
+                q(TABLES + 0x1000, (TABLES + 0x2000) | 3);
+                q(TABLES + 0x1000 + 3 * 8, 0xA000 | 3);
+                for i in 0..4u64 {
+                    q(TABLES + 0x2000 + i * 8, (i << 21) | 0x83);
+                }
+                put(m, DATA, &[0; 4]);
+                put(m, DEAD, &[1]);
+                let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+                libc::wick_uffd::register(ctx, m as u64, MEM as u64).unwrap();
+                uffd = Some((ctx, user));
+            });
+            let (_ctx, user) = uffd.unwrap();
+            // SAFETY: a page of the registered guest memory: dead once discarded.
+            assert_eq!(unsafe { libc::madvise(m.add(DEAD as usize).cast(), 4096, libc::MADV_DONTNEED) }, 0);
+            let mut sregs = vcpu.get_sregs().unwrap();
+            sregs.cr3 = TABLES;
+            vcpu.set_sregs(&sregs).unwrap();
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let mut reads = 0;
+            let first = one_run(&mut vcpu, &answer, &mut reads);
+            super::super::emulate::TRANSLATE_FLAGS_SEEN.store(0, Ordering::SeqCst);
+            let seen = super::super::settle::NOACCESS_SEEN.load(Ordering::SeqCst);
+            let ((second, took), chunks) = settled_hold(|| {
+                let t = std::time::Instant::now();
+                (one_run(&mut vcpu, &answer, &mut reads), t.elapsed())
+            });
+            let met = super::super::settle::NOACCESS_SEEN.load(Ordering::SeqCst) > seen;
+            let flags = super::super::emulate::TRANSLATE_FLAGS_SEEN.load(Ordering::SeqCst);
+            drop(watchdog);
+            let r = vcpu.get_regs().unwrap();
+            let data = bytes_at::<4>(m, DATA);
+            let case = if settle { "settled" } else { "as before" };
+            eprintln!(
+                "SETTLEDMMIO {case}: first {first}; the reclaim held, {chunks} chunk moved, the second run {second} after {} ms; \
+                 ERROR_NOACCESS met {met}; the emulator's translation flags {flags:#x}; RAM at {DATA:#x} {data:02x?}, RSI {:#x}, \
+                 RDI {:#x}; device reads {reads}",
+                took.as_millis(),
+                r.rsi,
+                r.rdi
+            );
+            if first != "read 0x600000 x4" || chunks != 1 || !met {
+                wrong.push(format!("{case}: the case was not met: first {first}, {chunks} chunks moved, ERROR_NOACCESS met {met}"));
+            } else if settle {
+                if !second.starts_with("out 0x80") || data != answer || (r.rsi, r.rdi) != (0x60_0004, DATA + 4) || reads != 1 {
+                    wrong.push(format!("settled: {second}, RAM {data:02x?}, RSI {:#x}, RDI {:#x}, reads {reads}", r.rsi, r.rdi));
+                }
+            } else if second != "InternalError" {
+                wrong.push(format!("as before: {second}, where the emulator's failure after a read stopped the vCPU"));
+            }
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: closes the handler's end; no fault is waiting.
+            unsafe { libc::close(user) };
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
+        super::super::settle::SETTLE_OFF.store(false, Ordering::SeqCst);
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// String port I/O through a page-table page missing in userfaultfd
+    /// guest RAM, as after a snapshot's restore (`settle::translate`, from
+    /// `VcpuFd::gpa_of`): OUTSB from GVA 0x40000000, which PDPT[1] maps
+    /// through a directory page never written before the register (so
+    /// missing) to the 2 MiB page at GPA 2 MiB, whose first byte is 0x5a.
+    /// The run loop's walk of the operand meets the missing page
+    /// (`settle::NOACCESS_SEEN` rises: asserted). As before
+    /// (`settle::SETTLE_OFF`): the run failed (its errno), which ends a
+    /// Firecracker VM, and no fault reached the handler. Now: the
+    /// directory page's fault is the handler's (one, filled with the
+    /// directory), and the exit is the OUT with 0x5a. SETTLEDSTRING lines.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_string_io_reads_through_a_page_table_page_missing_in_userfaultfd_memory() {
+        const DIRECTORY: u64 = 0x20_4000;
+        const MARK: u64 = 0x20_0000;
+        // mov rsi, 0x40000000; mov dx, PORT; outsb; jmp $
+        let program = [0x48, 0xC7, 0xC6, 0x00, 0x00, 0x00, 0x40, 0x66, 0xBA, PORT as u8, 0x00, 0x6E, 0xEB, 0xFE];
+        let mut wrong = Vec::new();
+        for settle in [false, true] {
+            super::super::settle::SETTLE_OFF.store(!settle, Ordering::SeqCst);
+            let mut uffd = None;
+            let (vm, mut vcpu, m) = mmio_guest_with(&program, |m| {
+                put(m, 0x2008, &((DIRECTORY | 3).to_le_bytes()));
+                put(m, MARK, &[0x5a]);
+                let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+                libc::wick_uffd::register(ctx, m as u64, MEM as u64).unwrap();
+                uffd = Some((ctx, user));
+            });
+            let (ctx, user) = uffd.unwrap();
+            let directory = m as u64 + DIRECTORY;
+            assert!(libc::wick_uffd::is_missing(directory), "the directory page is not missing after the register");
+            let handler = fill_faults(ctx, user, move |page| {
+                let mut data = vec![0u8; 4096];
+                if page == directory {
+                    data[..8].copy_from_slice(&(MARK | 0x83).to_le_bytes());
+                }
+                data
+            });
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let seen = super::super::settle::NOACCESS_SEEN.load(Ordering::SeqCst);
+            let mut reads = 0;
+            let out = one_run(&mut vcpu, &[], &mut reads);
+            let met = super::super::settle::NOACCESS_SEEN.load(Ordering::SeqCst) > seen;
+            drop(watchdog);
+            drop(vcpu);
+            drop(vm);
+            // SAFETY: closes the handler's end, which ends its reads.
+            unsafe { libc::close(user) };
+            let faults: Vec<u64> = handler.join().unwrap().iter().map(|&p| p - m as u64).collect();
+            let case = if settle { "settled" } else { "as before" };
+            eprintln!("SETTLEDSTRING {case}: {out}; ERROR_NOACCESS met {met}; the handler's faults (GPA) {faults:x?}");
+            if !met {
+                wrong.push(format!("{case}: the case was not met (no ERROR_NOACCESS): {out}, faults {faults:x?}"));
+            } else if settle {
+                if out != "out 0x80 [5a]" || faults != [DIRECTORY] {
+                    wrong.push(format!("settled: {out}, faults {faults:x?}"));
+                }
+            } else if !out.starts_with("run failed") || !faults.is_empty() {
+                wrong.push(format!("as before: {out}, faults {faults:x?}, where the run failed"));
+            }
+            // SAFETY: the test's mapping, no VM left using it.
+            assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        }
+        super::super::settle::SETTLE_OFF.store(false, Ordering::SeqCst);
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
     /// The record of `WHvTranslateGva`, the walk of the guest's page tables
     /// the instruction emulator asks of WHP (`translate_cb`, emulate.rs) with
     /// no gate and no exception in this process, while the tables' host
-    /// memory is moved or missing:
+    /// memory is moved or missing, as WHP answers it (`translate_raw`), and
+    /// the backend's answer with the tables settled first
+    /// (`settle::translate`, through `translate_walk`), asserted:
     /// - as a userfaultfd register moves its memory
     ///   (`libc::windows_mm::uffd_alias`): the private allocation made
     ///   read-only for the copy, then given back as a placeholder, then a
@@ -9249,6 +9492,23 @@ mod fpu_tests {
     ///   (registered and not yet filled: a reserved section's page with no
     ///   commit), as after a snapshot's restore, then filled.
     ///
+    /// - wick's own register, held after its copy (the mapping read-only:
+    ///   `test_hooks::set_register_hook`), and wick's own reclaim of the
+    ///   tables' chunk, held between its copy and its swap (the live pages
+    ///   closed: `test_hooks::set_move_hook`): WHP's answer while held, and
+    ///   the settled answer, which waits for the move and is the walk's
+    ///   (result 0 and the address) for each flag set, the first asked
+    ///   while the move is held (`settle::NOACCESS_SEEN` rises in it);
+    /// - the missing page through the settled walk: filled by the
+    ///   userfaultfd's handler (one fault, the PD page's), result 0 for
+    ///   each flag set.
+    ///
+    /// The hand-made stages (the register's and the reclaim's steps made by
+    /// the test itself, no move of wick's under way) stay WHP's record only:
+    /// the settled walk waits for wick's moves, and a page made read-only or
+    /// a placeholder by something else is one the host refuses (its answer
+    /// stays `ERROR_NOACCESS`, with a line).
+    ///
     /// The tables are in chunk 1 (GPA 2-4 MiB: PML4 at 0x201000, PDPT at
     /// 0x202000, PD at 0x203000) and map `0xffffffff80000000` to the 2 MiB
     /// page at GPA 0, in chunk 0, which stays put; the vCPU in long mode
@@ -9256,10 +9516,10 @@ mod fpu_tests {
     /// (`WHV_TRANSLATE_GVA_RESULT_CODE`: 0 success, 1 page not present, 4 GPA
     /// unmapped, 5 no read access, 6 no write access) and address for each
     /// flag set, or the call's failure; a stage still in the call after 30 s
-    /// ends the child with a line naming it. Asserted only that the walk
-    /// succeeds where the tables are in place (before each move and after
-    /// it, and once the missing page is filled) and that no stage hangs: the
-    /// stages between are the record.
+    /// ends the child with a line naming it. Asserted: the walk succeeds
+    /// where the tables are in place (before each move and after it, and
+    /// once the missing page is filled), the settled answers above, and that
+    /// no stage hangs; WHP's answers between are the record.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_translate_gva_while_page_tables_move_or_are_missing_on_record() {
@@ -9273,6 +9533,7 @@ mod fpu_tests {
     #[test]
     #[ignore = "run by test_translate_gva_while_page_tables_move_or_are_missing_on_record in a job of its own"]
     fn translate_gva_record_child() {
+        use std::sync::atomic::AtomicBool;
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
@@ -9311,7 +9572,7 @@ mod fpu_tests {
             let mut first = None;
             for (i, (name, flags)) in flag_sets.iter().enumerate() {
                 *STAGE.lock().unwrap() = (format!("{stage} {name}"), Some(std::time::Instant::now()));
-                let walk = vcpu.translate_walk(GVA, *flags);
+                let walk = vcpu.translate_raw(GVA, *flags);
                 STAGE.lock().unwrap().1 = None;
                 match walk {
                     Ok((code, gpa)) => println!("TRANSLATEREC {stage} {name}: result {code}, gpa {gpa:#x}"),
@@ -9445,7 +9706,7 @@ mod fpu_tests {
         };
         assert_ne!(m, libc::MAP_FAILED);
         let m = m as u64;
-        let (ctx, _user) = libc::wick_uffd::create(0, false, true).unwrap();
+        let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
         libc::wick_uffd::register(ctx, m, LEN as u64).unwrap();
         let fill = |gpa: u64, entries: &[(u64, u64)]| {
             let mut page = vec![0u8; PAGE as usize];
@@ -9463,8 +9724,159 @@ mod fpu_tests {
         let (vm, vcpu) = vm_over(m as usize);
         println!("TRANSLATEREC missing: the PD page missing {}", libc::wick_uffd::is_missing(m + 0x20_3000));
         record(&vcpu, "missing: PD page missing");
-        fill(0x20_3000, &TABLES[2..]);
+        // Through the settled walk: the PD page's fault, filled by the
+        // handler, then the walk's answer.
+        let pd = m + 0x20_3000;
+        let mut handler = Some(std::thread::spawn(move || {
+            let mut faults = Vec::new();
+            let mut rec = [0u8; libc::wick_uffd::proto::RECORD];
+            loop {
+                let mut got = 0;
+                while got < rec.len() {
+                    // SAFETY: a buffer of the length given.
+                    let n = unsafe { libc::read(user, rec[got..].as_mut_ptr().cast(), rec.len() - got) };
+                    if n <= 0 {
+                        return faults;
+                    }
+                    got += n.unsigned_abs();
+                }
+                let word = |i: usize| u64::from_le_bytes(rec[i * 8..i * 8 + 8].try_into().unwrap());
+                if word(0) != libc::wick_uffd::proto::EVENT_PAGEFAULT2 {
+                    continue;
+                }
+                let page = word(1) & !0xfff;
+                faults.push(page);
+                let mut data = vec![0u8; PAGE as usize];
+                if page == pd {
+                    data[..8].copy_from_slice(&TABLES[2].1.to_le_bytes());
+                }
+                // SAFETY: `data` holds a page.
+                let _ = unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), page, PAGE, true) };
+                if page == pd {
+                    return faults;
+                }
+            }
+        }));
+        for (name, flags) in &flag_sets {
+            *STAGE.lock().unwrap() = (format!("missing: settled {name}"), Some(std::time::Instant::now()));
+            let walk = vcpu.translate_walk(GVA, *flags);
+            STAGE.lock().unwrap().1 = None;
+            println!("TRANSLATEREC missing: settled {name}: {walk:?}");
+            assert_eq!(walk.ok(), Some((whv::WHvTranslateGvaResultSuccess, 0x1234)), "missing: settled {name}");
+            if let Some(handler) = handler.take() {
+                let faults = handler.join().unwrap();
+                println!("TRANSLATEREC missing: the handler's faults {faults:x?}");
+                assert_eq!(faults, [pd], "missing: the settled walk's faults");
+            }
+        }
         in_place(record(&vcpu, "missing: PD page filled"), "missing: PD page filled");
+        drop(vcpu);
+        drop(vm);
+
+        // wick's own moves of the tables' chunk, held in their middle.
+        let mapped = || {
+            // SAFETY: anonymous memory for the guest, never unmapped (the child ends).
+            let m = unsafe {
+                libc::mmap(std::ptr::null_mut(), LEN, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+            };
+            assert_ne!(m, libc::MAP_FAILED);
+            m as usize
+        };
+        // The settled walk for every flag set, the first while `held` holds
+        // the move (from a thread of its own, released after 300 ms): the
+        // last set first, write+setbits, which WHP fails on a read-only page
+        // as on a closed one or a placeholder.
+        let settled_through = |vcpu: &VcpuFd, stage: &str, held: &dyn Fn() -> bool| {
+            assert!(held(), "{stage}: the move was not held when the walk began");
+            let seen = super::super::settle::NOACCESS_SEEN.load(Ordering::SeqCst);
+            let begun = std::time::Instant::now();
+            for (i, (name, flags)) in flag_sets.iter().rev().enumerate() {
+                *STAGE.lock().unwrap() = (format!("{stage}: settled {name}"), Some(std::time::Instant::now()));
+                let walk = vcpu.translate_walk(GVA, *flags);
+                STAGE.lock().unwrap().1 = None;
+                println!("TRANSLATEREC {stage}: settled {name}: {walk:?}, {} ms from the first", begun.elapsed().as_millis());
+                assert_eq!(walk.ok(), Some((whv::WHvTranslateGvaResultSuccess, 0x1234)), "{stage}: settled {name}");
+                if i == 0 {
+                    assert!(
+                        super::super::settle::NOACCESS_SEEN.load(Ordering::SeqCst) > seen,
+                        "{stage}: the first settled walk met no ERROR_NOACCESS: the move was not under way"
+                    );
+                }
+            }
+        };
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        fn hold() {
+            ENTERED.store(true, Ordering::SeqCst);
+            let t = std::time::Instant::now();
+            while !RELEASE.load(Ordering::SeqCst) && t.elapsed() < std::time::Duration::from_secs(30) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        let wait_entered = |what: &str| {
+            let t = std::time::Instant::now();
+            while !ENTERED.load(Ordering::SeqCst) {
+                assert!(t.elapsed() < std::time::Duration::from_secs(10), "{what}: the hook was not reached in 10 s");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        let release_after = || {
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                RELEASE.store(true, Ordering::SeqCst);
+            })
+        };
+        let held = || ENTERED.load(Ordering::SeqCst) && !RELEASE.load(Ordering::SeqCst);
+
+        // A register's move: the mapping read-only after its copy.
+        let m = mapped();
+        write_tables(m);
+        let (vm, vcpu) = vm_over(m);
+        in_place(record(&vcpu, "register (wick): before"), "register (wick): before");
+        ENTERED.store(false, Ordering::SeqCst);
+        RELEASE.store(false, Ordering::SeqCst);
+        libc::wick_uffd::test_hooks::set_register_hook(hold);
+        let registering = std::thread::spawn(move || {
+            let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+            libc::wick_uffd::register(ctx, m as u64, LEN as u64).unwrap();
+            (ctx, user)
+        });
+        wait_entered("register (wick)");
+        record(&vcpu, "register (wick): copied, read-only");
+        let releaser = release_after();
+        settled_through(&vcpu, "register (wick)", &held);
+        releaser.join().unwrap();
+        let (_ctx, _user) = registering.join().unwrap();
+        in_place(record(&vcpu, "register (wick): after"), "register (wick): after");
+        drop(vcpu);
+        drop(vm);
+
+        // The reclaim's move of chunk 1: a page of it discarded (dead), the
+        // reclaim asked for, its live pages closed between copy and swap.
+        let m = mapped();
+        write_tables(m);
+        // SAFETY: within the mapping.
+        unsafe { ((m + 0x3F_F000) as *mut u64).write_volatile(1) };
+        let (ctx, _user) = libc::wick_uffd::create(0, false, true).unwrap();
+        libc::wick_uffd::register(ctx, m as u64, LEN as u64).unwrap();
+        // SAFETY: a page of the registered mapping.
+        assert_eq!(unsafe { libc::madvise((m + 0x3F_F000) as *mut _, PAGE as usize, libc::MADV_DONTNEED) }, 0);
+        let (vm, vcpu) = vm_over(m);
+        in_place(record(&vcpu, "reclaim (wick): before"), "reclaim (wick): before");
+        ENTERED.store(false, Ordering::SeqCst);
+        RELEASE.store(false, Ordering::SeqCst);
+        libc::wick_uffd::test_hooks::set_move_hook(Some(hold));
+        let reclaiming = std::thread::spawn(|| libc::wick_uffd::test_hooks::reclaim(CHUNK));
+        wait_entered("reclaim (wick)");
+        record(&vcpu, "reclaim (wick): live pages closed");
+        let releaser = release_after();
+        settled_through(&vcpu, "reclaim (wick)", &held);
+        releaser.join().unwrap();
+        let (chunks, freed) = reclaiming.join().unwrap();
+        libc::wick_uffd::test_hooks::set_move_hook(None);
+        println!("TRANSLATEREC reclaim (wick): {chunks} chunks moved, {freed} bytes given back");
+        assert_eq!(chunks, 1, "reclaim (wick): the tables' chunk moved");
+        in_place(record(&vcpu, "reclaim (wick): after"), "reclaim (wick): after");
         drop(vcpu);
         drop(vm);
     }
