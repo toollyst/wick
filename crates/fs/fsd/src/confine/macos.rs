@@ -4,6 +4,9 @@
 //! macOS's confinement (docs/design-fs.md §6.2), once stage 0 has accepted
 //! the one connection, checked its peer, and the backend holds the share's
 //! root:
+//! 0. libc's first uses that read what the profile denies, made before it
+//!    ([`first_uses`]): its value kept for the process's life, so the
+//!    confined server never makes the call; [`confine`] takes their proof;
 //! 1. the profile ([`profile`]) built for the share's canonical path and
 //!    compiled, with the operator's rights;
 //! 2. as root, the drop to the operator's `--uid`/`--gid` (required, never
@@ -22,7 +25,7 @@
 //! a [`Refusal`] naming it; no flag skips one. There is no fork and so no
 //! parent to confine: the process that accepted the connection serves it.
 
-use std::os::fd::RawFd;
+use std::os::fd::{BorrowedFd, RawFd};
 use std::path::Path;
 
 use wick_fs_sys as sys;
@@ -334,9 +337,40 @@ fn fcntl_discovery_rule(commands: &[String]) -> String {
     String::new()
 }
 
-/// Steps 1 to 4. `held`: the descriptors the caller holds and serves with
-/// (the connection, the backend's root).
-pub fn confine(plan: Plan, canonical: &Path, held: &[RawFd]) -> Result<(), Refusal> {
+/// Step 0's proof: libc's first uses are made ([`first_uses`]). Only that
+/// function makes one, and [`confine`] takes it, so no profile is applied
+/// before them.
+#[derive(Debug)]
+pub struct FirstUses(());
+
+/// Step 0: libc's first uses on the server's paths that read what the
+/// profile denies, each made once before it, on the share's `root`, and
+/// kept by libc for the process's life. One so far:
+/// - `fdopendir` (READDIR, and the search of a directory for a name a node
+///   no longer keeps): Libc's `__opendir_common` asks
+///   `__kernel_supports_unionfs()`, which reads `kern.secure_kernel` with
+///   `sysctlbyname` (`sysctl`, system call 202, which the profile kills) on
+///   its first use in a process and keeps the answer in a static
+///   (gen/FreeBSD/opendir.c in Libc-1669 to Libc-1725: macOS 15 and macOS
+///   26.0 to 26.3; Libc-1752, macOS 26.4 on, no longer asks). Measured on
+///   macOS 15.8.2 in CI run 44362564244: a confined server killed `deny(1)
+///   syscall-unix 202` in `fdopendir`. One `fdopendir` of the root, closed
+///   again, fills the static; confine_probe records, on each major, whether
+///   a fresh process confined without it is killed there.
+///
+/// A failure is a refusal naming it: the root that cannot be read as a
+/// directory here could not be served.
+pub fn first_uses(root: BorrowedFd<'_>) -> Result<FirstUses, Refusal> {
+    let again = sys::reopen_dir(root).map_err(|e| refuse("opening the share's root again (libc's first fdopendir)", e))?;
+    let stream = sys::DirReader::new(again).map_err(|e| refuse("libc's first fdopendir, of the share's root", e))?;
+    drop(stream);
+    Ok(FirstUses(()))
+}
+
+/// Steps 1 to 4, after step 0 ([`first_uses`], its proof `_first`). `held`:
+/// the descriptors the caller holds and serves with (the connection, the
+/// backend's root).
+pub fn confine(plan: Plan, canonical: &Path, _first: FirstUses, held: &[RawFd]) -> Result<(), Refusal> {
     let root_user = sys::euid() == 0;
     match (root_user, plan.drop_to) {
         (true, None) => {
@@ -432,6 +466,16 @@ mod tests {
         read_only: false,
         drop_to: Some((65534, 65534)),
     };
+
+    #[test]
+    fn test_first_uses_refused_by_name_where_the_root_is_no_directory() {
+        let file = std::fs::File::open("/etc/hosts").unwrap();
+        let e = first_uses(std::os::fd::AsFd::as_fd(&file)).unwrap_err().0;
+        assert!(e.starts_with("confinement: opening the share's root again (libc's first fdopendir) failed"), "{e}");
+        assert!(e.ends_with("wick-fsd does not serve unconfined"), "{e}");
+        let dir = std::fs::File::open("/").unwrap();
+        first_uses(std::os::fd::AsFd::as_fd(&dir)).unwrap();
+    }
 
     #[test]
     fn test_what_held_is_served_and_what_did_not_is_named() {

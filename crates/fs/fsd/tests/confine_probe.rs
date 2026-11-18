@@ -44,7 +44,7 @@ mod macos {
 
     use wick_fs_sys as sys;
     use wick_fs_sys::seatbelt::probe::{self, Ended, Fcntl, Forked, InShare};
-    use wick_fsd::confine::macos::{Plan, confine};
+    use wick_fsd::confine::macos::{Plan, confine, first_uses};
     use wick_fsd::host::unix::{HostDir, Options};
     use wick_fsd::limits::Limits;
     use wick_fsd::stage0::{Share, check};
@@ -111,6 +111,14 @@ mod macos {
         let dir_root = checked.root.as_raw_fd();
         let inside = checked.canonical.join("inside");
         let canonical = checked.canonical.clone();
+        // As wick-fsd's main: step 0 on the root, before the backend takes it.
+        let first = match first_uses(checked.root.as_fd()) {
+            Ok(f) => f,
+            Err(r) => {
+                eprintln!("{}", r.0);
+                return 7;
+            }
+        };
         let dir = match HostDir::new(checked.root, Options { case_insensitive_ok: true, ..Options::default() }) {
             Ok(d) => d,
             Err(r) => {
@@ -121,7 +129,7 @@ mod macos {
         let Ok(root) = sys::open_root(&canonical) else { return 6 };
         let vol = by_volume_id(&outside.join("secret"));
         let confined = match how {
-            How::Confined => confine(plan, &canonical, &[dir_root, root.as_raw_fd()]).map_err(|r| r.0),
+            How::Confined => confine(plan, &canonical, first, &[dir_root, root.as_raw_fd()]).map_err(|r| r.0),
             How::Reported => reported(&canonical),
         };
         if let Err(r) = confined {
@@ -418,7 +426,44 @@ mod macos {
         );
     }
 
+    /// On record, never checked: whether this macOS's Libc reads a sysctl on
+    /// a process's first `fdopendir`, which step 0 (`first_uses`) makes
+    /// before the profile. A fresh process (this binary started again, so
+    /// no directory stream was opened in it) applies the share's profile
+    /// without step 0 and opens the share's root as a stream: signal 9 where
+    /// Libc makes the call (`__kernel_supports_unionfs`, Libc-1669 to 1725:
+    /// macOS 15, macOS 26.0 to 26.3), exit 1 where it does not. When every
+    /// major CI runs says exit 1, step 0's `fdopendir` can go.
+    fn first_fdopendir_on_record(share: &Path) {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .env("WICK_FS_PROBE_FIRST_FDOPENDIR", share)
+            .status()
+            .unwrap();
+        let ended = status.signal().map_or_else(|| format!("exit {}", status.code().unwrap_or(-1)), |s| format!("signal {s}"));
+        let means = match (status.signal(), status.code()) {
+            (Some(9), _) => "this Libc makes the call: step 0 is needed here",
+            (_, Some(1)) => "this Libc does not make it",
+            _ => "neither: see the child's output",
+        };
+        println!("record: the first fdopendir confined without step 0 (a fresh process): {ended}: {means}");
+    }
+
+    /// The fresh process of [`first_fdopendir_on_record`]: nothing before
+    /// the profile but opening the share's root (`open`, no stream).
+    fn first_fdopendir_child() {
+        let Some(share) = std::env::var_os("WICK_FS_PROBE_FIRST_FDOPENDIR") else { return };
+        let canonical = std::fs::canonicalize(share).unwrap();
+        let root = sys::open_root(&canonical).unwrap();
+        let profile = wick_fsd::confine::macos::profile(&canonical, false).unwrap();
+        let compiled = sys::seatbelt::compile(&profile).unwrap();
+        sys::seatbelt::apply(&compiled).unwrap();
+        let opened = sys::reopen_dir(root.as_fd()).and_then(sys::DirReader::new).is_ok();
+        probe::exit_now(i32::from(opened));
+    }
+
     pub fn main() {
+        first_fdopendir_child();
         allocator_on_record();
         let since = std::process::Command::new("/bin/date").arg("+%Y-%m-%d %H:%M:%S").output().unwrap();
         let since = String::from_utf8_lossy(&since.stdout).trim().to_string();
@@ -441,6 +486,7 @@ mod macos {
             std::os::unix::fs::chown(share.join("inside"), Some(65534), Some(65534)).unwrap();
         }
         searchable_above(&outside.join("secret"));
+        first_fdopendir_on_record(&share);
         let cases: &[(&str, Act, i32)] = &[
             ("the outside canary by its path", |c| ok(std::fs::read(c.outside.join("secret"))), KILLED),
             // By the call the server makes for metadata (fstatat64, listed):

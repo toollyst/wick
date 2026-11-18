@@ -357,7 +357,7 @@ fn run(args: &Args, start: Start) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn run(args: &Args, start: Start) -> Result<(), String> {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsFd, AsRawFd};
 
     use wick_fsd::confine::macos::{self as confine, Plan};
 
@@ -369,10 +369,11 @@ fn run(args: &Args, start: Start) -> Result<(), String> {
     let canonical = checked.canonical.clone();
     let conn_fd = conn.as_raw_fd();
     let root_fd = checked.root.as_raw_fd();
+    let first = confine::first_uses(checked.root.as_fd()).map_err(|r| r.0)?;
     let mut session = session_over(args, checked.root)?;
     // What it holds when it serves, as on Linux: the connection and the
     // share's root (the backend holds no other descriptor before a request).
-    confine::confine(plan, &canonical, &[conn_fd, root_fd]).map_err(|r| r.0)?;
+    confine::confine(plan, &canonical, first, &[conn_fd, root_fd]).map_err(|r| r.0)?;
     eprintln!("wick-fsd: {}: confined (Seatbelt profile of the share, ids dropped)", args.id);
     serve_all(args, &mut conn, &mut session)
 }

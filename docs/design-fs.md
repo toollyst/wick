@@ -1061,6 +1061,11 @@ it means layer 1 let the request through.
   - **As built** (`crates/fs/fsd/src/confine/macos.rs`, the calls in `crates/fs/sys/src/unix/seatbelt.rs`), after
     stage 0 has accepted the one connection, checked its peer, and the backend holds the share's root. There is no
     fork: the process that accepted the connection serves it.
+    0. libc's first uses that read what the profile denies, made once before it on the share's root and kept by
+       libc for the process's life (`first_uses`; `confine` takes its proof, so no profile is applied before it):
+       one `fdopendir` of the root, closed again (below, after the allocator table). Its failure, the root not
+       opened again as a directory, is a refusal naming it
+       (`test_first_uses_refused_by_name_where_the_root_is_no_directory`);
     1. the profile below built for the canonical path and compiled (`sandbox_compile_string`), with the operator's
        rights;
     2. as root, `--uid`/`--gid` (required, never 0), its one group the gid's; not root, no `--uid`;
@@ -1173,8 +1178,14 @@ it means layer 1 let the request through.
     `fdopendir` (`__sysctl` ← `sysctlbyname` ← `__opendir_common`), in links.rs and requests.rs. Libc's
     `__opendir_common` reads `kern.secure_kernel` once per process (`__kernel_supports_unionfs`, a static filled on
     first use; gen/FreeBSD/opendir.c in Libc-1669 to 1725, macOS 15 and macOS 26.0 to 26.3; gone from Libc-1752,
-    macOS 26.4 on, and from 27.2 here). Not handled at this commit: there a confined server is killed at its first
-    READDIR, or its first search of a directory for a name a node no longer keeps (`HostDir::search`). Seatbelt does not check the number of some calls at all (Firecracker's
+    macOS 26.4 on, and from 27.2 here). There a confined server was killed at its first READDIR, or its first
+    search of a directory for a name a node no longer keeps (`HostDir::search`). Step 0 (`first_uses`) makes one
+    `fdopendir` of the share's root before the profile, which fills that static, so the confined server never
+    makes the call; no rule is added, and `sysctl` stays killed. The confined tests (requests.rs's every-request
+    set and links.rs, a READDIR and a search each under the profile) check it on each major CI runs, and
+    confine_probe records, on each, whether a fresh process confined without step 0 is killed at its first
+    `fdopendir` ("record: the first fdopendir confined without step 0"): signal 9 where Libc makes the call, exit 1
+    where it does not; when every major says exit 1, step 0's `fdopendir` can go. Seatbelt does not check the number of some calls at all (Firecracker's
     `UNFILTERED_SYSCALLS` in `overlay/vmm/ext/sandbox.rs`: `openat`, `close`, `write`, `pwrite`, `fchmod`,
     `fsetxattr`, `fremovexattr`, `linkat`, `unlinkat` among those wick-fsd makes); for those the file rules decide.
     `fcntl`'s command is checked too (`system-fcntl`, below).
