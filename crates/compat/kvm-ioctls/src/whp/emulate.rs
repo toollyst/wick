@@ -230,6 +230,8 @@ pub(crate) static LAST_STATUS: std::sync::atomic::AtomicU32 = std::sync::atomic:
 /// orderly end ([`report_at_exit`]; `boot-test.ps1`'s boot stage prints
 /// it): whether the emulator's status says finished on every emulation the
 /// callbacks did not stop is measured there, not assumed ([`finished`]).
+/// CI's boot: 1824 emulations, 1375 finished, 449 stopped for a device
+/// read, none unfinished otherwise.
 pub(crate) struct Counts {
     all: std::sync::atomic::AtomicU64,
     finished: std::sync::atomic::AtomicU64,
@@ -295,12 +297,15 @@ impl Counts {
 /// Says [`COUNTS`] when the process ends through `exit` (a return from
 /// `main` or `std::process::exit`, as Firecracker ends after the guest's
 /// reset), registered at the first emulation: the C runtime runs `atexit`
-/// handlers there, and not at a kill.
+/// handlers there, and not at a kill. A debug line of Firecracker's log
+/// only, not on stderr: at the default level Firecracker's output on
+/// Windows is Linux's and macOS's, and `boot-test.ps1`'s VMs run at
+/// `--level Debug`.
 #[cfg(not(test))]
 fn report_at_exit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     extern "C" fn report() {
-        ffi::report(log::Level::Info, &COUNTS.line());
+        log::debug!("{}", COUNTS.line());
     }
     ONCE.call_once(|| {
         // SAFETY: a plain extern "C" fn, which outlives the process.

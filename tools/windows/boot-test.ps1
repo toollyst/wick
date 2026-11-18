@@ -2368,9 +2368,10 @@ function Stage-Boot {
     $ramretry = if ($most.Count) { "$($most[0])" } else { 'at most 1' }
     # EMULATIONS: the MMIO emulations of the boot and the reset, by what the
     # emulator's status said (WHV_EMULATOR_STATUS bit 0, EmulationSuccessful),
-    # said by the backend at Firecracker's exit (whp::emulate::Counts): that
-    # an emulation the callbacks did not stop is finished by its status is
-    # measured here; printed, not asserted.
+    # a debug line of Firecracker's log at its exit, which this VM's --level
+    # Debug shows (whp::emulate::Counts): that an emulation the callbacks did
+    # not stop is finished by its status is measured here; printed, not
+    # asserted.
     $emu = [regex]::Match($said, 'whp: EMULATIONS (\d+) MMIO emulations: (\d+) finished \(EmulationSuccessful\), (\d+) stopped for a device read, (\d+) unfinished otherwise( \(the first: [^)]*\))?')
     Check $emu.Success "no EMULATIONS line at Firecracker's exit"
     $n = @(1..4 | ForEach-Object { [long]$emu.Groups[$_].Value })

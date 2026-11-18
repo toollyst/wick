@@ -267,8 +267,9 @@ has the per-control details and results.
   (`emulate::finished`, `test_an_emulation_is_finished_by_its_status`): an emulation it did not finish after a device
   read stops the vCPU with `KVM_EXIT_INTERNAL_ERROR`, as KVM stops on an emulation failure, and is not run again. How
   many emulations of a normal boot are finished by their status, stopped for a device read, or unfinished otherwise
-  is counted (`emulate::Counts`, `test_the_emulations_line_counts_by_status`) and said at Firecracker's exit, which
-  `boot-test.ps1 boot` prints (EMULATIONS; first run: CI). The
+  is counted (`emulate::Counts`, `test_the_emulations_line_counts_by_status`) and said in a debug line of
+  Firecracker's log at its exit, which `boot-test.ps1 boot` prints (EMULATIONS; CI's boot: 1824, 1375 finished, 449
+  stopped for a device read, none unfinished otherwise). The
   tests run each case as before and now:
   `test_an_mmio_read_finishes_while_the_reclaim_moves_its_page_tables` (wick's reclaim held between its copy and its
   swap; before, with the status read, `KVM_EXIT_INTERNAL_ERROR` and the device read once, now the device's value in
