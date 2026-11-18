@@ -38,7 +38,7 @@ impl Drop for Host {
 
 fn host(tag: &str) -> Host {
     let base = scratch(tag);
-    let dir = HostDir::new(sys::open_root(&base).unwrap(), Options { case_insensitive_ok: true }).unwrap();
+    let dir = HostDir::new(sys::open_root(&base).unwrap(), Options { case_insensitive_ok: true, ..Options::default() }).unwrap();
     Host { g: G::new(dir), base }
 }
 

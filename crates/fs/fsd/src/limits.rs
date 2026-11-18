@@ -10,21 +10,32 @@
 //! handle before the backend opens (EMFILE), bytes before they are written
 //! (ENOSPC). The queue of requests is the serving loop's (a later commit).
 
-/// Nodes the guest may hold at once, the root included. With
-/// [`DEFAULT_MAX_HANDLES`] and [`SPARE_FDS`], 9280 descriptors at most
-/// ([`descriptors`]): under [`LOWEST_STOCK_NOFILE`] with 960 to spare, so a
-/// default share starts on every stock host (docs/design-fs.md §4.2,
-/// Limits).
-pub const DEFAULT_MAX_NODES: usize = 8192;
+/// Nodes the guest may hold at once, the root included. A node costs
+/// memory, not a descriptor (the host backend's cache holds those,
+/// [`DEFAULT_MAX_HELD`]): at most `host::unix::NODE_BYTES_MAX` each on
+/// Linux and macOS, so a share's nodes take at most 2^18 times that
+/// (docs/design-fs.md §4.2, Limits); `--max-nodes` sets it per share.
+pub const DEFAULT_MAX_NODES: usize = 1 << 18;
+
+/// Descriptors the nodes may hold at once, the root's included: the host
+/// backend's cache of held directories and of leaves' widest opens, the
+/// least recently used let go first. With [`DEFAULT_MAX_HANDLES`] and
+/// [`SPARE_FDS`], 2112 descriptors at most ([`descriptors`]): under
+/// [`LOWEST_STOCK_NOFILE`], so a default share starts on every stock host.
+pub const DEFAULT_MAX_HELD: usize = 1024;
+
+/// The fewest descriptors the nodes hold: the root's and one more (a
+/// smaller `max_held` is taken as this).
+pub const MIN_HELD: usize = 2;
 
 /// Handles the guest may hold open at once.
 pub const DEFAULT_MAX_HANDLES: usize = 1024;
 
-/// Descriptors the server may have open besides one per node and one per
-/// handle: the standard streams, the connection, and those a request opens
-/// and closes before its reply (a directory reopened to list or search it,
-/// a descriptor for metadata, a directory opened by a lookup before its
-/// node is added).
+/// Descriptors the server may have open besides the nodes' cache (the
+/// share's root's included) and one per handle: the standard streams, the
+/// connection, and those a request opens or keeps before its reply (a directory reopened to list
+/// or search it, a descriptor for metadata, a descriptor the cache let go
+/// while the request uses it).
 pub const SPARE_FDS: u64 = 64;
 
 /// The lowest per-process descriptor limit of the stock hosts the server
@@ -35,12 +46,12 @@ pub const SPARE_FDS: u64 = 64;
 /// systemd service or a login shell (`DefaultLimitNOFILE=1024:524288`).
 pub const LOWEST_STOCK_NOFILE: u64 = 10240;
 
-/// The most descriptors a share with `limits` can hold open at once: one
-/// per node (a directory's own; a leaf's widest open, once opened), one per
-/// handle, and [`SPARE_FDS`]. Stage 0 refuses a share whose host limit is
+/// The most descriptors a share with `limits` can hold open at once: the
+/// nodes' cache ([`Limits::max_held`]), one per handle, and [`SPARE_FDS`],
+/// whatever the number of nodes. Stage 0 refuses a share whose host limit is
 /// below it, so the server never meets EMFILE itself.
 pub fn descriptors(limits: &Limits) -> u64 {
-    u64::try_from(limits.max_nodes)
+    u64::try_from(limits.max_held.max(MIN_HELD))
         .unwrap_or(u64::MAX)
         .saturating_add(u64::try_from(limits.max_handles).unwrap_or(u64::MAX))
         .saturating_add(SPARE_FDS)
@@ -82,6 +93,9 @@ pub const GUEST_XATTR_NAME_MAX: usize = 120;
 pub struct Limits {
     /// Nodes held at once (ENFILE beyond).
     pub max_nodes: usize,
+    /// Descriptors the nodes hold at once (the least recently used let go
+    /// beyond).
+    pub max_held: usize,
     /// Handles open at once (EMFILE beyond).
     pub max_handles: usize,
     /// Bytes the guest may add (ENOSPC beyond).
@@ -94,6 +108,7 @@ impl Default for Limits {
     fn default() -> Limits {
         Limits {
             max_nodes: DEFAULT_MAX_NODES,
+            max_held: DEFAULT_MAX_HELD,
             max_handles: DEFAULT_MAX_HANDLES,
             max_bytes: DEFAULT_MAX_BYTES,
             xattr_budget: DEFAULT_XATTR_BUDGET,
@@ -138,15 +153,24 @@ mod tests {
     #[test]
     fn test_default_limits_fit_stock_hosts() {
         let need = descriptors(&Limits::default());
-        assert_eq!(need, 9280);
+        assert_eq!(need, 2112);
         assert!(need <= LOWEST_STOCK_NOFILE, "{need} > {LOWEST_STOCK_NOFILE}");
         assert!(need <= 65536, "{need} > 65536");
     }
 
     #[test]
+    fn test_descriptors_count_the_root_and_one_more_at_least() {
+        let l = Limits {
+            max_held: 0,
+            ..Limits::default()
+        };
+        assert_eq!(descriptors(&l), 2 + 1024 + SPARE_FDS);
+    }
+
+    #[test]
     fn test_descriptors_saturate() {
         let l = Limits {
-            max_nodes: usize::MAX,
+            max_held: usize::MAX,
             ..Limits::default()
         };
         assert_eq!(descriptors(&l), u64::MAX);

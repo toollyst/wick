@@ -5,18 +5,30 @@
 //! §6.2): [`ConfinedDir`] over a held directory descriptor, one checked
 //! component at a time, through `wick_fs_sys`.
 //!
-//! - **Nodes.** A directory is held open (`O_RDONLY | O_DIRECTORY`), one
-//!   descriptor per identity, by its node only. Any
-//!   other object is one [`Leaf`] per identity: the names it is known by
-//!   beneath held directories (most recent first, kept as the guest looks up,
-//!   creates, links, renames and unlinks), and, once the guest has opened
-//!   it, the descriptor of its widest open. Each use finds the object by a
-//!   name and checks the identity there (a host's swap is never another
-//!   object); when no known name is it, an object without any name
+//! - **Nodes** cost memory, not descriptors. A directory is one [`DirNode`]
+//!   per identity: where it is (its parent's node and its name there) and,
+//!   while it is in the cache of held descriptors, its descriptor
+//!   (`O_RDONLY | O_DIRECTORY`). Any other object is one [`Leaf`] per
+//!   identity: the names it is known by beneath directories the guest
+//!   knows (most recent first, kept as the guest looks up, creates, links,
+//!   renames and unlinks), and, once the guest has opened it and while it
+//!   is in the cache, the descriptor of its widest open. Each use finds the
+//!   object by a name and checks the identity there (a host's swap is never
+//!   another object); when no known name is it, an object without any name
 //!   (`nlink` 0: unlinked while the guest held it) is served through the
 //!   descriptor, and one with a name is looked for in the held directories.
 //!   The same on both hosts: no `O_PATH` (macOS has none) and no reopening
 //!   through `/proc`.
+//! - **Held descriptors** are a cache of at most [`Options::max_held`],
+//!   least recently used let go first (the root's is always held). A
+//!   directory let go is opened again by its one name beneath its parent,
+//!   held or itself opened again so, and checked to be the same identity;
+//!   one that is not there any more (or is something else, a link
+//!   included, never followed) is ESTALE, the error Linux's FUSE gives
+//!   for a node it cannot find again (`fuse_get_dentry`, fs/fuse/inode.c,
+//!   v6.12, :1018 to :1043) and virtiofsd for a file handle that no longer
+//!   opens (`open_by_handle_at`, `exportfs_decode_fh`). A leaf let go is
+//!   found by its names, as before it was opened.
 //! - **Opens** never follow a link at any component and never leave their
 //!   directory (`openat2` beneath on Linux, `O_NOFOLLOW_ANY |
 //!   O_RESOLVE_BENEATH` on macOS). A host symlink, FIFO, socket or device is
@@ -36,7 +48,7 @@
 //!   `wick.x.n`. Other host attributes are neither shown nor touched.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
@@ -91,6 +103,11 @@ fn enoent() -> DirError {
     DirError::Errno(Errno::ENOENT)
 }
 
+/// A directory node the server cannot find again (module docs).
+fn estale() -> DirError {
+    DirError::Errno(Errno::ESTALE)
+}
+
 fn kind_of(mode: u32) -> HostKind {
     match mode & sys::mode::S_IFMT {
         sys::mode::S_IFREG => HostKind::File,
@@ -135,7 +152,8 @@ fn temporary_name() -> Vec<u8> {
     format!(".wick-recase-{:016x}", h.finish()).into_bytes()
 }
 
-/// A held directory.
+/// A held directory: its descriptor, while its node is in the cache or a
+/// request uses it.
 #[derive(Debug)]
 pub struct DirFd {
     fd: OwnedFd,
@@ -143,6 +161,140 @@ pub struct DirFd {
     /// Names beneath it are folded by the host: lookups check the stored
     /// name.
     folds: bool,
+    /// Its node, for the names of leaves found beneath it.
+    node: Weak<DirNode>,
+}
+
+/// Where a directory is: its parent's node and its name there.
+type Place = Option<(Weak<DirNode>, Box<[u8]>)>;
+
+/// A directory the guest knows: one per identity.
+#[derive(Debug)]
+pub struct DirNode {
+    id: HostId,
+    folds: bool,
+    /// Its parent's node and its name there, as the guest last looked it up
+    /// or renamed it; `None` for the root.
+    place: Mutex<Place>,
+    /// Its descriptor while the cache holds it (always, for the root).
+    fd: Mutex<Option<Arc<DirFd>>>,
+}
+
+impl DirNode {
+    fn held(&self) -> Option<Arc<DirFd>> {
+        lock(&self.fd).clone()
+    }
+
+    fn set_place(&self, parent: &DirFd, name: &[u8]) {
+        *lock(&self.place) = Some((parent.node.clone(), name.into()));
+    }
+}
+
+/// What a cache entry lets go of when it is pushed out.
+#[derive(Debug)]
+enum Holder {
+    Dir(Weak<DirNode>),
+    Leaf(Weak<Leaf>),
+}
+
+impl Holder {
+    fn alive(&self) -> bool {
+        match self {
+            Holder::Dir(w) => w.strong_count() > 0,
+            Holder::Leaf(w) => w.strong_count() > 0,
+        }
+    }
+
+    /// Drops the node's descriptor (a request using it keeps it until its
+    /// reply).
+    fn let_go(self) {
+        match self {
+            Holder::Dir(w) => {
+                if let Some(d) = w.upgrade() {
+                    lock(&d.fd).take();
+                }
+            }
+            // A descriptor a handle shares is the handle's to count: kept,
+            // and entered again when the handle closes (`close`).
+            Holder::Leaf(w) => {
+                if let Some(l) = w.upgrade() {
+                    let mut st = lock(&l.state);
+                    if st.held.as_ref().is_some_and(|(f, _)| Arc::strong_count(f) == 1) {
+                        st.held = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The descriptors nodes hold, at most `max`, the least recently used let
+/// go first. An entry whose node is gone (forgotten: its descriptor closed
+/// with it) still counts until it is pruned, so the count is never below
+/// the descriptors held.
+#[derive(Debug)]
+struct Held {
+    max: usize,
+    next: u64,
+    stamp: HashMap<HostId, u64>,
+    order: BTreeMap<u64, (HostId, Holder)>,
+}
+
+impl Held {
+    fn new(max: usize) -> Held {
+        Held {
+            max: max.max(1),
+            next: 0,
+            stamp: HashMap::new(),
+            order: BTreeMap::new(),
+        }
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
+
+    /// Marks `id`'s descriptor used now.
+    fn touch(&mut self, id: HostId) {
+        let now = self.tick();
+        if let Some(s) = self.stamp.get_mut(&id) {
+            let old = std::mem::replace(s, now);
+            if let Some(e) = self.order.remove(&old) {
+                self.order.insert(now, e);
+            }
+        }
+    }
+
+    /// Enters `holder`'s descriptor of `id`, used now; returns what must be
+    /// let go (outside the cache's lock) to stay within `max`.
+    #[must_use]
+    fn admit(&mut self, id: HostId, holder: Holder) -> Vec<Holder> {
+        let now = self.tick();
+        if let Some(old) = self.stamp.insert(id, now) {
+            self.order.remove(&old);
+        }
+        self.order.insert(now, (id, holder));
+        let mut out = Vec::new();
+        if self.order.len() > self.max {
+            let stamp = &mut self.stamp;
+            self.order.retain(|_, (id, h)| {
+                let keep = h.alive();
+                if !keep {
+                    stamp.remove(id);
+                }
+                keep
+            });
+        }
+        while self.order.len() > self.max {
+            let Some((_, (id, h))) = self.order.pop_first() else {
+                break;
+            };
+            self.stamp.remove(&id);
+            out.push(h);
+        }
+        out
+    }
 }
 
 /// How many names a [`Leaf`] keeps. A name used since moves to the front;
@@ -165,12 +317,12 @@ pub struct Leaf {
 #[derive(Debug, Default)]
 struct LeafState {
     /// (directory, its identity, name), the most recently used first, at
-    /// most [`NAMES_MAX`]. The directory is held by its own node, never by a
-    /// leaf's name: a name whose directory the guest forgot is dropped, so a
-    /// node holds one descriptor at most ([`crate::limits::descriptors`]).
-    names: Vec<(Weak<DirFd>, HostId, Box<[u8]>)>,
-    /// The widest descriptor the guest has had of it, kept until the node
-    /// is forgotten (as virtiofsd's `O_PATH` descriptor keeps the inode).
+    /// most [`NAMES_MAX`]. The directory is kept by its own node, never by a
+    /// leaf's name: a name whose directory the guest forgot is dropped.
+    names: Vec<(Weak<DirNode>, HostId, Box<[u8]>)>,
+    /// The widest descriptor the guest has had of it, kept while the cache
+    /// holds it ([`Held`]) and never past the node (as virtiofsd's `O_PATH`
+    /// descriptor keeps the inode).
     held: Option<(Arc<File>, OpenMode)>,
 }
 
@@ -180,19 +332,21 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Leaf {
     /// Puts `(dir, name)` first.
-    fn add_name(&self, dir: &Arc<DirFd>, name: &[u8]) {
+    fn add_name(&self, dir: &DirFd, name: &[u8]) {
         let mut st = lock(&self.state);
         st.names.retain(|(d, id, n)| d.strong_count() > 0 && !(*id == dir.id && **n == *name));
-        st.names.insert(0, (Arc::downgrade(dir), dir.id, name.into()));
-        st.names.truncate(NAMES_MAX);
+        // The oldest goes first, so the list never grows past NAMES_MAX
+        // (its memory is in `NODE_BYTES_MAX`).
+        st.names.truncate(NAMES_MAX - 1);
+        st.names.insert(0, (dir.node.clone(), dir.id, name.into()));
     }
 
     fn remove_name(&self, dir: HostId, name: &[u8]) {
         lock(&self.state).names.retain(|(_, id, n)| !(*id == dir && **n == *name));
     }
 
-    /// The names whose directory is still held, the others dropped.
-    fn names(&self) -> Vec<(Arc<DirFd>, Box<[u8]>)> {
+    /// The names whose directory the guest still knows, the others dropped.
+    fn names(&self) -> Vec<(Arc<DirNode>, Box<[u8]>)> {
         let mut st = lock(&self.state);
         let mut live = Vec::with_capacity(st.names.len());
         st.names.retain(|(d, _, n)| match d.upgrade() {
@@ -262,8 +416,8 @@ impl<T> Registry<T> {
 /// What the node table holds for each node.
 #[derive(Clone, Debug)]
 pub enum HostNode {
-    /// A directory, held open.
-    Dir(Arc<DirFd>),
+    /// A directory.
+    Dir(Arc<DirNode>),
     /// Anything else.
     Leaf(Arc<Leaf>),
 }
@@ -272,18 +426,31 @@ pub enum HostNode {
 #[derive(Debug)]
 pub enum HostOpen {
     /// A regular file, opened with the guest's access mode only (shared with
-    /// its leaf, which keeps the widest).
-    File(Arc<File>),
+    /// its leaf, which keeps the widest), and its identity.
+    File(Arc<File>, HostId),
     /// A directory being listed.
     Dir(RefCell<sys::DirReader>, HostId),
 }
 
 /// The share's settings that reach the backend.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
     /// Run on a volume that folds case (the operator's explicit choice,
     /// docs/design-fs.md §7): exact-name lookups, EEXIST on a collision.
     pub case_insensitive_ok: bool,
+    /// Descriptors the nodes may hold at once, the root's included
+    /// ([`crate::limits::Limits::max_held`]; at least
+    /// [`crate::limits::MIN_HELD`]).
+    pub max_held: usize,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            case_insensitive_ok: false,
+            max_held: crate::limits::DEFAULT_MAX_HELD,
+        }
+    }
 }
 
 /// Why a share is not served.
@@ -299,12 +466,16 @@ impl std::fmt::Display for Refusal {
 /// A shared host directory.
 #[derive(Debug)]
 pub struct HostDir {
-    root: Arc<DirFd>,
+    root: Arc<DirNode>,
+    /// The root's descriptor, always held.
+    root_fd: Arc<DirFd>,
     dev: u64,
     /// Each non-directory the server knows, one leaf per identity.
     leaves: Mutex<Registry<Leaf>>,
-    /// Each directory the server holds, for the search of a leaf's name.
-    dirs: Mutex<Registry<DirFd>>,
+    /// Each directory the server knows, one node per identity.
+    dirs: Mutex<Registry<DirNode>>,
+    /// The descriptors the nodes hold.
+    held: Mutex<Held>,
     /// The volume takes an exchange ([`sys::rename_swap`]); else EINVAL,
     /// without asking it.
     swap: bool,
@@ -355,29 +526,106 @@ impl HostDir {
             ));
         }
         let folds = folds(root.as_fd()).map_err(|e| Refusal(format!("cannot read the share's flags: {e:?}")))?;
-        let root = Arc::new(DirFd {
-            fd: root,
-            id: id_of(&st),
-            folds,
-        });
-        let swap = sys::rename_swap(root.fd.as_fd())
+        let swap = sys::rename_swap(root.as_fd())
             .map_err(|e| Refusal(format!("cannot read the share's volume capabilities: {e:?}")))?;
+        let id = id_of(&st);
+        let node = Arc::new_cyclic(|node| DirNode {
+            id,
+            folds,
+            place: Mutex::new(None),
+            fd: Mutex::new(Some(Arc::new(DirFd {
+                fd: root,
+                id,
+                folds,
+                node: node.clone(),
+            }))),
+        });
+        let root_fd = node.held().ok_or_else(|| Refusal("the share's root is not held".into()))?;
         let mut dirs = Registry::new();
-        dirs.insert(root.id, &root);
+        dirs.insert(id, &node);
         Ok(HostDir {
-            root,
+            root: node,
+            root_fd,
             dev: st.dev,
             leaves: Mutex::new(Registry::new()),
             dirs: Mutex::new(dirs),
+            // The root's is one of `max_held`, never let go.
+            held: Mutex::new(Held::new(options.max_held.max(crate::limits::MIN_HELD) - 1)),
             swap,
         })
     }
 
-    fn dir<'a>(&self, node: &'a HostNode) -> Result<&'a Arc<DirFd>, DirError> {
+    /// A directory node's descriptor (held, or opened again).
+    fn dir(&self, node: &HostNode) -> Result<Arc<DirFd>, DirError> {
         match node {
-            HostNode::Dir(d) => Ok(d),
+            HostNode::Dir(d) => self.fd_of(d),
             HostNode::Leaf(_) => Err(DirError::Errno(Errno::ENOTDIR)),
         }
+    }
+
+    /// Enters a descriptor a node now holds into the cache, letting go of
+    /// the least recently used beyond its bound.
+    fn admit(&self, id: HostId, holder: Holder) {
+        let out = lock(&self.held).admit(id, holder);
+        for h in out {
+            h.let_go();
+        }
+    }
+
+    /// `node`'s descriptor: held, else opened again by its name beneath its
+    /// parent (whose own descriptor is found the same way, up to one held
+    /// or the root), each checked to be the identity the guest knows.
+    /// ESTALE when a directory on the way is not where it was (module docs):
+    /// gone, moved by the host, or its parent forgotten (which a kernel never
+    /// does while it holds a child: a dentry holds its parent).
+    fn fd_of(&self, node: &Arc<DirNode>) -> Result<Arc<DirFd>, DirError> {
+        if let Some(fd) = node.held() {
+            lock(&self.held).touch(node.id);
+            return Ok(fd);
+        }
+        // The nodes without a descriptor, from `node` up.
+        let mut chain = vec![node.clone()];
+        let mut top = loop {
+            let last = chain.last().map(|n| lock(&n.place).clone());
+            let Some(Some((parent, _))) = last else {
+                // Only the root has no place, and it is always held.
+                return Err(estale());
+            };
+            let parent = parent.upgrade().ok_or_else(estale)?;
+            if let Some(fd) = parent.held() {
+                lock(&self.held).touch(parent.id);
+                break fd;
+            }
+            chain.push(parent);
+        };
+        while let Some(n) = chain.pop() {
+            let name = lock(&n.place).as_ref().map(|(_, name)| name.clone()).ok_or_else(estale)?;
+            // Gone, or something else now: a link in its place is never
+            // followed and is the same answer on both hosts (Linux's
+            // O_DIRECTORY gives ENOTDIR before O_NOFOLLOW's ELOOP, macOS
+            // ELOOP).
+            let fd = match sys::open_dir(top.fd.as_fd(), &name) {
+                Ok(fd) => fd,
+                Err(e) if [sys::errno::ENOENT, sys::errno::ENOTDIR, sys::errno::ELOOP].contains(&e.0) => {
+                    return Err(estale());
+                }
+                Err(e) => return Err(open_err(e)),
+            };
+            let st = sys::fstat(fd.as_fd()).map_err(err)?;
+            if id_of(&st) != n.id {
+                return Err(estale());
+            }
+            let d = Arc::new(DirFd {
+                fd,
+                id: n.id,
+                folds: n.folds,
+                node: Arc::downgrade(&n),
+            });
+            *lock(&n.fd) = Some(d.clone());
+            self.admit(n.id, Holder::Dir(Arc::downgrade(&n)));
+            top = d;
+        }
+        Ok(top)
     }
 
     /// ENOENT unless `name` is stored as exactly these bytes beneath `dir`.
@@ -423,10 +671,14 @@ impl HostDir {
     }
 
     /// The directory `name` beneath `parent`, which must be `want`: the
-    /// descriptor already held for that identity (one per directory, so a
-    /// node holds one at most), else opened.
-    fn hold_dir(&self, parent: &DirFd, name: &[u8], want: &sys::Stat) -> Result<Arc<DirFd>, DirError> {
+    /// node already known for that identity (one per directory), now known
+    /// to be there, else a new node with its descriptor opened (a lookup
+    /// reads whether names beneath it fold).
+    fn hold_dir(&self, parent: &DirFd, name: &[u8], want: &sys::Stat) -> Result<Arc<DirNode>, DirError> {
         if let Some(d) = lock(&self.dirs).get(id_of(want)) {
+            if d.id != self.root.id {
+                d.set_place(parent, name);
+            }
             return Ok(d);
         }
         let fd = sys::open_dir(parent.fd.as_fd(), name).map_err(open_err)?;
@@ -435,13 +687,37 @@ impl HostDir {
             return Err(enoent());
         }
         let folds = folds(fd.as_fd()).map_err(err)?;
-        let d = Arc::new(DirFd {
-            fd,
-            id: id_of(&st),
+        let id = id_of(&st);
+        let node = Arc::new_cyclic(|node| DirNode {
+            id,
             folds,
+            place: Mutex::new(Some((parent.node.clone(), name.into()))),
+            fd: Mutex::new(Some(Arc::new(DirFd {
+                fd,
+                id,
+                folds,
+                node: node.clone(),
+            }))),
         });
-        lock(&self.dirs).insert(d.id, &d);
-        Ok(d)
+        lock(&self.dirs).insert(id, &node);
+        self.admit(id, Holder::Dir(Arc::downgrade(&node)));
+        Ok(node)
+    }
+
+    /// A directory the guest renamed, if the server knows it: its new place.
+    fn moved_dir(&self, id: HostId, parent: &DirFd, name: &[u8]) {
+        if id == self.root.id {
+            return;
+        }
+        if let Some(d) = lock(&self.dirs).get(id) {
+            d.set_place(parent, name);
+        }
+    }
+
+    /// Keeps `f` as `leaf`'s held descriptor if it is wider, in the cache.
+    fn hold(&self, leaf: &Arc<Leaf>, f: &Arc<File>, mode: OpenMode) {
+        leaf.hold(f, mode);
+        self.admit(leaf.id, Holder::Leaf(Arc::downgrade(leaf)));
     }
 
     /// The leaf of `id`, made if the server knows none.
@@ -468,7 +744,12 @@ impl HostDir {
     /// directories. ENOENT if none.
     fn locate(&self, leaf: &Leaf) -> Result<At, DirError> {
         let mut failure = None;
-        for (d, n) in leaf.names() {
+        for (node, n) in leaf.names() {
+            // A directory not found again holds none of the leaf's names.
+            let Ok(d) = self.fd_of(&node) else {
+                leaf.remove_name(node.id, &n);
+                continue;
+            };
             match sys::fstatat(d.fd.as_fd(), &n) {
                 Ok(st) if id_of(&st) == leaf.id => {
                     leaf.add_name(&d, &n);
@@ -483,6 +764,7 @@ impl HostDir {
         if let Some((f, mode)) = leaf.held() {
             let st = sys::fstat(f.as_fd()).map_err(err)?;
             if st.nlink == 0 {
+                lock(&self.held).touch(leaf.id);
                 return Ok(At::Unlinked(f, mode));
             }
         }
@@ -493,17 +775,31 @@ impl HostDir {
         Err(failure.unwrap_or_else(enoent))
     }
 
-    /// A name of `id` in a directory the server holds, reading at most
-    /// [`SEARCH_MAX`] entries: an object the guest reaches is beneath one
-    /// (its parent's node holds it), so a name the leaf no longer keeps is
-    /// found here.
+    /// A name of `id` in a directory the guest knows, those the cache holds
+    /// first, reading at most [`SEARCH_MAX`] entries (a directory opened
+    /// again counts as one): an object the guest reaches is beneath one (its
+    /// parent's node), so a name the leaf no longer keeps is found here.
     fn search(&self, id: HostId) -> Option<(Arc<DirFd>, Box<[u8]>, sys::Stat)> {
         if id.volume != self.dev {
             return None;
         }
-        let dirs = lock(&self.dirs).live();
+        let mut dirs = lock(&self.dirs).live();
+        dirs.sort_by_key(|n| n.held().is_none());
         let mut read = 0;
-        for d in dirs {
+        for node in dirs {
+            let d = match node.held() {
+                Some(d) => d,
+                None => {
+                    read += 1;
+                    if read > SEARCH_MAX {
+                        return None;
+                    }
+                    let Ok(d) = self.fd_of(&node) else {
+                        continue;
+                    };
+                    d
+                }
+            };
             let Ok(fd) = sys::reopen_dir(d.fd.as_fd()) else {
                 continue;
             };
@@ -575,7 +871,7 @@ impl HostDir {
     fn meta_fd(&self, node: &HostNode) -> Result<Meta, DirError> {
         match node {
             HostNode::Dir(d) => {
-                let fd = sys::reopen_dir(d.fd.as_fd()).map_err(open_err)?;
+                let fd = sys::reopen_dir(self.fd_of(d)?.fd.as_fd()).map_err(open_err)?;
                 let st = sys::fstat(fd.as_fd()).map_err(err)?;
                 if id_of(&st) != d.id {
                     return Err(enoent());
@@ -705,12 +1001,12 @@ impl ConfinedDir for HostDir {
 
     fn lookup(&self, parent: &HostNode, name: Name<'_>) -> Result<(HostNode, HostStat), DirError> {
         let p = self.dir(parent)?;
-        let st = self.find(p, name.as_bytes())?;
+        let st = self.find(&p, name.as_bytes())?;
         let node = if kind_of(st.mode) == HostKind::Dir {
-            HostNode::Dir(self.hold_dir(p, name.as_bytes(), &st)?)
+            HostNode::Dir(self.hold_dir(&p, name.as_bytes(), &st)?)
         } else {
             let leaf = self.leaf(id_of(&st));
-            leaf.add_name(p, name.as_bytes());
+            leaf.add_name(&p, name.as_bytes());
             HostNode::Leaf(leaf)
         };
         Ok((node, host_stat(&st)))
@@ -719,7 +1015,7 @@ impl ConfinedDir for HostDir {
     fn stat(&self, node: &HostNode) -> Result<HostStat, DirError> {
         match node {
             HostNode::Dir(d) => {
-                let st = sys::fstat(d.fd.as_fd()).map_err(err)?;
+                let st = sys::fstat(self.fd_of(d)?.fd.as_fd()).map_err(err)?;
                 Ok(host_stat(&st))
             }
             HostNode::Leaf(l) => match self.locate(l)? {
@@ -737,8 +1033,8 @@ impl ConfinedDir for HostDir {
                     return Err(enoent());
                 }
                 let f = self.open_leaf(l, mode)?;
-                l.hold(&f, mode);
-                Ok(HostOpen::File(f))
+                self.hold(l, &f, mode);
+                Ok(HostOpen::File(f, l.id))
             }
         }
     }
@@ -758,7 +1054,18 @@ impl ConfinedDir for HostDir {
     }
 
     fn close(&self, open: HostOpen) {
+        // The leaf's descriptor this handle shared, if the cache let it go
+        // while the handle was open, is the cache's again.
+        let back = match &open {
+            HostOpen::File(f, id) => self
+                .known(*id)
+                .filter(|l| l.held().is_some_and(|(h, _)| Arc::ptr_eq(&h, f))),
+            HostOpen::Dir(..) => None,
+        };
         drop(open);
+        if let Some(l) = back {
+            self.admit(l.id, Holder::Leaf(Arc::downgrade(&l)));
+        }
     }
 
     fn create(&self, parent: &HostNode, name: Name<'_>, exclusive: bool) -> Result<(HostNode, HostOpen, HostStat), DirError> {
@@ -771,7 +1078,7 @@ impl ConfinedDir for HostDir {
                 if exclusive {
                     return Err(DirError::Errno(Errno::EEXIST));
                 }
-                if self.exact(p, n).is_err() {
+                if self.exact(&p, n).is_err() {
                     return Err(DirError::Errno(Errno::EEXIST));
                 }
                 match kind_of(st.mode) {
@@ -790,9 +1097,10 @@ impl ConfinedDir for HostDir {
         }
         let f = Arc::new(File::from(fd));
         let leaf = self.leaf(id_of(&st));
-        leaf.add_name(p, n);
-        leaf.hold(&f, OpenMode { read: true, write: true });
-        Ok((HostNode::Leaf(leaf), HostOpen::File(f), host_stat(&st)))
+        leaf.add_name(&p, n);
+        self.hold(&leaf, &f, OpenMode { read: true, write: true });
+        let id = leaf.id;
+        Ok((HostNode::Leaf(leaf), HostOpen::File(f, id), host_stat(&st)))
     }
 
     fn mkdir(&self, parent: &HostNode, name: Name<'_>) -> Result<(HostNode, HostStat), DirError> {
@@ -803,7 +1111,7 @@ impl ConfinedDir for HostDir {
 
     fn unlink(&self, parent: &HostNode, name: Name<'_>, expect: HostId) -> Result<(), DirError> {
         let p = self.dir(parent)?;
-        let st = self.find(p, name.as_bytes())?;
+        let st = self.find(&p, name.as_bytes())?;
         if id_of(&st) != expect {
             return Err(enoent());
         }
@@ -819,7 +1127,7 @@ impl ConfinedDir for HostDir {
 
     fn rmdir(&self, parent: &HostNode, name: Name<'_>, expect: HostId) -> Result<(), DirError> {
         let p = self.dir(parent)?;
-        let st = self.find(p, name.as_bytes())?;
+        let st = self.find(&p, name.as_bytes())?;
         if id_of(&st) != expect {
             return Err(enoent());
         }
@@ -832,13 +1140,13 @@ impl ConfinedDir for HostDir {
     fn rename(&self, from: (&HostNode, Name<'_>), to: (&HostNode, Name<'_>), flags: RenameFlags) -> Result<(), DirError> {
         let fd = self.dir(from.0)?;
         let td = self.dir(to.0)?;
-        let src = self.find(fd, from.1.as_bytes())?;
+        let src = self.find(&fd, from.1.as_bytes())?;
         // The target, if there is one, by its exact name: on a folding
         // volume another name for an object is a collision, not it.
         let target = match sys::fstatat(td.fd.as_fd(), to.1.as_bytes()) {
             Ok(st) => {
                 let same = (src.dev, src.ino) == (st.dev, st.ino);
-                if !same && self.exact(td, to.1.as_bytes()).is_err() {
+                if !same && self.exact(&td, to.1.as_bytes()).is_err() {
                     return Err(DirError::Errno(Errno::EEXIST));
                 }
                 if st.dev != self.dev {
@@ -856,7 +1164,7 @@ impl ConfinedDir for HostDir {
         // exchange is ENOENT, and the rename must store `to` (§4.3).
         if let Some(st) = &target
             && (src.dev, src.ino) == (st.dev, st.ino)
-            && self.exact(td, to.1.as_bytes()).is_err()
+            && self.exact(&td, to.1.as_bytes()).is_err()
         {
             if flags.exchange {
                 return Err(enoent());
@@ -865,11 +1173,12 @@ impl ConfinedDir for HostDir {
                 // Another directory's entry for it: a collision.
                 return Err(DirError::Errno(Errno::EEXIST));
             }
-            self.recase(fd, from.1.as_bytes(), to.1.as_bytes(), flags.noreplace)?;
+            self.recase(&fd, from.1.as_bytes(), to.1.as_bytes(), flags.noreplace)?;
             if let Some(s) = self.known(id_of(&src)) {
                 s.remove_name(fd.id, from.1.as_bytes());
-                s.add_name(td, to.1.as_bytes());
+                s.add_name(&td, to.1.as_bytes());
             }
+            self.moved_dir(id_of(&src), &td, to.1.as_bytes());
             return Ok(());
         }
         // Two names of one object, each stored as given: nothing to do, as
@@ -909,12 +1218,20 @@ impl ConfinedDir for HostDir {
         if let Some(t) = target.and_then(|t| self.known(t)) {
             t.remove_name(td.id, tname);
             if flags.exchange {
-                t.add_name(fd, fname);
+                t.add_name(&fd, fname);
             }
         }
         if let Some(s) = self.known(src) {
             s.remove_name(fd.id, fname);
-            s.add_name(td, tname);
+            s.add_name(&td, tname);
+        }
+        // The directories follow theirs too, so one let go is opened again
+        // where the guest moved it.
+        self.moved_dir(src, &td, tname);
+        if flags.exchange
+            && let Some(t) = target
+        {
+            self.moved_dir(t, &fd, fname);
         }
         Ok(())
     }
@@ -942,12 +1259,12 @@ impl ConfinedDir for HostDir {
             let _ = sys::unlinkat(td.fd.as_fd(), to.1.as_bytes(), false);
             return Err(enoent());
         }
-        l.add_name(td, to.1.as_bytes());
+        l.add_name(&td, to.1.as_bytes());
         Ok(host_stat(&new))
     }
 
     fn read_at(&self, open: &HostOpen, offset: u64, buf: &mut [u8]) -> Result<usize, DirError> {
-        let HostOpen::File(f) = open else {
+        let HostOpen::File(f, _) = open else {
             return Err(DirError::Errno(Errno::EISDIR));
         };
         let mut done = 0;
@@ -966,7 +1283,7 @@ impl ConfinedDir for HostDir {
     }
 
     fn write_at(&self, open: &HostOpen, offset: u64, data: &[u8]) -> Result<usize, DirError> {
-        let HostOpen::File(f) = open else {
+        let HostOpen::File(f, _) = open else {
             return Err(DirError::Errno(Errno::EISDIR));
         };
         let mut done = 0;
@@ -988,7 +1305,7 @@ impl ConfinedDir for HostDir {
 
     fn sync(&self, open: &HostOpen, data_only: bool) -> Result<(), DirError> {
         let fd = match open {
-            HostOpen::File(f) => f.as_fd(),
+            HostOpen::File(f, _) => f.as_fd(),
             HostOpen::Dir(r, _) => {
                 let r = r.borrow();
                 return sys::fsync(r.fd(), data_only).map_err(err);
@@ -1012,7 +1329,7 @@ impl ConfinedDir for HostDir {
     }
 
     fn allocate(&self, open: &HostOpen, offset: u64, len: u64, keep_size: bool, punch: bool) -> Result<(), DirError> {
-        let HostOpen::File(f) = open else {
+        let HostOpen::File(f, _) = open else {
             return Err(DirError::Errno(Errno::EISDIR));
         };
         sys::fallocate(f.as_fd(), offset, len, keep_size, punch).map_err(err)
@@ -1088,11 +1405,11 @@ impl ConfinedDir for HostDir {
 
     fn statfs(&self, node: &HostNode) -> Result<StatFs, DirError> {
         let fd = match node {
-            HostNode::Dir(d) => d.fd.as_fd(),
+            HostNode::Dir(d) => self.fd_of(d)?,
             // Every leaf is on the share's volume.
-            HostNode::Leaf(_) => self.root.fd.as_fd(),
+            HostNode::Leaf(_) => self.root_fd.clone(),
         };
-        let s = sys::fstatvfs(fd).map_err(err)?;
+        let s = sys::fstatvfs(fd.fd.as_fd()).map_err(err)?;
         Ok(StatFs {
             blocks: s.blocks,
             bfree: s.bfree,
@@ -1173,7 +1490,46 @@ fn io_err(e: &std::io::Error) -> DirError {
     err(sys::HostErrno(e.raw_os_error().unwrap_or(5)))
 }
 
+/// What the nodes keep in memory beyond their fixed size: the names
+/// ([`HostDir::footprint`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Footprint {
+    /// Leaves the server knows.
+    pub leaves: usize,
+    /// Directories the server knows, the root's included.
+    pub dirs: usize,
+    /// Names the leaves keep, at most [`NAMES_MAX`] each.
+    pub names: usize,
+    /// Bytes of the leaves' names and the directories' names in their
+    /// parents, at most [`crate::fuse::name::NAME_MAX`] each.
+    pub name_bytes: usize,
+}
+
+/// The most memory one node costs the server on Linux and macOS: its entry
+/// in the node table and the backend's leaf or directory node, with
+/// [`NAMES_MAX`] names of [`crate::fuse::name::NAME_MAX`] bytes each,
+/// allocator rounding and the tables' spare capacity included
+/// (docs/design-fs.md §4.2, Limits; measured by tests/memory.rs, every node
+/// a leaf looked up by more such names than it keeps).
+pub const NODE_BYTES_MAX: usize = 4096;
+
 impl HostDir {
+    /// What the known nodes keep, counted.
+    pub fn footprint(&self) -> Footprint {
+        let mut f = Footprint::default();
+        for l in lock(&self.leaves).live() {
+            let st = lock(&l.state);
+            f.leaves += 1;
+            f.names += st.names.len();
+            f.name_bytes += st.names.iter().map(|(_, _, n)| n.len()).sum::<usize>();
+        }
+        for d in lock(&self.dirs).live() {
+            f.dirs += 1;
+            f.name_bytes += lock(&d.place).as_ref().map_or(0, |(_, n)| n.len());
+        }
+        f
+    }
+
     /// The share root's identity.
     pub fn root_id(&self) -> HostId {
         self.root.id
@@ -1182,5 +1538,57 @@ impl HostDir {
     /// The identity of a node.
     pub fn id(node: &HostNode) -> HostId {
         Self::node_id(node)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(n: u64) -> HostId {
+        HostId { volume: 1, file: u128::from(n) }
+    }
+
+    fn leaf(n: u64) -> Arc<Leaf> {
+        Arc::new(Leaf {
+            id: id(n),
+            state: Mutex::default(),
+        })
+    }
+
+    fn ids(out: &[Holder]) -> Vec<u64> {
+        out.iter()
+            .map(|h| match h {
+                Holder::Leaf(w) => u64::try_from(w.upgrade().unwrap().id.file).unwrap(),
+                Holder::Dir(_) => u64::MAX,
+            })
+            .collect()
+    }
+
+    /// The least recently used goes first; a use moves an entry last; an
+    /// entry whose node is gone is pruned before a live one is let go.
+    #[test]
+    fn test_held_lets_go_the_least_recently_used() {
+        let mut h = Held::new(2);
+        let (a, b, c, d) = (leaf(1), leaf(2), leaf(3), leaf(4));
+        assert!(h.admit(a.id, Holder::Leaf(Arc::downgrade(&a))).is_empty());
+        assert!(h.admit(b.id, Holder::Leaf(Arc::downgrade(&b))).is_empty());
+        h.touch(a.id);
+        assert_eq!(ids(&h.admit(c.id, Holder::Leaf(Arc::downgrade(&c)))), [2]);
+        // Admitted again: used now, not a second entry.
+        assert!(h.admit(a.id, Holder::Leaf(Arc::downgrade(&a))).is_empty());
+        assert_eq!(h.order.len(), 2);
+        drop(c);
+        assert!(h.admit(d.id, Holder::Leaf(Arc::downgrade(&d))).is_empty(), "the dead entry goes first");
+        assert_eq!(h.order.len(), 2);
+        assert_eq!(h.stamp.len(), 2);
+    }
+
+    #[test]
+    fn test_held_keeps_one_at_least() {
+        let mut h = Held::new(0);
+        let (a, b) = (leaf(1), leaf(2));
+        assert!(h.admit(a.id, Holder::Leaf(Arc::downgrade(&a))).is_empty());
+        assert_eq!(ids(&h.admit(b.id, Holder::Leaf(Arc::downgrade(&b)))), [1]);
     }
 }

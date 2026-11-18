@@ -75,7 +75,7 @@ mod linux {
                 return 3;
             }
         };
-        let dir = match HostDir::new(root, Options { case_insensitive_ok: true }) {
+        let dir = match HostDir::new(root, Options { case_insensitive_ok: true, ..Options::default() }) {
             Ok(d) => d,
             Err(r) => {
                 eprintln!("{}", r.0);

@@ -9,7 +9,7 @@
 //! wick-fsd --share-dir DIR --socket PATH --id ID [--read-only]
 //!          [--cache auto|never|always] [--cache-timeout-ms N]
 //!          [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD]
-//!          [--case-insensitive-ok] [--max-nodes N] [--max-handles N] [--max-bytes N]
+//!          [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]
 //! ```
 //!
 //! Stage 0, with the operator's rights and no byte from the VMM: the share's
@@ -46,7 +46,7 @@ struct Args {
 
 const USAGE: &str = "usage: wick-fsd --share-dir DIR --socket PATH --id ID [--read-only] [--cache auto|never|always] \
                      [--cache-timeout-ms N] [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD] \
-                     [--case-insensitive-ok] [--max-nodes N] [--max-handles N] [--max-bytes N]";
+                     [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]";
 
 fn number<T: std::str::FromStr>(flag: &str, v: Option<String>) -> Result<T, String> {
     let v = v.ok_or_else(|| format!("{flag} needs a value"))?;
@@ -73,6 +73,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--gid" => gid = Some(number(&flag, it.next())?),
             "--ready-fd" => ready_fd = Some(number(&flag, it.next())?),
             "--max-nodes" => limits.max_nodes = number(&flag, it.next())?,
+            "--max-held" => limits.max_held = number(&flag, it.next())?,
             "--max-handles" => limits.max_handles = number(&flag, it.next())?,
             "--max-bytes" => limits.max_bytes = number(&flag, it.next())?,
             "--help" | "-h" => return Err(USAGE.into()),
@@ -186,6 +187,7 @@ fn run(args: &Args) -> Result<(), String> {
         root,
         Options {
             case_insensitive_ok: args.case_insensitive_ok,
+            max_held: args.limits.max_held,
         },
     )
     .map_err(|r| r.0)?;

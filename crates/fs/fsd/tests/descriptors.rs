@@ -3,8 +3,9 @@
 
 //! docs/design-fs.md §4.3: the host directory holds at most one descriptor
 //! per node (a directory's own, a leaf's widest open) and one per handle,
-//! the bound stage 0 checks against the host's limit
-//! (`limits::descriptors`). Counted after each step of a guest that tries
+//! with a cache larger than the nodes here (the cache's own bound, which
+//! stage 0 checks against the host's limit, is tests/held.rs's). Counted
+//! after each step of a guest that tries
 //! to hold more: directories looked up again and again, a leaf linked into
 //! directories the guest then forgets (a leaf's names never keep a
 //! directory open), every leaf open twice with different access, every
@@ -51,7 +52,7 @@ fn test_one_descriptor_per_node_and_handle() {
     for j in 0..FILES {
         std::fs::write(base.join(format!("f{j}")), b"x").unwrap();
     }
-    let dir = HostDir::new(sys::open_root(&base).unwrap(), Options { case_insensitive_ok: true }).unwrap();
+    let dir = HostDir::new(sys::open_root(&base).unwrap(), Options { case_insensitive_ok: true, ..Options::default() }).unwrap();
     let mut g = G::new(dir);
     let before = descriptors();
 

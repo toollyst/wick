@@ -248,6 +248,7 @@ fuzz_target!(|input: Input| {
         owner: (1000, 1000),
         limits: Limits {
             max_nodes: 12,
+            max_held: 4,
             max_handles: 4,
             max_bytes: 256 << 10,
             xattr_budget: 256,

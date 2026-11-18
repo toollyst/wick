@@ -7,9 +7,10 @@ decoder of §6, the reply encoder and layer 1 of row 1 with the escape mapping o
 `fs_decode` fuzz target), **wick-fsd's server core over an in-memory directory** (`crates/fs/fsd/src/session.rs`
 and its tables, limits, record and cache modes, the `ConfinedDir` interface of the host backends and `MemDir`, a test
 backend; its unit tests and the `fs_session` fuzz target), **its Linux and macOS host directory** (`crates/fs/fsd/src/host`
-and `crates/fs/sys`, the backend of §4.3, and stage 0's share checks, `stage0.rs`; their unit tests and the
-host-directory tests in `crates/fs/fsd/tests`), **the `wick-fsd` binary on Linux**: stage 0's one connection and peer
-check, the serving loop and Linux's confinement of §6.1 (`crates/fs/fsd/src/{main,serve}.rs`, `confine/linux.rs`,
+and `crates/fs/sys`, the backend of §4.3 with nodes that cost memory only and a cache of held descriptors, and stage
+0's share checks, `stage0.rs`; their unit tests and the host-directory tests in `crates/fs/fsd/tests`), **the
+`wick-fsd` binary on Linux**: stage 0's one connection and peer check, the serving loop and Linux's confinement
+of §6.1 (`crates/fs/fsd/src/{main,serve}.rs`, `confine/linux.rs`,
 `crates/fs/sys/src/unix/confine.rs`; tests `server.rs` and `confine_probe.rs`, and the corpus and link sequences
 against a confined server; macOS's confinement is not built, so there wick-fsd refuses to start,
 `test_refuses_without_confinement`), and the guest
@@ -351,7 +352,7 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
   - only then set up the confinement (§6), with the connected socket and the share root its only handles.
 - Built for Linux (`crates/fs/fsd/src/main.rs`): `wick-fsd --share-dir DIR --socket PATH --id ID [--read-only]
   [--cache auto|never|always] [--cache-timeout-ms N] [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD]
-  [--case-insensitive-ok] [--max-nodes N] [--max-handles N] [--max-bytes N]`. It refuses a socket path that exists
+  [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]`. It refuses a socket path that exists
   (it never removes what it did not make), says it is ready (a byte on `--ready-fd`, else a `ready` line), accepts
   one connection, closes and unlinks the listener at once, and serves only a peer of `--peer-uid` (default: its own
   uid). At the end it writes its counters to stderr (layer-2 refusals among them).
@@ -369,18 +370,32 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
   - server-chosen node ids, never host inode numbers; a request's `nodeid` is looked up, never interpreted.
   - Identity = (volume id, file id) from the open handle: Linux `(st_dev, st_ino)`, macOS `(st_dev, st_ino)`,
     Windows `(VolumeSerialNumber, FileId 128-bit)`.
-  - Entries hold a directory handle (dirs), or on Linux and macOS a leaf: the names it is known by, each
-    re-verified against the identity at use (§4.3).
+  - Entries hold, on Linux and macOS, a directory node (where it is, and its descriptor while the cache holds it)
+    or a leaf (the names it is known by), each re-verified against the identity at use (§4.3); on Windows a handle
+    opened by id.
 - **Limits, identical on every host:**
-  - inode entries: 8192 by default (`DEFAULT_MAX_NODES`), **provisional**: bound by the descriptors each node holds
-    today, too few for a large checkout, until nodes are bounded by memory and descriptors by a cache of held
-    directories (§10, question 11, decided: before fs v1);
+  - inode entries: 2^18 (262144) by default (`DEFAULT_MAX_NODES`; `--max-nodes` sets it per share). On Linux and
+    macOS a node costs memory, not a descriptor (§10, question 11): at most 4096 bytes (`NODE_BYTES_MAX`: its
+    node-table entry, and a leaf with 8 names of 255 bytes, the most it keeps, or a directory node with its name,
+    allocator rounding and the tables' spare capacity included). Measured as the growth of the process's resident
+    memory, every node that worst case: 2768 to 3300 bytes; typical, one short name: 965 to 1116 bytes, the
+    tables' growth included [meas: `test_a_node_costs_at_most_node_bytes_max`, 4096 and 16384 leaves, six runs,
+    macOS 27.2, 2026-11-18]; 3230 and 807 bytes on Linux [meas: the same test, Docker's linuxkit 7.0.14 aarch64 on
+    this Mac, 2026-11-18]. So a share's nodes take at most 1 GiB (2^18 × 4096) whatever the guest does,
+    about 280 MiB when every node is typical, and a VM with N shares N times that; an operator who wants less
+    lowers `--max-nodes`. The bound holds by construction (a leaf keeps at most `NAMES_MAX` names, a
+    name is at most 255 bytes, a directory one name in its parent), which `HostDir::footprint` counts in the same
+    test after more links and long names than a leaf keeps. (The `fs_session` fuzz target drives `MemDir`, whose
+    objects are the share itself, so the bound is checked there over the host directory instead.);
   - open host handles: 1024 by default (`DEFAULT_MAX_HANDLES`; self-limited: Windows has no per-process handle limit
     [meas: `jailer-test.ps1 nofile`]);
-  - the descriptors these let the server hold at once, `limits::descriptors`: one per node, one per handle, and 64 spare
-    (`SPARE_FDS`: the standard streams, the connection, and what one request opens and closes before its reply), 9280 by
-    default. Stage 0 refuses a share whose host limit is below it, so the server itself never meets EMFILE mid-run, and
-    never lowers a limit the operator set. The defaults fit the lowest stock limit with 960 to spare
+  - descriptors the nodes hold at once: 1024 by default, the root's included (`DEFAULT_MAX_HELD`; `--max-held`), a
+    cache whose least recently used is let go first (§4.3); independent of the number of nodes;
+  - the descriptors these let the server hold at once, `limits::descriptors`: the nodes' cache, one per handle, and 64
+    spare (`SPARE_FDS`: the standard streams, the connection, and what one request opens or keeps before its reply),
+    2112 by default, whatever the number of nodes. Stage 0 refuses a share whose host limit is below it, so the server
+    itself never meets EMFILE mid-run, and never lowers a limit the operator set. The defaults fit the lowest stock
+    limit with 8128 to spare
     (`test_default_limits_fit_stock_hosts`): macOS enforces the lower of `RLIMIT_NOFILE` and `kern.maxfilesperproc` (xnu
     `proc_limitgetcur_nofile`) [src], which is `OPEN_MAX`, 10240, on a Mac with 8 GB or less (`bsd_scale_setup` scales
     it only for a scale above 2; `scale_setup` gives 2 below 8 GB and memory / 4 GB above) [src]; 122880 on a 32 GB M1
@@ -388,8 +403,8 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
     `setrlimit`, macOS 27.2, 2026-11-18]; GitHub's ubuntu-latest (Ubuntu 26.04) and ubuntu-24.04-arm runners have a hard
     limit of 65536 (CI run 44188936001, which refused the earlier defaults, 65536 nodes and 4096 handles, 69696
     descriptors); a systemd service, and a login shell started by one, 524288 (`DefaultLimitNOFILE=1024:524288`,
-    systemd-system.conf(5)) [doc]. Windows has no such limit. The cost is the guest's: a guest that keeps more than 8192
-    objects looked up gets ENFILE (§10, question 11);
+    systemd-system.conf(5)) [doc]. Windows has no such limit. A guest that keeps more objects looked up than the node
+    limit gets ENFILE;
   - worker threads; queued requests;
   - name ≤ 255 bytes;
   - xattr value ≤ 64 KiB, list ≤ 64 KiB; a guest xattr name ≤ 120 bytes, ERANGE beyond (macOS keeps names of at
@@ -485,30 +500,70 @@ backend implements: Linux, macOS, Windows, and `MemDir`, an in-memory directory 
 **The Linux and macOS backend** (`crates/fs/fsd/src/host/unix.rs`; every system call in `crates/fs/sys`, the
 server's only unsafe code, `wick-fsd` itself forbids it):
 
-- **Nodes, the same on both hosts.** A directory is held open (`O_RDONLY|O_DIRECTORY`), identified once by
-  `(st_dev, st_ino)`. Any other object is one *leaf* per identity, which keeps:
-  - the names it is known by, as (held directory, name), the most recently used first, at most 8 (`NAMES_MAX`).
-    Every LOOKUP, CREATE and LINK that reaches it adds its name; the guest's UNLINK removes one; RENAME moves one
-    (and takes it from an object renamed over; EXCHANGE swaps them);
-  - once the guest has opened it, the descriptor of its widest open (read-write over write over read), kept
-    until the node is forgotten, as virtiofsd's `O_PATH` descriptor keeps the inode (`test_forget_frees_an_unlinked_file`).
-    It is the open's own descriptor, shared with the handle, so a node holds one descriptor at most (a
-    directory's, or a leaf's) and a handle one: within stage 0's limit of nodes plus handles plus 64 (§4.2,
-    Limits). A leaf only looked up holds none. A directory has one descriptor per identity, held by its node
-    alone: a leaf's names refer to their directories without keeping them open, and a name whose directory the
-    guest forgot is dropped (a guest kernel keeps a parent's node while a child's entry lives, so an honest
-    guest loses no name it uses), so a guest that links a file into directories and forgets them holds no more
-    descriptors (`test_one_descriptor_per_node_and_handle`, which counts them after each step).
+- **Nodes, the same on both hosts.** A node costs memory; the descriptors nodes hold are a cache of at most
+  `--max-held` (1024 by default, the root's included, which is never let go), the least recently used let go
+  first, so the descriptors are bounded whatever the number of nodes (§4.2, Limits).
+  - A directory is one *directory node* per identity, `(st_dev, st_ino)`: where it is (its parent's node and its name
+    there, as the guest last looked it up or renamed it) and, while the cache holds it, its descriptor
+    (`O_RDONLY|O_DIRECTORY`). One the cache let go is opened again by its one name beneath its parent (whose descriptor
+    is found the same way, up to one held or the root), with the same beneath flags as any open, and checked to be the
+    same identity. Where the guest moved it, it is found there; where the host moved, removed or replaced it (a link put
+    in its place included, never followed: Linux's `O_DIRECTORY` answers ENOTDIR before `O_NOFOLLOW`'s ELOOP, macOS
+    ELOOP, both ESTALE), or its parent's node is gone (a guest kernel never forgets a parent while it holds a child: a
+    dentry holds its parent), it is ESTALE until a LOOKUP finds it again, the error Linux's FUSE gives for a node it
+    cannot find again (`fuse_get_dentry`, fs/fuse/inode.c, v6.12, :1018 to :1043: a LOOKUP of `.` that finds nothing, or
+    another generation, is ESTALE) [src] and virtiofsd for an inode whose file handle no longer opens
+    (`--inode-file-handles`, which keeps a file handle in place of an `O_PATH` descriptor per inode [doc];
+    `open_by_handle_at` is ESTALE from `exportfs_decode_fh`, fs/exportfs/expfs.c, v6.12, :166 and :190 [src])
+    (`crates/fs/fsd/tests/stale.rs`). An identity is `(st_dev, st_ino)`, as a leaf's (below, Inode numbers reused). A
+    directory the cache still holds is served wherever the host moved it, as before
+    (`test_a_held_directory_the_host_moved_is_served`).
+  - Any other object is one *leaf* per identity, which keeps the names it is known by, as (directory node, name),
+    the most recently used first, at most 8 (`NAMES_MAX`); every LOOKUP, CREATE and LINK that reaches it adds its
+    name; the guest's UNLINK removes one; RENAME moves one (and takes it from an object renamed over; EXCHANGE
+    swaps them). Once the guest has opened it, the leaf keeps the descriptor of its widest open (read-write over
+    write over read), as virtiofsd's `O_PATH` descriptor keeps the inode, until the node is forgotten
+    (`test_forget_frees_an_unlinked_file`) or the cache lets it go. It is the open's own descriptor, shared with
+    the handle: while a handle shares it, it is the handle's to count and the cache does not take it, so a file
+    the guest unlinked while it holds it open stays served (`test_an_unlinked_file_open_while_the_cache_lets_go_is_served`);
+    once the last such handle closes it is the cache's again. A leaf only looked up holds none.
+  - A leaf's names refer to their directory nodes without keeping a descriptor, and a name whose directory the
+    guest forgot is dropped (an honest guest loses no name it uses), so a guest that links a file into
+    directories and forgets them holds no more descriptors (`test_one_descriptor_per_node_and_handle`); a guest
+    that walks many times more directories and files than the cache holds, one chain 24 deep and 48 side by
+    side, and uses each again after it was let go, never holds more than the cache and its handles
+    (`test_a_walk_beyond_the_cache_holds_at_most_the_cache`, which counts the process's descriptors after every
+    step; the swap race runs again with a cache of two, `test_swap_race`).
+  - **Inode numbers reused.** An object is known by `(st_dev, st_ino)` only, and a file system may give a freed inode
+    number to the next object it makes (ext4 does: `test_a_directory_the_host_removed_or_replaced_is_estale` met it in
+    Docker on this Mac, overlayfs over ext4; APFS does not). A number is freed only once its object has no name and
+    nothing holds it open, so it is never reused while a guest handle, a leaf's held descriptor or a directory's
+    descriptor in the cache holds the object: the guest's I/O goes through its handle's own descriptor, and an open file
+    the host unlinks and replaces is still the guest's file. Reuse is possible for an object the server holds nothing
+    of: a leaf only looked up, or one whose descriptor the cache let go, and a directory the cache let go. If the host
+    removes one, makes another under one of its known names, and the file system gives it the same number, the node is
+    rebound to the new object without an error: the guest then sees the new object's contents, size, times and record
+    under the old node, as if a host process had rewritten the file, or replaced the directory's contents, in place;
+    nothing outside the share is reachable, as the name and the parent are the ones the guest knew. Before the cache, a
+    directory and an opened leaf held their descriptor and were not rebound; a leaf only looked up was, as it is now.
+    Telling the two apart would cost: the birth time, with the identity (Linux `statx` with `STATX_BTIME` where the file
+    system reports it in `stx_mask`, as ext4, btrfs and XFS do, and the identity alone where it does not; macOS
+    `st_birthtimespec` from the `fstatat` the server makes already, APFS and HFS+): 16 bytes a node and no extra system
+    call on either host, since `statx` replaces the `fstatat` on Linux (allowed with `AT_SYMLINK_NOFOLLOW`); two objects
+    born in the same nanosecond with the same number would still be one. The inode generation would need an open and
+    `FS_IOC_GETVERSION` per check on Linux (not in the filter) and is root-only on macOS (xnu's `vn_stat_noauth`,
+    bsd/vfs/vfs_vnops.c, xnu-12377.121.6, :1693, gives `st_gen` 0 to a process that is not root), so it is not a cheap
+    check on either. Not built (open question 12, §10).
 
   Each use finds the object by the first known name that still is it (`fstatat`, then the identity checked with
   `fstat` on anything opened): a host's swap is ENOENT, never another object. When no known name is it:
   - an object with no name at all (`nlink` 0: unlinked while the guest holds it) is served through the held
     descriptor: GETATTR and SETATTR with or without the handle flag, a new OPEN the descriptor's access covers,
     and truncation if it may write; LINK is ENOENT, as Linux's `link(2)` of an unlinked file;
-  - any other is looked for in the directories the server holds, at most 65536 entries per search
-    (`SEARCH_MAX`), each a guest name checked by `fstatat` (overlayfs's `d_ino` is not always `st_ino`). An
-    object the guest reaches has its parent's node held, so a name the leaf pushed out is found; one the host
-    moved out of every held directory is ENOENT.
+  - any other is looked for in the directories the guest knows, those the cache holds first, at most 65536 entries
+    per search (`SEARCH_MAX`; a directory opened again counts as one), each a guest name checked by `fstatat`
+    (overlayfs's `d_ino` is not always `st_ino`). An object the guest reaches has its parent's node, so a name the
+    leaf pushed out is found; one the host moved out of every directory the guest knows is ENOENT.
 
   So the guest's own links, renames and unlinks never make a live object ENOENT
   (`crates/fs/fsd/tests/links.rs`: each sequence over `MemDir` and over the host directory: a link's other name
@@ -942,8 +997,12 @@ it means layer 1 let the request through.
     per inode under a limit raised to `fs.nr_open`, would not. Recommendation: decouple the two, nodes bounded by memory
     (a node is a few hundred bytes) and descriptors by a cache of held directories closed least recently used first and
     reopened by name beneath a held parent as leaves are now, so the descriptor bound stays fixed and the node limit can
-    be 2^20; its own commit, with the leaf tests and the race over it. Decided: required before fs v1, the commit after
-    staging 6; a directory that cannot be found again is the error Linux's FUSE and virtiofsd give for a stale node.
+    be 2^20; its own commit, with the leaf tests and the race over it. **Resolved:** decoupled (§4.3, Nodes), the
+    node limit 2^18 by default (a worst-case node is 4 KiB, so 2^20 would let a guest hold 4 GiB of the host's
+    memory; §4.2, Limits), and a directory that cannot be found again is ESTALE.
+12. **Inode numbers reused** (§4.3): a node the server holds nothing of is rebound, with no error, to an object
+    the host made under its name with a reused inode number. Recommendation: the birth time with the identity
+    (16 bytes a node, no extra call on either host), where the file system reports one; decide before fs v1.
 
 ---
 

@@ -161,6 +161,7 @@ pub fn open(share: &Share, home: Option<&Path>) -> Result<HostDir, Refusal> {
         checked.root,
         Options {
             case_insensitive_ok: share.case_insensitive_ok,
+            max_held: share.limits.max_held,
         },
     )
 }
@@ -234,7 +235,7 @@ pub fn check(share: &Share, home: Option<&Path>) -> Result<Checked, Refusal> {
         if hard < need {
             return Err(Refusal(format!(
                 "the {LIMIT} ({hard}) is below the {need} descriptors this share's limits may hold open \
-                 (nodes + handles + {SPARE_FDS}); raise it, or lower the limits"
+                 (held descriptors + handles + {SPARE_FDS}); raise it, or lower the limits"
             )));
         }
         sys::set_nofile(need).map_err(|e| Refusal(format!("RLIMIT_NOFILE to {need}: {e:?}")))?;

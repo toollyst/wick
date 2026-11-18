@@ -39,7 +39,7 @@ fn test_forget_frees_an_unlinked_file() {
 
     // The host directory: the held descriptor closes when the node goes.
     let base = scratch("forget");
-    let dir = HostDir::new(sys::open_root(&base).unwrap(), Options { case_insensitive_ok: true }).unwrap();
+    let dir = HostDir::new(sys::open_root(&base).unwrap(), Options { case_insensitive_ok: true, ..Options::default() }).unwrap();
     let mut g = G::new(dir);
     let before = descriptors();
     let (n, fh) = g.create(ROOT, b"f");

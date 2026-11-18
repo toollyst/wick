@@ -171,7 +171,11 @@ impl H {
         let root = sys::open_root(&share).unwrap();
         // The test volumes of macOS fold case; the backend then checks every
         // name it finds (which is what these tests exercise there).
-        let dir = HostDir::new(root, Options { case_insensitive_ok: true }).unwrap();
+        let options = Options {
+            case_insensitive_ok: true,
+            max_held: config.limits.max_held,
+        };
+        let dir = HostDir::new(root, options).unwrap();
         let config = Config {
             owner: (UID, GID),
             ..config

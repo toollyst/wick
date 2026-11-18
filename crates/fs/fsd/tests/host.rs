@@ -38,7 +38,7 @@ fn xattr_get(path: &Path, n: &[u8]) -> Option<Vec<u8>> {
 #[test]
 fn test_mount_point_beneath_the_share_is_exdev() {
     let mount = if cfg!(target_os = "macos") { &b"dev"[..] } else { b"proc" };
-    let mut s = session_over(Path::new("/"), Options { case_insensitive_ok: true }, Config::default()).unwrap();
+    let mut s = session_over(Path::new("/"), Options { case_insensitive_ok: true, ..Options::default() }, Config::default()).unwrap();
     let (e, _) = call(&mut s, Opcode::Lookup, ROOT, &[&name(mount)]);
     assert_eq!(errno(e), Errno::EXDEV);
     // Listed, as the host lists it; never entered.
@@ -206,6 +206,7 @@ fn share(dir: &Path, read_only: bool) -> Share {
         case_insensitive_ok: true,
         limits: Limits {
             max_nodes: 256,
+            max_held: 256,
             max_handles: 64,
             ..Limits::default()
         },
@@ -239,10 +240,10 @@ fn test_stage0_refusals() {
     let (_, hard) = sys::nofile().unwrap();
     let small = share(&home.join("src"), false).limits;
     let spare = descriptors(&small) - 256;
-    if let Some(nodes) = hard.checked_sub(spare).and_then(|n| n.checked_add(1)).and_then(|n| usize::try_from(n).ok()) {
+    if let Some(held) = hard.checked_sub(spare).and_then(|n| n.checked_add(1)).and_then(|n| usize::try_from(n).ok()) {
         let big = Share {
             limits: Limits {
-                max_nodes: nodes,
+                max_held: held,
                 ..small
             },
             ..share(&home.join("src"), false)
@@ -253,7 +254,7 @@ fn test_stage0_refusals() {
         // And exactly the limit is served.
         let fits = Share {
             limits: Limits {
-                max_nodes: nodes - 1,
+                max_held: held - 1,
                 ..small
             },
             ..big
@@ -339,7 +340,7 @@ fn test_stage0_and_renames_on_other_volumes() {
         after("C"),
         after("D")
     );
-    let mut s = session_over(&dir, Options { case_insensitive_ok: true }, Config::default()).unwrap();
+    let mut s = session_over(&dir, Options { case_insensitive_ok: true, ..Options::default() }, Config::default()).unwrap();
     let (e, _) = call(&mut s, Opcode::Rename2, ROOT, &[&rn2(ROOT, 2), &name(b"A"), &name(b"B")]);
     let outcome = exchange_outcome(&dir, e);
     eprintln!("exchange on msdos: {outcome}");
@@ -373,7 +374,7 @@ fn test_stage0_and_renames_on_other_volumes() {
     assert!(e.0.contains("case-insensitive"), "{}", e.0);
     std::fs::write(dir.join("A"), b"a").unwrap();
     std::fs::write(dir.join("B"), b"b").unwrap();
-    let mut s = session_over(&dir, Options { case_insensitive_ok: true }, Config::default()).unwrap();
+    let mut s = session_over(&dir, Options { case_insensitive_ok: true, ..Options::default() }, Config::default()).unwrap();
     // Case: a lookup by another case is not the file (a negative entry with
     // the default cache mode: node id 0).
     let (e, out) = call(&mut s, Opcode::Lookup, ROOT, &[&name(b"a")]);

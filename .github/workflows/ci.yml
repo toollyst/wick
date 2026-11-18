@@ -1313,6 +1313,13 @@ jobs:
         run: >-
           cargo test --locked -p wick-fsd --test host -- --exact test_stage0_and_renames_on_other_volumes --nocapture 2>&1
           | grep -E "^msdos on|^exchange on|test result"
+      # On record: what a node costs in memory here, worst case and typical,
+      # for design-fs §4.2 (the test also asserts the worst case's bound).
+      - name: Node memory on record
+        if: runner.os != 'Windows'
+        run: >-
+          cargo test --locked -p wick-fsd --test memory -- --nocapture 2>&1
+          | grep -E "^memory:|test result"
       # Every test's result in one format (tools/ci-results.py, results.tsv),
       # for the docs' run claims; a step that did not run gives no rows.
       - name: Results in one format

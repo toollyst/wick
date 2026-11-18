@@ -242,7 +242,8 @@ decoder and guest-name rules (`crates/fs/fsd/src/fuse`, its unit tests and the `
 server core over an in-memory test directory (`crates/fs/fsd/src/session.rs`, the `fs_session` fuzz target), its
 Linux and macOS host directory with stage 0's share checks (`crates/fs/fsd/src/host`, `crates/fs/sys`; the traversal
 corpus and swap race against a real directory, `test_traversal_corpus`, `test_swap_race`; the guest's links, renames
-and unlinks of held and open files over the model and the host, `crates/fs/fsd/tests/links.rs`), the `wick-fsd`
+and unlinks of held and open files over the model and the host, `crates/fs/fsd/tests/links.rs`; nodes that cost
+memory only and a cache of held descriptors, `held.rs`, `stale.rs`, `memory.rs`), the `wick-fsd`
 binary confined on Linux (namespaces, `pivot_root` into the share, the id and capability drop, `no_new_privs`, Landlock
 where present and a seccomp allow-list; `test_confined_status`, `confine_probe`, one refusal test per step, and the
 corpus against the confined server), and guest kernels with

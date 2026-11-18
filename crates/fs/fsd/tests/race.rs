@@ -5,7 +5,10 @@
 //! in the share with a symlink to a directory outside it, atomically and
 //! without pause, while the guest works through the name. Nothing may happen
 //! outside the share; a layer-2 refusal is the expected answer to a swap
-//! that lands between the server's look and its open.
+//! that lands between the server's look and its open. It runs twice: with
+//! the default cache of held descriptors, and with a cache of two, where
+//! every directory is opened again by its name between requests (ESTALE
+//! when the swap moved it, docs/design-fs.md §4.3).
 //!
 //! `WICK_FS_RACE_ITERATIONS` sets the guest's rounds (default 10⁵, each
 //! about ten requests: 10⁶ requests against the swap). A
@@ -26,6 +29,8 @@ use std::time::{Duration, Instant};
 use common::*;
 use wick_fs_sys as sys;
 use wick_fsd::fuse::{Errno, Opcode};
+use wick_fsd::limits::Limits;
+use wick_fsd::session::Config;
 
 fn watchdog(progress: Arc<AtomicU64>, done: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -49,7 +54,25 @@ fn test_swap_race() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(100_000);
-    let mut h = H::new("race");
+    race("race", Limits::default(), rounds);
+    // A cache of two (the root and one more): every directory is let go
+    // between requests and opened again by its name while the swap runs.
+    race(
+        "race-held",
+        Limits {
+            max_held: 2,
+            ..Limits::default()
+        },
+        rounds / 2,
+    );
+}
+
+fn race(tag: &str, limits: Limits, rounds: u64) {
+    let config = Config {
+        limits,
+        ..Config::default()
+    };
+    let mut h = H::with(tag, config, |_| {});
     let outside = h.outside.clone();
     std::fs::create_dir(h.share.join("d")).unwrap();
     std::fs::write(h.share.join("d/inner"), b"in").unwrap();
@@ -96,7 +119,7 @@ fn test_swap_race() {
                     made += 1;
                     h.raw(Opcode::Forget as u32, f, &[&le64(1)], 0);
                 }
-                Err(e) => assert!(matches!(e, Errno::EEXIST | Errno::ENOENT | Errno::EACCES), "{e:?}"),
+                Err(e) => assert!(matches!(e, Errno::EEXIST | Errno::ENOENT | Errno::EACCES | Errno::ESTALE), "{e:?}"),
             }
             if let Ok(e) = h.lookup(node, b"inner") {
                 let inner = u64_at(&e, 0);
@@ -106,8 +129,7 @@ fn test_swap_race() {
                 }
                 h.raw(Opcode::Forget as u32, inner, &[&le64(1)], 0);
             }
-            // The new directory's node forgotten, as a guest kernel does
-            // (the node limit is the default's, 8192).
+            // The new directory's node forgotten, as a guest kernel does.
             if let (0, e) = h.call(Opcode::Mkdir, node, &[&le32(0o755), &le32(0), &name(b"sub")]) {
                 h.raw(Opcode::Forget as u32, u64_at(&e, 0), &[&le64(1)], 0);
             }
@@ -140,8 +162,9 @@ fn test_swap_race() {
     assert_eq!(snapshot(&outside), canaries, "the directory outside the share changed");
     h.canaries_untouched();
     eprintln!(
-        "test_swap_race: {rounds} rounds in {:.1?}, {} swaps; directory {dirs}, symlink {links}, files made {made}, \
+        "test_swap_race ({tag}, {} held): {rounds} rounds in {:.1?}, {} swaps; directory {dirs}, symlink {links}, files made {made}, \
          layer-2 refusals {}",
+        limits.max_held,
         start.elapsed(),
         swaps.load(Ordering::SeqCst),
         h.s.counters().layer_refusals

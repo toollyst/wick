@@ -62,7 +62,7 @@ fn names(dir: &Path) -> Vec<String> {
 fn case_collisions(dir: &Path) {
     std::fs::write(dir.join("Foo"), b"f").unwrap();
     std::fs::write(dir.join("x"), b"").unwrap();
-    let mut s = session_over(dir, Options { case_insensitive_ok: true }, Config::default()).unwrap();
+    let mut s = session_over(dir, Options { case_insensitive_ok: true, ..Options::default() }, Config::default()).unwrap();
     let node = lookup(&mut s, b"Foo").unwrap();
     assert_eq!(lookup(&mut s, b"foo"), Err(Errno::ENOENT));
     assert_eq!(lookup(&mut s, b"FOO"), Err(Errno::ENOENT));
