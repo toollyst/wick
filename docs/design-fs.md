@@ -101,8 +101,9 @@ documented or measured; **measure** = the fix is designed, a measurement on the 
 8. **Home and system directories are refused as share roots by default** (row 12), because host tools read what a
    guest writes there.
 
-Still open: the performance of the split design against vhost-user (to be measured first, row 22), and whether the
-extension point can carry a `VirtioDeviceType::Fs` variant and metrics generically.
+Still open: the performance of the split design against vhost-user (to be measured first, row 22). The extension
+point carries the `VirtioDeviceType::Fs` variant and metrics generically (patch 0056: `Extension::write_metrics`, a
+`wick` object in the metrics line, none without an extension's metrics).
 
 ---
 
@@ -1334,8 +1335,9 @@ it means layer 1 let the request through.
 5. **Quota:** decided for a byte budget in the server (§0, decision 7).
 6. **Performance of C** vs vhost-user (measure before deciding whether a VMM↔server bounce ring, never guest
    memory, is needed).
-7. **Patch footprint:** a `VirtioDeviceType::Fs` variant, metrics, and later persist. Can the extension point carry
-   these generically for future devices?
+7. **Patch footprint:** a `VirtioDeviceType::Fs` variant, metrics, and later persist. Answered for the variant and
+   metrics: patch 0056 (the variant; `Extension::write_metrics`, generic for later devices); persist is not needed
+   while a snapshot with fs is refused.
 8. **Read-only shares on macOS/Windows:** do atime updates on reads (virtiofsd notes this on Linux) matter to
    operators?
 9. Share roots: home and system locations are refused by default (§0, decision 8). The list per host is §4.3's,

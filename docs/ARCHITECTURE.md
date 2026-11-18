@@ -46,7 +46,7 @@ Code that is new rather than a change to an upstream file lives outside the
 submodule. The overlay modules are declared from upstream's `vmm/src/lib.rs`
 with `#[path = "../../../../../overlay/vmm/..."]`, so they are part of the vmm
 crate (`crate::` paths work) while their files belong to wick. The patches
-therefore only change existing upstream files: 55 feature patches touching 88
+therefore only change existing upstream files: 56 feature patches touching 91
 files.
 
 ## Layers
@@ -126,7 +126,15 @@ firecracker binary, vmm   (upstream source + patches/)
    from a few fixed places, and `wick-ext` implements the features
    (`PUT /extensions/{name}`, the config file's `extensions` section). It has
    none yet: every extension request is refused as unknown and nothing is
-   attached at boot (`crates/ext`, `test_unknown_extension_is_rejected`).
+   attached at boot (`crates/ext`, `test_unknown_extension_is_rejected`). The
+   metrics line carries an extension's metrics as a `wick` object, and is
+   upstream's line, byte for byte, when it has none
+   (`test_no_extension_metrics_leave_the_line_as_upstreams`). Virtio device
+   type 26, virtio-fs, is known to the device manager for host folder sharing
+   (`test_fs_device_type_is_26`; the `fs` feature, off by default; no device
+   yet, docs/design-fs.md). A snapshot with such a device is refused before
+   any state is saved (`Vmm::check_unsnapshottable_devices`), not tested
+   until the device exists.
 6. **No pretending.** If a host lacks a facility, wick builds the same
    semantics itself: io_uring → worker-thread queues, seccomp-BPF → Seatbelt,
    SSBD → `PSTATE.SSBS`, holes APFS fills → restored with `F_PUNCHHOLE`, TAP →

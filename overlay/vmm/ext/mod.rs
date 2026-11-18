@@ -95,6 +95,14 @@ pub trait Extension: Send + Sync + Debug {
     fn snapshot_blocker(&self) -> Option<String> {
         None
     }
+
+    /// Adds the extension's metrics to `out`, each under a name of its own
+    /// (`fs_<id>`, ...). Firecracker's metrics line carries them as a `wick`
+    /// object; with none added it has no `wick` key and is upstream's line.
+    /// Called wherever upstream writes the line, a fatal signal's handler
+    /// included, so it reads counters and takes no lock a device holds while
+    /// it works.
+    fn write_metrics(&self, _out: &mut serde_json::Map<String, Value>) {}
 }
 
 /// What an extension may use while the microVM is built.
@@ -239,6 +247,45 @@ pub(crate) fn attach_boot_devices(
     })
 }
 
+/// The registered extension's metrics ([`Extension::write_metrics`]): empty
+/// without an extension or when it has none.
+pub fn write_metrics() -> serde_json::Map<String, Value> {
+    write_metrics_with(registered())
+}
+
+fn write_metrics_with(extension: Option<&dyn Extension>) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    if let Some(extension) = extension {
+        extension.write_metrics(&mut out);
+    }
+    out
+}
+
+/// The field of upstream's `FirecrackerMetrics` that carries the extension's
+/// metrics. Flattened into the line, it adds `"wick": {...}` when
+/// [`write_metrics`] has any, and nothing otherwise, so the line is then
+/// byte for byte upstream's.
+#[derive(Debug, Default)]
+pub struct ExtMetricsSerializeProxy;
+
+impl serde::Serialize for ExtMetricsSerializeProxy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_metrics(&write_metrics(), serializer)
+    }
+}
+
+fn serialize_metrics<S: serde::Serializer>(
+    metrics: &serde_json::Map<String, Value>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(None)?;
+    if !metrics.is_empty() {
+        map.serialize_entry("wick", metrics)?;
+    }
+    map.end()
+}
+
 /// Fails if an extension cannot be snapshotted. Called before a snapshot is created.
 pub(crate) fn check_snapshot() -> Result<(), ExtError> {
     check_snapshot_with(registered())
@@ -259,6 +306,7 @@ mod tests {
     struct Recorder {
         configured: Mutex<Vec<ExtRequest>>,
         blocker: Option<String>,
+        metrics: Option<(String, Value)>,
     }
 
     impl Extension for Recorder {
@@ -276,6 +324,12 @@ mod tests {
 
         fn snapshot_blocker(&self) -> Option<String> {
             self.blocker.clone()
+        }
+
+        fn write_metrics(&self, out: &mut serde_json::Map<String, Value>) {
+            if let Some((name, value)) = &self.metrics {
+                out.insert(name.clone(), value.clone());
+            }
         }
     }
 
@@ -335,5 +389,63 @@ mod tests {
         };
         check_snapshot_with(Some(&ext)).unwrap_err();
         check_snapshot_with(Some(&Recorder::default())).unwrap();
+    }
+
+    /// A line of two fields with the extension's metrics flattened in, as
+    /// `FirecrackerMetrics` has them.
+    #[derive(serde::Serialize)]
+    struct Line<'a> {
+        first: u32,
+        #[serde(flatten)]
+        wick: Wick<'a>,
+        last: &'static str,
+    }
+
+    struct Wick<'a>(&'a serde_json::Map<String, Value>);
+
+    impl serde::Serialize for Wick<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serialize_metrics(self.0, serializer)
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct Upstream {
+        first: u32,
+        last: &'static str,
+    }
+
+    #[test]
+    fn test_no_extension_metrics_leave_the_line_as_upstreams() {
+        let upstream = serde_json::to_string(&Upstream { first: 1, last: "x" }).unwrap();
+        for metrics in [write_metrics_with(None), write_metrics_with(Some(&Recorder::default()))] {
+            assert!(metrics.is_empty());
+            let line = serde_json::to_string(&Line { first: 1, wick: Wick(&metrics), last: "x" }).unwrap();
+            assert_eq!(line, upstream);
+        }
+        // No extension is registered in these tests: Firecracker's own line
+        // has no `wick` key.
+        assert!(write_metrics().is_empty());
+        let line = serde_json::to_string(&*crate::logger::METRICS).unwrap();
+        assert!(!line.contains("\"wick\""), "{line}");
+    }
+
+    #[test]
+    fn test_extension_metrics_are_a_wick_object() {
+        let ext = Recorder {
+            metrics: Some(("fs_share".to_string(), serde_json::json!({"requests": 3}))),
+            ..Default::default()
+        };
+        let metrics = write_metrics_with(Some(&ext));
+        let line = serde_json::to_string(&Line { first: 1, wick: Wick(&metrics), last: "x" }).unwrap();
+        assert_eq!(line, r#"{"first":1,"wick":{"fs_share":{"requests":3}},"last":"x"}"#);
+    }
+
+    #[test]
+    fn test_fs_device_type_is_26() {
+        use crate::devices::virtio::device::VirtioDeviceType;
+        assert_eq!(VirtioDeviceType::Fs as u8, 26, "VIRTIO_ID_FS, the virtio spec's file system device");
+        let text = serde_json::to_string(&VirtioDeviceType::Fs).unwrap();
+        assert_eq!(serde_json::from_str::<VirtioDeviceType>(&text).unwrap(), VirtioDeviceType::Fs);
     }
 }

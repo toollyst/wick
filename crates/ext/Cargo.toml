@@ -11,6 +11,11 @@ description = "Features of wick, attached through vmm::ext."
 [lib]
 bench = false
 
+[features]
+# Host folder sharing (virtio-fs), off by default: Firecracker's `fs`
+# feature turns it on (docs/design-fs.md).
+fs = []
+
 [dependencies]
 vmm = { path = "../../lib/firecracker/src/vmm" }
 

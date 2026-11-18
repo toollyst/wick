@@ -250,8 +250,11 @@ where present and a seccomp allow-list, its waiting parent confined too, and eve
 against the confined server) and on macOS (a Seatbelt profile that kills whatever it does not allow: each file
 operation the server makes allowed in the share alone, the system calls, Mach traps and MIG routines it makes
 listed, as root the drop to `--uid`/`--gid`, read back before serving; `confine_probe`, and every request kind, the
-corpus and the link sequences against the confined server), and guest kernels with
-`CONFIG_VIRTIO_FS` built by CI's `guest-kernels` job (`tools/linux/guest-kernel.sh`); nothing a guest can use yet. The plan:
+corpus and the link sequences against the confined server), guest kernels with
+`CONFIG_VIRTIO_FS` built by CI's `guest-kernels` job (`tools/linux/guest-kernel.sh`), and in Firecracker the device
+type 26 with a snapshot refused, the `fs` feature (off by default) and the extension's metrics in the metrics line
+(patch 0056, `test_fs_device_type_is_26`, `test_no_extension_metrics_leave_the_line_as_upstreams`); nothing a guest
+can use yet. The plan:
 
 - The device in Firecracker only copies bounded, unparsed requests between the virtqueues and one socket.
 - A separate server, `wick-fsd`, one per share, parses FUSE and does the file operations. It never sees guest

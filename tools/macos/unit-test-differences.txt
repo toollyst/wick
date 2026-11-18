@@ -76,7 +76,7 @@
 # `python3 -I tools/macos/check-unit-tests.py --list-only`, which builds and
 # lists the tests without running them and compares the counts a run gives
 # when exactly the listed tests fail.
-#   count vmm 933 pass 139 fail 85 ignored
+#   count vmm 936 pass 139 fail 85 ignored
 #   count acpi-tables 22 pass 0 fail 0 ignored
 #   count clippy-tracing 17 pass 0 fail 0 ignored
 #   count cpu-template-helper 26 pass 5 fail 0 ignored

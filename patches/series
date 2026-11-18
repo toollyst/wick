@@ -55,3 +55,4 @@
 0053-tests-a-slot-plugged-after-a-userfaultfd-restore-sti.patch
 0054-vmm-anonymous-guest-RAM-is-committed-through-one-sea.patch
 0055-cpu-template-helper-macOS-the-firmware-test-decodes-.patch
+0056-vmm-virtio-fs-device-type-26-the-fs-feature-and-exte.patch

@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Wed, 18 Nov 2026 21:26:45 +0900
+Subject: [PATCH] vmm: virtio-fs device type (26), the fs feature and extension
+ metrics
+
+VirtioDeviceType::Fs (VIRTIO_ID_FS): full_config has no entry for it (its
+extension configures it), the MMIO and PCI saves save nothing for it, and
+Vmm::check_unsnapshottable_devices refuses a snapshot with one before any
+state is saved. Firecracker's `fs` feature turns on wick-ext's. The metrics
+line carries the registered extension's metrics as a `wick` object, and
+nothing when it has none (vmm::ext::ExtMetricsSerializeProxy).
+---
+ src/firecracker/Cargo.toml             | 2 ++
+ src/vmm/src/device_manager/pci_mngr.rs | 4 ++++
+ src/vmm/src/device_manager/persist.rs  | 4 ++++
+ src/vmm/src/devices/virtio/device.rs   | 3 +++
+ src/vmm/src/lib.rs                     | 8 ++++++++
+ src/vmm/src/logger/metrics.rs          | 7 +++++++
+ 6 files changed, 28 insertions(+)
+
+diff --git a/src/firecracker/Cargo.toml b/src/firecracker/Cargo.toml
+index 38728c506c0dc24f1293a4fbe4b2a2771020a1ff..84273b8060f57758d10c0d20a5056dccbc0b914c 100644
+--- a/src/firecracker/Cargo.toml
++++ b/src/firecracker/Cargo.toml
+@@ -18,6 +18,8 @@ bench = false
+ [features]
+ tracing = ["log-instrument", "utils/tracing", "vmm/tracing"]
+ fuzzing = ["vmm/fuzzing"]
++# wick: host folder sharing (virtio-fs), off by default (docs/design-fs.md).
++fs = ["wick-ext/fs"]
+ gdb = ["vmm/gdb"]
+ 
+ [dependencies]
+diff --git a/src/vmm/src/device_manager/pci_mngr.rs b/src/vmm/src/device_manager/pci_mngr.rs
+index 1dee825c7aa6c1e6027c322c8b13fcf43a82a05c..161d7da27fd796c8b6dcf11e8171cc5a9a9cdfee 100644
+--- a/src/vmm/src/device_manager/pci_mngr.rs
++++ b/src/vmm/src/device_manager/pci_mngr.rs
+@@ -495,6 +495,10 @@ impl<'a> Persist<'a> for PciDevices {
+                         transport_state,
+                     })
+                 }
++                // wick: never saved; `Vmm::save_state` refuses a snapshot
++                // with a virtio-fs device before any state is saved
++                // (`check_unsnapshottable_devices`).
++                VirtioDeviceType::Fs => {}
+             }
+         }
+ 
+diff --git a/src/vmm/src/device_manager/persist.rs b/src/vmm/src/device_manager/persist.rs
+index 0037dbe84adb22d1ed7ff34eacaf78f8ddd6cac9..821a42f5e67e34ed8599935e5a702d3498cbc8f7 100644
+--- a/src/vmm/src/device_manager/persist.rs
++++ b/src/vmm/src/device_manager/persist.rs
+@@ -391,6 +391,10 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
+                         device_info,
+                     });
+                 }
++                // wick: never saved; `Vmm::save_state` refuses a snapshot
++                // with a virtio-fs device before any state is saved
++                // (`check_unsnapshottable_devices`).
++                VirtioDeviceType::Fs => {}
+             };
+ 
+             Ok(())
+diff --git a/src/vmm/src/devices/virtio/device.rs b/src/vmm/src/devices/virtio/device.rs
+index 31a6a932eca6bfda3ce752a74f8305a82055cbcc..d7a9ecf4f1a57d85216f739434bd30b4b60b88a9 100644
+--- a/src/vmm/src/devices/virtio/device.rs
++++ b/src/vmm/src/devices/virtio/device.rs
+@@ -70,6 +70,9 @@ pub enum VirtioDeviceType {
+     Vsock = virtio_ids::VIRTIO_ID_VSOCK as u8,
+     Mem = virtio_ids::VIRTIO_ID_MEM as u8,
+     Pmem = virtio_ids::VIRTIO_ID_PMEM as u8,
++    // wick: virtio-fs (host folder sharing), a device of wick-ext's; its
++    // snapshot is refused (`Vmm::check_unsnapshottable_devices`).
++    Fs = virtio_ids::VIRTIO_ID_FS as u8,
+ }
+ 
+ /// Unique identifier for a virtio device: its type and string ID.
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index 2ae177efa06110148fef559e424a011aac6bad45..0f6b5b0d402ac1627ba025a34123f7abdf15b43a 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -417,6 +417,9 @@ impl Vmm {
+                         memory_hotplug = Some(MemoryHotplugConfig::from(m));
+                     }
+                 }
++                // wick: a virtio-fs device is configured through its
++                // extension (`PUT /extensions/fs`), not upstream's config.
++                VirtioDeviceType::Fs => {}
+             });
+ 
+         let mmds_config = mmds_ref.map(|mmds| {
+@@ -470,6 +473,11 @@ impl Vmm {
+                 {
+                     tuples.push(("vhost-user-block", b.id().to_owned()));
+                 }
++                // wick: a virtio-fs device's state is the server's, out of
++                // the VMM: no snapshot (docs/design-fs.md row 17).
++                if let VirtioDeviceType::Fs = device_type {
++                    tuples.push(("virtio-fs", device.id().to_owned()));
++                }
+             });
+         if tuples.is_empty() {
+             Ok(())
+diff --git a/src/vmm/src/logger/metrics.rs b/src/vmm/src/logger/metrics.rs
+index aba032d789cb990d068dd58354e26b3f91188f1c..6caea6cf928a3b1419de02695c9eaf6a8149a0bb 100644
+--- a/src/vmm/src/logger/metrics.rs
++++ b/src/vmm/src/logger/metrics.rs
+@@ -1055,6 +1055,11 @@ pub struct FirecrackerMetrics {
+     #[serde(flatten)]
+     /// Virtio-mem device related metrics (memory hotplugging)
+     pub memory_hotplug_ser: MemoryHotplugSerializeProxy,
++    // wick: the registered extension's metrics, a `wick` object, or nothing
++    // (the line as upstream's) when it has none.
++    #[serde(flatten)]
++    /// Metrics of wick's extension (`crate::ext::write_metrics`).
++    pub wick_ser: crate::ext::ExtMetricsSerializeProxy,
+ }
+ impl FirecrackerMetrics {
+     /// Const default construction.
+@@ -1085,6 +1090,8 @@ impl FirecrackerMetrics {
+             vhost_user_ser: VhostUserMetricsSerializeProxy {},
+             interrupts: InterruptMetrics::new(),
+             memory_hotplug_ser: MemoryHotplugSerializeProxy {},
++            // wick: the extension's metrics.
++            wick_ser: crate::ext::ExtMetricsSerializeProxy,
+         }
+     }
+ }
