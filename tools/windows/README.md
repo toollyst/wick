@@ -22,8 +22,13 @@
   `cgroup.freeze` and `cgroup.events`, invalid values restored, the jail
   unable to write its control file, the jailer's death ending a frozen jail,
   `freezer.state=FROZEN` at the start holding the operator's command, plain
-  and with `--daemonize`, `--new-pid-ns` and both, each case reported; it
-  prints the Windows build), `cpuset` (`cpuset.cpus` is the jailed process's
+  and with `--daemonize`, `--new-pid-ns` and both, each case reported, with
+  when each relaunched jailer, the jail and any console host started after
+  `THAWED` (a WMI process trace, elevated only), and on a failure what the
+  stage saw: the jailers' starts and exit statuses, those alive with their
+  command lines, the pid file, the root's files and the control file; it
+  prints the Windows build and whether Defender's real-time protection is
+  on), `cpuset` (`cpuset.cpus` is the jailed process's
   affinity), `weight` (two jailed processes at `cpu.weight` 50 and 100
   sharing one processor), `low` (a low-integrity process of the user is kept
   out of a jail), `links` (a jail makes no hard link to a file outside it and

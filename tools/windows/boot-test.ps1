@@ -2366,13 +2366,23 @@ function Stage-Boot {
     $said = $vm.Output + "`n" + (Get-Content -Raw $vm.LogPath -ErrorAction SilentlyContinue)
     $most = @([regex]::Matches($said, 'whp: RAMRETRY (\d+) ') | ForEach-Object { [int]$_.Groups[1].Value } | Sort-Object -Descending)
     $ramretry = if ($most.Count) { "$($most[0])" } else { 'at most 1' }
+    # EMULATIONS: the MMIO emulations of the boot and the reset, by what the
+    # emulator's status said (WHV_EMULATOR_STATUS bit 0, EmulationSuccessful),
+    # said by the backend at Firecracker's exit (whp::emulate::Counts): that
+    # an emulation the callbacks did not stop is finished by its status is
+    # measured here; printed, not asserted.
+    $emu = [regex]::Match($said, 'whp: EMULATIONS (\d+) MMIO emulations: (\d+) finished \(EmulationSuccessful\), (\d+) stopped for a device read, (\d+) unfinished otherwise( \(the first: [^)]*\))?')
+    Check $emu.Success "no EMULATIONS line at Firecracker's exit"
+    $n = @(1..4 | ForEach-Object { [long]$emu.Groups[$_].Value })
+    Check ($n[0] -gt 0 -and $n[0] -eq $n[1] + $n[2] + $n[3]) "EMULATIONS: $($emu.Value)"
+    $emulations = "$($n[0]) MMIO emulations, $($n[1]) finished by their status, $($n[2]) stopped for a device read, $($n[3]) unfinished otherwise$($emu.Groups[5].Value)"
     # The heap's allocator Firecracker says it runs with: wick's, which
     # reclaims and then ends the VMM with 137 at the memory limit
     # (vmm::ext::allocator; its tests are libc's test_a_heap_allocation_*).
     # A debug line at the VM's build, which this VM's --level Debug shows
     # (Start-Vm).
     Check ($said -match "wick: the heap's allocator is wick's") "the heap's allocator is wick's (Firecracker's debug line at the VM's build)"
-    return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), serial input after 30 s of silence and after a full FIFO, reset exits 0; SRSO: {2}; MSRREC the MSRs the guest reached that are #GP(0), as on KVM: {3}; RAMRETRY the most runs again in a row of one guest RAM access: $ramretry; the heap's allocator: wick's" -f $dt, $host_dt, (($srso -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | '), $msrs)
+    return ("init, serial in/out, x86_64, 1 CPU, $mem kB, hypervisor bit, clock {0:N2} s in {1:N2} s ($clock), serial input after 30 s of silence and after a full FIFO, reset exits 0; SRSO: {2}; MSRREC the MSRs the guest reached that are #GP(0), as on KVM: {3}; RAMRETRY the most runs again in a row of one guest RAM access: $ramretry; EMULATIONS: $emulations; the heap's allocator: wick's" -f $dt, $host_dt, (($srso -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | '), $msrs)
 }
 
 # CPU 1 taken offline and back online three times, then work on it: on x86

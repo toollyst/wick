@@ -246,7 +246,10 @@ has the per-control details and results.
   table's, released ranges' and lazy memory's locks, so that nothing moves between the look and the call; past 16
   looks the first answer stands, with a line (kvm-ioctls `whp/settle.rs`). The emulator's status is read too
   (`emulate::finished`, `test_an_emulation_is_finished_by_its_status`): an emulation it did not finish after a device
-  read stops the vCPU with `KVM_EXIT_INTERNAL_ERROR`, as KVM stops on an emulation failure, and is not run again. The
+  read stops the vCPU with `KVM_EXIT_INTERNAL_ERROR`, as KVM stops on an emulation failure, and is not run again. How
+  many emulations of a normal boot are finished by their status, stopped for a device read, or unfinished otherwise
+  is counted (`emulate::Counts`, `test_the_emulations_line_counts_by_status`) and said at Firecracker's exit, which
+  `boot-test.ps1 boot` prints (EMULATIONS; first run: CI). The
   tests run each case as before and now:
   `test_an_mmio_read_finishes_while_the_reclaim_moves_its_page_tables` (wick's reclaim held between its copy and its
   swap; before, with the status read, `KVM_EXIT_INTERNAL_ERROR` and the device read once, now the device's value in

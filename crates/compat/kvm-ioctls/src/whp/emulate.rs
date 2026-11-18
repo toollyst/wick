@@ -216,12 +216,99 @@ pub(crate) fn mmio(
     let status = unsafe { status.AsUINT32 };
     #[cfg(test)]
     LAST_STATUS.store(status, std::sync::atomic::Ordering::SeqCst);
+    COUNTS.note(hres, status, ctx.exit_kind == 0 || ctx.mismatch.is_some());
+    #[cfg(not(test))]
+    report_at_exit();
     Ok(interpret(&ctx, hres, status))
 }
 
 /// Tests: the `WHV_EMULATOR_STATUS` of the last MMIO emulation.
 #[cfg(test)]
 pub(crate) static LAST_STATUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The MMIO emulations of this process, said in the EMULATIONS line at its
+/// orderly end ([`report_at_exit`]; `boot-test.ps1`'s boot stage prints
+/// it): whether the emulator's status says finished on every emulation the
+/// callbacks did not stop is measured there, not assumed ([`finished`]).
+pub(crate) struct Counts {
+    all: std::sync::atomic::AtomicU64,
+    finished: std::sync::atomic::AtomicU64,
+    /// Stopped by the callbacks: a device read asked of Firecracker, or one
+    /// that did not match the read given ([`Outcome::Read`],
+    /// [`Outcome::Mismatch`]): unfinished by design, finished at the next run.
+    stopped: std::sync::atomic::AtomicU64,
+    /// Unfinished otherwise ([`Outcome::Failed`], or a write captured from
+    /// an emulation that did not finish).
+    unfinished: std::sync::atomic::AtomicU64,
+    /// The first of those: its `HRESULT` in the high half, its status in
+    /// the low; `u64::MAX` none yet.
+    first_unfinished: std::sync::atomic::AtomicU64,
+}
+
+pub(crate) static COUNTS: Counts = Counts::new();
+
+impl Counts {
+    pub(crate) const fn new() -> Counts {
+        use std::sync::atomic::AtomicU64;
+        Counts {
+            all: AtomicU64::new(0),
+            finished: AtomicU64::new(0),
+            stopped: AtomicU64::new(0),
+            unfinished: AtomicU64::new(0),
+            first_unfinished: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// One emulation: the call's `hres`, the emulator's `status`, and
+    /// whether the callbacks stopped it.
+    pub(crate) fn note(&self, hres: i32, status: u32, stopped: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.all.fetch_add(1, Relaxed);
+        if finished(hres, status) {
+            self.finished.fetch_add(1, Relaxed);
+        } else if stopped {
+            self.stopped.fetch_add(1, Relaxed);
+        } else {
+            self.unfinished.fetch_add(1, Relaxed);
+            let first = (u64::from(hres.cast_unsigned()) << 32) | u64::from(status);
+            let _ = self.first_unfinished.compare_exchange(u64::MAX, first, Relaxed, Relaxed);
+        }
+    }
+
+    /// The EMULATIONS line.
+    pub(crate) fn line(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let first = match self.first_unfinished.load(Relaxed) {
+            u64::MAX => String::new(),
+            f => format!(" (the first: HRESULT {:#010x}, status {:#x})", f >> 32, f & 0xffff_ffff),
+        };
+        format!(
+            "whp: EMULATIONS {} MMIO emulations: {} finished (EmulationSuccessful), {} stopped for a device read, {} unfinished otherwise{first}",
+            self.all.load(Relaxed),
+            self.finished.load(Relaxed),
+            self.stopped.load(Relaxed),
+            self.unfinished.load(Relaxed),
+        )
+    }
+}
+
+/// Says [`COUNTS`] when the process ends through `exit` (a return from
+/// `main` or `std::process::exit`, as Firecracker ends after the guest's
+/// reset), registered at the first emulation: the C runtime runs `atexit`
+/// handlers there, and not at a kill.
+#[cfg(not(test))]
+fn report_at_exit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    extern "C" fn report() {
+        ffi::report(log::Level::Info, &COUNTS.line());
+    }
+    ONCE.call_once(|| {
+        // SAFETY: a plain extern "C" fn, which outlives the process.
+        if unsafe { libc::atexit(report) } != 0 {
+            ffi::report(log::Level::Warn, "whp: EMULATIONS not said at the end: atexit refused the handler");
+        }
+    });
+}
 
 /// Whether the emulator finished the instruction: the call succeeded and
 /// its status says so (`WHV_EMULATOR_STATUS` bit 0, `EmulationSuccessful`).
@@ -425,5 +512,25 @@ mod tests {
         assert!(!finished(S_OK, 1 << 4));
         assert!(!finished(S_OK, 0));
         assert!(!finished(E_FAIL, 1));
+    }
+
+    // The EMULATIONS line counts each emulation once, by what its status
+    // and the callbacks say, and names the first unfinished one.
+    #[test]
+    fn test_the_emulations_line_counts_by_status() {
+        let c = Counts::new();
+        assert_eq!(
+            c.line(),
+            "whp: EMULATIONS 0 MMIO emulations: 0 finished (EmulationSuccessful), 0 stopped for a device read, 0 unfinished otherwise"
+        );
+        c.note(S_OK, 1, false);
+        // A device read asked: the memory callback's E_FAIL (MemoryCallbackFailed, bit 3).
+        c.note(S_OK, 1 << 3, true);
+        c.note(S_OK, 1 << 4, false);
+        c.note(E_FAIL, 1, false);
+        assert_eq!(
+            c.line(),
+            "whp: EMULATIONS 4 MMIO emulations: 1 finished (EmulationSuccessful), 1 stopped for a device read, 2 unfinished otherwise (the first: HRESULT 0x00000000, status 0x10)"
+        );
     }
 }

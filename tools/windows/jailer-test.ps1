@@ -2485,6 +2485,56 @@ function Stage-Freeze {
         param([string]$name, [scriptblock]$body)
         try { $script:report += "${name}: $(& $body)" } catch { $script:fails += "${name}: $($_.Exception.Message)" }
     }
+    # What a start case saw, for its failure: CI run 44287648054's said "the jail did not start
+    # after THAWED:" and no more (--daemonize --new-pid-ns), the operator's jailer having written
+    # nothing and the jailers it started writing to NUL (--daemonize). Their starts and ends, with
+    # parent and exit status, come from a kernel trace through WMI (elevated only), which sees a
+    # process that lived a millisecond; then what is alive, the pid file, the root's files and the
+    # control file, each timed from THAWED. The trace also counts the console hosts the jailers'
+    # tree started: a console program started by one without a console (the --daemonize jailer
+    # starting the --new-pid-ns keeper) gets a console of its own (Learn, "Creation of a Console").
+    $jname = Split-Path -Leaf $Jailer
+    $traced = "wjt-freeze-$PID"
+    $trace = if ($elevated) {
+        try {
+            foreach ($k in 'Start', 'Stop') {
+                $null = Register-CimIndicationEvent -Query "SELECT * FROM Win32_Process${k}Trace WHERE ProcessName='$jname' OR ProcessName='$exe' OR ProcessName='conhost.exe'" -SourceIdentifier "${traced}-$k" -ErrorAction Stop
+            }
+            $null
+        } catch { "not traced: $($_.Exception.Message)" }
+    } else { 'not traced: not elevated' }
+    $defender = try { "Defender real-time protection $(if ((Get-MpComputerStatus -ErrorAction Stop).RealTimeProtectionEnabled) { 'on' } else { 'off' })" } catch { "Defender: $($_.Exception.Message)" }
+    $at = { param([DateTime]$t, [DateTime]$t0) '{0:+0.000;-0.000} s' -f ($t - $t0).TotalSeconds }
+    # The traced processes of the tree from $root (the operator's jailer), in order.
+    $tree = {
+        param([int]$root)
+        $ours = @{ $root = $true }
+        $events = @(Get-Event -ErrorAction SilentlyContinue | Where-Object { $_.SourceIdentifier -like "${traced}-*" } | ForEach-Object {
+                $e = $_.SourceEventArgs.NewEvent
+                [pscustomobject]@{ Start = $_.SourceIdentifier -like '*-Start'; Id = [int]$e.ProcessID; Parent = [int]$e.ParentProcessID; Name = $e.ProcessName; Status = $e.ExitStatus; At = [DateTime]::FromFileTime([long]$e.TIME_CREATED) }
+            } | Sort-Object At)
+        foreach ($e in $events) {
+            if ($e.Start -and $ours.ContainsKey($e.Parent)) { $ours[$e.Id] = $true }
+            if ($ours.ContainsKey($e.Id)) { $e }
+        }
+    }
+    $saw = {
+        param($id, $p, [DateTime]$t0)
+        $now = [DateTime]::Now
+        $traceSaid = if ($trace) { $trace } else {
+            # WMI hands the events over late.
+            Start-Sleep -Milliseconds 1500
+            $seen = @(& $tree $p.Id | ForEach-Object { if ($_.Start) { "$($_.Name) $($_.Id) started by $($_.Parent) at $(& $at $_.At $t0)" } else { "$($_.Name) $($_.Id) ended $($_.Status) at $(& $at $_.At $t0)" } })
+            if ($seen) { $seen -join ', ' } else { 'none traced' }
+        }
+        $op = if ($p.HasExited) { "exited $($p.ExitCode) at $(& $at $p.ExitTime $t0)" } else { 'running' }
+        $live = @(Get-CimInstance Win32_Process -Filter "Name='$jname' OR Name='$exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match "--id $id " -or "$($_.ExecutablePath)" -like "$(& $dirOf $id)\*" } | ForEach-Object { "$($_.Name) $($_.ProcessId) (parent $($_.ParentProcessId), started $(& $at $_.CreationDate $t0)): $($_.CommandLine)" })
+        $root = Join-Path (& $dirOf $id) 'root'
+        $pidFile = Join-Path $root "$exe.pid"
+        $pf = if (Test-Path $pidFile) { "holds '$(Get-Content -Raw $pidFile -ErrorAction SilentlyContinue)'" } else { 'none' }
+        $files = try { @(Get-ChildItem -Force $root -ErrorAction Stop | ForEach-Object { "$($_.Name)$(if (-not $_.PSIsContainer) { " $($_.Length) B" }) written $(& $at $_.LastWriteTime $t0)" }) -join ', ' } catch { $_.Exception.Message }
+        "looked $(& $at $now $t0) after THAWED; the operator's jailer $($p.Id) $op, its output '$((& $said $id).Trim())'; jailers and jail-probes: $traceSaid; alive: $(if ($live) { $live -join '; ' } else { 'none' }); pid file $pf; root: $files; freezer.state '$((& $read $id 'freezer.state') -replace "`n", '\n')'; $defender"
+    }
     $script:report = @(); $script:fails = @()
     try {
         & $case 'v1 at run time' {
@@ -2572,13 +2622,15 @@ function Stage-Freeze {
                 Check ((& $procs $id).Count -eq 0) "the jail started while frozen ($((& $procs $id).Count) processes)"
                 Check (-not $p.HasExited) "the operator's jailer returned while frozen (exit $($p.ExitCode)): $(& $said $id)"
                 Check (-not (Test-Path (Join-Path (& $dirOf $id) "root\$exe.pid"))) 'a pid file while frozen'
+                $t0 = [DateTime]::Now
                 & $write $id 'freezer.state' 'THAWED'
-                Check (& $started $id) "the jail did not start after THAWED: $(& $said $id)"
+                # The failure's detail is looked for only on a failure: it waits for the trace.
+                if (-not (& $started $id)) { Check $false "the jail did not start after THAWED: $(& $saw $id $p $t0)" }
                 $run = & $cpu $id
                 Check ($run -gt 200) "after THAWED: CPU $($run -join ', ') ms per s"
                 $returned = if ($flags) {
-                    Check ($p.WaitForExit(10000)) "the operator's jailer did not return with $($flags -join ' ')"
-                    Check ($p.ExitCode -eq 0) "the operator's jailer exited $($p.ExitCode): $(& $said $id)"
+                    if (-not $p.WaitForExit(10000)) { Check $false "the operator's jailer did not return with $($flags -join ' '): $(& $saw $id $p $t0)" }
+                    if ($p.ExitCode -ne 0) { Check $false "the operator's jailer exited $($p.ExitCode): $(& $saw $id $p $t0)" }
                     'returned 0'
                 } else {
                     Check (-not $p.HasExited) 'the jailer ended while its jail runs'
@@ -2595,7 +2647,15 @@ function Stage-Freeze {
                 $again = & $cpu $id
                 Check ($again -gt 200) "thawed at run time: CPU $($again -join ', ') ms per s"
                 & $stop $id
-                "held (no process, no pid file, the command not returned) until THAWED; then ran $($run -join '/') ms/s, the command $returned; frozen again $($frozen -join '/'), thawed $($again -join '/')"
+                # When each jailer after the operator's and the jail started, from THAWED (the trace).
+                $when = if ($trace) { $trace } else {
+                    $t = @(& $tree $p.Id | Where-Object { $_.Start -and $_.At -ge $t0 })
+                    $j = @($t | Where-Object { $_.Name -eq $jname } | ForEach-Object { & $at $_.At $t0 })
+                    $f = @($t | Where-Object { $_.Name -eq $exe } | Select-Object -First 1 | ForEach-Object { & $at $_.At $t0 })
+                    $c = @($t | Where-Object { $_.Name -eq 'conhost.exe' }).Count
+                    "jailers started at $(if ($j) { $j -join ', ' } else { 'none' }), the jail at $(if ($f) { $f[0] } else { 'none traced' }), console hosts $c"
+                }
+                "held (no process, no pid file, the command not returned) until THAWED; then ran $($run -join '/') ms/s ($when), the command $returned; frozen again $($frozen -join '/'), thawed $($again -join '/')"
             }
         }
         & $case 'start values' {
@@ -2618,11 +2678,14 @@ function Stage-Freeze {
         }
     } finally {
         Get-Process jail-probe -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$base\*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+        foreach ($k in 'Start', 'Stop') { Unregister-Event -SourceIdentifier "${traced}-$k" -ErrorAction SilentlyContinue }
+        Get-Event -ErrorAction SilentlyContinue | Where-Object { $_.SourceIdentifier -like "${traced}-*" } | Remove-Event -ErrorAction SilentlyContinue
     }
     foreach ($l in $script:report) { Write-Host "     $l" }
     foreach ($l in $script:fails) { Write-Host "     FAIL $l" }
-    Check ($script:fails.Count -eq 0) "Windows $build$(if ($elevated) { ', elevated' } else { ', unelevated' }): $($script:fails.Count) of $($script:report.Count + $script:fails.Count) cases failed: $($script:fails -join ' | ')"
-    "Windows $build$(if ($elevated) { ', elevated' } else { ', unelevated' }): $($script:report.Count) cases: $($script:report -join ' | ')"
+    $on = "Windows $build$(if ($elevated) { ', elevated' } else { ', unelevated' }), $defender"
+    Check ($script:fails.Count -eq 0) "${on}: $($script:fails.Count) of $($script:report.Count + $script:fails.Count) cases failed: $($script:fails -join ' | ')"
+    "${on}: $($script:report.Count) cases: $($script:report -join ' | ')"
 }
 
 # A stage that needs a console of its own (pidns types into its console and
