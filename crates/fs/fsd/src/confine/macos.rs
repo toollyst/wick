@@ -558,7 +558,9 @@ mod tests {
     // - a READDIR batch (session.rs, READDIR_BATCH entries asked of the
     //   backend; the host's `read_dir` stops at that `max`, as its raw list);
     // - the host backend's own (host::unix `grown_bounds`): a leaf's names,
-    //   a chunk of a node's chain of ancestors, a search's batch;
+    //   a chunk of a node's chain of ancestors and the list of chunks at the
+    //   default node limit (the list stays at or under 1.5 MiB for chains of
+    //   up to 2^28 directories, host::unix `Chunked`), a search's batch;
     // - a name escaped for the host (fuse::name `escape`: at most three
     //   bytes for each of a name's NAME_MAX).
     // Lists whose length is the guest's or the host's to choose are

@@ -742,6 +742,12 @@ mod tests {
 
     #[test]
     fn test_reopen_after_fork() {
+        crate::macos::run_alone("macos::epoll::tests::reopen_after_fork_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_reopen_after_fork in a process of its own"]
+    fn reopen_after_fork_child() {
         // As an epoll instance on Linux, the instance works in a forked child
         // (here once reopened): same descriptor, same interests and data.
         let epoll = Epoll::new().unwrap();

@@ -30,7 +30,15 @@
 # found the lock still held ("Busy"); with one thread, 47 of 48 pass in 84 s
 # and the 48th, upstream's resource_limits::tests::test_set_resource_limits,
 # fails at raising the descriptor limit, which takes root. The product makes
-# its forks from one thread (the jailer has no other).
+# its forks from one thread (the jailer has no other). Since then each of
+# the jailer's tests that forks does so in a process of its own, running
+# that test alone (platform::macos::tests::run_alone, as the compatibility
+# vmm-sys-util's terminal and epoll tests that fork do, crate::macos's
+# run_alone): another test's thread can no longer hold a lock or a
+# descriptor across a fork. Measured on macOS 27.2, without root, on
+# 2026-11-19: threaded without the two descriptor-closing tests, three runs,
+# 54 pass and test_set_resource_limits alone fails (root); with one thread,
+# 56 of 57 pass, the same one failing. The two still need one thread.
 #
 # Root only, among vmm's tests: two cases of
 # ext::sandbox::macos::tests::test_unfiltered_syscalls_are_limited_by_their_rule,
@@ -71,7 +79,9 @@
 # 27.2, 2026-11-18, by check-unit-tests.py over every crate; compat-libc's
 # line from CI run 44207018536, whose macos job counted 118 pass after
 # a7a9b15a added test_a_discard_woken_by_the_release_returns_after_its_teardown
-# (every other line was that run's). Before a push of a commit that adds or
+# (every other line was that run's); compat-vmm-sys-util's 2 ignored are
+# the forking tests' children, counted on 27.2 on 2026-11-19 with
+# `--crate compat-vmm-sys-util`. Before a push of a commit that adds or
 # removes a test in a counted crate:
 # `python3 -I tools/macos/check-unit-tests.py --list-only`, which builds and
 # lists the tests without running them and compares the counts a run gives
@@ -102,7 +112,7 @@
 #   count compat-userfaultfd 17 pass 0 fail 1 ignored
 #   count compat-vhost 0 pass 0 fail 0 ignored
 #   count compat-vm-memory 0 pass 0 fail 0 ignored
-#   count compat-vmm-sys-util 38 pass 0 fail 0 ignored
+#   count compat-vmm-sys-util 38 pass 0 fail 2 ignored
 #
 # What the counts do not say:
 #   vmm: its ignored tests include the ext:: helpers their parent tests run

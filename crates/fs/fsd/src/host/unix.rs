@@ -316,9 +316,15 @@ const SEARCH_BATCH: usize = 256;
 /// node up to one whose descriptor is held, as many as the guest's nodes
 /// (`--max-nodes`), are never one buffer grown by realloc. libmalloc moves
 /// a buffer grown past 2 MiB with a VM copy (`mach_vm_copy`, `vm_copy`),
-/// which wick-fsd's macOS profile does not allow (confine::macos's pin);
-/// a chunk is at most `CHAIN_CHUNK` pointers, and the list of chunks would
-/// need more than 87,000 of them, hundreds of millions of nodes, to reach it.
+/// which wick-fsd's macOS profile does not allow (confine::macos's pin).
+/// A chunk is at most `CHAIN_CHUNK` pointers (32 KiB). The list of chunks
+/// is grown too, by doubling, 24 bytes a chunk: at most 65,536 chunks
+/// (1.5 MiB) for a chain of up to 2^28 (268,435,456) directories, and only
+/// a longer one takes it to 3 MiB. A chain is at most the guest's nodes:
+/// 64 chunks (1,536 bytes) at the default `--max-nodes`
+/// ([`crate::limits::DEFAULT_MAX_NODES`], 2^18); `--max-nodes` is the
+/// operator's, and a share past the bound needs more than 2^28 directories
+/// each inside the last.
 struct Chunked<T>(Vec<Vec<T>>);
 
 /// Entries of a [`Chunked`] buffer.
@@ -353,17 +359,24 @@ impl<T> Chunked<T> {
 
 /// The largest buffer each list this backend grows by realloc can reach,
 /// for confine::macos's pin: a leaf's names (at most [`NAMES_MAX`], the
-/// oldest dropped first), a chunk of a chain ([`Chunked`]), a search's batch
-/// ([`SEARCH_BATCH`] entries, `DirReader::read` stopping at its `max`).
+/// oldest dropped first), a chunk of a chain and its list of chunks at the
+/// default node limit ([`Chunked`], which gives the bound past it), a
+/// search's batch ([`SEARCH_BATCH`] entries, `DirReader::read` stopping at
+/// its `max`).
 /// What else the backend collects is allocated once at its full length
 /// (the live nodes, the attribute names) or is one evicted holder per
 /// insertion (`Held::admit`: one entry in, so at most one out). macOS only:
 /// the VM copy it guards is libmalloc's.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) fn grown_bounds() -> [(&'static str, usize); 3] {
+pub(crate) fn grown_bounds() -> [(&'static str, usize); 4] {
     [
         ("a leaf's names: NAMES_MAX entries", NAMES_MAX * std::mem::size_of::<(Weak<DirNode>, HostId, Box<[u8]>)>()),
         ("a chain's chunk: CHAIN_CHUNK pointers", CHAIN_CHUNK * std::mem::size_of::<Arc<DirNode>>()),
+        (
+            "a chain's list of chunks at the default --max-nodes, its capacity doubled",
+            crate::limits::DEFAULT_MAX_NODES.div_ceil(CHAIN_CHUNK).next_power_of_two()
+                * std::mem::size_of::<Vec<Arc<DirNode>>>(),
+        ),
         ("a search's batch: SEARCH_BATCH entries", SEARCH_BATCH * std::mem::size_of::<sys::RawEntry>()),
     ]
 }
@@ -1658,5 +1671,95 @@ mod tests {
         let (a, b) = (leaf(1), leaf(2));
         assert!(h.admit(a.id, Holder::Leaf(Arc::downgrade(&a))).is_empty());
         assert_eq!(ids(&h.admit(b.id, Holder::Leaf(Arc::downgrade(&b)))), [1]);
+    }
+
+    /// A Chunked stack across two chunk boundaries and back: a new chunk at
+    /// CHAIN_CHUNK + 1 and 2 × CHAIN_CHUNK + 1 entries, none fuller than
+    /// CHAIN_CHUNK, `last` the newest throughout; popped, an emptied chunk
+    /// goes at once, so `last` after a pop at a boundary is the previous
+    /// chunk's tail, and the order is the reverse of the pushes to the end.
+    #[test]
+    fn test_chunked_crosses_its_chunks_both_ways() {
+        let n = 2 * CHAIN_CHUNK + 1;
+        let mut c = Chunked::new(0usize);
+        assert_eq!((c.0.len(), c.last()), (1, Some(&0)));
+        for v in 1..n {
+            c.push(v);
+            assert_eq!(c.last(), Some(&v));
+            assert_eq!(c.0.len(), v / CHAIN_CHUNK + 1, "after {} entries", v + 1);
+            assert!(c.0.iter().all(|k| !k.is_empty() && k.len() <= CHAIN_CHUNK));
+        }
+        assert_eq!(c.0.iter().map(Vec::len).collect::<Vec<_>>(), [CHAIN_CHUNK, CHAIN_CHUNK, 1]);
+        assert!(c.0.iter().all(|k| k.capacity() <= CHAIN_CHUNK), "a chunk grown past its bound");
+        for v in (0..n).rev() {
+            assert_eq!(c.pop(), Some(v));
+            assert_eq!(c.0.len(), v.div_ceil(CHAIN_CHUNK), "after the pop of {v}");
+            assert_eq!(c.last(), v.checked_sub(1).as_ref());
+        }
+        // At each boundary: popped 2 × CHAIN_CHUNK (the third chunk's only
+        // entry), the second chunk's tail was last; popped CHAIN_CHUNK, the
+        // first's (checked in the loop: `last` is v - 1 after every pop).
+        assert!(c.0.is_empty());
+        assert_eq!((c.pop(), c.last()), (None, None));
+    }
+
+    /// The walk up a chain of directories none of which holds a descriptor,
+    /// deeper than two chunks (2 × CHAIN_CHUNK + 2 levels, one name each),
+    /// opens each again by its name from the root down and finds the
+    /// identity it knew: the deepest's stat is its own, and it holds its
+    /// descriptor after. The tree is made from the bottom up by renames,
+    /// each two levels deep at most: made by a mkdir beneath the last, the
+    /// 8,194 levels took 183 s on macOS 27.2 (22 ms a level on average),
+    /// where the walk itself took 4; made so, the whole test takes 12.
+    #[test]
+    fn test_a_walk_deeper_than_two_chunks_opens_every_level_again() {
+        let depth = 2 * CHAIN_CHUNK + 2;
+        let base = std::env::temp_dir().join(format!("wick-fsd-chunked-{}", std::process::id()));
+        let _ = std::fs::remove_dir(&base);
+        std::fs::create_dir(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let (c, n) = (base.join("c"), base.join("n"));
+        std::fs::create_dir(&c).unwrap();
+        for _ in 1..depth {
+            std::fs::create_dir(&n).unwrap();
+            std::fs::rename(&c, n.join("c")).unwrap();
+            std::fs::rename(&n, &c).unwrap();
+        }
+        let d = HostDir::new(
+            sys::open_root(&base).unwrap(),
+            Options {
+                case_insensitive_ok: true,
+                max_held: crate::limits::MIN_HELD,
+            },
+        )
+        .unwrap();
+        let name = Name::new(b"c").unwrap();
+        // Every node kept here, as the session keeps the nodes the guest knows.
+        let mut chain = vec![d.root()];
+        let mut want = None;
+        for _ in 0..depth {
+            let (node, st) = d.lookup(chain.last().unwrap(), name).unwrap();
+            chain.push(node);
+            want = Some(st.id);
+        }
+        // A directory beside the chain takes the cache's one place.
+        d.mkdir(&chain[0], Name::new(b"x").unwrap()).unwrap();
+        let HostNode::Dir(deepest) = chain.last().unwrap() else { panic!("not a directory") };
+        let unheld = chain[1..].iter().filter(|n| matches!(n, HostNode::Dir(n) if n.held().is_none())).count();
+        assert_eq!(unheld, depth, "every level of the chain without its descriptor");
+        assert_eq!(d.stat(chain.last().unwrap()).unwrap().id, want.unwrap());
+        assert!(deepest.held().is_some());
+        drop((chain, d));
+        // Removed a level at a time by short paths: base/c/c moves up to
+        // base/t, base/c goes, base/t becomes base/c.
+        let (cc, t) = (base.join("c/c"), base.join("t"));
+        while cc.exists() {
+            std::fs::rename(&cc, &t).unwrap();
+            std::fs::remove_dir(&c).unwrap();
+            std::fs::rename(&t, &c).unwrap();
+        }
+        std::fs::remove_dir(&c).unwrap();
+        std::fs::remove_dir(base.join("x")).unwrap();
+        std::fs::remove_dir(&base).unwrap();
     }
 }

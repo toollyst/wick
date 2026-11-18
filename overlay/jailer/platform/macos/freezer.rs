@@ -2320,6 +2320,14 @@ mod tests {
     // holds freezer files, naming `chflags nouchg`); then it is removed.
     #[test]
     fn test_a_supervisor_killed_while_writing_back_leaves_a_removable_jail() {
+        crate::platform::macos::tests::run_alone(
+            "platform::macos::freezer::tests::a_supervisor_killed_while_writing_back_leaves_a_removable_jail_child",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by test_a_supervisor_killed_while_writing_back_leaves_a_removable_jail in a process of its own"]
+    fn a_supervisor_killed_while_writing_back_leaves_a_removable_jail_child() {
         use std::os::darwin::fs::MetadataExt as _;
         let immutable = |p: &Path| std::fs::metadata(p).unwrap().st_flags() & libc::UF_IMMUTABLE != 0;
         let tmp = vmm_sys_util::tempdir::TempDir::new().unwrap();
@@ -2535,6 +2543,12 @@ mod tests {
     // what is left, and the supervisor ends once the jail is empty.
     #[test]
     fn test_supervisor_protocol() {
+        crate::platform::macos::tests::run_alone("platform::macos::freezer::tests::supervisor_protocol_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_supervisor_protocol in a process of its own"]
+    fn supervisor_protocol_child() {
         let tmp = vmm_sys_util::tempdir::TempDir::new().unwrap();
         let dir = tmp.as_path().to_owned();
         let files = Files::create(&dir, Version::V2, State::Thawed, uid()).unwrap();
@@ -2685,6 +2699,12 @@ mod tests {
     // Firecracker runs).
     #[test]
     fn test_setexec_reports_note_exec() {
+        crate::platform::macos::tests::run_alone("platform::macos::freezer::tests::setexec_reports_note_exec_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_setexec_reports_note_exec in a process of its own"]
+    fn setexec_reports_note_exec_child() {
         let tmp = vmm_sys_util::tempdir::TempDir::new().unwrap();
         let files = Files::create(tmp.as_path(), Version::V1, State::Thawed, uid()).unwrap();
         let watch = Watch::new(&files).unwrap();

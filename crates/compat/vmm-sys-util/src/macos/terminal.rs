@@ -235,6 +235,12 @@ mod tests {
     // a read gives 0 and a write fails with EIO.
     #[test]
     fn test_a_revoked_tty_is_linux_s_hung_up_one() {
+        crate::macos::run_alone("macos::terminal::tests::a_revoked_tty_is_linux_s_hung_up_one_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_revoked_tty_is_linux_s_hung_up_one in a process of its own"]
+    fn a_revoked_tty_is_linux_s_hung_up_one_child() {
         let (_master, replica) = revoked_pty();
         let fd = replica.as_raw_fd();
         assert_eq!(unsafe { isatty(fd) }, 0);

@@ -1234,6 +1234,12 @@ mod tests {
     // not close-on-exec, is not; it says so and waits for its stdin to end.
     #[test]
     fn test_the_network_lock_is_held_by_the_program_the_jailer_becomes() {
+        run_alone("platform::macos::tests::the_network_lock_is_held_by_the_program_the_jailer_becomes_child");
+    }
+
+    #[test]
+    #[ignore = "run by test_the_network_lock_is_held_by_the_program_the_jailer_becomes in a process of its own"]
+    fn the_network_lock_is_held_by_the_program_the_jailer_becomes_child() {
         let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
         let net = dir.as_path().canonicalize().unwrap();
         let (_sub, lock) = network_for_jail(&net, "a", 54321).unwrap();
