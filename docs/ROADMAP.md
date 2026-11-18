@@ -253,10 +253,14 @@ listed, as root the drop to `--uid`/`--gid`, read back before serving; `confine_
 corpus and the link sequences against the confined server), guest kernels with
 `CONFIG_VIRTIO_FS` built by CI's `guest-kernels` job (`tools/linux/guest-kernel.sh`), and in Firecracker the device
 type 26 with a snapshot refused, the `fs` feature (off by default) and the extension's metrics in the metrics line
-(patch 0056, `test_fs_device_type_is_26`, `test_no_extension_metrics_leave_the_line_as_upstreams`); nothing a guest
-can use yet. The plan:
+(patch 0056, `test_fs_device_type_is_26`, `test_no_extension_metrics_leave_the_line_as_upstreams`), and the
+virtio-fs device on Linux and macOS (`crates/ext/src/fs`: `PUT /extensions/fs`, a device per share that connects to
+its server at boot, checks each reply's header and answers `-EIO` once the server is lost; its tests against a fake
+server, `test_fs_snapshot_refused`, the `fs_proxy` fuzz target, `tools/check-fs-off.sh`); nothing a guest
+has used yet (the jailer's socket and the boot stages are next). The plan:
 
-- The device in Firecracker only copies bounded, unparsed requests between the virtqueues and one socket.
+- The device in Firecracker only copies bounded requests between the virtqueues and one socket, reading of FUSE only
+  the header fields that pair a reply with its request.
 - A separate server, `wick-fsd`, one per share, parses FUSE and does the file operations. It never sees guest
   memory, confines itself on each host (Linux: namespaces, `pivot_root`, seccomp; macOS: Seatbelt limited to the
   share; Windows: an LPAC token with an ACE on the share, a Job Object and wick's mitigation profile), and refuses to

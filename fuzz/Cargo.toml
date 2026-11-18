@@ -96,3 +96,10 @@ path = "fuzz_targets/fs_session.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fs_proxy"
+path = "fuzz_targets/fs_proxy.rs"
+test = false
+doc = false
+bench = false

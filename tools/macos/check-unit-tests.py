@@ -103,6 +103,8 @@ def crates():
         "snapshot-editor": ["-p", "snapshot-editor"],
         "utils": ["-p", "utils"],
         "wick-ext": ["-p", "wick-ext"],
+        # Host folder sharing's device, built only with the feature.
+        "wick-ext-fs": ["-p", "wick-ext", "--features", "fs"],
         "wick-version": ["-p", "wick-version"],
     }
     compat = os.path.join(ROOT, "crates", "compat")

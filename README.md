@@ -42,7 +42,7 @@ runs on Linux with KVM. If you build on Firecracker, your laptop needs a Linux V
 wick removes that limit without forking Firecracker in the usual sense:
 
 - **Upstream stays upstream.** `lib/firecracker` is the official repository at a release tag. wick changes it
-  through 56 small patches (about 3,300 lines in 91 files), each marked with a `wick:` comment. Everything
+  through 57 small patches (about 3,300 lines in 91 files), each marked with a `wick:` comment. Everything
   else is new code outside the submodule.
 - **Same API, same meaning.** Tools that drive Firecracker work unchanged: the binary is still called `firecracker`,
   and the API, the config file, the snapshot format and the vsock convention mean the same on all three hosts.
@@ -200,8 +200,8 @@ The short version; the [full roadmap](docs/ROADMAP.md) has the status of every r
   limits, the freezer; Windows: the jail drive and token, Job Object limits, the freezer, the mitigation profile, `--daemonize`; both:
   `--netns` as a directory of network endpoints)
 - [ ] Images everywhere: x86_64 images on Apple silicon (FEX-Emu with hardware TSO), arm64 images on Windows
-- [ ] Desktop devices: user-mode networking, virtio-fs (designed, being built: the frame format between the VMM and
-  the file server exists, nothing a guest can use yet: [design](docs/design-fs.md))
+- [ ] Desktop devices: user-mode networking, virtio-fs (designed, being built: the confined file server and the VMM's
+  device exist on Linux and macOS, off by default; no guest has mounted a share yet: [design](docs/design-fs.md))
 - [ ] GPU: headless Vulkan for a guest (designed, no code yet: [design](docs/design-gpu.md))
 - [ ] Distribution: release binaries, Homebrew, automatic rebase attempts on new upstream tags
 
@@ -252,8 +252,9 @@ space inside an arm64 guest, through FEX-Emu with Apple's hardware TSO, is plann
 <details>
 <summary><b>Can a guest share host folders or use the host's GPU?</b></summary>
 
-Not yet: wick has neither today. Both are designed and will be off by default. Host folders are being built (so far
-only the frame format between the VMM and the file server, nothing a guest can use); the GPU has no code yet.
+Not yet: wick has neither today. Both are designed and will be off by default. Host folders are being built (on Linux
+and macOS the file server confines itself and the VMM's device is built with the `fs` feature, but no guest has
+mounted a share yet); the GPU has no code yet.
 
 - **Host folders:** virtio-fs, served by a separate process that confines itself on each host and never sees guest
   memory ([design](docs/design-fs.md), [roadmap](docs/ROADMAP.md#m7-desktop-devices) M7).

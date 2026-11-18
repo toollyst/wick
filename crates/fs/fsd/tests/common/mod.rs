@@ -382,10 +382,20 @@ fn hdiutil(mut command: std::process::Command, what: &str, dir: &Path) {
 #[cfg(target_os = "macos")]
 impl Drop for Image {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("hdiutil")
-            .args(["detach", "-quiet", "-force"])
-            .arg(&self.mount)
-            .status();
+        // A failed detach leaves the image attached for the tests after:
+        // said on standard error with what hdiutil said (a panic here, in an
+        // unwind, would abort the test binary).
+        match std::process::Command::new("hdiutil").args(["detach", "-force"]).arg(&self.mount).output() {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => eprintln!(
+                "hdiutil detach -force {}: {}\nstdout: {}\nstderr: {}",
+                self.mount.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => eprintln!("hdiutil detach -force {}: cannot run hdiutil: {e}", self.mount.display()),
+        }
         remove(&self.dir);
     }
 }

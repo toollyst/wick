@@ -46,7 +46,7 @@ Code that is new rather than a change to an upstream file lives outside the
 submodule. The overlay modules are declared from upstream's `vmm/src/lib.rs`
 with `#[path = "../../../../../overlay/vmm/..."]`, so they are part of the vmm
 crate (`crate::` paths work) while their files belong to wick. The patches
-therefore only change existing upstream files: 56 feature patches touching 91
+therefore only change existing upstream files: 57 feature patches touching 91
 files.
 
 ## Layers
@@ -124,17 +124,19 @@ firecracker binary, vmm   (upstream source + patches/)
    would otherwise keep the old pages.
 5. **wick features go through the extension point.** Upstream calls `vmm::ext`
    from a few fixed places, and `wick-ext` implements the features
-   (`PUT /extensions/{name}`, the config file's `extensions` section). It has
-   none yet: every extension request is refused as unknown and nothing is
-   attached at boot (`crates/ext`, `test_unknown_extension_is_rejected`). The
-   metrics line carries an extension's metrics as a `wick` object, and is
-   upstream's line, byte for byte, when it has none
-   (`test_no_extension_metrics_leave_the_line_as_upstreams`). Virtio device
-   type 26, virtio-fs, is known to the device manager for host folder sharing
-   (`test_fs_device_type_is_26`; the `fs` feature, off by default; no device
-   yet, docs/design-fs.md). A snapshot with such a device is refused before
-   any state is saved (`Vmm::check_unsnapshottable_devices`), not tested
-   until the device exists.
+   (`PUT /extensions/{name}`, the config file's `extensions` section). A
+   default build has none: every extension request is refused as unknown and
+   nothing is attached at boot (`crates/ext`,
+   `test_unknown_extension_is_rejected`). Built with Firecracker's `fs`
+   feature, off by default, it has `fs`, host folder sharing on Linux and
+   macOS: a virtio-fs device, type 26, per share, which copies each request
+   to its file server over a socket connected at boot (`crates/ext/src/fs`,
+   docs/design-fs.md §4.1; a default build holds none of its code,
+   `tools/check-fs-off.sh`). The metrics line carries an extension's metrics
+   as a `wick` object, and is upstream's line, byte for byte, when it has none
+   (`test_no_extension_metrics_leave_the_line_as_upstreams`). A snapshot with
+   a virtio-fs device is refused before any state is saved, on MMIO and PCI
+   (`Vmm::check_unsnapshottable_devices`, `test_fs_snapshot_refused`).
 6. **No pretending.** If a host lacks a facility, wick builds the same
    semantics itself: io_uring → worker-thread queues, seccomp-BPF → Seatbelt,
    SSBD → `PSTATE.SSBS`, holes APFS fills → restored with `F_PUNCHHOLE`, TAP →

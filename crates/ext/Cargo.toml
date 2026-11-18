@@ -13,11 +13,30 @@ bench = false
 
 [features]
 # Host folder sharing (virtio-fs), off by default: Firecracker's `fs`
-# feature turns it on (docs/design-fs.md).
-fs = []
+# feature turns it on (docs/design-fs.md). Without it no fs code is built
+# (tools/check-fs-off.sh).
+fs = [
+  "dep:wick-fs-frame",
+  "dep:event-manager",
+  "dep:libc",
+  "dep:serde",
+  "dep:utils",
+  "dep:vmm-sys-util",
+]
 
 [dependencies]
 vmm = { path = "../../lib/firecracker/src/vmm" }
+# The frames between the device and wick-fsd: no dependencies of its own,
+# taken by path from crates/fs's workspace.
+wick-fs-frame = { path = "../fs/frame", optional = true }
+# The versions vmm builds with (lib/firecracker/src/vmm/Cargo.toml).
+event-manager = { version = "0.4.2", optional = true }
+libc = { version = "0.2.186", optional = true }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+# Extension::write_metrics's map.
+serde_json = "1.0.150"
+utils = { path = "../../lib/firecracker/src/utils", optional = true }
+vmm-sys-util = { version = "0.15.0", features = ["with-serde"], optional = true }
 
 [lints]
 workspace = true

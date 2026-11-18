@@ -76,7 +76,7 @@
 # `python3 -I tools/macos/check-unit-tests.py --list-only`, which builds and
 # lists the tests without running them and compares the counts a run gives
 # when exactly the listed tests fail.
-#   count vmm 936 pass 139 fail 85 ignored
+#   count vmm 937 pass 140 fail 86 ignored
 #   count acpi-tables 22 pass 0 fail 0 ignored
 #   count clippy-tracing 17 pass 0 fail 0 ignored
 #   count cpu-template-helper 26 pass 5 fail 0 ignored
@@ -88,6 +88,7 @@
 #   count snapshot-editor 6 pass 0 fail 0 ignored
 #   count utils 16 pass 0 fail 0 ignored
 #   count wick-ext 1 pass 0 fail 0 ignored
+#   count wick-ext-fs 23 pass 0 fail 0 ignored
 #   count wick-version 2 pass 0 fail 0 ignored
 #   count compat-event-manager 0 pass 0 fail 0 ignored
 #   count compat-kvm-bindings 0 pass 0 fail 0 ignored
@@ -323,6 +324,7 @@ no-hvf vmm devices::virtio::transport::pci::device::tests::test_pci_configuratio
 no-hvf vmm devices::virtio::transport::pci::device::tests::test_pci_device_config
 no-hvf vmm devices::virtio::transport::pci::device::tests::test_reading_bars
 no-hvf vmm devices::virtio::transport::pci::device::tests::test_reset_and_reinitialization
+no-hvf vmm ext::fs_snapshot_tests::test_fs_snapshot_refused
 no-hvf vmm ext::snapshot_vcpu_tests::test_a_snapshot_keeps_the_firmware_registers
 no-hvf vmm ext::snapshot_vcpu_tests::test_a_state_with_ptrauth_keys_needs_ptrauth
 no-hvf vmm pci::msix::tests::test_access_table

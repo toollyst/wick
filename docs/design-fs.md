@@ -15,10 +15,13 @@ confinement of §6.1 and macOS's of §6.2 (`crates/fs/fsd/src/{main,serve}.rs`, 
 (Linux), `confine_probe.rs`, and the corpus, link and request sequences against a confined server; on Windows,
 whose confinement is not built, wick-fsd refuses to start, `test_refuses_without_confinement`), and the guest
 kernels of row 21: CI's `guest-kernels` job builds upstream's CI kernel
-(6.1, 6.18) with `CONFIG_VIRTIO_FS=y` (`tools/linux/guest-kernel.sh`), though nothing boots them yet. Nothing a guest
-can use exists yet, and nothing here describes what wick does today:
-today `PUT /extensions/fs` is refused as an unknown extension (`crates/ext/src/lib.rs`,
-`test_unknown_extension_is_rejected`).
+(6.1, 6.18) with `CONFIG_VIRTIO_FS=y` (`tools/linux/guest-kernel.sh`), though nothing boots them yet, and **the
+VMM's virtio-fs device on Linux and macOS** (`crates/ext/src/fs`, §4.1, only in a build with Firecracker's `fs`
+feature: `PUT /extensions/fs` configures shares, each a device that connects to its server's socket at boot; its unit
+tests against a fake server, the `fs_proxy` fuzz target, `test_fs_snapshot_refused`). No guest has mounted a share
+yet: the boot stages are planned (plan commit 12), and the jailer does not yet place the socket (plan commit 11). A
+default build has none of it: there `PUT /extensions/fs` is refused as an unknown extension (`crates/ext/src/lib.rs`,
+`test_unknown_extension_is_rejected`; `tools/check-fs-off.sh`).
 The work is the virtio-fs item of [M7](ROADMAP.md#m7-desktop-devices). Every "is", "does" and "returns" below about
 fs, `wick-fsd` or the fs device describes the design, not shipped behaviour.
 
@@ -59,7 +62,7 @@ documented or measured; **measure** = the fix is designed, a measurement on the 
 | 6 | FUSE parser bugs from guest-controlled lengths | Bounded decoder in its own crate; fuzzed like wick's existing targets | `fs_decode`, `fs_session` fuzz targets on CI (1 min) + nightly | now |
 | 7 | Host device nodes, FIFOs, sockets, setuid files (CVE-2020-35517, CVE-2023-2861, CVE-2022-0358) | Only regular files and directories are ever opened for I/O (`fstat` on the handle first); `mknod` never called; ownership, modes, setuid, devices, FIFOs live in a wick-private metadata record; server has no capabilities | Corpus: host FIFO/device/socket in the share; setuid bit never reaches the host (`test_special_files_never_opened`, `test_host_device_node_never_opened`, `test_setuid_never_reaches_host`) | now |
 | 8 | Open by handle/id escapes (`open_by_handle_at` "shocker", `/.vol`, `FILE_OPEN_BY_FILE_ID`) | Never used; no `CAP_DAC_READ_SEARCH`; OS sandbox still applies | Open-by-id of an outside file from inside the server → denied. L: `confine_probe`'s `open_by_handle_at` case, killed by the seccomp filter (no capabilities either, `test_confined_status`). M: `confine_probe`'s `/.vol/<dev>/<ino>` read of the outside canary, killed by the profile's file rule (the path read before the profile) | now (L, M); measure W open-by-id under LPAC |
-| 9 | Guest exhausts handles, inodes, CPU, disk | Server caps inode table, open handles, queue depth and READDIR page size (same numbers on all hosts; Windows has no per-process handle limit, so the cap is the server's own); VMM rate limiter = upstream's block-device `RateLimiter`; CPU/memory via cgroup / jetsam + jailer CPU limit / Job; disk: a server byte budget (same on all hosts) | Limit tests: ENFILE/EMFILE/backpressure at the same numbers on every host; queue flood keeps VMM in-flight bytes under the cap | now |
+| 9 | Guest exhausts handles, inodes, CPU, disk | Server caps inode table, open handles, queue depth and READDIR page size (same numbers on all hosts; Windows has no per-process handle limit, so the cap is the server's own); VMM rate limiter = upstream's block-device `RateLimiter` (built, `test_rate_limiter_holds_chains`); VMM: the reply bytes it waits for capped at 16 MiB, chains left on the queue at the cap (built, `test_inflight_cap_backpressure`); CPU/memory via cgroup / jetsam + jailer CPU limit / Job; disk: a server byte budget (same on all hosts) | Limit tests: ENFILE/EMFILE/backpressure at the same numbers on every host; queue flood keeps VMM in-flight bytes under the cap | now |
 | 10 | DAX: host truncates a file mapped into the guest → fault in the VMM | Not offered in v1 (ENOSYS) on any host | Guest mount with `dax` fails cleanly | now |
 | 11 | Socket between VMM and server hijacked | Accept once, check the peer (`SO_PEERCRED` / `LOCAL_PEERCRED` / `SIO_AF_UNIX_GETPEERPID` → SID), then unlink | Second connection refused; wrong peer refused | now |
 | 12 | Host apps act on guest-written files (Spotlight, Defender, IDEs following links) | Guest symlinks are plain files on the host, so no host tool follows them; refuse `/`, `~`, `/System`, `C:\`, `C:\Windows` as share roots by default; docs: use a dedicated directory, mark it `.metadata_never_index` | Guest `ln -s /etc/passwd x` → host sees a regular file (`test_guest_symlink_is_a_regular_file_on_host`) | now (residual risk stated in SECURITY.md) |
@@ -67,8 +70,8 @@ documented or measured; **measure** = the fix is designed, a measurement on the 
 | 14 | A directory the host moves out of the share stays reachable through held handles | Host action, trusted in Firecracker's model; L Landlock and M Seatbelt check at access time; W ACL travels with the directory | Documented in SECURITY.md | limit (W), documented |
 | 15 | Case-insensitive APFS/NTFS gives names Linux treats as different | Default: refuse a case-insensitive root with an error naming the fix (case-sensitive APFS volume/sparse image; W per-directory case sensitivity, needs admin). With the operator's flag: exact-name lookups, EEXIST on case collisions | Case collision returns EEXIST on every host (`test_case_collision_is_eexist`) | now (limit: W needs admin for existing dirs) |
 | 16 | Host changes not notified to the guest (no inotify) | Impossible on every host: Linux's virtio-fs driver has no notification queue. Offer `cache=never` for shares edited on both sides | Documented; `cache=never` test | limit (all hosts, same) |
-| 17 | Snapshot with a live FUSE session | v1: snapshot refused with an API error naming virtio-fs (`snapshot_blocker` hook exists). Later: server state saved as paths and re-resolved beneath the root on restore | Snapshot create with fs → API error | now |
-| 18 | Feature off still adds attack surface | Cargo feature `fs`, default off; `wick-fsd` separate binary; no device/process/socket without config | Default build has no fs symbols; a planned boot-test stage `fs-off` shows no virtio device 26 | now |
+| 17 | Snapshot with a live FUSE session | v1: snapshot refused with an API error naming virtio-fs: by the extension's `snapshot_blocker` and by the VMM's `check_unsnapshottable_devices` on MMIO and PCI, before any state is saved; the device managers' saves past it leave the device out with an error line, never a panic (built, `test_fs_snapshot_refused`, patch 0056). Later: server state saved as paths and re-resolved beneath the root on restore | Snapshot create with fs → API error | now |
+| 18 | Feature off still adds attack surface | Cargo feature `fs`, default off; `wick-fsd` separate binary; no device/process/socket without config | Default build has no fs symbols (built: `tools/check-fs-off.sh` in CI's linux and macos jobs, on the default `firecracker` binary, with wick-ext's fs test binary as the control that the names searched for exist); a planned boot-test stage `fs-off` shows no virtio device 26 | now |
 | 19 | Older macOS releases lack `O_RESOLVE_BENEATH` | Require the first macOS release that has the flag and refuse loudly on older ones (the same layers on every host, no reduced mode). **Which release that is is unconfirmed:** the flag is in the macOS 27.2 SDK's `sys/fcntl.h` (read 2026-11-13); this research read it in XNU's `bsd/sys/fcntl.h` from xnu-11417 on, which it took to be macOS 15.4; a third-party rsync patch says macOS 15 ([patch](https://sources.suse.com/SUSE:SLFO:1.1:Build/rsync/c0c245c4f613433f762b3dee895547b4/rsync-hardening-0021-syscall-also-use-O_RESOLVE_BENEATH-on-FreeBSD-and-Ma.patch)). 15.4 is used below as that working assumption, not as a settled floor. XNU's own tags agree: xnu-11215.81.4's `bsd/sys/fcntl.h` has no `O_RESOLVE_BENEATH` and xnu-11417.101.15's has it (which macOS release each tag is, is Apple's tag numbering, not read in the source [inf]). **What the flag answers differs:** xnu-11417 refuses `..` at the starting directory, an absolute path and a link that restarts at `/` with EACCES, and xnu-12377 (macOS 26) made each ENOTCAPABLE (`bsd/vfs/vfs_lookup.c`, `lookup` and `namei`, both tags) [src]; CI's macOS 15 runner refused the probe's `..` with EACCES (run 44296604010, `test_open_never_follows_a_link_or_leaves_the_directory`), so the flag acts there. EACCES is also a plain permission refusal's errno: `probe_beneath` confirms it with an absolute path, which `namei` refuses before any lookup or permission check, and on macOS 15 a refusal by the flag is the guest's EACCES, not counted as layer 2 (layer 1 never lets a guest name reach it) | macOS 15 CI job: fs starts where the flag works and refuses below; `test_open_never_follows_a_link_or_leaves_the_directory` checks each kernel's errno by its Darwin release | first run: CI |
 | 20 | Linux host with unprivileged user namespaces disabled (Ubuntu AppArmor) | Start wick-fsd from root, which confines and drops to an unprivileged uid with no capabilities, as the jailer does, or as a user under an AppArmor profile that grants the wick-fsd binary `userns` alone (§6.1); otherwise refuse loudly, naming the sysctl and AppArmor profile the host reads | Run with userns disabled: refuses without root, confined with root. `test_userns_restricted_refused` (as a user where the host restricts user namespaces, as CI's Ubuntu does, run 44207018536); the root path is every confined test run as root (CI's fs job's sudo step); user-namespace path: the fs job's AppArmor-profile step, the confined tests as the runner's user under a profile granting wick-fsd `userns` (first full pass CI run 44238015541, both Ubuntu runners; §6.1 has the profile), and Docker on the Mac; the refusal names the sysctl and the AppArmor profile it reads (`test_the_refusal_names_the_restriction_it_reads`) | now |
 | 21 | Guest kernel lacks the driver | Upstream CI configs have `CONFIG_FUSE_FS=y`, `# CONFIG_VIRTIO_FS is not set`; wick's guest kernels add `CONFIG_VIRTIO_FS=y` (built: `tools/linux/guest-kernel.sh` with the fragment `tools/linux/guest-kernel-virtio-fs.config`, CI's `guest-kernels` job) | Guest boot with fs mounts the share | now |
@@ -110,7 +113,8 @@ point carries the `VirtioDeviceType::Fs` variant and metrics generically (patch 
 ## 1. Summary and recommendation
 
 **Recommendation: a "split" virtio-fs device.** The guest gets a standard virtio-fs device (`mount -t virtiofs tag
-/mnt`). Inside Firecracker, that device is a *thin copier* that knows nothing about FUSE. It takes each descriptor
+/mnt`). Inside Firecracker, that device is a *thin copier* that reads of FUSE only the two header fields that pair a reply
+with its request (`unique`, and the reply's `len`, §4.1). It takes each descriptor
 chain's readable bytes (bounded), sends them as one framed message over a connected Unix stream socket, and writes
 the reply into the chain's writable buffers. All FUSE parsing and every file operation happen in **`wick-fsd`**: a
 separate per-VM, per-share server process that sandboxes itself and never sees guest memory. It is the same Rust code
@@ -216,7 +220,8 @@ byte stream.
   - docs/memory-hotplug.md adds: *"Firecracker cannot guarantee protection of unplugged memory from a vhost-user
     backend."*
 
-The split design (C) answers each objection: no FUSE code in the VMM, no guest memory outside the VMM, rate limiting
+The split design (C) answers each objection: no FUSE decoding in the VMM (it checks a reply's `len` and `unique`
+only, §4.1), no guest memory outside the VMM, rate limiting
 and metrics in the VMM, and snapshots refused loudly until designed.
 
 ### 2.3 B (vhost-user) vs C (split), in detail
@@ -299,44 +304,98 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
 
 ### 4.1 VMM side (in `wick-ext`, behind `vmm::ext`)
 
-- Config `extensions.fs`: `{"shares": [{"id", "tag", "socket", "read_only", "queue_size", "rate_limiter"}]}`.
-  `rate_limiter` uses upstream's block schema. The VMM knows only the tag and the socket path. The shared directory
-  is the server's configuration, so the VMM never holds a handle to it.
-- At `attach_boot_devices`, before the sandbox narrows, the device connects to `socket`. The socket is in the jail
-  root under the jailer, as vhost-user-blk's socket is (PORTING row 14). Failure means boot fails, with the error.
-  Hot-plug is refused (`update` → error) in v1.
+Built (`crates/ext/src/fs`, only with Firecracker's `fs` feature: a default build holds none of it,
+`tools/check-fs-off.sh` in CI's linux and macos jobs; Linux and macOS, while a Windows build with the feature refuses
+`PUT /extensions/fs` by name). Unit tests: `crates/ext/src/fs/{config,copy,metrics}.rs` and
+`crates/ext/src/fs/device/tests.rs` (a fake server on a socket pair, the queues in guest memory as upstream's tests
+lay them out); fuzz target `fs_proxy`. No guest has used it yet (commit 12's boot stages).
+
+- Config `extensions.fs`: `{"shares": [{"id", "tag", "socket", "queue_size", "rate_limiter"}]}`, 1 to 8 shares,
+  ids and tags unique (`test_bad_configs_are_refused`). `socket` is required: the VMM never connects to a path it was
+  not given (a default in the jail comes with the jailer's `--fs-share`, plan commit 11). `queue_size` a power of two
+  from 2 to 256 (default 256); `rate_limiter` upstream's block schema. The VMM knows only the tag and the socket
+  path: the shared directory and `read_only` are the server's configuration (refused here as unknown fields), so the
+  VMM never holds a handle to the share.
+- At `attach_boot_devices`, before the sandbox narrows, each device connects to its `socket` and exchanges hellos (10
+  s each way): another share's id, another protocol version, a peer that sends something else, closes or says
+  nothing each stop the build with the share and the path named (`test_hello_refusals`). Then the socket is
+  non-blocking. The socket is in the jail root under the jailer, as vhost-user-blk's socket is (PORTING row 14).
+  `update` is refused after boot (`extension \`fs\` cannot be changed after boot`), and a snapshot is refused while a
+  share is attached, by the extension (`snapshot not supported: virtio-fs (shares ...)`) and by the VMM's own check
+  on both transports (`test_fs_snapshot_refused`, with the persist arms that are reached only past it).
 - Frame (built: `crates/fs/frame`, whose doc comment has the byte layout): a 24-byte little-endian header
   `{u32 len, u16 kind, u16 queue, u64 cookie, u32 writable_cap, u32 reserved}`, then the payload. Kinds: hello (each
   side's first frame: protocol version and share id, checked by the other side; an id is 1 to 64 characters of
   `[a-z0-9_-]`, no capitals, since it names the jail's `fs-<id>.sock` and `Data` and `data` would be one file on a
   file system that ignores case, NTFS or APFS as macOS formats it), request (VMM → server: a chain's
   readable bytes) and reply (server → VMM: the bytes for that chain).
-  - `len ≤ 1 MiB + 4 KiB`, checked from the header alone, before any payload is buffered. The writable capacity of a
-    chain must hold `fuse_out_header`, or the chain is completed with used length 0. Linux's driver then fails the
-    request.
-  - The reply bytes the VMM waits for are capped at 16 MiB (`MAX_IN_FLIGHT_REPLY_BYTES`, the sum of the waiting
-    requests' `writable_cap`). At the cap the VMM stops popping the queue, so its memory cannot grow without bound
-    (queue_size × 1 MiB would otherwise be 256 MiB).
-  - **The server is untrusted input to the VMM too:** a reply longer than `writable_cap`, an unknown or duplicate
-    cookie, or a short frame marks the device `DEVICE_NEEDS_RESET` and closes the socket. It never makes an
-    out-of-bounds write.
-- Patches needed:
-  - `VirtioDeviceType` is a closed enum without `Fs` (`devices/virtio/device.rs`), so `VIRTIO_ID_FS` (26) needs a
-    variant [src].
-  - Metrics need an `fs_<id>` section.
-  - Persist enums are needed when snapshots come.
-  - No change to guest memory allocation.
+- A chain is its readable buffers, then its writable ones: one readable after a writable, an indirect descriptor
+  (not offered) or a buffer outside guest memory completes it with used length 0, nothing sent. More readable bytes
+  than a frame carries (`len ≤ 1 MiB + 4 KiB`) is answered with `-EIO`; a writable part shorter than
+  `fuse_out_header` (16 bytes) is completed with used length 0; a chain without a writable part (FORGET) is sent and
+  completed at once with used length 0 (`test_hostile_chains`).
+- **Bounded, never blocking.** The reply bytes the VMM waits for are capped at 16 MiB (`MAX_IN_FLIGHT_REPLY_BYTES`, the
+  sum of the waiting requests' `writable_cap`) and their count at both queues' size; at a cap, and while a frame's
+  worth of request bytes is unsent, the device takes no chain and the rest stay on the queue
+  (`test_inflight_cap_backpressure`). Replies are read 4 MiB at most per event. A server that stops reading or
+  answering never blocks the event loop (`test_server_hang_never_blocks_the_loop`: other devices are served, at most
+  two frames are buffered); with requests outstanding and nothing read or sent for 10 s the share's `stalled` metric
+  is 1 and one warning names the requests waiting, until a reply comes (no per-request deadline in v1: a slow host
+  file system is not a hang).
+- **What the VMM reads of FUSE**: bytes 8..16 of each request (`fuse_in_header.unique`) and bytes 0..16 of each
+  reply (`fuse_out_header`: `len` and `unique`; `error` is copied, not read), nothing else: no opcode, no argument.
+  The reason: Linux's driver checked a reply itself only from v7.1 (`virtio_fs_verify_response`, commit
+  <https://git.kernel.org/torvalds/c/68b69fa0edb2>, "virtiofs: add FUSE protocol validation", 2026-02-27; not in v6.1, v6.12, v6.18, v6.19 or v7.0, read
+  in each [src]). Before it, the used length is ignored and `copy_args_from_argbuf` takes `fuse_out_header.len` as
+  given (fs/fuse/virtio_fs.c, v6.1 :520-545) [src], so a server taken over could hand an old guest kernel a "success"
+  with lengths the driver trusts. So each reply is checked before it is written into its chain: at least 16 bytes,
+  `len` equal to the reply's byte count and at most the chain's writable bytes, `unique` the request's
+  (`test_each_reply_header_mismatch_loses_the_server`, `test_hostile_replies`).
+- **What remains the guest's exposure to a hostile server on kernels before v7.1**, from the source (v6.1
+  fs/fuse/virtio_fs.c and dev.c) [src]: (a) a reply shorter than a request's fixed-size out arguments but with a
+  correct `len`: the driver copies each fixed argument whole from `argbuf`, which `virtio_fs_enqueue_req` allocated
+  with `kmalloc` and filled only with the in arguments (:505), so the guest kernel reads its own uninitialized heap
+  as attributes; (b) `error` outside -511..0: `fuse_simple_request` returns it as is (dev.c :512), where /dev/fuse
+  refuses it and v7.1 checks it; (c) what any FUSE server is trusted with (attributes, names, data). The VMM checks
+  neither (a) nor (b): either would read FUSE semantics (the opcode's argument sizes, the error's meaning). The host is
+  not exposed by them; the guest is, to its own kernel's handling.
+- **The server is lost** when its connection ends (EOF, EPIPE, ECONNRESET), a write or read fails, or it sends a
+  frame that breaks a rule (a header the format refuses, a kind other than reply, a cookie no chain waits for or
+  waits no more, a reply longer than its chain, a header mismatch above). Then every waiting chain with 16 writable
+  bytes or more is answered with a `fuse_out_header` `{len 16, error -EIO, unique}` (the request's bytes 8..16, 0 if
+  shorter), used length 16; one with fewer, used length 0; and every chain taken after the loss gets the same at once,
+  never a hang (`test_server_death_fails_inflight_with_eio`). Nothing reconnects (`test_no_reconnect_after_loss`):
+  one error line names the share and the cause, and `server_lost` is 1. Virtio-fs carries no notification on these
+  queues: the device does not offer `VIRTIO_FS_F_NOTIFICATION`, so a reply whose `unique` is not its request's,
+  0 included (FUSE_NOTIFY_*), is a bad frame. **Not as planned:** the device does not set `DEVICE_NEEDS_RESET`.
+  Upstream's transports set that status only when an activation fails (transport/mmio.rs, transport/pci/device.rs),
+  and a device has no call to set it; Linux's driver has no config-change handler that would act on it. Setting it
+  would take a transport patch; the `-EIO` answers are what the guest sees instead.
+- A guest's reset of the device (a driver unbound and bound again) loses the server too: the FUSE session the
+  server holds belongs to the connection, and the chains waiting are no longer the guest's to write. Nothing is
+  written; the connection closes at the device's next event, and after a new activation every request fails with
+  `-EIO` (`test_reset_loses_the_server`). A device never activated keeps its connection.
+- Patches: `VirtioDeviceType::Fs` (26), the `fs` feature and the metrics hook (patch 0056); `Cargo.lock` for
+  wick-ext's dependencies (patch 0057). Metrics: `fs_<id>` in the metrics line's `wick` object, atomics only, read
+  without the device's lock (`test_write_metrics_takes_no_device_lock`): requests, request_bytes, replies,
+  reply_bytes, refused_chains, eio_answers, inflight_full, rate_limited, event_fails, and the states server_lost,
+  stalled, waiting.
 - Config space: `struct virtio_fs_config { u8 tag[36]; le32 num_request_queues; }`
-  (`include/uapi/linux/virtio_fs.h`) [src]. The tag is validated as UTF-8, ≤36 bytes.
-- No FUSE parsing in the VMM, not even `fuse_in_header`: frames are opaque. Rate limiting charges one op per chain plus the readable + writable byte counts, with upstream's `RateLimiter`, as
-  block does.
+  (`include/uapi/linux/virtio_fs.h`) [src], one request queue (`test_config_space_is_the_tag_and_one_request_queue`).
+  The tag is UTF-8, 1 to 36 bytes, without NUL. Features: `VIRTIO_F_VERSION_1` only.
+- Rate limiting charges one op per chain plus its readable bytes and its writable bytes clamped to a frame, with
+  upstream's `RateLimiter`, as block does; a chain without tokens stays on its queue until the limiter's timer
+  (`test_rate_limiter_holds_chains`).
 - Transport: upstream's device manager attaches over MMIO or PCI as for its own devices; virtio-fs needs nothing
   transport-specific. DAX would need shared-memory-region support (virtio PCI `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG`,
   MMIO SHM registers; Linux `virtio_get_shm_region` in `virtio_fs_setup_dax`, `virtio_mmio.c` `vm_get_shm_region`).
   Neither upstream transport has it (grep of `transport/mmio.rs`, `transport/pci/`) [src].
-- **Claim to prove:** turning fs on adds no system call, Mach trap or mitigation exception to the VMM's narrowed
-  sandbox. The socket is connected before narrowing, and read/write on Unix streams is already allowed for vsock
-  [inf → test `tools/macos/sandbox-discovery.sh` with an fs device; Windows mitigation profile unchanged].
+- **No rule or system call added to the VMM's sandbox.** The socket is connected in the setup phase; at run time the
+  device reads and writes it, registers it with the event manager and arms a timer, as vsock and the rate limiter
+  do. macOS: `test_fs_socket_survives_each_profile` connects in the jail under the setup profile, narrows, then sends
+  frames of up to 1 MiB and 4 KiB both ways through a non-blocking socket watched by epoll, jailed and not. Linux:
+  each call is in upstream's `vmm` filter (`socket`, `connect`, `read`, `write`, `recvfrom`, `sendto`, `epoll_ctl`,
+  `timerfd_settime`, `close`) [src]; the boot stage under the filter is commit 12's.
 
 ### 4.2 Server side (`wick-fsd`, its own crate and binary, not linked into `firecracker`)
 
@@ -1086,8 +1145,8 @@ it means layer 1 let the request through.
       routine 33, neither allowed (`confine_probe`'s "the host's privileged port");
     - `(allow system-info (info-type "vfs.disk-space"))`, which `fstatfs` asks: denied, the free blocks are rounded
       (measured: 5945470 shown as 5940000), where Linux's STATFS answers exactly. The guest learns the share
-      volume's free space, as on Linux; `requests.rs` requires STATFS confined to equal STATFS in process on both
-      hosts.
+      volume's free space, as on Linux, or what the byte budget leaves where that is less; `requests.rs` requires
+      STATFS confined to equal STATFS in process, from a session that served the same requests, on both hosts.
 
   - **Why the share's other operations are refused with an error and not killed.** Seatbelt evaluates, for both
     names of a hard link (`linkat`), the share's whole set of file operations, the composites `file*`,
@@ -1247,7 +1306,7 @@ it means layer 1 let the request through.
 | inotify/fsnotify for host changes | **not delivered**: Linux's virtio-fs driver has only hiprio and request queues, no notification queue (`fs/fuse/virtio_fs.c`, `VQ_HIPRIO`/`VQ_REQUEST`) [src]; guest-side changes do fire in the guest | | | |
 | `O_TMPFILE` (FUSE_TMPFILE), POSIX ACLs, ioctls | ENOSYS/EOPNOTSUPP, so applications fall back | | | |
 | Sparse files, fallocate, punch hole | supported; wick's `platform::fs` already has hole semantics per host | native | `F_PUNCHHOLE` | `FSCTL_SET_ZERO_DATA` |
-| Quotas / free space | `statfs` from the host volume | | | |
+| Quotas / free space | `statfs` from the host volume, its free and available blocks capped by what the server's byte budget leaves this run (decision 7; `Session::statfs`, `test_byte_budget_is_enospc_counted_and_shown_in_statfs`), so the guest sees the budget where the volume has more free | | | |
 | `fsync`, `fdatasync` | the data on stable storage when the call returns, as Linux's `fsync` (§4.3) | `fsync` / `fdatasync` | both `F_FULLFSYNC` (macOS's `fsync` stops at the drive's cache); slower by the drive's flush | — |
 | Open flags | only the access mode reaches the host; `O_APPEND`, `O_TRUNC`, `O_DIRECT`, `O_SYNC` are the guest kernel's (§4.3) | same | same | — |
 
@@ -1366,7 +1425,7 @@ it means layer 1 let the request through.
 
 1. **Off by default:**
    - `test_unknown_extension_is_rejected` (exists);
-   - a default build has no fs symbols;
+   - a default build has no fs symbols (exists: `tools/check-fs-off.sh`, CI's linux and macos jobs);
    - with the feature but no config: no virtio device 26 in the guest, no socket, no process (a planned boot-test
      stage `fs-off` on each host).
 2. **Traversal corpus (host-side harness, no VM, every CI host).** Exists for Linux and macOS as
@@ -1393,7 +1452,9 @@ it means layer 1 let the request through.
 4. **Fuzzing** (cargo-fuzz in `fuzz/`, CI one minute each like the existing targets, longer nightly):
    - `fs_decode`: frame → request; no panic, bounded allocation;
    - `fs_session`: request sequences against an in-memory backend and a temp-dir backend with canaries;
-   - `fs_proxy`: VMM device with hostile descriptor chains **and** hostile server replies.
+   - `fs_proxy` (exists): the device's request/reply core (`crates/ext/src/fs/copy.rs`) with hostile descriptor
+     chains **and** hostile server replies (headers of the wrong length, of another request, short, unknown or
+     repeated cookies, a lost server), checked against a model of the requests waiting.
 5. **Guest-level, on each host:**
    - pjdfstest in the guest on the share;
    - an xfstests `generic` subset with `FSTYP=virtiofs`;
@@ -1415,8 +1476,17 @@ it means layer 1 let the request through.
 8. **VMM sandbox unchanged:** `tools/macos/sandbox-discovery.sh` with an fs device shows no new entries; the Windows
    profile is identical; Linux seccomp is unchanged.
 9. **Limits:** inode/handle/queue caps produce ENFILE/EMFILE/backpressure with the same numbers on every host;
-   VMM in-flight bytes stay under the cap with a guest flooding the queue.
-10. **Snapshot refusal:** snapshot create with fs attached → API error naming virtio-fs.
+   VMM in-flight bytes stay under the cap with a guest flooding the queue (the VMM's exists:
+   `test_inflight_cap_backpressure`, `test_the_in_flight_limit_holds_chains_back`).
+10. **Snapshot refusal:** snapshot create with fs attached → API error naming virtio-fs (the VMM's refusal on both
+    transports exists: `test_fs_snapshot_refused`; through the API, a planned boot stage).
+11. **The VMM device against its server** (exist, `crates/ext/src/fs/device/tests.rs`, a fake server over a socket
+    pair): `test_a_request_and_its_reply`, `test_server_death_fails_inflight_with_eio`,
+    `test_no_reconnect_after_loss`, `test_server_hang_never_blocks_the_loop`, `test_hostile_chains`,
+    `test_hostile_replies`, `test_reset_loses_the_server`, `test_hello_refusals`,
+    `test_write_metrics_takes_no_device_lock`; the header checks one by one in `copy.rs`
+    (`test_each_reply_header_mismatch_loses_the_server`). In a guest, on 6.1 and 6.18: the server killed mid-request
+    → the guest's system call returns `EIO`, no hang (planned, plan commit 12's boot stage).
 
 ---
 

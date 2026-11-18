@@ -30,6 +30,8 @@ pub mod sysfs;
 pub mod vcpu_thread;
 #[cfg(all(test, target_os = "macos"))]
 mod snapshot_vcpu_tests;
+#[cfg(test)]
+mod fs_snapshot_tests;
 #[cfg(all(test, unix))]
 mod nonblocking_pipe_tests;
 #[cfg(test)]

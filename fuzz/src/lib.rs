@@ -98,3 +98,10 @@ pub mod whp_cr4;
 #[allow(unreachable_pub, dead_code)]
 #[path = "../../crates/compat/kvm-ioctls/src/whp/tscsync.rs"]
 pub mod whp_tscsync;
+
+/// What the virtio-fs device does with a descriptor chain and a reply frame
+/// (`crates/ext/src/fs/copy.rs`), compiled from its source (it uses nothing
+/// but `std` and `wick_fs_frame`) so the `fs_proxy` target runs exactly the
+/// device's code without the vmm crate, and its tests run on every host.
+#[path = "../../crates/ext/src/fs/copy.rs"]
+pub mod fs_copy;

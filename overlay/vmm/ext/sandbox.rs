@@ -5773,6 +5773,102 @@ mod macos {
             println!("CHILD-OK");
         }
 
+        /// A virtio-fs device's connection to wick-fsd (docs/design-fs.md
+        /// §4.1) under each profile the VMM runs with, jailed and not: the
+        /// socket is connected and the hello exchanged while the microVM is
+        /// built (the setup phase), then the profile narrows and frames of
+        /// up to the largest (1 MiB and 4 KiB) go both ways through a
+        /// non-blocking socket watched by epoll, as the device and the
+        /// event manager do. No rule was added for it: a call the narrowed
+        /// lists lack would kill the child.
+        #[test]
+        fn test_fs_socket_survives_each_profile() {
+            use std::io::{Read, Write};
+            let base = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("wick-fs-socket-{}", std::process::id()));
+            let jail = base.join("jail");
+            std::fs::create_dir_all(&jail).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(jail.join("fs-docs.sock")).unwrap();
+            for jailed in ["jailed", "unjailed"] {
+                // wick-fsd's part: everything read is sent back.
+                let server = std::thread::spawn({
+                    let listener = listener.try_clone().unwrap();
+                    move || {
+                        let (mut c, _) = listener.accept().unwrap();
+                        let mut buf = vec![0u8; 64 << 10];
+                        while let Ok(n) = c.read(&mut buf) {
+                            if n == 0 || c.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                let out = child(
+                    "fs_socket_child",
+                    &[("WICK_TEST_JAIL", jail.to_str().unwrap()), ("WICK_TEST_JAILED", jailed)],
+                );
+                server.join().unwrap();
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(out.status.success() && stdout.contains("CHILD-OK"), "{jailed}: {}", text(&out));
+            }
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        #[test]
+        #[ignore = "run by test_fs_socket_survives_each_profile in a separate process"]
+        fn fs_socket_child() {
+            use std::io::{ErrorKind, Read, Write};
+            use std::os::fd::AsRawFd;
+            use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+            let jail = std::path::PathBuf::from(std::env::var("WICK_TEST_JAIL").unwrap());
+            let jailed = std::env::var("WICK_TEST_JAILED").unwrap() == "jailed";
+            let narrowed = Token::issue(NARROWED).unwrap();
+            install(&profile_for(jailed.then_some(jail.as_path()), None).unwrap()).unwrap();
+            // The setup phase: attach_boot_devices's connect and hello, the
+            // event manager's epoll.
+            let mut conn = std::os::unix::net::UnixStream::connect(jail.join("fs-docs.sock")).unwrap();
+            conn.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+            conn.set_write_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+            conn.write_all(b"hello").unwrap();
+            let mut hello = [0u8; 5];
+            conn.read_exact(&mut hello).unwrap();
+            conn.set_nonblocking(true).unwrap();
+            let epoll = Epoll::new().unwrap();
+            narrowed.consume().unwrap();
+            // The run phase: the device's registration and its frames.
+            epoll
+                .ctl(ControlOperation::Add, conn.as_raw_fd(), EpollEvent::new(EventSet::IN | EventSet::OUT, 4))
+                .unwrap();
+            let mut buf = vec![0u8; 256 << 10];
+            for size in [24usize, (1 << 20) + (4 << 10), 64 << 10, (1 << 20) + (4 << 10)] {
+                let frame: Vec<u8> = (0..size).map(|i| u8::try_from(i % 251).unwrap()).collect();
+                let (mut sent, mut got) = (0, Vec::with_capacity(size));
+                while got.len() < size {
+                    let mut ready = [EpollEvent::default(); 4];
+                    epoll.wait(1000, &mut ready).unwrap();
+                    if sent < size {
+                        match conn.write(&frame[sent..]) {
+                            Ok(n) => sent += n,
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                            Err(e) => panic!("write: {e}"),
+                        }
+                    }
+                    match conn.read(&mut buf) {
+                        Ok(0) => panic!("the server closed the connection"),
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                        Err(e) => panic!("read: {e}"),
+                    }
+                }
+                assert!(got == frame, "a frame of {size} bytes came back otherwise");
+            }
+            epoll.ctl(ControlOperation::Delete, conn.as_raw_fd(), EpollEvent::default()).unwrap();
+            drop(conn);
+            println!("CHILD-OK");
+        }
+
         /// The operations a jailed profile leaves to rules other than its
         /// file rules, without `--netns`: one child per case and phase makes
         /// one attempt, outside the jail where the operation names something,

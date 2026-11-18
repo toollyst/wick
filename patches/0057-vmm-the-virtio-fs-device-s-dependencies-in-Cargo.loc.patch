@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Wed, 18 Nov 2026 22:40:53 +0900
+Subject: [PATCH] vmm: the virtio-fs device's dependencies in Cargo.lock; the
+ Fs save arms say a device was left out
+
+wick-ext's `fs` feature (the virtio-fs device, crates/ext/src/fs) takes
+event-manager, libc, serde, utils and vmm-sys-util at vmm's versions, and
+wick-fs-frame by path: Cargo.lock gains them and wick-fs-frame's entry.
+
+The VirtioDeviceType::Fs arms of the MMIO and PCI saves, reached only past
+Vmm::check_unsnapshottable_devices's refusal, log an error naming the
+device, and their comments name the test that reaches both
+(ext::fs_snapshot_tests::test_fs_snapshot_refused, on each transport).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                             | 11 +++++++++++
+ src/vmm/src/device_manager/pci_mngr.rs | 15 +++++++++++----
+ src/vmm/src/device_manager/persist.rs  | 14 ++++++++++----
+ 3 files changed, 32 insertions(+), 8 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 19305381c381f9b4d575d8eb85be849854dcc989..0bfd3c2f24f33ed638fba32885415d883dc99081 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2079,9 +2079,20 @@ dependencies = [
+ name = "wick-ext"
+ version = "0.1.0"
+ dependencies = [
++ "event-manager 0.4.2",
++ "libc 0.2.189",
++ "serde",
++ "serde_json",
++ "utils",
+  "vmm",
++ "vmm-sys-util 0.15.0",
++ "wick-fs-frame",
+ ]
+ 
++[[package]]
++name = "wick-fs-frame"
++version = "0.1.0"
++
+ [[package]]
+ name = "wick-os"
+ version = "0.1.0"
+diff --git a/src/vmm/src/device_manager/pci_mngr.rs b/src/vmm/src/device_manager/pci_mngr.rs
+index 161d7da27fd796c8b6dcf11e8171cc5a9a9cdfee..f2d9d84b4eef0e3ec0e28a602a95f0542e0a24c1 100644
+--- a/src/vmm/src/device_manager/pci_mngr.rs
++++ b/src/vmm/src/device_manager/pci_mngr.rs
+@@ -495,10 +495,17 @@ impl<'a> Persist<'a> for PciDevices {
+                         transport_state,
+                     })
+                 }
+-                // wick: never saved; `Vmm::save_state` refuses a snapshot
+-                // with a virtio-fs device before any state is saved
+-                // (`check_unsnapshottable_devices`).
+-                VirtioDeviceType::Fs => {}
++                // wick: never saved, and said; `Vmm::save_state` refuses a
++                // snapshot with a virtio-fs device before any state is saved
++                // (`check_unsnapshottable_devices`), so this is reached only
++                // past that refusal (`ext::fs_snapshot_tests::
++                // test_fs_snapshot_refused` reaches it on MMIO and PCI).
++                VirtioDeviceType::Fs => {
++                    crate::logger::error!(
++                        "virtio-fs device {} not saved: a snapshot with one is refused",
++                        locked_virtio_dev.id()
++                    );
++                }
+             }
+         }
+ 
+diff --git a/src/vmm/src/device_manager/persist.rs b/src/vmm/src/device_manager/persist.rs
+index 821a42f5e67e34ed8599935e5a702d3498cbc8f7..6ae4b83180e2b3a3b2a366039f7c85e012a89406 100644
+--- a/src/vmm/src/device_manager/persist.rs
++++ b/src/vmm/src/device_manager/persist.rs
+@@ -391,10 +391,16 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
+                         device_info,
+                     });
+                 }
+-                // wick: never saved; `Vmm::save_state` refuses a snapshot
+-                // with a virtio-fs device before any state is saved
+-                // (`check_unsnapshottable_devices`).
+-                VirtioDeviceType::Fs => {}
++                // wick: never saved, and said; `Vmm::save_state` refuses a
++                // snapshot with a virtio-fs device before any state is saved
++                // (`check_unsnapshottable_devices`), so this is reached only
++                // past that refusal (`ext::fs_snapshot_tests::
++                // test_fs_snapshot_refused` reaches it on MMIO and PCI).
++                VirtioDeviceType::Fs => {
++                    crate::logger::error!(
++                        "virtio-fs device {device_id} not saved: a snapshot with one is refused"
++                    );
++                }
+             };
+ 
+             Ok(())
