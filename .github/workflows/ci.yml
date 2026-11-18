@@ -920,10 +920,21 @@ jobs:
   macos-15-root-vmnet:
     runs-on: macos-15
     # Limits as the macos job's comment says. The vmnet stage's longest run
-    # was 2.9 minutes (run 44398279915), its step 2.6. The jailer scenarios
-    # have not run here yet: their step has the macos job's limit for the
-    # same step (5; 2.2 there at most), and the job 15, to be derived again
-    # from this job's own runs.
+    # was 2.9 minutes (run 44398279915), its step 2.6; that step's
+    # boot-test.sh builds Firecracker, its tools and examples and
+    # vhost-user-blk (release) into the target directories jailer-test.sh
+    # uses. The jailer scenarios have not run here yet. In the macos job the
+    # same step builds them first too, after a build of Firecracker as here
+    # (run 44398279915): the jailer with the dependencies Firecracker's
+    # build had not made (4.5 s), Firecracker's uffd_on_demand_handler
+    # example (4.0 s) and vhost-user-blk (8.7 s), both built here by the
+    # vmnet step already, compat libc's uffd_charge_probe (0.3 s); it runs
+    # every no-VM stage, the jail stage's 11 s idle included: 2.2 minutes at
+    # most over the ten runs, 1.8 in 44398279915, the first with that idle.
+    # So its
+    # step gets 5, and the job 2.9 + 2.2 = 5.1 minutes, which the rule
+    # makes 10; it has 15 until this job's own runs give that step's time on
+    # macOS 15, the one input not measured on this runner.
     timeout-minutes: 15
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
