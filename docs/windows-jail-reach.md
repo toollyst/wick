@@ -59,6 +59,15 @@ In short:
     Users and Everyone, and with the `hypervisorPlatform` capability SID (refused); an AppContainer and two LPACs
     with that capability (option Q), each followed by option Q's own checks (`q_checks`). Not yet run.
 
+- **In CI, the record stage.** `jailer-test.ps1 reach` makes the same record with the jailer's own spawn on CI's
+  windows-guest runner (Windows Server 2025 build 26100, with Hyper-V): `jail-probe reachlist` (the operator) lists
+  every named object, pipe and mailslot into the jail's root, and `jail-probe reach`, after Firecracker's preload and
+  `RevertToSelf`, opens each as `devjail` does (`tools/windows/jail-reach.rs`, the same code) and runs the checks
+  that are not names (a DLL loaded and HKLM read after the revert, TCP to loopback, the link-local metadata address
+  and 8.8.8.8:53, an AF_UNIX bind, a pipe and a mailslot made, the pipes listed). Its output, one `reach` line per
+  name reached and a `reach-summary` per type, is the format the fix's allowlist will read; it asserts nothing yet;
+  the fix makes it an assertion against one exact allowlist. First run: CI.
+
 ## What the jail reaches
 
 All counts are `devjail` under the jailer, unless marked otherwise.
@@ -566,6 +575,7 @@ to when the partition is made. What it brings, and what the next record (`jail-v
 
 - Anything a host with Hyper-V adds to the lists above (this host has no Hyper-V); WHP's devices are measured
   above, on CI's runner.
-- A desktop Windows 10 or 11, whose services and drivers differ: rerun `list-objects` and `devjail` there.
+- A desktop Windows 10 or 11, whose services and drivers differ: rerun `list-objects` and `devjail` there, or
+  `jailer-test.ps1 -Stage reach`.
 - What the I/O controls of each reached driver accept beyond the undefined one. No driver's or service's own checks
   were attacked.

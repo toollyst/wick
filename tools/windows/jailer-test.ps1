@@ -6,10 +6,10 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,restart,shared,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user|x2storm] [-Bin <dir>] [-X2ApicFirecracker <exe>]
+#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,reach,boot,restart,shared,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user|x2storm] [-Bin <dir>] [-X2ApicFirecracker <exe>]
 #
-# `refuse`, `freeze`, `cpuset`, `parent`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
-# and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
+# `refuse`, `freeze`, `cpuset`, `parent`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`,
+# `api` and `reach` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
 # and reads it): run with other stages, it is run alone in a console of
 # its own, as CI's step runs it (<WorkDir>-pidns); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
 # Platform filters). `hugepages` needs the account to hold "Lock pages in memory" (it
@@ -31,7 +31,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'freeze', 'cpuset', 'parent', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'restart', 'shared', 'bindlink', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'freeze', 'cpuset', 'parent', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'reach', 'boot', 'restart', 'shared', 'bindlink', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = '',
@@ -847,6 +847,50 @@ function Stage-Isolation {
         "jailed: no user files, nothing outside its jail, no other jail, API socket or process (the operator's, another microVM's); the operator reaches the API socket ($($expect.Count) checks)"
     } finally {
         Remove-Item $secret, $outside, 'C:\Users\Public\wick-jailer-test.txt' -ErrorAction SilentlyContinue
+        Stop-Jailed
+    }
+}
+
+# What a jailed process reaches of the host's named objects, a record under
+# the jail's token as the jailer makes it today (docs/windows-jail-reach.md;
+# option P, step A): jail-probe `reachlist`, run by the operator, lists
+# every named object of the object manager's namespace, every named pipe and
+# every mailslot into the jail's root; jail-probe `reach`, the jailer's own
+# spawn, after Firecracker's preload and RevertToSelf as every jailed check
+# runs, opens each (a device by its name or beneath it, an ALPC port
+# connected to, the rest by name) and runs the checks that are not names: a
+# DLL loaded after the revert, HKLM read, TCP to loopback (a listener of
+# this stage), the link-local metadata address and -External, an AF_UNIX
+# bind, a pipe and a mailslot made, the pipes listed (tools/windows/
+# jail-reach.rs). Its lines (`reach <type> <path> <how>`, `reach-check
+# <name> <result>`, `reach-summary <type> tried <n> reached <m>`) are
+# printed here whole: the format the allowlist will read. It asserts
+# nothing of what is reached, only that the record is whole: the list made,
+# the jailed probe's end line, a summary. Needs no guest.
+function Stage-Reach([string]$External = '8.8.8.8:53') {
+    $probe = Get-Probe
+    $base = New-Base 'reach'
+    $root = Join-Path $base 'jail-probe.exe\r\root'
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    # The list in the jail's root, which the jail's directory grants it, as
+    # a file Firecracker opens there is.
+    $made = & $probe "reachlist:$(Join-Path $root 'objects.txt')"
+    Check ($made -match ' allowed (\d+) names') "the operator's list: $made"
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        $port = $listener.LocalEndpoint.Port
+        $r = Invoke-Jailer @('--id', 'r', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', "reach:/objects.txt:${port}:$External") 900000
+        $lines = @($r[1] -split "`r?`n" | Where-Object { $_ })
+        foreach ($l in $lines) { Write-Host "     $l" }
+        $done = $lines | Where-Object { $_ -match '^reach:\S+ done \d+ of \d+ names reached$' } | Select-Object -First 1
+        Check ($r[0] -eq 0 -and $done) "the jailed record did not end: exit $($r[0]): $(($lines | Select-Object -Last 3) -join ' | ')"
+        $summary = @($lines | Where-Object { $_.StartsWith('reach-summary ') } | ForEach-Object { $_.Substring('reach-summary '.Length) })
+        Check ($summary.Count -gt 0) 'the jailed record has no reach-summary line'
+        $checks = @($lines | Where-Object { $_.StartsWith('reach-check ') })
+        "a record under today's token, nothing asserted: the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks"
+    } finally {
+        $listener.Stop()
         Stop-Jailed
     }
 }

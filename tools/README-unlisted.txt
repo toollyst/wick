@@ -24,6 +24,7 @@ tools/macos/jailer-test.py run through tools/macos/jailer-test.sh, which builds 
 tools/windows/enclave-refusal-test.py run by CI's windows job, "Nitro Enclave refused without the device"
 tools/windows/jail-parent.rs built by CI's windows job ("Build the probes"), used by tools/windows/jailer-test.ps1
 tools/windows/jail-probe.rs built by CI's windows job ("Build the probes"), run by tools/windows/jailer-test.ps1 as the jailed binary
+tools/windows/jail-reach.rs a module of tools/windows/jail-probe.rs (its `reachlist` and `reach` checks, for jailer-test.ps1's `reach` stage), built with it
 tools/windows/fs-probe.rs a probe, run by hand as an elevated administrator: what each confinement considered for the virtio-fs server reaches on a Windows host (docs/design-fs.md §6.3), and, run by the jailer as the jailed binary (`devjail`), what the Windows jail's token reaches (docs/windows-jail-reach.md), and (`whp-token`) whether the Windows Hypervisor Platform works under each lockdown token the jailer could make; built by CI's windows job ("Build the probes"), and `whp-token` run as a record by its windows-guest job
 tools/windows/job-freeze-probe.ps1 a probe: whether a Job Object's processes freeze and thaw as a group
 tools/windows/memory-partition-probe.rs a probe: whether a memory partition bounds what a jailed process takes, built by CI's windows job

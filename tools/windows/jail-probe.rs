@@ -28,11 +28,14 @@
 //!                               private:<MiB> sections:<MiB> filesections:<MiB>
 //!                               namedjob:<object name> namespace:0
 //!                               dacl:<path> owner:<path> deleteopen:<path>
+//!                               reachlist:<file>
+//!                               reach:<file>:<port>:<ip>:<port>
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
 //!
-//! Prints one line per check: `<check> allowed` or `<check> denied <error>`.
+//! Prints one line per check: `<check> allowed` or `<check> denied <error>`;
+//! `reach` prints its record's lines before its own (jail-reach.rs).
 //! No dependencies: `rustc -O jail-probe.rs` builds it.
 
 #![allow(non_snake_case, clippy::upper_case_acronyms)]
@@ -40,6 +43,11 @@
 /// Firecracker's preload before its revert (vmm::ext::jail), the same code.
 #[path = "../../overlay/vmm/ext/jail_preload.rs"]
 mod preload;
+
+/// The `reachlist` and `reach` checks: what the jail reaches of the host's
+/// named objects (jailer-test.ps1's `reach` stage).
+#[path = "jail-reach.rs"]
+mod reach;
 
 use std::ffi::c_void;
 use std::io::{Read, Write};
@@ -497,6 +505,8 @@ fn check(c: &str) -> String {
         Err(e) => format!("denied {e}"),
     };
     match kind {
+        "reachlist" => reach::list(arg),
+        "reach" => reach::reach(arg),
         "read" => io(std::fs::File::open(arg).and_then(|mut f| f.read(&mut [0u8; 1]).map(drop))),
         "write" => io(std::fs::OpenOptions::new()
             .create(true)

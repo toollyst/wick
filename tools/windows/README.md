@@ -48,9 +48,15 @@
   given the first's: each endpoint in its jail's own directory of the
   network, which no other jail reaches; a second jail of a running id
   refused; TCP and UDP denied; an unelevated jailer refused the flag; needs
-  an elevated PowerShell) and
+  an elevated PowerShell),
   `api` (the jail runs Firecracker and its API server's process, the latter
-  under the whole mitigation profile; each one's end ends the other). With a
+  under the whole mitigation profile; each one's end ends the other) and
+  `reach` (a record, nothing asserted yet: every named object, pipe and
+  mailslot of the host, listed by the operator, is opened by `jail-probe.rs`
+  in the jail as the jailer makes it, with the checks that are not names, a
+  DLL loaded after the revert, HKLM, TCP and AF_UNIX; one `reach` line per
+  name reached and a `reach-summary` per type, the format the allowlist will
+  read; `jail-reach.rs`). With a
   guest: `netguest` (frames through the endpoint in the jail's own directory of the network),
   `isolation` (`jail-probe.rs`, run through the jailer as the jailed binary,
   may not read the user's files or SAM, write files outside its jail, reach another
