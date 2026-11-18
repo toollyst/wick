@@ -66,8 +66,8 @@ pub fn descriptors(limits: &Limits) -> u64 {
 }
 
 /// Bytes the guest's writes may add to the share in one run of the server
-/// (docs/design-fs.md decision 7). Provisional, until the jailer's
-/// `--fs-share` sets it per share.
+/// (docs/design-fs.md decision 7). Provisional, until a per-share setting
+/// on the jailer's `--fs-share` (ROADMAP M7); `--max-bytes` sets it here.
 pub const DEFAULT_MAX_BYTES: u64 = 64 << 30;
 
 /// The largest READ or READDIR reply's data: `max_write`, the most one

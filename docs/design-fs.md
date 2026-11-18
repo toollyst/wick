@@ -19,7 +19,8 @@ kernels of row 21: CI's `guest-kernels` job builds upstream's CI kernel
 VMM's virtio-fs device on Linux and macOS** (`crates/ext/src/fs`, §4.1, only in a build with Firecracker's `fs`
 feature: `PUT /extensions/fs` configures shares, each a device that connects to its server's socket at boot; its unit
 tests against a fake server, the `fs_proxy` fuzz target, `test_fs_snapshot_refused`). No guest has mounted a share
-yet: the boot stages are planned (plan commit 12), and the jailer does not yet place the socket (plan commit 11). A
+yet: the boot stages are planned (plan commit 12). The jailer starts one `wick-fsd` per `--fs-share` and gives its
+socket to the jail (§8, Jailer; not with `--daemonize` or `--new-pid-ns` in this version). A
 default build has none of it: there `PUT /extensions/fs` is refused as an unknown extension (`crates/ext/src/lib.rs`,
 `test_unknown_extension_is_rejected`; `tools/check-fs-off.sh`).
 The work is the virtio-fs item of [M7](ROADMAP.md#m7-desktop-devices). Every "is", "does" and "returns" below about
@@ -90,7 +91,7 @@ documented or measured; **measure** = the fix is designed, a measurement on the 
    place. Rejected for now: option B, kept as a possible Linux-only extra.
 3. **The jailer starts `wick-fsd` next to Firecracker** when the configuration has `extensions.fs`, so an operator
    writes one configuration entry. Rejected: Firecracker starting it, because the VMM's sandbox allows no process
-   creation and adding it would weaken the VMM for everyone. Until the jailer does it, the operator starts it.
+   creation and adding it would weaken the VMM for everyone. Without the jailer the operator starts it (§8, Jailer).
 4. **Windows confinement: an ACE for the share's own AppContainer SID** (row 13). Rejected: a broker that opens files
    for the LPAC server, because the broker would parse guest names with the user's full rights, outside any
    sandbox.
@@ -311,8 +312,10 @@ Built (`crates/ext/src/fs`, only with Firecracker's `fs` feature: a default buil
 lay them out); fuzz target `fs_proxy`. No guest has used it yet (commit 12's boot stages).
 
 - Config `extensions.fs`: `{"shares": [{"id", "tag", "socket", "queue_size", "rate_limiter"}]}`, 1 to 8 shares,
-  ids and tags unique (`test_bad_configs_are_refused`). `socket` is required: the VMM never connects to a path it was
-  not given (a default in the jail comes with the jailer's `--fs-share`, plan commit 11). `queue_size` a power of two
+  ids and tags unique (`test_bad_configs_are_refused`). `socket` defaults to `/fs-<id>.sock`, where the jailer's
+  `--fs-share` puts it in the jail's root (`test_the_default_socket_is_the_jailer_s`); without the jailer it is
+  required, and the default, a name at the host's root, is refused at the connect naming it and saying so
+  (`test_the_default_socket_s_refusal_says_it_is_required`). `queue_size` a power of two
   from 2 to 256 (default 256); `rate_limiter` upstream's block schema. The VMM knows only the tag and the socket
   path: the shared directory and `read_only` are the server's configuration (refused here as unknown fields), so the
   VMM never holds a handle to the share.
@@ -450,7 +453,9 @@ lay them out); fuzz target `fs_proxy`. No guest has used it yet (commit 12's boo
 - Built for Linux (`crates/fs/fsd/src/main.rs`): `wick-fsd --share-dir DIR --socket PATH --id ID [--read-only]
   [--cache auto|never|always] [--cache-timeout-ms N] [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD (3 or more)]
   [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]`. It refuses a socket path that exists
-  (it never removes what it did not make), says it is ready (a byte on `--ready-fd`, else a `ready` line), accepts
+  (it never removes what it did not make), says it is ready (a byte on `--ready-fd`, else a `ready` line; a server
+  that refuses before that holds `--ready-fd` until its refusal is on stderr, so a launcher that kills it at the
+  pipe's end, as the jailer does, never cuts the reason off), accepts
   one connection, closes and unlinks the listener at once, and serves only a peer of `--peer-uid` (default: its own
   uid). At the end it writes its counters to stderr (layer-2 refusals among them). `wick-fsd --version` prints its
   version, and a discovery build (§6.2, how the lists were checked) adds that it is one, never a product, there and
@@ -495,8 +500,11 @@ lay them out); fuzz target `fs_proxy`. No guest has used it yet (commit 12's boo
   - the descriptors these let the server hold at once, `limits::descriptors`: the nodes' cache, one per handle, and 64
     spare (`SPARE_FDS`: the standard streams, the connection, and what one request opens or keeps before its reply),
     2112 by default, whatever the number of nodes. Stage 0 refuses a share whose host limit is below it, so the server
-    itself never meets EMFILE mid-run, and never lowers a limit the operator set. The defaults fit the lowest stock
-    limit with 8128 to spare
+    itself never meets EMFILE mid-run. It then sets its soft and its hard `RLIMIT_NOFILE` both to exactly that, before
+    the id drop, and reads them back (`sys::set_nofile_exact`): whatever hard limit it was started with (a shell's may
+    be a million) is not kept, and without privilege the hard limit is never raised again
+    (`test_the_descriptor_limit_is_exactly_the_need`, which reads `/proc/<pid>/limits` on Linux). The defaults fit the
+    lowest stock limit with 8128 to spare
     (`test_default_limits_fit_stock_hosts`): macOS enforces the lower of `RLIMIT_NOFILE` and `kern.maxfilesperproc` (xnu
     `proc_limitgetcur_nofile`) [src], which is `OPEN_MAX`, 10240, on a Mac with 8 GB or less (`bsd_scale_setup` scales
     it only for a scale above 2; `scale_setup` gives 2 below 8 GB and memory / 4 GB above) [src]; 122880 on a 32 GB M1
@@ -512,7 +520,7 @@ lay them out); fuzz target `fs_proxy`. No guest has used it yet (commit 12's boo
     most 127 bytes, `XATTR_MAXNAMELEN`, less the 7 of the `wick.x.` prefix; `GUEST_XATTR_NAME_MAX`);
   - READDIR reply ≤ the request size;
   - bytes the guest's writes may add in one run of the server (decision 7): 64 GiB by default, **provisional** until
-    the jailer's `--fs-share` sets it per share (virtio-fs staging 11);
+    a per-share setting on the jailer's `--fs-share` (ROADMAP M7; today `--max-bytes` on wick-fsd's own command line);
   - guest xattrs per node: 3 KiB by default, each attribute charged 32 bytes (`XATTR_ENTRY_COST`) plus its name
     and value. Default ext4 is the tightest Linux file system: beside the record it held one value of 4028 bytes, or
     146 empty attributes, which the charge counts as 4066 and 5002 bytes, both over the budget; xfs, btrfs and tmpfs
@@ -1586,11 +1594,75 @@ it means layer 1 let the request through.
     but this costs nothing. Failures become ESTALE (virtiofsd's `guest-error` analogue).
   - Share contents are the operator's job. virtiofsd says: "virtiofsd's state includes absolutely no data". One
     snapshot restored into many VMs needs one share copy per clone. This is upstream's 2020 concern, so document it.
-- **Jailer:**
-  - the server runs outside the jail, as upstream advises for vhost-user backends;
-  - its socket is inside the jail root, as vhost-user-blk's is (PORTING row 14);
-  - the share is never visible inside the jail;
-  - the server confines itself (§6); a jailer flag could start it as a sibling later.
+- **Jailer** (Linux and macOS; `overlay/jailer/fs_share.rs`; Windows refuses the flags until its port):
+  - `--fs-server PATH` (absolute) names wick-fsd; `--fs-share id=ID,dir=DIR,uid=U,gid=G[,ro]`, repeatable, one share
+    each. Everything is checked before anything starts, and a refusal names the share and what is wrong: the id is
+    wick-fsd's (1 to 64 of `[a-z0-9_-]`) and its socket's path, `<jail root>/fs-<id>.sock`, fits a Unix socket's; no
+    id and no directory (canonical) is given twice; `U` and `G` are neither 0 nor the jail's, so the kernel's checks
+    by id separate the server from the VMM as well as the two sandboxes do; one flag without the other is refused
+    (`test_fs_share_parse`, `test_fs_share_refusals_name_what`).
+  - **Order.** One server per share is started just before the chroot: after `--netns` is joined, the resource limits
+    are installed and the cgroup is set up, so on Linux it is in the jail's cgroups (the jailer attaches itself, and
+    a child inherits them), and before `/dev/null`, the chroot, the jail's directories and the exec. It is forked by
+    the process that then execs Firecracker, as root, with `--uid U --gid G --peer-uid <jail uid> --ready-fd 3
+    [--read-only]`, standard input `/dev/null`, the jailer's (cleared) environment and its standard output and error.
+    The jailer waits for its ready byte (10 s), checks the socket (a socket, mode 0600, root's) and gives it to the
+    jail's `uid:gid` without following a link; only then the next share, and only after all of them the chroot.
+  - **The socket.** wick-fsd binds it with the umask 0177 and checks it is a socket of mode 0600 and its own before
+    `listen` (`sys::listen_private`), so no other process can connect first, the jailed VMM included until the
+    jailer gives it the socket; the socket's directory must be owned by root, wick-fsd's euid or `--peer-uid` and
+    writable by no group or other, else wick-fsd refuses naming its mode and owner (`/tmp`, 1777, is refused). In the
+    jail root (root's, made by the jailer) the jailed VMM can rename or replace the socket only to its own harm: the
+    server checks the peer's uid and its hello (`test_the_socket_is_private_and_its_directory_too`; as root, uids
+    65534 and 65533 refused before the chown, 65534 taken after). The VMM's `socket` is `/fs-<id>.sock` when not
+    given (§4.1).
+  - **Failure.** Any failure of the jailer's after a server started (its ready byte not in time, its end, the socket
+    check, the next share's start, any later step before the exec) kills every server it started and waits for
+    each; none is left behind, and on a refusal at the parse nothing was started
+    (`test_fs_share_start_kills_what_it_started`, by pid after). A step between the fork and the exec that fails
+    is named on the ready pipe (`test_fs_share_a_failure_before_the_exec_is_named`). Under the real jailer as root,
+    the macOS jailer-test `fs` stage and `tools/linux/jailer-fs-check.py`: six refusals and two failing servers
+    leave no process, and a real wick-fsd is Firecracker's child (Linux: a payload's, as
+    `jailer-cgroup-check.py` runs it), its socket 0600 and the jail's; on Linux also in the jail's cgroup, its
+    descriptor limit its own need under the jail's `no-file=1024` (CI's macos and linux jobs are their first
+    runs as root).
+  - **Parent, reaping, early end.** The exec makes Firecracker of the process that forked the servers, so
+    Firecracker is their parent; it never waits for them. A server that ends while Firecracker runs stays a zombie
+    (a process-table entry, no memory) until Firecracker ends, when it is reparented and reaped; a server ends when
+    its connection does, so on Firecracker's end too, but **not before its connection** (a known limit of this
+    version): a server whose Firecracker ends before the device connected (no boot was started) waits for its
+    connection, as root in stage 0, until it is killed; the jailer-test `fs` stage and `jailer-fs-check.py` record
+    it. A parent-death signal cannot end it on Linux, and macOS has none: the kernel sends `PR_SET_PDEATHSIG`'s
+    signal as the dying parent (kernel/exit.c `forget_original_parent`) through the kill permission check
+    (kernel/signal.c `check_kill_permission`, `kill_ok_by_cred`: a uid of the sender must match the target's, or
+    the sender needs `CAP_KILL`), and the parent is Firecracker at the jail's uid with no capabilities while the
+    server is root, so the signal is dropped (measured on Linux 7.0.14: a root child's signal fires when its root
+    parent ends, not when the parent dropped to another uid first). The next item below ends it with the VMM by a
+    descriptor on the parent instead (Linux `pidfd_open`, macOS a kqueue `EVFILT_PROC`), which no such check
+    governs. A server that dies early is seen by the device as the
+    connection's end: the share's requests fail from then on and the device's metrics count the server's EOF
+    (§4.1); the rest of the VM goes on.
+  - **Stated limit of this version: neither `--daemonize` nor `--new-pid-ns` with `--fs-share`** (refused by
+    name). Each leaves the process that would be the servers' parent behind (the daemonizing fork's parent exits;
+    the new PID namespace's first process is a fork of it), so a server could outlive the jail. Next item (ROADMAP
+    M7): the server watches its parent by a descriptor until its connection, so it ends when the VMM ends before
+    it connected; then the parent it watches passed by the jailer in a form that holds across those two (a
+    daemonizing fork, a new PID namespace), which lifts this limit.
+  - **What the server inherits from the jailer, and what it does not** (so nothing surprises as `no-file` did):
+
+    | Limit | Linux | macOS | What it means for wick-fsd |
+    |---|---|---|---|
+    | `--resource-limit no-file` (default 2048, soft = hard) | not inherited: the forked child sets back the jailer's own `RLIMIT_NOFILE`, read before the jail's is installed (`HostLimits`) | same | wick-fsd sets both its limits to exactly its need (2112 by default, above the jail's 2048); `test_fs_share_server_gets_the_jailer_s_limits` |
+    | `--resource-limit fsize` | not inherited, as above | same | `fsize` bounds files Firecracker writes; the share's growth is the server's own budget (`--max-bytes`, 64 GiB by default). An `RLIMIT_FSIZE` the operator's shell gave the jailer is the server's: a guest write past it ends the server with SIGXFSZ until the follow-up that ignores the signal (SECURITY) |
+    | other rlimits (`RLIMIT_AS`, `DATA`, `STACK`, `NPROC`, `MEMLOCK`, `CORE`, `CPU`) | inherited from the jailer's launcher, as Firecracker inherits them; the jailer sets none | same | the operator's; wick-fsd's caps (below) do not depend on them |
+    | cgroup `memory`, `cpu`, `pids`, `freezer` | **inherited**: the server is in the jail's cgroups and shares their budget with Firecracker; `pids.max` counts its threads; freezing the jail freezes the server too | no cgroups: the memory cgroup is a jetsam limit set at Firecracker's exec (`posix_spawnattr_setjetsam_ext`), the CPU cgroup a limit Firecracker applies to itself (`WICK_JAIL_CPU`, platform `set_cpu_limit_percent`): **neither applies to the server**; the freezer's supervisor suspends Firecracker and, before listing them, its children (`proc_listchildpids`, `overlay/jailer/platform/macos/freezer.rs`), and after the exec the server is Firecracker's child, so a frozen jail's server is suspended too [src; the jailer-test `fs` stage measures it] | macOS: the server's memory and CPU are bounded by its own caps only (below); its own jetsam and CPU limits are ROADMAP M7 |
+    | `--netns` | joined before the fork: the server is in it, and makes a network namespace of its own (§6.1) | no network namespaces | none: the server has no network |
+    | environment | cleared by the jailer at its start | same | `HOME` is unset, so stage 0's home-directory refusal (`refused_root`) does not apply under the jailer; the system trees and holders still do |
+
+    The server's own caps, the same on every host and per share: 2^18 nodes, at most 4096 bytes each (1 GiB worst
+    case, about 280 MiB typical), 1024 open handles, 1024 held descriptors, 2112 descriptors in all, 64 GiB of
+    growth (`--max-bytes`), 3 KiB of guest xattrs per node; requests one frame of at most 1 MiB of data at a time.
+    N shares are N times that. Per-share settings of these on `--fs-share` are ROADMAP M7.
 - **Rate limiting:** in the VMM, with upstream's `RateLimiter` (ops + bandwidth), the block device's schema. The same
   code on all hosts gives parity.
 - **Metrics:**

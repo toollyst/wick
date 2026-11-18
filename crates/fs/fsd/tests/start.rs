@@ -15,6 +15,7 @@ use std::os::fd::OwnedFd;
 use std::process::Command;
 use std::time::Duration;
 
+use wick_fs_sys as sys;
 use wick_fs_sys::launch::{self, Descriptors, Io};
 
 fn wick_fsd(dir: &std::path::Path, ready: Option<OwnedFd>) -> (Command, Descriptors) {
@@ -36,10 +37,16 @@ fn wick_fsd_at(dir: &std::path::Path, at: &str, ready: Option<OwnedFd>) -> (Comm
     (cmd, Descriptors { inherited, ..Default::default() })
 }
 
+/// As root under /tmp, whose directories every uid can search (root's own
+/// temporary directory on macOS is 0700, which the uid the root test drops
+/// to cannot search: common/mod.rs's scratch says so). A name left there
+/// is removed as a name (`remove_dir_all` follows no link), then made with
+/// `create_dir`, which fails on a name already there.
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("wick-fsd-start-{tag}-{}", std::process::id()));
+    let base = if sys::euid() == 0 { std::path::PathBuf::from("/tmp") } else { std::env::temp_dir() };
+    let dir = base.join(format!("wick-fsd-start-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir(&dir).unwrap();
     dir
 }
 
@@ -177,4 +184,185 @@ fn test_a_build_says_whether_it_is_a_discovery_build() {
         assert!(!line.contains("discovery"), "{line}");
         assert!(err.is_empty(), "{err}");
     }
+}
+
+/// wick-fsd over `dir/share` with its socket `sock`, the ready byte on a
+/// pipe whose read end is returned (its write end at 40, given by
+/// [`launch`]), and `extra` arguments.
+fn wick_fsd_socket(
+    dir: &std::path::Path,
+    sock: &std::path::Path,
+    extra: &[&str],
+) -> (Command, Descriptors, std::io::PipeReader) {
+    std::fs::create_dir_all(dir.join("share")).unwrap();
+    let (read_end, write_end) = std::io::pipe().unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wick-fsd"));
+    cmd.arg("--share-dir")
+        .arg(dir.join("share"))
+        .arg("--socket")
+        .arg(sock)
+        .args(["--id", "t", "--ready-fd", "40"])
+        .args(extra);
+    (cmd, Descriptors { inherited: vec![(write_end.into(), 40)], ..Default::default() }, read_end)
+}
+
+/// The ready byte or the server's end, within 30 s; the server is killed
+/// and reaped either way, and its stderr returned. A server that refuses
+/// holds `--ready-fd` until its refusal is written (main.rs), so the end of
+/// the pipe comes after it: the kill never cuts it off.
+fn ready_then_kill(
+    (cmd, fds, mut read_end): (Command, Descriptors, std::io::PipeReader),
+    then: impl FnOnce(u32),
+) -> (Vec<u8>, String) {
+    let mut child = launch::launch(&cmd, [Io::Null, Io::Null, Io::Piped], fds).unwrap();
+    drop(cmd);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut got = Vec::new();
+        let _ = read_end.read_to_end(&mut got);
+        let _ = tx.send(got);
+    });
+    let got = rx.recv_timeout(Duration::from_secs(30)).expect("the pipe's end, within 30 s");
+    if got == b"R" {
+        then(child.id());
+    }
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    (got, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// As root: whether a process of `uid`:`gid` can connect to `sock`. On
+/// Linux a forked child (sys::connect_as); on macOS this test binary started
+/// again by posix_spawn ([`launch`]) on `connect_as_child` alone, since a
+/// fork in a test process can abort in libSystem's fork child handler
+/// (sys/src/unix/launch.rs says why).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn connect_as(sock: &std::path::Path, uid: u32, gid: u32) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        sys::connect_as(sock, uid, gid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "connect_as_child", "--ignored", "--test-threads=1", "--nocapture"])
+            .env("WICK_FSD_CONNECT_AS", format!("{uid}:{gid}:{}", sock.display()));
+        let out = launch::output(&cmd, Descriptors::default()).unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        // libtest's "test connect_as_child ... " may lead the line.
+        match text.lines().find_map(|l| l.split_once("connect_as: ").map(|(_, r)| r)) {
+            Some("ok") => Ok(()),
+            Some(e) => Err(e.to_string()),
+            None => panic!("connect_as_child said nothing: {out:?}"),
+        }
+    }
+}
+
+/// [`connect_as`]'s child on macOS: drops to the uid and gid it is given and
+/// connects, then says how that went on stdout. Ignored, and nothing without
+/// its variable.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "connect_as's child, run by connect_as alone"]
+fn connect_as_child() {
+    let Ok(spec) = std::env::var("WICK_FSD_CONNECT_AS") else { return };
+    let mut it = spec.splitn(3, ':');
+    let (uid, gid, path) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+    let r = sys::connect_as_here(std::path::Path::new(path), uid.parse().unwrap(), gid.parse().unwrap());
+    println!("connect_as: {}", r.map_or_else(|e| e, |()| "ok".to_string()));
+}
+
+/// The socket is made 0600 and this euid's before it is listened on
+/// (sys::listen_private), in a directory that must be owned by root, this
+/// euid or `--peer-uid` and writable by no group or other (docs/design-fs.md
+/// §4.2): a directory another uid can write is refused by its mode and
+/// owner, and nothing is bound in it. As root (CI's root runs; the first run
+/// on macOS is CI's): a directory owned by another uid is refused unless it
+/// is `--peer-uid`'s, and the jail's uid (`--peer-uid 65534`) cannot connect
+/// to the socket until it is given the socket, as the jailer does after the
+/// ready byte (overlay/jailer/fs_share.rs), when it can.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn test_the_socket_is_private_and_its_directory_too() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    let dir = scratch("private");
+    let sockets = dir.join("sockets");
+    std::fs::create_dir(&sockets).unwrap();
+    let sock = sockets.join("fs.sock");
+    let euid = sys::euid();
+
+    for mode in [0o777, 0o775, 0o757, 0o1777, 0o722] {
+        std::fs::set_permissions(&sockets, std::fs::Permissions::from_mode(mode)).unwrap();
+        let (got, err) = ready_then_kill(wick_fsd_socket(&dir, &sock, &[]), |_| {});
+        assert!(got.is_empty(), "{mode:o}: ready said: {err}");
+        assert!(
+            err.contains(&format!("--socket's directory {} is mode {mode:04o} owned by uid {euid}", sockets.display())),
+            "{mode:o}: {err}"
+        );
+        assert!(sock.symlink_metadata().is_err(), "{mode:o}: bound");
+    }
+
+    std::fs::set_permissions(&sockets, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (got, err) = ready_then_kill(wick_fsd_socket(&dir, &sock, &[]), |_| {
+        let m = sock.symlink_metadata().unwrap();
+        assert!(m.file_type().is_socket(), "{m:?}");
+        assert_eq!((m.mode() & 0o7777, m.uid()), (0o600, euid));
+    });
+    assert_eq!(got, b"R", "{err}");
+    let _ = std::fs::remove_file(&sock);
+
+    if euid == 0 {
+        // A directory of another uid: refused, unless that uid is the peer.
+        std::os::unix::fs::chown(&sockets, Some(65534), None).unwrap();
+        std::fs::set_permissions(&sockets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (got, err) = ready_then_kill(wick_fsd_socket(&dir, &sock, &[]), |_| {});
+        assert!(got.is_empty() && err.contains("is mode 0700 owned by uid 65534"), "{err}");
+
+        // The peer's directory: taken. Before the socket is given to the
+        // peer's uid it cannot connect (mode 0600, root's), and no other
+        // uid can; after, it can.
+        let (got, err) = ready_then_kill(wick_fsd_socket(&dir, &sock, &["--peer-uid", "65534"]), |_| {
+            for uid in [65534, 65533] {
+                let e = connect_as(&sock, uid, 65534).unwrap_err();
+                assert!(e.contains("Permission denied"), "uid {uid}: {e}");
+            }
+            std::os::unix::fs::chown(&sock, Some(65534), Some(65534)).unwrap();
+            assert_eq!(connect_as(&sock, 65533, 65534).map_err(|e| e.contains("Permission denied")), Err(true));
+            connect_as(&sock, 65534, 65534).unwrap();
+        });
+        assert_eq!(got, b"R", "{err}");
+        let _ = std::fs::remove_file(&sock);
+        std::os::unix::fs::chown(&sockets, Some(0), None).unwrap();
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The soft and the hard RLIMIT_NOFILE are both the descriptors the share's
+/// limits may hold open, whatever hard limit the server was started with
+/// (here the test's, above it): the hard one is not raised again once the
+/// ids are dropped. Linux reads it from /proc; both hosts read the server's
+/// own read-back, which it states.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn test_the_descriptor_limit_is_exactly_the_need() {
+    let dir = scratch("nofile");
+    let sockets = dir.join("sockets");
+    std::fs::create_dir(&sockets).unwrap();
+    // 1024 held + 100 handles + 64 spare.
+    let need = 1188;
+    let (_, hard) = sys::nofile().unwrap();
+    assert!(hard > need, "the test's own hard limit {hard} must be above {need}");
+    let (got, err) = ready_then_kill(wick_fsd_socket(&dir, &sockets.join("fs.sock"), &["--max-handles", "100"]), |_pid| {
+        #[cfg(target_os = "linux")]
+        {
+            let limits = std::fs::read_to_string(format!("/proc/{_pid}/limits")).unwrap();
+            let line = limits.lines().find(|l| l.starts_with("Max open files")).unwrap();
+            let v: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(v[3..5], [need.to_string(), need.to_string()], "{line}");
+        }
+    });
+    assert_eq!(got, b"R", "{err}");
+    assert!(err.contains(&format!("wick-fsd: t: RLIMIT_NOFILE {need} (soft and hard)")), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
 }

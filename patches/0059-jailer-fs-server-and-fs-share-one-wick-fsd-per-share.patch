@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 19 Nov 2026 01:24:16 +0900
+Subject: [PATCH] jailer: --fs-server and --fs-share, one wick-fsd per share
+ started before the chroot (overlay/jailer/fs_share.rs)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+wick's host folder sharing (docs/design-fs.md §8, Jailer). main.rs: the
+fs_share module (Unix), JailerError::FsShare, and the two arguments.
+env.rs:
+- Env::new checks --fs-server and --fs-share with the jail's chroot
+  directory, uid, gid, --daemonize and --new-pid-ns before anything is
+  made (fs_share::parse); Windows refuses both flags by name.
+- Env::run reads the jailer's own RLIMIT_NOFILE and RLIMIT_FSIZE first
+  (fs_share::HostLimits), and just before the chroot, after the cgroup,
+  starts the servers, each ready and its socket given to the jail before
+  the next. `fs_started` is held to the end of run: an exec that works
+  leaves the servers to Firecracker; any error returned before it, the
+  exec's own included, drops it, killing and reaping each.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/jailer/src/env.rs  | 53 ++++++++++++++++++++++++++++++++++++++++++
+ src/jailer/src/main.rs | 15 ++++++++++++
+ 2 files changed, 68 insertions(+)
+
+diff --git a/src/jailer/src/env.rs b/src/jailer/src/env.rs
+index bffb10a08842b7b73973599c460aef2488d50b32..a71c5da918bb99c0dd9c8265da3fd876f373d00f 100644
+--- a/src/jailer/src/env.rs
++++ b/src/jailer/src/env.rs
+@@ -154,6 +154,9 @@ pub struct Env {
+     resource_limits: ResourceLimits,
+     uffd_dev_minor: Option<u32>,
+     ne_dev_minor: Option<u32>,
++    // wick: host folder sharing's servers, one per --fs-share (overlay/jailer/fs_share.rs).
++    #[cfg(unix)]
++    fs_shares: Option<crate::fs_share::FsShares>,
+ }
+ 
+ /// Creates a new file owned by the given uid/gid at `dst` and writes `line`
+@@ -300,6 +303,31 @@ impl Env {
+         let uffd_dev_minor = Self::get_misc_dev_minor_number("userfaultfd").ok();
+         let ne_dev_minor = Self::get_misc_dev_minor_number("nitro_enclaves").ok();
+ 
++        // wick: --fs-server and --fs-share, checked before anything is made
++        // (overlay/jailer/fs_share.rs); Windows has no wick-fsd confinement yet.
++        #[cfg(unix)]
++        let fs_shares = crate::fs_share::parse(
++            arguments.single_value("fs-server").map(String::as_str),
++            arguments.multiple_values("fs-share").unwrap_or_default(),
++            crate::fs_share::Jail {
++                chroot_dir: &chroot_dir,
++                uid,
++                gid,
++                daemonize,
++                new_pid_ns,
++            },
++        )?;
++        #[cfg(windows)]
++        if arguments.single_value("fs-server").is_some()
++            || arguments.multiple_values("fs-share").is_some()
++        {
++            return Err(JailerError::FsShare(
++                "--fs-server and --fs-share: not on Windows yet (wick-fsd's Windows confinement is not \
++                 built; docs/design-fs.md §6.3)"
++                    .into(),
++            ));
++        }
++
+         Ok(Env {
+             id: id.to_owned(),
+             chroot_dir,
+@@ -317,6 +345,8 @@ impl Env {
+             resource_limits,
+             uffd_dev_minor,
+             ne_dev_minor,
++            #[cfg(unix)]
++            fs_shares,
+         })
+     }
+ 
+@@ -750,6 +780,10 @@ impl Env {
+     }
+ 
+     pub fn run(mut self) -> Result<(), JailerError> {
++        // wick: the limits the jailer was started with, which each wick-fsd
++        // gets back (the jail's are Firecracker's; overlay/jailer/fs_share.rs).
++        #[cfg(unix)]
++        let fs_limits = crate::fs_share::HostLimits::read()?;
+         let exec_file_name = self.copy_exec_to_chroot()?;
+         let chroot_exec_file = PathBuf::from("/").join(exec_file_name);
+ 
+@@ -793,6 +827,25 @@ impl Env {
+         #[cfg(target_arch = "aarch64")]
+         self.copy_midr_el1_info()?;
+ 
++        // wick: one wick-fsd per --fs-share, started here, after the cgroup
++        // and before the chroot, by the process that execs Firecracker
++        // (overlay/jailer/fs_share.rs). Held to the end of this function: an
++        // exec does not return and leaves them to Firecracker; any error
++        // returned before it drops `fs_started`, which kills and reaps each.
++        #[cfg(unix)]
++        let mut fs_started = crate::fs_share::Started::default();
++        #[cfg(unix)]
++        if let Some(shares) = &self.fs_shares {
++            let jail = crate::fs_share::Jail {
++                chroot_dir: &self.chroot_dir,
++                uid: self.uid,
++                gid: self.gid,
++                daemonize: self.daemonize,
++                new_pid_ns: self.new_pid_ns,
++            };
++            shares.start(jail, fs_limits, crate::fs_share::READY_TIMEOUT, &mut fs_started)?;
++        }
++
+         // Jail self.
+         chroot(self.chroot_dir())?;
+ 
+diff --git a/src/jailer/src/main.rs b/src/jailer/src/main.rs
+index 5166fc5dbc0169bd3fbae2c8a28cc59048e36f98..ca87be9e6b58e631931e6cb4d4b5190e15ef17d1 100644
+--- a/src/jailer/src/main.rs
++++ b/src/jailer/src/main.rs
+@@ -28,6 +28,10 @@ mod cgroup;
+ #[cfg_attr(windows, path = "../../../../../overlay/jailer/platform/windows/chroot.rs")]
+ mod chroot;
+ mod env;
++// wick: host folder sharing, a wick-fsd per --fs-share (overlay/jailer/fs_share.rs).
++#[cfg(unix)]
++#[path = "../../../../../overlay/jailer/fs_share.rs"]
++mod fs_share;
+ #[cfg(not(target_os = "linux"))]
+ #[path = "../../../../../overlay/jailer/platform/mod.rs"]
+ mod platform;
+@@ -171,6 +175,9 @@ pub enum JailerError {
+     #[cfg(not(target_os = "linux"))]
+     #[error("{0}")]
+     Host(platform::HostError),
++    // wick: --fs-server and --fs-share (overlay/jailer/fs_share.rs).
++    #[error("{0}")]
++    FsShare(String),
+ }
+ 
+ /// Create an ArgParser object which contains info about the command line argument parser and
+@@ -245,6 +252,14 @@ pub fn build_arg_parser() -> ArgParser<'static> {
+                 .takes_value(true)
+                 .help("Parent cgroup in which the cgroup of this microvm will be placed."),
+         )
++        // wick: host folder sharing, a wick-fsd per share (overlay/jailer/fs_share.rs).
++        .arg(Argument::new("fs-server").takes_value(true).help(
++            "The absolute path of wick-fsd, the file server of host folder sharing (with --fs-share).",
++        ))
++        .arg(Argument::new("fs-share").allow_multiple(true).help(
++            "A host folder for the microVM: id=ID,dir=DIR,uid=U,gid=G[,ro], served by a wick-fsd of its own \
++             running as U:G (neither 0 nor the jail's), its socket /fs-ID.sock in the jail.",
++        ))
+         .arg(
+             Argument::new("version")
+                 .takes_value(false)

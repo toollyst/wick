@@ -737,8 +737,10 @@ fn test_the_refusal_names_the_restriction_it_reads() {
         ("srv-names-none", "user/max_user_namespaces", "58304"),
     ] {
         let s = setup(tag);
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&s.base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        // The server, 65534, binds its socket here: the directory is its
+        // own, as wick-fsd requires of a socket's directory that no group or
+        // other can write (main.rs socket_dir_is_private).
+        std::os::unix::fs::chown(&s.base, Some(65534), Some(65534)).unwrap();
         let stand_in = s.base.join("proc-sys");
         for d in ["kernel", "user"] {
             std::fs::create_dir_all(stand_in.join(d)).unwrap();

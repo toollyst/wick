@@ -199,6 +199,15 @@ jobs:
         run: cargo build --locked -p jailer
       - name: Upstream jailer's freezer and devices cgroups
         run: sudo python3 -I tools/linux/jailer-cgroup-check.py --jailer lib/firecracker/build/cargo_target/debug/jailer
+      # The jailer's --fs-share with wick-fsd as root (docs/design-fs.md §8,
+      # Jailer): refusals and failing servers leave no process; a real server
+      # is the payload's child, in the jail's cgroup, its socket the jail's.
+      - name: The jailer's host folder sharing
+        if: success() || failure()
+        run: |
+          (cd crates/fs && CARGO_TARGET_DIR=target cargo build --locked -p wick-fsd)
+          sudo python3 -I tools/linux/jailer-fs-check.py --jailer lib/firecracker/build/cargo_target/debug/jailer \
+            --wick-fsd crates/fs/target/debug/wick-fsd
 
   # Upstream's unit tests as upstream's CI runs them (its development
   # container, as root, musl, one test thread: tools/linux/unit-tests.sh),

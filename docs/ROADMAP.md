@@ -283,8 +283,10 @@ type 26 with a snapshot refused, the `fs` feature (off by default) and the exten
 (patch 0056, `test_fs_device_type_is_26`, `test_no_extension_metrics_leave_the_line_as_upstreams`), and the
 virtio-fs device on Linux and macOS (`crates/ext/src/fs`: `PUT /extensions/fs`, a device per share that connects to
 its server at boot, checks each reply's header and answers `-EIO` once the server is lost; its tests against a fake
-server, `test_fs_snapshot_refused`, the `fs_proxy` fuzz target, `tools/check-fs-off.sh`); nothing a guest
-has used yet (the jailer's socket and the boot stages are next). The plan:
+server, `test_fs_snapshot_refused`, the `fs_proxy` fuzz target, `tools/check-fs-off.sh`), and the jailer's
+`--fs-server` and `--fs-share` on Linux and macOS (one wick-fsd per share started before the chroot, its socket
+made 0600 and given to the jail, every server killed on any failure before the exec; design-fs.md §8, Jailer);
+nothing a guest has used yet (the boot stages are next). The plan:
 
 - The device in Firecracker only copies bounded requests between the virtqueues and one socket, reading of FUSE only
   the header fields that pair a reply with its request.
@@ -292,7 +294,13 @@ has used yet (the jailer's socket and the boot stages are next). The plan:
   memory, confines itself on each host (Linux: namespaces, `pivot_root`, seccomp; macOS: Seatbelt limited to the
   share; Windows: an LPAC token with an ACE on the share, a Job Object and wick's mitigation profile), and refuses to
   start if any of that fails.
-- The jailer starts it next to Firecracker.
+- The jailer starts it next to Firecracker. In the first version not with `--daemonize` or `--new-pid-ns`, each
+  of which leaves the server's parent behind (refused by name). Next: the server watches its parent by a descriptor
+  until its connection (Linux pidfd, macOS kqueue; no parent-death signal can, design-fs.md §8), so it ends with a
+  VMM that ended first; then the watched parent passed by the jailer across `--daemonize` and `--new-pid-ns`; then
+  a socket pair made by the jailer instead of a socket in the jail root; then per-share limits on `--fs-share`
+  (nodes, handles, bytes) and, on macOS, the server's own jetsam and CPU limits (the jail's are Firecracker's
+  alone there; design-fs.md §8, Jailer).
 - It is off by default (a cargo feature `fs`), with no DAX window and no snapshots in the first version.
 - In the first version a guest's reset of the device (the driver unbound and bound again, or a kexec) loses the
   share for the rest of the VMM's life: every request fails with `-EIO` (`test_reset_loses_the_server`). Later: a new

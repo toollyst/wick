@@ -44,10 +44,13 @@ pub struct ShareConfig {
     /// The tag the guest mounts (`mount -t virtiofs <tag>`): UTF-8, 1 to 36
     /// bytes.
     pub tag: String,
-    /// wick-fsd's socket. Required: the VMM never connects to a path it
-    /// was not given (a default in the jail comes with the jailer's
-    /// `--fs-share`, plan commit 11).
-    pub socket: PathBuf,
+    /// wick-fsd's socket. When not given, `/fs-<id>.sock`
+    /// ([`default_socket`]): where the jailer's `--fs-share` puts it, in the
+    /// jail's root (overlay/jailer/fs_share.rs). Without the jailer it is
+    /// required: the default is then a name at the host's root, which the
+    /// connect refuses naming it and saying so.
+    #[serde(default)]
+    pub socket: Option<PathBuf>,
     /// Each queue's size: a power of two, at most 256.
     #[serde(default)]
     pub queue_size: Option<u16>,
@@ -57,7 +60,18 @@ pub struct ShareConfig {
     pub rate_limiter: Option<RateLimiterConfig>,
 }
 
+/// The socket of share `id` when its `socket` is not given: the jailer's
+/// name for it, in the jail's root.
+pub fn default_socket(id: &str) -> PathBuf {
+    PathBuf::from(format!("/fs-{id}.sock"))
+}
+
 impl ShareConfig {
+    /// The socket the device connects to: `socket`, or [`default_socket`].
+    pub fn socket(&self) -> PathBuf {
+        self.socket.clone().unwrap_or_else(|| default_socket(&self.id))
+    }
+
     /// The queues' size.
     pub fn queue_size(&self) -> u16 {
         self.queue_size.unwrap_or(MAX_QUEUE_SIZE)
@@ -93,7 +107,7 @@ impl FsConfig {
                     share.id
                 ));
             }
-            if share.socket.as_os_str().is_empty() {
+            if share.socket.as_ref().is_some_and(|s| s.as_os_str().is_empty()) {
                 return Err(format!("share {}: an empty socket path", share.id));
             }
             for other in &self.shares[..i] {
@@ -127,7 +141,7 @@ mod tests {
     #[test]
     fn test_a_share_with_defaults() {
         let c = FsConfig::parse(json!({"shares": [share("docs", "Docs ü", json!({}))]})).unwrap();
-        assert_eq!(c.shares[0].socket, PathBuf::from("/run/fs-docs.sock"));
+        assert_eq!(c.shares[0].socket(), PathBuf::from("/run/fs-docs.sock"));
         assert_eq!(c.shares[0].queue_size(), 256);
         assert!(c.shares[0].rate_limiter.is_none());
     }
@@ -145,8 +159,6 @@ mod tests {
             json!({"shares": [share("d", "t", json!({"queue_size": 512}))]}),
             json!({"shares": [share("d", "t", json!({"queue_size": 1}))]}),
             json!({"shares": [share("d", "t", json!({"socket": ""}))]}),
-            // No socket: never a path the VMM was not given.
-            json!({"shares": [{"id": "d", "tag": "t"}]}),
             json!({"shares": [share("d", "t", json!({})), share("d", "u", json!({}))]}),
             json!({"shares": [share("d", "t", json!({})), share("e", "t", json!({}))]}),
             // The host directory and read_only are the server's, never the VMM's.
@@ -162,5 +174,15 @@ mod tests {
         // 36 bytes of UTF-8 is the longest tag.
         let tag = "ü".repeat(18);
         FsConfig::parse(json!({"shares": [share("d", &tag, json!({}))]})).unwrap();
+    }
+
+    /// No `socket`: the jailer's name for the share's socket, in the jail's
+    /// root (device::tests::test_the_default_socket_s_refusal_says_it_is_required
+    /// has the connect's refusal without the jailer).
+    #[test]
+    fn test_the_default_socket_is_the_jailer_s() {
+        let c = FsConfig::parse(json!({"shares": [{"id": "docs", "tag": "t"}]})).unwrap();
+        assert_eq!(c.shares[0].socket, None);
+        assert_eq!(c.shares[0].socket(), PathBuf::from("/fs-docs.sock"));
     }
 }

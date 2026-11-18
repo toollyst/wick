@@ -83,7 +83,14 @@ const EV_STALL: u32 = 5;
 /// microVM is built (`attach_boot_devices`), before the VMM's sandbox
 /// narrows (design-fs §4.1).
 pub fn connect(share: &ShareConfig) -> Result<UnixStream, String> {
-    connect_to(&share.socket, &share.id, HELLO_TIMEOUT)
+    let path = share.socket();
+    connect_to(&path, &share.id, HELLO_TIMEOUT).map_err(|e| match &share.socket {
+        Some(_) => e,
+        None => format!(
+            "{e}: `socket` was not given, so this is the jailer's name for it (--fs-share); without the jailer \
+             `socket` is required"
+        ),
+    })
 }
 
 fn connect_to(path: &Path, id: &str, timeout: Duration) -> Result<UnixStream, String> {

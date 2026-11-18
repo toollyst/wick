@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1607,8 +1608,92 @@ def stage_freeze(ctx):
     return _cgroup_test().stage_freeze(ctx, types.SimpleNamespace(**globals()))
 
 
+# The file server's ids under --fs-share: not 0 and not the jail's.
+FS_UID = 4272
+
+
+def processes_naming(text):
+    """(pid, ppid, uid) of each process whose command line contains `text`."""
+    ps = subprocess.run(["ps", "-axo", "pid=,ppid=,uid=,command="], capture_output=True, text=True).stdout
+    rows = []
+    for line in ps.splitlines():
+        f = line.split(None, 3)
+        if len(f) == 4 and text in f[3]:
+            rows.append((int(f[0]), int(f[1]), int(f[2])))
+    return rows
+
+
+def stage_fs(ctx):
+    """Host folder sharing (no VM): --fs-share's refusals start nothing; a server that is never ready, or
+    ends first, is killed and named; a real wick-fsd is Firecracker's child, its socket 0600 and the jail's."""
+    share = os.path.join(ctx.base, "fs-share")
+    os.mkdir(share)
+    os.chown(share, FS_UID, FS_UID)
+    ok_share = f"id=docs,dir={share},uid={FS_UID},gid={FS_UID}"
+    fsd = ctx.wick_fsd
+    # Refused before anything starts: no process names the server after.
+    refusals = [
+        (["--fs-share", ok_share], "--fs-share needs --fs-server"),
+        (["--fs-server", fsd], "without any --fs-share"),
+        (["--fs-server", fsd, "--fs-share", ok_share, "--daemonize"], "--daemonize"),
+        (["--fs-server", fsd, "--fs-share", ok_share, "--new-pid-ns"], "--new-pid-ns"),
+        (["--fs-server", fsd, "--fs-share", f"id=docs,dir={share},uid={UID},gid={GID}"], "must not be the jail's"),
+        (["--fs-server", fsd, "--fs-share", f"id=docs,dir={share}/none,uid={FS_UID},gid={FS_UID}"], "/none"),
+    ]
+    for i, (extra, want) in enumerate(refusals):
+        rc, out = run_jailer(ctx, jailer_base(ctx, f"fs-refuse{i}") + extra)
+        check(rc != 0 and want in out, f"{extra}: exit {rc}, {out!r}")
+        left = processes_naming(f"/fs-refuse{i}/root/fs-docs.sock")
+        check(not left, f"{extra}: refused, but processes were left: {left}")
+    # A server that is never ready: killed at the jailer's 10 s; one that
+    # ends first: named. Neither is left.
+    scripts = os.path.join(ctx.base, "fs-scripts")
+    os.mkdir(scripts)
+    os.chmod(scripts, 0o755)
+    for name, body, want, limit in [
+        ("never", "while :; do sleep 1; done", "no ready byte in 10 s", 30),
+        ("ends", "exit 3", "ended before it was ready", 20),
+    ]:
+        script = os.path.join(scripts, name)
+        with open(script, "w") as f:
+            f.write(f"#!/bin/sh\n{body}\n")
+        os.chmod(script, 0o755)
+        rc, out = run_jailer(ctx, jailer_base(ctx, f"fs-{name}") + ["--fs-server", script, "--fs-share", ok_share],
+                             timeout=limit)
+        check(rc != 0 and want in out and "id=docs" in out, f"{name}: exit {rc}, {out!r}")
+        left = processes_naming(f"/fs-{name}/root/fs-docs.sock")
+        check(not left, f"{name}: the jailer failed, but its server was left: {left}")
+    # The real server, under a jailed Firecracker without a VM.
+    jail = Jail(ctx, "fs", [])
+    vm = JailedVm(ctx, "fs", jail, jailer_args=["--fs-server", fsd, "--fs-share", ok_share])
+    sock = jail.host("/fs-docs.sock")
+    st = os.lstat(sock)
+    check(stat.S_ISSOCK(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o600 and (st.st_uid, st.st_gid) == (UID, GID),
+          f"{sock}: mode {stat.S_IMODE(st.st_mode):o}, owner {st.st_uid}:{st.st_gid}; wanted a socket 600 {UID}:{GID}")
+    servers = processes_naming(f"--socket {sock}")
+    check(len(servers) == 1, f"wick-fsd processes for {sock}: {servers}")
+    pid, ppid, uid = servers[0]
+    # Before its connection a server is still in stage 0, as root.
+    check(ppid == vm.proc.pid and uid == 0,
+          f"wick-fsd pid {pid}: parent {ppid}, uid {uid}; wanted Firecracker's pid {vm.proc.pid}, root")
+    vm.kill()
+    ctx.vms.remove(vm)
+    # Known limit of this version (design-fs §8, Jailer): a server whose VMM
+    # ended before it connected waits for its connection until it is
+    # killed. On record, then killed here.
+    time.sleep(1)
+    still = [r for r in processes_naming(f"--socket {sock}") if r[0] == pid]
+    print(f"   after Firecracker's end, wick-fsd pid {pid} {'still waits (the known limit)' if still else 'ended'}",
+          flush=True)
+    if still:
+        os.kill(pid, signal.SIGKILL)
+    return (f"{len(refusals)} refusals and 2 failing servers left no process; wick-fsd pid {pid} was "
+            f"Firecracker's child, its socket 0600 {UID}:{GID}")
+
+
 STAGES = {
     "refuse": stage_refuse,
+    "fs": stage_fs,
     "cgroup-devices": stage_cgroup_devices,
     "freeze": stage_freeze,
     "jail": stage_jail,
@@ -1638,6 +1723,7 @@ class Context:
         self.uffd_handler = args.uffd_handler
         self.uffd_charge_probe = args.uffd_charge_probe
         self.vub = args.vhost_user_blk
+        self.wick_fsd = args.wick_fsd
         self.out = args.out
         self.rlimit_probe = None
         # Unix socket paths must be shorter than 104 bytes: a short base.
@@ -1661,6 +1747,7 @@ def main():
     p.add_argument("--uffd-handler", required=True)
     p.add_argument("--vhost-user-blk", required=True)
     p.add_argument("--uffd-charge-probe", required=True)
+    p.add_argument("--wick-fsd", required=True)
     p.add_argument("--cache", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--no-vm", action="store_true", help="skip the stages that boot a VM")

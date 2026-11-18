@@ -455,6 +455,11 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   `freezer.state` and `devices.*` on mounted v1 hierarchies, v2
   `cgroup.freeze`), the reference the other hosts' jailers follow: it asserts
   each exit code and error text and prints them.
+- `tools/linux/jailer-fs-check.py` runs the jailer's `--fs-share` with
+  wick-fsd as root in the Linux CI, with the same kind of payload in
+  Firecracker's place: refusals and failing servers leave no process, and a
+  real server is the payload's child, in the jail's cgroup, its socket 0600
+  and the jail's, its descriptor limit its own (docs/design-fs.md §8).
 - `tools/linux/guest-ram-grain.c` and `tools/linux/guest-ram-record.py` print
   Linux's side of the lazy-RAM grain, in the Linux CI under THP `madvise`
   and `always`. The first is KVM guest RAM mapped as upstream maps it, with

@@ -44,17 +44,30 @@ pub fn base_args(share: &Path, socket: &Path) -> Vec<String> {
     a
 }
 
+/// Where [`socket_in`] makes a short directory of its own.
+const SHORT_SOCKET_DIRS: &str = "/tmp/wick-fsd-s-";
+
 /// A socket path for a test beneath `base`: `base/fs.sock`, or, where that
 /// is longer than a Unix socket's path may be (macOS's temporary directory
-/// is deep), one in `/tmp` named for this process and a counter.
+/// is deep), `fs.sock` in a directory of its own in `/tmp`, named for this
+/// process and a counter, made 0700 with `create_dir` (wick-fsd refuses a
+/// socket's directory that others can write, as `/tmp` is), which the
+/// server's drop removes.
 pub fn socket_in(base: &Path) -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let p = base.join("fs.sock");
     if p.as_os_str().len() < 100 {
         return p;
     }
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    PathBuf::from(format!("/tmp/wick-fsd-{}-{n}.sock", std::process::id()))
+    let dir = PathBuf::from(format!("{SHORT_SOCKET_DIRS}{}-{n}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .unwrap_or_else(|e| panic!("making {}: {e}", dir.display()));
+    dir.join("fs.sock")
 }
 
 /// As root the server drops to 65534: the share must be its.
@@ -236,14 +249,62 @@ impl Server {
                 break s;
             }
             if start.elapsed() > Duration::from_secs(30) {
+                // Where it is, before the kill: a server that does not end
+                // within 30 s of its connection's end is a failure of its
+                // own, and its state says which.
+                let state = self.state_of_a_stuck_server();
                 let _ = self.child.kill();
-                break self.child.wait().unwrap();
+                let s = self.child.wait().unwrap();
+                self.stderr
+                    .lock()
+                    .unwrap()
+                    .push_str(&format!("\n(test) the server had not ended in 30 s; killed. Its state then:\n{state}\n"));
+                break s;
             }
             std::thread::sleep(Duration::from_millis(20));
         };
         // The reader thread ends at the pipe's end.
         std::thread::sleep(Duration::from_millis(50));
         (status, self.stderr.lock().unwrap().clone())
+    }
+
+    /// The process state, the descriptors and, on macOS, the log's lines
+    /// naming the pid in the last 40 s (Seatbelt's, the kernel's); on Linux
+    /// each of the server's processes' state, wait channel and system call.
+    fn state_of_a_stuck_server(&self) -> String {
+        let pid = self.child.id();
+        let run = |cmd: &str, args: &[&str]| match Command::new(cmd).args(args).output() {
+            Ok(o) => format!("$ {cmd} {}\n{}{}", args.join(" "), String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)),
+            Err(e) => format!("$ {cmd}: {e}\n"),
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let p = pid.to_string();
+            run("/bin/ps", &["-o", "pid,ppid,uid,stat,etime,time,command", "-p", &p])
+                + &run("/usr/sbin/lsof", &["-n", "-P", "-p", &p])
+                + &run(
+                    "/usr/bin/log",
+                    &["show", "--last", "40s", "--style", "compact", "--predicate", &format!("eventMessage CONTAINS \"({p})\"")],
+                )
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut out = String::new();
+            let mut pids = vec![i32::try_from(pid).unwrap()];
+            pids.extend(self.confined_pid());
+            for p in pids {
+                for f in ["status", "wchan", "syscall", "stack"] {
+                    let text = std::fs::read_to_string(format!("/proc/{p}/{f}")).unwrap_or_else(|e| format!("({e})"));
+                    let text = if f == "status" {
+                        text.lines().filter(|l| l.starts_with("State") || l.starts_with("SigBlk")).collect::<Vec<_>>().join("\n")
+                    } else {
+                        text
+                    };
+                    out.push_str(&format!("/proc/{p}/{f}: {}\n", text.trim_end()));
+                }
+            }
+            out + &run("/bin/ls", &["-l", &format!("/proc/{pid}/fd")])
+        }
     }
 
     /// What the server's processes wrote to stderr so far (a confined child
@@ -279,6 +340,12 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // A directory socket_in made for it: its socket (left when nothing
+        // connected) and the directory.
+        if let Some(dir) = self.socket.parent().filter(|d| d.to_string_lossy().starts_with(SHORT_SOCKET_DIRS)) {
+            let _ = std::fs::remove_file(&self.socket);
+            let _ = std::fs::remove_dir(dir);
+        }
     }
 }
 

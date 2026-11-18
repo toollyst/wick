@@ -39,7 +39,7 @@ fn share(queue_size: u16) -> ShareConfig {
     ShareConfig {
         id: "docs".to_string(),
         tag: "docs".to_string(),
-        socket: "/nonexistent".into(),
+        socket: Some("/nonexistent".into()),
         queue_size: Some(queue_size),
         rate_limiter: None,
     }
@@ -294,7 +294,7 @@ fn test_no_reconnect_after_loss() {
     });
     let conn = connect_to(&path, "docs", Duration::from_secs(5)).unwrap();
     let server = server.join().unwrap();
-    let mut rig = Rig::over(ShareConfig { socket: path.clone(), ..share(16) }, conn, server);
+    let mut rig = Rig::over(ShareConfig { socket: Some(path.clone()), ..share(16) }, conn, server);
     rig.server.shutdown(std::net::Shutdown::Both).unwrap();
     rig.run();
     assert!(rig.dev.lock().unwrap().proxy.lost().is_some());
@@ -639,4 +639,22 @@ fn test_hello_refusals() {
     }
     let e = connect_to(std::path::Path::new("/nonexistent/s.sock"), "docs", Duration::from_millis(300)).unwrap_err();
     assert!(e.contains("cannot connect"), "{e}");
+}
+
+/// Without `socket` and without the jailer, the default is a name at the
+/// host's root that is not there: refused, naming it and saying `socket`
+/// is required without the jailer. With `socket` given, the refusal is
+/// the path's alone.
+#[test]
+fn test_the_default_socket_s_refusal_says_it_is_required() {
+    let id = format!("absent-{}", std::process::id());
+    let default = ShareConfig { id: id.clone(), socket: None, ..share(16) };
+    assert!(!std::path::Path::new(&format!("/fs-{id}.sock")).exists());
+    let e = connect(&default).unwrap_err();
+    assert!(
+        e.contains(&format!("/fs-{id}.sock")) && e.contains("cannot connect") && e.contains("without the jailer `socket` is required"),
+        "{e}"
+    );
+    let e = connect(&share(16)).unwrap_err();
+    assert!(e.contains("/nonexistent") && !e.contains("jailer"), "{e}");
 }

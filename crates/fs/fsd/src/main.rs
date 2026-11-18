@@ -217,17 +217,25 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match run(&args, start) {
+    // `start` (with `--ready-fd`, until the ready byte) is held until the
+    // refusal is written: the end of `--ready-fd` without the byte tells the
+    // launcher the server ended, and it may kill it then (the jailer does,
+    // overlay/jailer/fs_share.rs), so its reason must be out first.
+    let mut start = start;
+    let ended = run(&args, &mut start);
+    let code = match ended {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("wick-fsd: {}: {e}", args.id);
             ExitCode::FAILURE
         }
-    }
+    };
+    drop(start);
+    code
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn run(_: &Args, _: Start) -> Result<(), String> {
+fn run(_: &Args, _: &mut Start) -> Result<(), String> {
     Err("this host has no confinement for wick-fsd yet (Linux and macOS have; Windows comes with its port), and \
          wick-fsd does not serve unconfined"
         .into())
@@ -248,11 +256,39 @@ fn discovery_control() {
     }
 }
 
+/// The socket's directory: owned by root, by this process's euid or by the
+/// peer's uid, and writable by no group and no other (docs/design-fs.md
+/// §4.2). A directory another uid can write lets that uid rename the socket
+/// away and bind its own under the name before the VMM connects; in one only
+/// these uids can write, the jailed VMM (the peer) can do that only to its
+/// own harm, since wick-fsd checks its uid and its hello. The directory is
+/// the one the name is in, links followed (`/tmp` is refused: it is 1777).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn socket_dir_is_private(socket: &std::path::Path, peer_uid: u32, euid: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = match socket.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let meta = std::fs::metadata(dir).map_err(|e| format!("--socket's directory {}: {e}", dir.display()))?;
+    let (mode, owner) = (meta.mode() & 0o7777, meta.uid());
+    let owner_ok = owner == 0 || owner == euid || owner == peer_uid;
+    if !meta.is_dir() || !owner_ok || mode & 0o022 != 0 {
+        return Err(format!(
+            "--socket's directory {} is mode {mode:04o} owned by uid {owner}: it must be a directory owned by root, \
+             uid {euid} (wick-fsd) or uid {peer_uid} (the peer) that no group or other can write",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Stage 0 on a Unix host: the share checked, the soft RLIMIT_NOFILE set,
 /// the socket bound, ready said, one connection accepted, the listener
 /// unlinked, and the peer checked.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn accept_one(args: &Args, start: Start) -> Result<(wick_fsd::stage0::Checked, std::os::unix::net::UnixStream), String> {
+fn accept_one(args: &Args, start: &mut Start) -> Result<(wick_fsd::stage0::Checked, std::os::unix::net::UnixStream), String> {
     use std::io::Write;
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixListener;
@@ -268,21 +304,30 @@ fn accept_one(args: &Args, start: Start) -> Result<(wick_fsd::stage0::Checked, s
     };
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let checked = stage0::check(&share, home.as_deref()).map_err(|r| r.0)?;
-    // The soft RLIMIT_NOFILE set to exactly what the limits may hold open
-    // (stage 0 checked the hard one allows it): no more for the server,
-    // and the bound of the Linux read-back's walk over its descriptors.
+    // The soft and the hard RLIMIT_NOFILE set to exactly what the limits
+    // may hold open (stage 0 checked the hard one allows it): no more for the
+    // server whatever its launcher's hard limit was (a shell's may be a
+    // million; the jailer gives back the one it was started with), never
+    // raised again once the ids are dropped, and the bound of the Linux
+    // read-back's walk over its descriptors.
     let need = wick_fsd::limits::descriptors(&args.limits);
-    sys::set_nofile(need).map_err(|e| format!("RLIMIT_NOFILE to {need}: {e:?}"))?;
-    let (soft, _) = sys::nofile().map_err(|e| format!("RLIMIT_NOFILE: {e:?}"))?;
-    if soft != need {
-        return Err(format!("the soft RLIMIT_NOFILE is {soft} after setting it to {need}"));
+    sys::set_nofile_exact(need).map_err(|e| format!("RLIMIT_NOFILE to {need}: {e:?}"))?;
+    let now = sys::nofile().map_err(|e| format!("RLIMIT_NOFILE: {e:?}"))?;
+    if now != (need, need) {
+        return Err(format!("RLIMIT_NOFILE is {now:?} (soft, hard) after setting both to {need}"));
     }
+    eprintln!("wick-fsd: {}: RLIMIT_NOFILE {need} (soft and hard)", args.id);
+    socket_dir_is_private(&args.socket, args.peer_uid.unwrap_or_else(sys::euid), sys::euid())?;
     if args.socket.symlink_metadata().is_ok() {
         return Err(format!("{} exists; wick-fsd never removes what it did not make", args.socket.display()));
     }
-    let listener = UnixListener::bind(&args.socket).map_err(|e| format!("{}: {e}", args.socket.display()))?;
+    // Made 0600 and checked so before listen (sys::listen_private): from the
+    // moment the name exists only this euid can connect, and under the
+    // jailer, which gives the socket to the jail's uid after ready, no other
+    // process can be first. One thread here, as the umask needs.
+    let listener = UnixListener::from(sys::listen_private(&args.socket, 1)?);
     // The ready byte, then `--ready-fd` closed: it is not held after.
-    match start.ready {
+    match start.ready.take() {
         Some(fd) => std::fs::File::from(fd).write_all(b"R").map_err(|e| format!("--ready-fd: {e}"))?,
         None => println!("ready"),
     }
@@ -363,7 +408,7 @@ fn serve_all(
 }
 
 #[cfg(target_os = "linux")]
-fn run(args: &Args, start: Start) -> Result<(), String> {
+fn run(args: &Args, start: &mut Start) -> Result<(), String> {
     use std::os::fd::AsRawFd;
 
     use wick_fsd::confine::linux::{self as confine, Plan};
@@ -392,7 +437,7 @@ fn run(args: &Args, start: Start) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn run(args: &Args, start: Start) -> Result<(), String> {
+fn run(args: &Args, start: &mut Start) -> Result<(), String> {
     use std::os::fd::{AsFd, AsRawFd};
 
     use wick_fsd::confine::macos::{self as confine, Plan};

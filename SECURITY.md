@@ -1907,8 +1907,8 @@ upstream Firecracker and its jailer.
 
 wick-fsd, the virtio-fs file server, is not reachable from a guest yet: the VMM's virtio-fs device exists on Linux
 and macOS, only in a build with Firecracker's `fs` feature (a default build holds none of its code,
-`tools/check-fs-off.sh`), but no guest has mounted a share and the jailer does not yet place its socket (the
-virtio-fs item of roadmap M7). wick-fsd confines itself on Linux and macOS before it reads a request, and refuses to
+`tools/check-fs-off.sh`), but no guest has mounted a share (the virtio-fs item
+of roadmap M7). wick-fsd confines itself on Linux and macOS before it reads a request, and refuses to
 start on Windows, whose confinement is not built ([docs/design-fs.md](docs/design-fs.md) §6.1, §6.2). Until the commit that lists `madvise`
 in its profile, a guest could end its own share's server on macOS by a large read (each READ's zeroed reply buffer is
 a large block the allocator clears with `madvise`; never in a release: the device is behind a feature); the profile
@@ -1924,6 +1924,23 @@ and on macOS 26 wherever its allocator is xzone, a confined server was killed at
 after it started (libmalloc's deferred reclamation makes a Mach trap on a 10 s timer), until the commit that lists
 that trap and the reclamation ring's two MIG routines, which act on the server's own memory only (design-fs.md
 §6.2).
+
+The jailer's `--fs-share` (Linux and macOS) starts one wick-fsd per share as root, with ids of its own (never 0,
+never the jail's), before it jails Firecracker; the server binds its socket 0600 and its own before it listens, in a
+directory no other uid can write, and the jailer gives the socket to the jail's uid only after it is ready, so no
+other process can connect first. A failure of the jailer's before the exec kills and waits for every server it
+started. The server gets the jailer's own `RLIMIT_NOFILE` and `RLIMIT_FSIZE` back, not the jail's, and sets its
+descriptor limit, soft and hard, to exactly what its share's limits may hold. Its memory and CPU are the jail's
+cgroups' on Linux; on macOS, where the jail's limits are a jetsam limit set at Firecracker's exec and a CPU limit
+Firecracker applies to itself, the server has its own caps only (design-fs.md §8, Jailer, has every inherited
+limit). Known and stated: not with `--daemonize` or `--new-pid-ns` in this version (refused by name); **a server
+whose Firecracker ends before the device connected waits, as root in its first stage, until it is killed** (its
+socket only the jail's uid can reach, so nothing else connects; no parent-death signal can end it, since the kernel
+refuses one from Firecracker, at the jail's uid, to a root process: design-fs.md §8, Jailer), until the next item
+ends it with its parent; and **a server
+under an `RLIMIT_FSIZE` (one the operator's shell gave it, or the jailer's launcher) ends with SIGXFSZ when a guest
+writes past it**, which loses that guest's own share and nothing else, until the follow-up that ignores the signal
+so the write fails with `EFBIG`.
 
 The device adds no rule or system call to the VMM's sandbox, connects to its server before the sandbox narrows and
 never again, and never blocks the event loop on the server (`test_server_hang_never_blocks_the_loop`); the reply

@@ -1073,6 +1073,139 @@ pub fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// A Unix stream socket bound at `path` and listening, which only this
+/// process's euid can connect to from the moment the name exists: bound with
+/// the umask 0177 (so made 0600; the umask is the process's, so the caller
+/// has one thread), then checked by `lstat` to be a socket of mode 0600
+/// owned by this process (its euid or uid) before `listen`, so that no connection can be queued
+/// on it otherwise. `path` must not exist. The error names the step.
+pub fn listen_private(path: &std::path::Path, backlog: c_int) -> std::result::Result<OwnedFd, String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let (addr, len) = unix_addr(path)?;
+    // SAFETY: integer arguments only.
+    let fd = check(unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) }).map_err(|e| format!("socket: {e:?}"))?;
+    // SAFETY: the descriptor just made, this function's.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: a descriptor this function owns.
+    check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) }).map_err(|e| format!("FD_CLOEXEC: {e:?}"))?;
+    // SAFETY: umask cannot fail; the old mask is put back below.
+    let old = unsafe { libc::umask(0o177) };
+    // SAFETY: the socket and an address of `len` bytes.
+    let bound = check(unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast::<libc::sockaddr>(), len) });
+    // SAFETY: as above.
+    unsafe { libc::umask(old) };
+    bound.map_err(|e| format!("{}: bind: {e:?}", path.display()))?;
+    let m = std::fs::symlink_metadata(path).map_err(|e| format!("{}: lstat after bind: {e}", path.display()))?;
+    let (mode, owner) = (m.mode() & 0o7777, m.uid());
+    // This process's: its effective uid, which the kernel gives what it
+    // makes, or its real uid, the same in every way wick-fsd is started
+    // (refusals.rs's drop test takes an unprivileged server for root by
+    // geteuid alone). Another uid's socket under the name is refused.
+    if !m.file_type().is_socket() || mode != 0o600 || (owner != euid() && owner != uid()) {
+        let _ = std::fs::remove_file(path);
+        return Err(format!(
+            "{}: after bind it is {}mode {mode:o}, owner {owner}, where a socket of mode 600 owned by uid {} was made: \
+             not listened on",
+            path.display(),
+            if m.file_type().is_socket() { "" } else { "not a socket, " },
+            euid()
+        ));
+    }
+    // SAFETY: the bound socket.
+    check(unsafe { libc::listen(fd.as_raw_fd(), backlog) }).map_err(|e| format!("{}: listen: {e:?}", path.display()))?;
+    Ok(fd)
+}
+
+/// `path` as an `AF_UNIX` address and its length.
+fn unix_addr(path: &std::path::Path) -> std::result::Result<(libc::sockaddr_un, libc::socklen_t), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: plain data, filled below.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.contains(&0) || bytes.len() >= addr.sun_path.len() {
+        return Err(format!("{}: not a socket path (at most {} bytes, no NUL)", path.display(), addr.sun_path.len() - 1));
+    }
+    addr.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX).unwrap_or_default();
+    for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
+        *to = libc::c_char::from_ne_bytes([*from]);
+    }
+    let len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_un>()).unwrap_or(libc::socklen_t::MAX);
+    Ok((addr, len))
+}
+
+/// For tests run as root: whether a process of `uid`:`gid` and no
+/// supplementary group can connect to the socket at `path`. A child is forked
+/// that drops to them and connects; between the fork and its `_exit` it makes
+/// system calls only (the address is built before), so on Linux the caller
+/// may have threads. Not on macOS: libSystem's fork runs its child handlers,
+/// which can abort the child in a process whose other thread is inside a
+/// first-time `os_once` (unix/launch.rs); there a process started for it
+/// alone calls [`connect_as_here`]. `Ok(())` is a connection, `Err(errno)`
+/// the refusal (or the step that failed: setgroups, setgid, setuid,
+/// socket).
+pub fn connect_as(path: &std::path::Path, uid: u32, gid: u32) -> std::result::Result<(), String> {
+    let (addr, len) = unix_addr(path)?;
+    // SAFETY: the child makes system calls only and ends with _exit.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(format!("fork: {:?}", last()));
+    }
+    if pid == 0 {
+        // SAFETY: system calls on integers and the address built above; the
+        // child exits with 0 or the errno.
+        unsafe {
+            let errno = || std::io::Error::last_os_error().raw_os_error().unwrap_or(255);
+            if libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
+                libc::_exit(200);
+            }
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            if fd < 0 {
+                libc::_exit(201);
+            }
+            let r = libc::connect(fd, (&raw const addr).cast::<libc::sockaddr>(), len);
+            libc::_exit(if r == 0 { 0 } else { errno().clamp(1, 199) });
+        }
+    }
+    let mut status = 0;
+    // SAFETY: the child just forked.
+    while unsafe { libc::waitpid(pid, &raw mut status, 0) } < 0 {
+        let e = last();
+        if e.0 != libc::EINTR {
+            return Err(format!("waitpid: {e:?}"));
+        }
+    }
+    match (libc::WIFEXITED(status), libc::WEXITSTATUS(status)) {
+        (true, 0) => Ok(()),
+        (true, 200) => Err("the child could not drop to the uid and gid".into()),
+        (true, 201) => Err("socket failed in the child".into()),
+        (true, e) => Err(std::io::Error::from_raw_os_error(e).to_string()),
+        _ => Err(format!("the child ended with status {status:#x}")),
+    }
+}
+
+/// [`connect_as`] in this process, which it leaves at `uid`:`gid` for good:
+/// for a process started for that alone (macOS's tests start one with
+/// posix_spawn instead of a fork). The same results as [`connect_as`].
+pub fn connect_as_here(path: &std::path::Path, uid: u32, gid: u32) -> std::result::Result<(), String> {
+    let (addr, len) = unix_addr(path)?;
+    // SAFETY: system calls on integers and the address built above.
+    unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
+            return Err("the child could not drop to the uid and gid".into());
+        }
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err("socket failed in the child".into());
+        }
+        let r = libc::connect(fd, (&raw const addr).cast::<libc::sockaddr>(), len);
+        let e = std::io::Error::last_os_error();
+        libc::close(fd);
+        if r == 0 { Ok(()) } else { Err(e.to_string()) }
+    }
+}
+
 /// The real uid of this process.
 pub fn uid() -> u32 {
     // SAFETY: getuid cannot fail.
@@ -1620,6 +1753,18 @@ pub fn set_nofile(soft: u64) -> Result<()> {
         let soft = soft.min(u64::from(r.rlim_max));
         r.rlim_cur = soft.try_into().map_err(|_| HostErrno(libc::EINVAL))?;
     }
+    // SAFETY: a valid input buffer.
+    check(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) }).map(drop)
+}
+
+/// Sets the soft and the hard `RLIMIT_NOFILE` to `n`: the hard limit is
+/// never raised again by a process without privilege, so a server that drops
+/// its ids after this keeps at most `n` whatever its launcher's hard limit
+/// was. The caller reads [`nofile`] back.
+pub fn set_nofile_exact(n: u64) -> Result<()> {
+    #[allow(clippy::useless_conversion)]
+    let n: libc::rlim_t = n.try_into().map_err(|_| HostErrno(libc::EINVAL))?;
+    let r = libc::rlimit { rlim_cur: n, rlim_max: n };
     // SAFETY: a valid input buffer.
     check(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) }).map(drop)
 }

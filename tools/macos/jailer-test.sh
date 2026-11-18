@@ -8,7 +8,7 @@
 #
 #   tools/macos/jailer-test.sh [--release] [--no-vm] [stage...]
 #
-# Stages (default: all): refuse cgroup-devices freeze jail daemonize pidns limits fsize no-api boot netns vmnet
+# Stages (default: all): refuse fs cgroup-devices freeze jail daemonize pidns limits fsize no-api boot netns vmnet
 # vmnet-guest memory uffd-charge cpu hugepages uffd vhost-user. fsize, no-api, boot, netns, vmnet-guest, memory, cpu,
 # hugepages, uffd and vhost-user start a VM and need Hypervisor.framework; --no-vm skips them (GitHub's
 # macOS runners have no Hypervisor.framework). Results and logs go to
@@ -38,6 +38,8 @@ TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/lib/firecracker/build/cargo_target}"
         --example uffd_on_demand_handler &&
     CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked ${cargo_profile[@]+"${cargo_profile[@]}"} \
         --manifest-path ../../crates/compat/libc/Cargo.toml --example uffd_charge_probe)
+# Host folder sharing's server, which the jailer starts per --fs-share (the fs stage).
+(cd "$ROOT/crates/fs" && CARGO_TARGET_DIR="$ROOT/crates/fs/target" cargo build --locked ${cargo_profile[@]+"${cargo_profile[@]}"} -p wick-fsd)
 # The operator's processes outside the jail: a uffd handler, a vhost-user backend.
 (cd "$ROOT/tools/vhost-user-blk" && CARGO_TARGET_DIR="$ROOT/lib/firecracker/build/vhost-user-blk" \
     cargo build --release --locked)
@@ -68,5 +70,6 @@ exec sudo python3 -I -B "$ROOT/tools/macos/jailer-test.py" \
     --uffd-handler "$TARGET_DIR/$PROFILE/examples/uffd_on_demand_handler" \
     --vhost-user-blk "$ROOT/lib/firecracker/build/vhost-user-blk/release/vhost-user-blk" \
     --uffd-charge-probe "$TARGET_DIR/$PROFILE/examples/uffd_charge_probe" \
+    --wick-fsd "$ROOT/crates/fs/target/$PROFILE/wick-fsd" \
     --cache "$CACHE" \
     --out "$OUT" "$@"
