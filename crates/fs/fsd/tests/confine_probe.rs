@@ -164,6 +164,33 @@ mod macos {
         PathBuf::from(format!("/.vol/{}/{}", m.dev(), m.ino()))
     }
 
+    /// On record: each directory above `path`, with its mode and owner, and,
+    /// as root, whether the id the child drops to (65534) may search it. A
+    /// case by path reaches the profile only through directories it may
+    /// search; one it may not is refused at that directory first (EACCES), so
+    /// such a directory fails the probe here, naming it.
+    fn searchable_above(path: &Path) {
+        let root = sys::euid() == 0;
+        let mut blocked = Vec::new();
+        for dir in path.ancestors().skip(1) {
+            let m = std::fs::metadata(dir).unwrap();
+            let mode = m.mode() & 0o7777;
+            let search = !root
+                || mode & 0o001 != 0
+                || (m.uid() == 65534 && mode & 0o100 != 0)
+                || (m.gid() == 65534 && mode & 0o010 != 0);
+            let by_65534 = if root { format!(", searchable by 65534: {search}") } else { String::new() };
+            println!("above the canary: {} mode {mode:o} owner {}:{}{by_65534}", dir.display(), m.uid(), m.gid());
+            if !search {
+                blocked.push(dir.to_path_buf());
+            }
+        }
+        assert!(
+            blocked.is_empty(),
+            "the id the child drops to cannot search {blocked:?}: the cases by path would be refused there, before the profile"
+        );
+    }
+
     pub fn main() {
         // As wick-fsd's first step: what this process was started with is
         // not the confined process's.
@@ -176,6 +203,14 @@ mod macos {
         std::fs::write(outside.join("secret"), b"canary").unwrap();
         std::fs::write(share.join("inside"), b"shared").unwrap();
         give_share(&share);
+        if sys::euid() == 0 {
+            // The share's file is the dropped id's, as an unprivileged run's
+            // is that user's: a case on it is then refused by the profile,
+            // not by the file's owner (fchflags, fchown and fchmod of
+            // another user's file are EPERM before any rule).
+            std::os::unix::fs::chown(share.join("inside"), Some(65534), Some(65534)).unwrap();
+        }
+        searchable_above(&outside.join("secret"));
         let cases: &[(&str, Act, i32)] = &[
             ("the outside canary by its path", |c| ok(std::fs::read(c.outside.join("secret"))), KILLED),
             // By the call the server makes for metadata (fstatat64, listed):

@@ -54,8 +54,19 @@ pub fn name(n: &[u8]) -> Vec<u8> {
 }
 
 /// A fresh directory for one test: `<tmp>/wick-fsd-<tag>-<pid>`.
+///
+/// As root, `<tmp>` is `/tmp`: a server or confined child started as root
+/// drops to 65534 (`--uid`/`--gid`), and the tests reach the share and the
+/// canaries by path after that drop, so every directory above them must be
+/// one that id can search. On macOS, where `sudo` clears `TMPDIR`, std's
+/// temporary directory is root's own (`confstr(_CS_DARWIN_USER_TEMP_DIR)`,
+/// `/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T`, mode 0700), which
+/// 65534 cannot search: every case by path then failed at the directory's
+/// permission, before the profile was asked (CI run 44317533490's root step
+/// of confine_probe). Linux's is `/tmp` already.
 pub fn scratch(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("wick-fsd-{tag}-{}", std::process::id()));
+    let tmp = if sys::euid() == 0 { PathBuf::from("/tmp") } else { std::env::temp_dir() };
+    let p = tmp.join(format!("wick-fsd-{tag}-{}", std::process::id()));
     remove(&p);
     std::fs::create_dir_all(&p).unwrap();
     std::fs::canonicalize(&p).unwrap()

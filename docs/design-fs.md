@@ -1037,7 +1037,12 @@ it means layer 1 let the request through.
 
 - **Confinement:** stage 0 resolves the share with `realpath` and checks it; Seatbelt matches the canonical path at
   each access. The share reached by its firmlink form (`/System/Volumes/Data/...` vs `/Users/...`) is an open
-  question; an outside file by its firmlink alias or by `/.vol/<dev>/<ino>` is killed (`confine_probe`).
+  question; an outside file by its firmlink alias or by `/.vol/<dev>/<ino>` is killed (`confine_probe`). As root,
+  `confine_probe` drops to 65534, so its share and canaries are under `/tmp` and the share's file is 65534's: under
+  root's own temporary directory (`/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T`, mode 0700, std's choice when
+  `sudo` clears `TMPDIR`) every case by path was refused at that directory before the profile was asked (CI run
+  44317533490); the probe now fails naming any directory above the canary the dropped id cannot search. The server
+  itself reaches the share through descriptors only, so where the share's parents are does not change it.
   - **As built** (`crates/fs/fsd/src/confine/macos.rs`, the calls in `crates/fs/sys/src/unix/seatbelt.rs`), after
     stage 0 has accepted the one connection, checked its peer, and the backend holds the share's root. There is no
     fork: the process that accepted the connection serves it.
