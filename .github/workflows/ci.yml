@@ -1526,6 +1526,21 @@ jobs:
       # release firecracker.exe none once its build has failed: the first
       # cause stays the one red step (run 43783880314: setup's fetch of
       # upstream failed, a 503, and some 100 later errors buried it).
+      # A broken intra-doc link in wick's Windows code fails here, as the
+      # macOS job's "Rustdoc links" step does for the code macOS builds:
+      # the same crates, the lint denied for each. libc's wick_uffd,
+      # wick_nofile and wick_alloc and userfaultfd's windows module are built
+      # on Windows only, so no other job documents them. vmm, firecracker and
+      # the jailer are not documented here yet: their Windows overlay has had
+      # no Windows rustdoc run.
+      - name: Rustdoc links
+        if: (success() || failure()) && steps.setup.outcome == 'success'
+        working-directory: lib/firecracker
+        run: |
+          for c in ../../crates/compat/*/ ../../crates/ext/ ../../crates/version/; do
+            RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" \
+              cargo doc --locked --no-deps --manifest-path "$c/Cargo.toml"
+          done
       # The boot test's own helpers (serial-console protocol, vsock, network
       # switch) against stand-ins, in Windows PowerShell 5.1 as users run it.
       # Its boot stages run on the WHP PC, with its guest image.

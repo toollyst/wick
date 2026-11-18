@@ -68,18 +68,22 @@ pub use timerfd::*;
 
 #[cfg(windows)]
 extern crate std;
-/// The kernel side of userfaultfd (a wick API, not part of `libc`).
+// The three wick modules are documented by their files' inner docs alone: a
+// module with outer docs too has rustdoc resolve the inner docs' links in
+// the crate root, where none of the module's items is (12 unresolved links
+// on x86_64-pc-windows-msvc before).
+// The kernel side of userfaultfd (a wick API, not part of `libc`).
 #[cfg(windows)]
 #[path = "windows_uffd.rs"]
 pub mod wick_uffd;
-/// The jailer's `--resource-limit no-file=`: descriptors past it fail with
-/// `EMFILE` (a wick API, not part of `libc`).
+// The jailer's `--resource-limit no-file=`: descriptors past it fail with
+// `EMFILE` (a wick API, not part of `libc`).
 #[cfg(windows)]
 #[path = "windows_nofile.rs"]
 pub mod wick_nofile;
-/// The heap's allocator for wick's Windows binaries, which reclaims and
-/// then ends the VMM with 137 at the memory limit (a wick API, not part of
-/// `libc`).
+// The heap's allocator for wick's Windows binaries, which reclaims and
+// then ends the VMM with 137 at the memory limit (a wick API, not part of
+// `libc`).
 #[cfg(windows)]
 #[path = "windows_alloc.rs"]
 pub mod wick_alloc;

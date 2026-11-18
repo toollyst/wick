@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `userfaultfd` on Windows, with the API and semantics of the Linux crate;
-//! the macOS module ([`macos.rs`]) with Windows means.
+//! the macOS module (`macos.rs`, built on macOS only) with Windows means.
 //!
 //! The kernel side (fault capture, waiting threads, filling pages) is
 //! `libc::wick_uffd`. A [`Uffd`] made by [`UffdBuilder::create`] owns a

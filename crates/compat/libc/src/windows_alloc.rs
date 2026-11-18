@@ -33,6 +33,7 @@
 //!    reservation never touched, which lives on Linux, ends here;
 //! 3. any other size: the limit is reached, and the reclaim may make room
 //!    (below).
+//!
 //! Not in a job (unjailed), the host's commit limit is the limit of 1 and 3,
 //! and there is no 2. A limit that cannot be read is no limit for 1 and 2:
 //! a refusal is never turned into an allocation error by a failed read.
