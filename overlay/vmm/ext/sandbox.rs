@@ -898,9 +898,9 @@ mod macos {
     /// limit behind it, where the jail's profile let a jailed process
     /// without `--netns` connect and send to any Unix socket on the host
     /// by its path until 2026-11-18 (`test_jailed_profile_limits_operations`).
-    /// A bind outside the jail already failed with EPERM in both phases
-    /// (measured by the same test; no sandbox report names the operation
-    /// that refuses it).
+    /// A bind outside the jail fails with EPERM in both phases (measured by
+    /// the same test): the file rule denies making the socket's file, which
+    /// Seatbelt checks before `network-bind` (see [`RUN_DENIED_OPERATIONS`]).
     pub fn files_in_jail(root: &Path, netns: Option<&Path>) -> Result<String, SandboxError> {
         let root = quoted(root, "jail")?;
         let mut rule = format!("(allow file-read* file-write* (subpath \"{root}\"))\n");
@@ -1102,8 +1102,17 @@ mod macos {
     /// then; but for the endpoint of a network device hot-plugged into a
     /// running microVM, which Linux's filter lets open its TAP (`openat`,
     /// `ioctl`): a Unix socket in the jail's network, or outside a jail at
-    /// the operator's path, binds after [`narrow`] too (`run_rule`). Seatbelt
-    /// decides their system calls by these operations, not by number
+    /// the operator's path, binds after [`narrow`] too (`run_rule`). A Unix
+    /// socket's bind where the file rule does not let the socket's file be
+    /// made fails with EPERM before `network-bind` is consulted, so this
+    /// kill does not reach it: in a jail, a bind outside the jail and its
+    /// network fails with EPERM after [`narrow`] as before it
+    /// (`test_jailed_profile_limits_operations`); the same rules with the
+    /// file rule widened to the bind's directory kill it (a probe of these
+    /// rules alone, under `(allow default)`, macOS 27.2; not in the
+    /// repository). The kill answers a bind whose file the file rule lets
+    /// be made and no `network-bind` allow covers. Seatbelt decides their
+    /// system calls by these operations, not by number
     /// ([`UNFILTERED_SYSCALLS`]).
     pub const RUN_DENIED_OPERATIONS: &[&str] = &[
         "file-write-mode", "file-write-owner", "file-write-flags", "file-write-times",
