@@ -2844,9 +2844,12 @@ function Stage-Freeze {
     # nothing and the jailers it started writing to NUL (--daemonize). Their starts and ends, with
     # parent and exit status, come from a kernel trace through WMI (elevated only), which sees a
     # process that lived a millisecond; then what is alive, the pid file, the root's files and the
-    # control file, each timed from THAWED. The trace also counts the console hosts the jailers'
-    # tree started: a console program started by one without a console (the --daemonize jailer
-    # starting the --new-pid-ns keeper) gets a console of its own (Learn, "Creation of a Console").
+    # control file, each timed from THAWED. The trace also names the process each console host
+    # the tree started belongs to: a console program started by one without a console (the
+    # --daemonize jailer starting the --new-pid-ns keeper) gets a console of its own (Learn,
+    # "Creation of a Console"). The trace's events are in the order WMI gave them; their
+    # TIME_CREATED is not when the process started (run 44307674793: the operator's jailer,
+    # started 1.5 s before THAWED, and the jail had the same time, after THAWED), so none is shown.
     $jname = Split-Path -Leaf $Jailer
     $traced = "wjt-freeze-$PID"
     $trace = if ($elevated) {
@@ -2859,17 +2862,25 @@ function Stage-Freeze {
     } else { 'not traced: not elevated' }
     $defender = try { "Defender real-time protection $(if ((Get-MpComputerStatus -ErrorAction Stop).RealTimeProtectionEnabled) { 'on' } else { 'off' })" } catch { "Defender: $($_.Exception.Message)" }
     $at = { param([DateTime]$t, [DateTime]$t0) '{0:+0.000;-0.000} s' -f ($t - $t0).TotalSeconds }
-    # The traced processes of the tree from $root (the operator's jailer), in order.
+    # The traced processes of the tree from $root (the operator's jailer), in WMI's order, each
+    # with its role: the operator's jailer, jailer 1 and 2 (relaunched by the one before), the
+    # jail's process, or a console host of one of those.
     $tree = {
         param([int]$root)
-        $ours = @{ $root = $true }
-        $events = @(Get-Event -ErrorAction SilentlyContinue | Where-Object { $_.SourceIdentifier -like "${traced}-*" } | ForEach-Object {
+        $role = @{ $root = "the operator's jailer" }
+        $gen = @{ $root = 0 }
+        $events = @(Get-Event -ErrorAction SilentlyContinue | Where-Object { $_.SourceIdentifier -like "${traced}-*" } | Sort-Object EventIdentifier | ForEach-Object {
                 $e = $_.SourceEventArgs.NewEvent
-                [pscustomobject]@{ Start = $_.SourceIdentifier -like '*-Start'; Id = [int]$e.ProcessID; Parent = [int]$e.ParentProcessID; Name = $e.ProcessName; Status = $e.ExitStatus; At = [DateTime]::FromFileTime([long]$e.TIME_CREATED) }
-            } | Sort-Object At)
+                [pscustomobject]@{ Start = $_.SourceIdentifier -like '*-Start'; Id = [int]$e.ProcessID; Parent = [int]$e.ParentProcessID; Name = $e.ProcessName; Status = $e.ExitStatus }
+            })
         foreach ($e in $events) {
-            if ($e.Start -and $ours.ContainsKey($e.Parent)) { $ours[$e.Id] = $true }
-            if ($ours.ContainsKey($e.Id)) { $e }
+            if ($e.Start -and $role.ContainsKey($e.Parent) -and -not $role.ContainsKey($e.Id)) {
+                $role[$e.Id] = if ($e.Name -eq $jname) {
+                    $gen[$e.Id] = [int]$gen[$e.Parent] + 1
+                    "jailer $($gen[$e.Id])"
+                } elseif ($e.Name -eq $exe) { "the jail's $exe" } else { "a console host of $($role[$e.Parent])" }
+            }
+            if ($role.ContainsKey($e.Id)) { $e | Add-Member -NotePropertyName Role -NotePropertyValue $role[$e.Id] -PassThru }
         }
     }
     $saw = {
@@ -2878,8 +2889,8 @@ function Stage-Freeze {
         $traceSaid = if ($trace) { $trace } else {
             # WMI hands the events over late.
             Start-Sleep -Milliseconds 1500
-            $seen = @(& $tree $p.Id | ForEach-Object { if ($_.Start) { "$($_.Name) $($_.Id) started by $($_.Parent) at $(& $at $_.At $t0)" } else { "$($_.Name) $($_.Id) ended $($_.Status) at $(& $at $_.At $t0)" } })
-            if ($seen) { $seen -join ', ' } else { 'none traced' }
+            $seen = @(& $tree $p.Id | ForEach-Object { if ($_.Start) { "$($_.Role) $($_.Id) started" } else { "$($_.Role) $($_.Id) ended $($_.Status)" } })
+            if ($seen) { "in WMI's order: $($seen -join ', ')" } else { 'none traced' }
         }
         $op = if ($p.HasExited) { "exited $($p.ExitCode) at $(& $at $p.ExitTime $t0)" } else { 'running' }
         $live = @(Get-CimInstance Win32_Process -Filter "Name='$jname' OR Name='$exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match "--id $id " -or "$($_.ExecutablePath)" -like "$(& $dirOf $id)\*" } | ForEach-Object { "$($_.Name) $($_.ProcessId) (parent $($_.ParentProcessId), started $(& $at $_.CreationDate $t0)): $($_.CommandLine)" })
@@ -3001,13 +3012,12 @@ function Stage-Freeze {
                 $again = & $cpu $id
                 Check ($again -gt 200) "thawed at run time: CPU $($again -join ', ') ms per s"
                 & $stop $id
-                # When each jailer after the operator's and the jail started, from THAWED (the trace).
+                # The jailers relaunched and whose each console host is (the trace).
                 $when = if ($trace) { $trace } else {
-                    $t = @(& $tree $p.Id | Where-Object { $_.Start -and $_.At -ge $t0 })
-                    $j = @($t | Where-Object { $_.Name -eq $jname } | ForEach-Object { & $at $_.At $t0 })
-                    $f = @($t | Where-Object { $_.Name -eq $exe } | Select-Object -First 1 | ForEach-Object { & $at $_.At $t0 })
-                    $c = @($t | Where-Object { $_.Name -eq 'conhost.exe' }).Count
-                    "jailers started at $(if ($j) { $j -join ', ' } else { 'none' }), the jail at $(if ($f) { $f[0] } else { 'none traced' }), console hosts $c"
+                    $t = @(& $tree $p.Id | Where-Object { $_.Start })
+                    $j = @($t | Where-Object { $_.Name -eq $jname }).Count - 1
+                    $h = @($t | Where-Object { $_.Name -eq 'conhost.exe' } | ForEach-Object { $_.Role -replace '^a console host of ', '' })
+                    "$j jailers relaunched; console hosts of: $(if ($h) { $h -join ', ' } else { 'none' })"
                 }
                 "held (no process, no pid file, the command not returned) until THAWED; then ran $($run -join '/') ms/s ($when), the command $returned; frozen again $($frozen -join '/'), thawed $($again -join '/')"
             }

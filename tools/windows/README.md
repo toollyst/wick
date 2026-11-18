@@ -23,9 +23,9 @@
   unable to write its control file, the jailer's death ending a frozen jail,
   `freezer.state=FROZEN` at the start holding the operator's command, plain
   and with `--daemonize`, `--new-pid-ns` and both, each case reported, with
-  when each relaunched jailer, the jail and any console host started after
-  `THAWED` (a WMI process trace, elevated only), and on a failure what the
-  stage saw: the jailers' starts and exit statuses, those alive with their
+  how many jailers were relaunched and whose each console host is (a WMI
+  process trace, elevated only), and on a failure what the stage saw: the
+  jailers' starts and exit statuses in the trace's order, those alive with their
   command lines, the pid file, the root's files and the control file; it
   prints the Windows build and whether Defender's real-time protection is
   on), `cpuset` (`cpuset.cpus` is the jailed process's
