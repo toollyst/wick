@@ -569,9 +569,28 @@ def stage_jail(ctx):
     # A Unix socket the operator listens on inside the jail is reachable
     # (vsock's guest-to-host connections, a network endpoint).
     vm.api("PUT", "/vsock", {"guest_cid": 3, "uds_path": "/v.sock"})
+    # The jailed API process serving across an idle of 11 s: libmalloc's
+    # deferred reclamation, where a process has its ring, makes a Mach trap
+    # at the first free 10 s or more after the ring's last sample, which
+    # neither profile allows (vmm::ext::sandbox, `reclamation_ring`:
+    # Firecracker's configuration has no ring, and the sandbox refuses a
+    # process with one). Requests with a 40 KiB body, parsed by the API
+    # process and refused by Firecracker, before and after, the same API
+    # process throughout. Until this step no run kept it serving past 10 s.
+    api = bt.children(pid)
+    check(len(api) == 1, f"Firecracker's children {api}: not its one API process")
+    churn = {"drive_id": "x", "path_on_host": "/" + "a" * (40 << 10), "is_root_device": False,
+             "is_read_only": True}
+    for _ in range(4):
+        vm.api("PUT", "/drives/x", churn, expect=(400,))
+    time.sleep(11)
+    for _ in range(4):
+        vm.api("PUT", "/drives/x", churn, expect=(400,))
+    check(vm.proc.poll() is None and bt.children(pid) == api,
+          f"after the idle: Firecracker {vm.proc.poll()}, API process {bt.children(pid)} (was {api})")
     vm.kill()
     return ("uid/gid, pid file, chroot, exec'd from a root-owned copy, no inherited descriptors, "
-            "libmalloc's configuration; outside files unreachable")
+            "libmalloc's configuration; outside files unreachable; the API process serving after 11 s idle")
 
 
 def daemon_pid(jail):

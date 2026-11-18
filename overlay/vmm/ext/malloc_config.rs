@@ -298,6 +298,36 @@ fn fail(message: &str, code: i32) -> ! {
     unsafe { libc::_exit(code) }
 }
 
+/// The variable that keeps a process of this crate's unit tests on
+/// libmalloc's defaults ([`wick_malloc_config_test_before_main`]): only for a test that needs a
+/// process as Firecracker never runs, with a deferred-reclamation ring (the
+/// sandbox's refusal of one, `ext::sandbox`). Such a process is started with
+/// [`MALLOC_ENV`]'s variables removed and this one set.
+#[cfg(test)]
+pub const TEST_DEFAULT_MALLOC: &str = "WICK_TEST_DEFAULT_MALLOC";
+
+/// This crate's unit tests run libmalloc as Firecracker does: the test
+/// binary starts again with [`MALLOC_ENV`] before `main`, by the same
+/// [`before_main`], so that each sandbox profile is tested in the
+/// allocator's configuration the product runs it in (the sandbox refuses a
+/// process with a deferred-reclamation ring, which libmalloc's defaults make
+/// from macOS 26). Not with [`TEST_DEFAULT_MALLOC`] set.
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub extern "C" fn wick_malloc_config_test_before_main() {
+    if std::env::var_os(TEST_DEFAULT_MALLOC).is_none() {
+        before_main();
+    }
+}
+
+#[cfg(test)]
+core::arch::global_asm!(
+    ".section __DATA,__mod_init_func,mod_init_funcs",
+    ".p2align 3",
+    ".quad _wick_malloc_config_test_before_main",
+    ".text",
+);
+
 /// Firecracker's exit codes (`crate::FcExitCode`) this module ends with.
 mod vmm_exit {
     pub const GENERIC_ERROR: i32 = crate::FcExitCode::GenericError as i32;

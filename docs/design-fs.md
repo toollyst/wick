@@ -1385,7 +1385,10 @@ it means layer 1 let the request through.
     killed and the server was killed at the second round. Not done: `MallocLargeCache=0` in the server's environment,
     which turns the reclamation off (xzone reads it in release builds, `_xzm_production_getenv`; measured: no ring,
     and the 11 s case passes under a rule killing the trap), because it needs a re-exec or the launcher to set it
-    and puts the allocator in a mode measured nowhere else.
+    and puts the allocator in a mode measured nowhere else. Firecracker differs: it runs libmalloc with
+    `MallocSpaceEfficient=1` (`vmm::ext::malloc_config`), in which xzone makes no ring (xzone_malloc.c :8576,
+    :9124), so its profiles list none of the three and it refuses to apply one to a process the kernel records a ring
+    for (SECURITY.md, Heap); wick-fsd runs libmalloc's default mode and keeps its entries.
 
   - **How the lists were made, and the limit of that.** A discovery build (`--cfg wick_fsd_discovery`, never
     released) ends the profile with `(allow default (with report))` and allows unlisted calls with a report;

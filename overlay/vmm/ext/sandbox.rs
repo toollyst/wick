@@ -51,12 +51,14 @@ pub enum SandboxError {
     CustomFilterUnsupported,
     /// The jail's CPU limit of {0}% holds only with the sandbox: without it Firecracker could lift the limit itself (unlike a cgroup's). Drop --no-seccomp or the CPU cgroup
     CpuLimitNeedsSandbox(u8),
+    /// libmalloc's deferred reclamation is on in this process ({0}), whose calls the sandbox profile does not allow: Firecracker runs libmalloc with MallocSpaceEfficient=1, which turns it off
+    ReclamationRing(String),
 }
 
 #[cfg(target_os = "macos")]
 pub use macos::{
     API_FCNTL_COMMANDS, API_MACH_TRAPS, API_MIG_ROUTINES, API_SYSCALLS, FCNTL_COMMANDS,
-    ABSENT, EXCEPTION_MIG_ROUTINES, FILES_ANYWHERE, Limit, MACH_TRAPS, MACH_TRAPS_IF_DEFINED, MEASURED_MAJORS, MIG_ROUTINES,
+    ABSENT, EXCEPTION_MIG_ROUTINES, FILES_ANYWHERE, Limit, MACH_TRAPS, MEASURED_MAJORS, MIG_ROUTINES,
     PROFILE, RUN_DENIED_OPERATIONS, SETUP_MIG_ROUTINES_IF_DEFINED, SYSCALLS, Skip,
     SigsysHandler, UNFILTERED_SYSCALLS, api_profile, apply, apply_api, narrowed,
     denied_elsewhere, denied_syscall, files_in_jail, narrow, prepare, profile, profile_for, select,
@@ -650,11 +652,6 @@ mod macos {
     /// [`SETUP_MIG_ROUTINES`] or [`MIG_ROUTINES`] still fails to compile.
     pub const SETUP_MIG_ROUTINES_IF_DEFINED: &[&str] = &["mach_vm_reallocate", "vm_reallocate"];
 
-    /// Mach traps of [`MACH_TRAPS`]' kind that only newer macOS releases have
-    /// (allowed where Seatbelt knows them). Measured: libmalloc's deferred
-    /// reclamation.
-    pub const MACH_TRAPS_IF_DEFINED: &[&str] = &["mach_vm_reclaim_update_kernel_accounting_trap"];
-
     /// The API process's system calls (`ext::api_process`), each line the
     /// rule of upstream's `api` filter it stands for: an HTTP server on a
     /// socket it already listens on.
@@ -761,6 +758,7 @@ mod macos {
         if state.policy == Policy::None || state.installed {
             return Ok(());
         }
+        refuse_a_reclamation_ring()?;
         install_compiled(&compiled_api_profile()?)?;
         state.installed = true;
         state.narrowed_done = true;
@@ -1375,11 +1373,6 @@ mod macos {
             rule.push_str(&allow("syscall-mig", "", "kernel-mig-routine", "", PVTIME_MIG_ROUTINES));
         }
         rule.push_str(&exception_rule());
-        for name in MACH_TRAPS_IF_DEFINED {
-            rule.push_str(&format!(
-                "(when (defined? 'MSC_{name}) (allow syscall-mach (machtrap-number MSC_{name})))\n"
-            ));
-        }
         for name in SETUP_MIG_ROUTINES_IF_DEFINED {
             rule.push_str(&format!(
                 "(when (defined? '{name}) (allow syscall-mig (require-all (kernel-mig-routine {name}) {setup})))\n"
@@ -1630,6 +1623,108 @@ mod macos {
         STATE.lock().unwrap().policy
     }
 
+    /// The Darwin major of the running kernel (`kern.osrelease`: 24 is
+    /// macOS 15, 25 is macOS 26, 26 is macOS 27), or `None` if it cannot be
+    /// read.
+    fn darwin_major() -> Option<u32> {
+        let mut buf = [0u8; 32];
+        let mut len = buf.len();
+        // SAFETY: a NUL-terminated name, an output buffer of `len` bytes.
+        let r = unsafe {
+            libc::sysctlbyname(c"kern.osrelease".as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+        };
+        if r != 0 {
+            return None;
+        }
+        let text = std::str::from_utf8(buf.get(..len)?).ok()?;
+        text.trim_end_matches('\0').split('.').next()?.parse().ok()
+    }
+
+    /// libmalloc's deferred-reclamation ring of this process, as the kernel
+    /// records it: `Ok(None)` when the process has none, `Ok(Some((address,
+    /// size)))` when it has one, `Err` when it cannot tell.
+    ///
+    /// From macOS 26 libmalloc's xzone allocator, unless it runs in
+    /// space-efficient mode, puts the spans it frees into a ring it shares
+    /// with the kernel, made at malloc's start (libmalloc-812.100.31
+    /// xzone_malloc.c :9124, `xzm_reclaim_init`, only when one of
+    /// `defer_tiny`, `defer_small`, `defer_large` or the huge cache is on;
+    /// :8576 turns all of them off when `malloc_space_efficient_enabled`;
+    /// libmalloc-792.80.2, macOS 26, :7246 and :7652 the same). A process
+    /// with a ring makes Mach trap 63 at the first free 10 s or more after
+    /// the ring's last sample, and the MIG routines that resize and flush
+    /// the ring when it is full or a reuse loses a race with the kernel;
+    /// neither profile allows any of them (measured on macOS 27.2: each a
+    /// denial under each profile, `test_neither_profile_allows_the_ring_s_calls`).
+    ///
+    /// The answer is the kernel's, from the routine
+    /// `mach_vm_deferred_reclamation_buffer_query` of this task (xnu-12377.1.9
+    /// osfmk/vm/vm_user.c :1980, osfmk/vm/vm_reclaim.c
+    /// `vm_deferred_reclamation_buffer_query_internal`: the address and size
+    /// of the ring the task registered, zero when it registered none), the
+    /// call libsystem_kernel's `mach_vm_reclaim_get_rings_for_task` makes.
+    /// It reads the process's state, not its environment: a
+    /// `MallocSpaceEfficient=1` libmalloc did not honour still shows its
+    /// ring. It cannot answer "none" for a ring libmalloc uses: libmalloc
+    /// has one only by registering it with the kernel
+    /// (`mach_vm_reclaim_ring_allocate`, the routine
+    /// `mach_vm_deferred_reclamation_buffer_allocate`), which records it in
+    /// the task's metadata that the query reads, and it makes the ring at
+    /// its own start, before any of Firecracker's code
+    /// (`_malloc_initialize`), so none is made after this check.
+    ///
+    /// Where the routine is missing from libsystem_kernel or fails, the
+    /// answer is "none" only on Darwin 24 (macOS 15) and earlier, by source:
+    /// libmalloc-715.140.5 has reclamation code only in its magazine
+    /// allocator, compiled out on macOS (platform.h
+    /// `CONFIG_MAGAZINE_DEFERRED_RECLAIM` 0), and none in its xzone
+    /// allocator (src/xzone). On a later major, or one that cannot be read,
+    /// it is `Err`: a libmalloc that has reclamation and cannot be asked.
+    pub(super) fn reclamation_ring() -> Result<Option<(u64, u64)>, String> {
+        unsafe extern "C" {
+            static mach_task_self_: libc::mach_port_t;
+        }
+        type Query = unsafe extern "C" fn(libc::mach_port_t, *mut u64, *mut u64) -> libc::c_int;
+        // SAFETY: a NUL-terminated name, looked up in every loaded image.
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mach_vm_deferred_reclamation_buffer_query".as_ptr()) };
+        let asked = if symbol.is_null() {
+            Err("libsystem_kernel has no mach_vm_deferred_reclamation_buffer_query".to_owned())
+        } else {
+            // SAFETY: libsystem_kernel's MIG stub of that name, with the
+            // routine's arguments (osfmk/mach/mach_vm.defs :599: a task
+            // port, then the ring's address and size out).
+            let query = unsafe { std::mem::transmute::<*mut libc::c_void, Query>(symbol) };
+            let (mut addr, mut size) = (0u64, 0u64);
+            // SAFETY: this task's port and two output words.
+            match unsafe { query(mach_task_self_, &mut addr, &mut size) } {
+                0 if addr == 0 => return Ok(None),
+                0 => return Ok(Some((addr, size))),
+                kr => Err(format!("mach_vm_deferred_reclamation_buffer_query: {kr:#x}")),
+            }
+        };
+        match darwin_major() {
+            Some(major) if major <= 24 => Ok(None),
+            Some(major) => asked.map_err(|why| format!("{why} on Darwin {major}")),
+            None => asked.map_err(|why| format!("{why}, and kern.osrelease cannot be read")),
+        }
+    }
+
+    /// Refuses to sandbox a process that has a deferred-reclamation ring,
+    /// or cannot tell ([`reclamation_ring`]): the profile would kill it at
+    /// its first free 10 s or more after the ring's last sample.
+    /// Firecracker and its API process run libmalloc with
+    /// `MallocSpaceEfficient=1` (`ext::malloc_config`), which has none; this
+    /// is the check that it holds, made before either profile is applied.
+    fn refuse_a_reclamation_ring() -> Result<(), SandboxError> {
+        match reclamation_ring() {
+            Ok(None) => Ok(()),
+            Ok(Some((addr, size))) => {
+                Err(SandboxError::ReclamationRing(format!("a ring of {size} bytes at {addr:#x}")))
+            }
+            Err(why) => Err(SandboxError::ReclamationRing(format!("cannot tell: {why}"))),
+        }
+    }
+
     /// Installs the selected sandbox if it is not installed yet.
     pub fn apply() -> Result<(), SandboxError> {
         let mut state = STATE.lock().unwrap();
@@ -1644,6 +1739,7 @@ mod macos {
                 None => Ok(()),
             };
         }
+        refuse_a_reclamation_ring()?;
         // Issued before the sandbox, which denies issuing; an extension
         // taken before the sandbox is installed would not attach to it.
         let narrowed = Token::issue(NARROWED)?;
@@ -2120,13 +2216,21 @@ mod macos {
             use std::sync::mpsc;
             // With this process's directory of endpoints: the children
             // run under Firecracker's profile, which names it.
-            let mut proc = crate::platform::net::test_binary()
-                .args([
-                    "--exact",
-                    &format!("ext::sandbox::macos::tests::{name}"),
-                    "--ignored",
-                    "--nocapture",
-                ])
+            let mut command = crate::platform::net::test_binary();
+            command.args([
+                "--exact",
+                &format!("ext::sandbox::macos::tests::{name}"),
+                "--ignored",
+                "--nocapture",
+            ]);
+            // A child on libmalloc's defaults ([`RING_ENV`]) does not inherit
+            // this process's configuration.
+            if env.iter().any(|(k, _)| *k == crate::ext::malloc_config::TEST_DEFAULT_MALLOC) {
+                for (variable, _) in crate::ext::malloc_config::MALLOC_ENV {
+                    command.env_remove(variable);
+                }
+            }
+            let mut proc = command
                 .envs(env.iter().copied())
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -3442,6 +3546,350 @@ mod macos {
             std::io::stdout().flush().unwrap();
             std::thread::sleep(std::time::Duration::from_secs(5));
             println!("CHILD-SURVIVED");
+        }
+
+        /// A child's environment for a process on libmalloc's defaults, as
+        /// Firecracker never runs ([`crate::ext::malloc_config::TEST_DEFAULT_MALLOC`];
+        /// [`child_run`] removes the configuration this process runs with):
+        /// from macOS 26 its xzone allocator has a deferred-reclamation ring.
+        const RING_ENV: (&str, &str) = (crate::ext::malloc_config::TEST_DEFAULT_MALLOC, "1");
+
+        /// The calls libmalloc makes on its ring (xnu-12377.1.9
+        /// libsyscall/mach/vm_reclaim.c): the accounting trap (63) at the
+        /// first free 10 s or more after the ring's last sample, and the
+        /// MIG routines that resize the ring when a free finds it full and
+        /// flush it when that fails or a reuse loses a race with the kernel
+        /// (libmalloc-812.100.31 xzone_segment.c :345, :300, :305, :260).
+        const RECLAMATION_CALLS: [&str; 3] = [
+            "mach_vm_reclaim_update_kernel_accounting_trap",
+            "mach_vm_deferred_reclamation_buffer_resize",
+            "mach_vm_deferred_reclamation_buffer_flush",
+        ];
+
+        /// The process's ring, as a line for its output.
+        fn ring_line() -> String {
+            match reclamation_ring() {
+                Ok(Some((addr, size))) => format!("RING {addr:#x} {size}"),
+                Ok(None) => "RING none".to_owned(),
+                Err(why) => format!("RING cannot tell: {why}"),
+            }
+        }
+
+        /// Whether a child's output says it had a ring.
+        fn had_ring(out: &std::process::Output) -> bool {
+            String::from_utf8_lossy(&out.stdout).contains("RING 0x")
+        }
+
+        /// Says on standard error, past libtest's capture, that `what` was
+        /// not run on this host and why: a record, not a pass.
+        fn not_run(test: &str, what: &str, out: &std::process::Output) {
+            use std::io::Write;
+            let ring = String::from_utf8_lossy(&out.stdout).lines().find(|l| l.starts_with("RING")).unwrap_or("").to_owned();
+            let _ = writeln!(std::io::stderr(), "{test}: NOT RUN: {what} ({ring})");
+        }
+
+        /// The ring's call `which` on this process's ring `addr`, as
+        /// libmalloc makes it: the accounting trap, a flush of one entry, a
+        /// resize to twice the ring's capacity. The kernel's answer.
+        fn reclaim_call(which: &str, addr: u64) -> i32 {
+            unsafe extern "C" {
+                static mach_task_self_: libc::mach_port_t;
+            }
+            let symbol = |name: &std::ffi::CStr| {
+                // SAFETY: a NUL-terminated name, looked up in every image.
+                let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+                assert!(!p.is_null(), "{name:?}");
+                p
+            };
+            type RingCall = unsafe extern "C" fn(usize, u32) -> i32;
+            let ring = usize::try_from(addr).unwrap();
+            let (mut bytes, mut deadline) = (0u64, 0u64);
+            // SAFETY: libsystem_kernel's functions of those names, with
+            // xnu-12377.1.9's signatures (libsyscall/mach/vm_reclaim.c), on
+            // this process's own ring and task; the trap's third argument is
+            // macOS 27's (26's two-argument trap ignores it).
+            unsafe {
+                match which {
+                    "accounting" => std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(u32, *mut u64, *mut u64) -> i32>(
+                        symbol(c"mach_vm_reclaim_update_kernel_accounting_trap"),
+                    )(mach_task_self_, &mut bytes, &mut deadline),
+                    "flush" => std::mem::transmute::<*mut libc::c_void, RingCall>(symbol(c"mach_vm_reclaim_ring_flush"))(ring, 1),
+                    "resize" => {
+                        let mut capacity = 0u32;
+                        let kr = std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(usize, *mut u32) -> i32>(symbol(
+                            c"mach_vm_reclaim_ring_capacity",
+                        ))(ring, &mut capacity);
+                        assert_eq!(kr, 0, "mach_vm_reclaim_ring_capacity");
+                        let round = std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(u32) -> u32>(symbol(
+                            c"mach_vm_reclaim_round_capacity",
+                        ));
+                        std::mem::transmute::<*mut libc::c_void, RingCall>(symbol(c"mach_vm_reclaim_ring_resize"))(
+                            ring,
+                            round(capacity.saturating_mul(2)),
+                        )
+                    }
+                    other => panic!("{other}"),
+                }
+            }
+        }
+
+        /// Allocations of each size from 64 bytes to 2 MiB, written and
+        /// freed, every 100 ms for `period`, waiting in between on a
+        /// condition variable (what both profiles allow): a free crosses
+        /// the end of a ring's 10 s sampling period (xnu-12377.1.9
+        /// osfmk/vm/vm_reclaim.c :79, `vm_reclaim_sampling_period_ns`).
+        fn heap_churn(period: std::time::Duration) {
+            let start = std::time::Instant::now();
+            let (lock, wake) = (std::sync::Mutex::new(()), std::sync::Condvar::new());
+            let mut held = Vec::new();
+            while start.elapsed() < period {
+                for shift in [6, 10, 12, 14, 16, 18, 20, 21] {
+                    let block = vec![1u8; 1 << shift];
+                    std::hint::black_box(&block);
+                    // Kept a few rounds, so frees come in batches.
+                    held.push(block);
+                }
+                if held.len() > 64 {
+                    held.clear();
+                }
+                let guard = lock.lock().unwrap();
+                drop(wake.wait_timeout(guard, std::time::Duration::from_millis(100)).unwrap());
+            }
+            drop(held);
+        }
+
+        /// `phase`'s profile applied as [`apply`] and [`narrow`] (`run`) or
+        /// [`apply_api`] (`api`) apply it, without their check for a ring:
+        /// what the profile does to a process the check refuses.
+        fn sandboxed_without_the_ring_check(phase: &str) {
+            select(Policy::Default);
+            match phase {
+                "run" => {
+                    {
+                        let mut state = STATE.lock().unwrap();
+                        let narrowed = Token::issue(NARROWED).unwrap();
+                        install_compiled(&compiled_profile().unwrap()).unwrap();
+                        state.installed = true;
+                        state.narrowed = Some(narrowed);
+                    }
+                    narrow().unwrap();
+                }
+                _ => install_compiled(&compiled_api_profile().unwrap()).unwrap(),
+            }
+        }
+
+        // Firecracker runs libmalloc with MallocSpaceEfficient=1
+        // (ext::malloc_config), and xzone has no deferred-reclamation ring
+        // in that mode (libmalloc-812.100.31 xzone_malloc.c :8576 and
+        // :9124), so Firecracker and its API process never make the ring's
+        // calls; this test binary runs the same (malloc_config's test
+        // initializer). On libmalloc's defaults a process has a ring from
+        // macOS 26's xzone on (measured on 27.2: 1016 entries).
+        #[test]
+        fn test_firecracker_s_allocator_has_no_reclamation_ring() {
+            for (variable, value) in crate::ext::malloc_config::MALLOC_ENV {
+                assert_eq!(std::env::var(variable).as_deref(), Ok(value), "{variable}");
+            }
+            assert_eq!(reclamation_ring(), Ok(None));
+            let out = child("ring_child", &[]);
+            assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("RING none\n"), "{}", text(&out));
+            let out = child("ring_child", &[RING_ENV]);
+            assert!(out.status.success(), "{}", text(&out));
+            if !had_ring(&out) {
+                // macOS 15 (libmalloc-715 has none on macOS) and 26 where
+                // its default is the magazine allocator: on record.
+                assert!(darwin_major().unwrap() < 26, "macOS 27 had a ring (measured): {}", text(&out));
+                not_run("test_firecracker_s_allocator_has_no_reclamation_ring", "a process with a ring", &out);
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_firecracker_s_allocator_has_no_reclamation_ring in a separate process"]
+        fn ring_child() {
+            drop(std::hint::black_box(vec![1u8; 1 << 20]));
+            println!("{}", ring_line());
+        }
+
+        // A process with a ring is refused by each profile before it is
+        // applied (SandboxError::ReclamationRing), where the profile would
+        // kill it at its first free 10 s after the ring's last sample.
+        #[test]
+        fn test_a_process_with_a_ring_is_refused_by_each_profile() {
+            for phase in ["run", "api"] {
+                let out = child("refused_child", &[RING_ENV, ("WICK_TEST_CASE", phase)]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if !had_ring(&out) {
+                    not_run("test_a_process_with_a_ring_is_refused_by_each_profile", phase, &out);
+                    continue;
+                }
+                assert!(out.status.success(), "{phase}: {}", text(&out));
+                assert!(
+                    stdout.contains("REFUSED libmalloc's deferred reclamation is on in this process (a ring of "),
+                    "{phase}: {}",
+                    text(&out)
+                );
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_a_process_with_a_ring_is_refused_by_each_profile in a separate process"]
+        fn refused_child() {
+            println!("{}", ring_line());
+            let report = |result: Result<(), SandboxError>| match result {
+                Ok(()) => println!("APPLIED"),
+                Err(e) => println!("REFUSED {e}"),
+            };
+            select(Policy::Default);
+            match std::env::var("WICK_TEST_CASE").unwrap().as_str() {
+                "run" => report(apply()),
+                _ => in_fork(|| report(apply_api())),
+            }
+        }
+
+        // Neither profile lets a ring's calls through: each, made by the
+        // call itself on the process's own ring under each profile, is a
+        // denial (the sandbox's kill, by its exit reason). Measured on
+        // 27.2: in the run phase the trap is "deny(1) syscall-mach 63" and
+        // the routines "syscall-mig 327" and "329"; in the API process the
+        // trap is 63 and the routines end at their message,
+        // "syscall-mach 47" (mach_msg2_trap: it sends no Mach message).
+        #[test]
+        fn test_neither_profile_allows_the_ring_s_calls() {
+            let lists = [
+                MACH_TRAPS, SETUP_MACH_TRAPS, API_MACH_TRAPS, MIG_ROUTINES, SETUP_MIG_ROUTINES,
+                SETUP_MIG_ROUTINES_IF_DEFINED, PVTIME_MIG_ROUTINES, API_MIG_ROUTINES, EXCEPTION_MIG_ROUTINES,
+            ]
+            .concat();
+            for name in RECLAMATION_CALLS {
+                assert!(!lists.contains(&name), "{name}");
+                assert!(!syscall_rule().contains(name) && !api_profile().contains(name), "{name}");
+            }
+            let mut failed = Vec::new();
+            for phase in ["run", "api"] {
+                for call in ["accounting", "flush", "resize"] {
+                    let case = format!("{phase} {call}");
+                    let out = child("ring_call_child", &[RING_ENV, ("WICK_TEST_CASE", phase), ("WICK_TEST_CALL", call)]);
+                    if !had_ring(&out) {
+                        not_run("test_neither_profile_allows_the_ring_s_calls", &case, &out);
+                        continue;
+                    }
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    if !(stdout.contains(&format!("SANDBOXED\nCALLING {call}\n")) && denied(&out) && !stdout.contains("RETURNED")) {
+                        failed.push(format!("{case}: {}", text(&out)));
+                    }
+                }
+            }
+            assert!(failed.is_empty(), "{}", failed.join("\n=====\n"));
+        }
+
+        #[test]
+        #[ignore = "run by test_neither_profile_allows_the_ring_s_calls in a separate process"]
+        fn ring_call_child() {
+            println!("{}", ring_line());
+            let Ok(Some((addr, _))) = reclamation_ring() else { return };
+            let call = std::env::var("WICK_TEST_CALL").unwrap();
+            let run = move || {
+                println!("CALLING {call}");
+                let kr = reclaim_call(&call, addr);
+                println!("RETURNED {kr:#x}");
+            };
+            let phase = std::env::var("WICK_TEST_CASE").unwrap();
+            match phase.as_str() {
+                // On a thread made before the profile that has made no MIG
+                // call, as a vCPU thread would be.
+                "run" => {
+                    let (go, wait) = std::sync::mpsc::channel::<()>();
+                    let thread = std::thread::spawn(move || {
+                        wait.recv().unwrap();
+                        run();
+                    });
+                    sandboxed_without_the_ring_check("run");
+                    println!("SANDBOXED");
+                    go.send(()).unwrap();
+                    let _ = thread.join();
+                }
+                _ => in_fork(|| {
+                    sandboxed_without_the_ring_check("api");
+                    println!("SANDBOXED");
+                    run();
+                }),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("CHILD-SURVIVED");
+        }
+
+        // Each profile in the allocator's configuration Firecracker runs
+        // with lives past a ring's 10 s sampling period while it allocates
+        // and frees; with a ring, which the profiles' check refuses, each is
+        // killed by its first free after the period (measured on 27.2:
+        // "deny(1) syscall-mach 63", the API process too: a fork keeps its
+        // parent's ring, xnu osfmk/vm/vm_reclaim.c
+        // `vm_deferred_reclamation_task_fork`).
+        #[test]
+        fn test_each_profile_outlives_the_reclamation_period() {
+            for phase in ["run", "api"] {
+                let out = child("long_lived_child", &[("WICK_TEST_CASE", phase)]);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(stdout.contains("RING none\nSANDBOXED\n"), "{phase}: {}", text(&out));
+                assert!(out.status.success() && stdout.contains("PAST-PERIOD\nCHILD-OK"), "{phase}: {}", text(&out));
+            }
+        }
+
+        #[test]
+        fn test_a_ring_under_either_profile_is_killed_after_the_period() {
+            for phase in ["run", "api"] {
+                let out = child("long_lived_child", &[RING_ENV, ("WICK_TEST_CASE", phase)]);
+                if !had_ring(&out) {
+                    not_run("test_a_ring_under_either_profile_is_killed_after_the_period", phase, &out);
+                    continue;
+                }
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(stdout.contains("SANDBOXED") && denied(&out), "{phase}: {}", text(&out));
+                assert!(!stdout.contains("PAST-PERIOD"), "{phase}: {}", text(&out));
+            }
+        }
+
+        #[test]
+        #[ignore = "run by test_each_profile_outlives_the_reclamation_period and \
+                    test_a_ring_under_either_profile_is_killed_after_the_period in a separate process"]
+        fn long_lived_child() {
+            println!("{}", ring_line());
+            let ring = had_ring_here();
+            let phase = std::env::var("WICK_TEST_CASE").unwrap();
+            let body = || {
+                println!("SANDBOXED");
+                heap_churn(std::time::Duration::from_secs(12));
+                println!("PAST-PERIOD");
+                println!("CHILD-OK");
+            };
+            let sandbox = |phase: &str| {
+                if ring {
+                    sandboxed_without_the_ring_check(phase);
+                } else {
+                    select(Policy::Default);
+                    if phase == "run" {
+                        apply().unwrap();
+                        narrow().unwrap();
+                    } else {
+                        apply_api().unwrap();
+                    }
+                }
+            };
+            match phase.as_str() {
+                "run" => {
+                    sandbox("run");
+                    body();
+                }
+                _ => in_fork(|| {
+                    sandbox("api");
+                    body();
+                }),
+            }
+        }
+
+        /// Whether this process has a ring.
+        fn had_ring_here() -> bool {
+            matches!(reclamation_ring(), Ok(Some(_)))
         }
 
         // Executable mappings end the process as upstream's mmap and mprotect
@@ -5650,10 +6098,9 @@ mod macos {
         #[test]
         fn test_mach_trap_names_are_known() {
             let mut names = MACH_TRAPS.to_vec();
-            names.extend(MACH_TRAPS_IF_DEFINED);
             names.sort_unstable();
             names.dedup();
-            assert_eq!(names.len(), MACH_TRAPS.len() + MACH_TRAPS_IF_DEFINED.len());
+            assert_eq!(names.len(), MACH_TRAPS.len());
             for needed in ["mach_msg2_trap", "_kernelrpc_mach_vm_map_trap", "semaphore_wait_trap"] {
                 assert!(MACH_TRAPS.contains(&needed), "{needed}");
             }

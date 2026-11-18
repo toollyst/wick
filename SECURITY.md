@@ -184,6 +184,24 @@ given back: libmalloc's own report of its configuration, `MallocReportConfig`). 
 and 26) run the magazine allocator, which has no buckets; there the two variables only make one magazine and give
 freed memory back (`Max Magazines: 1`, `Aggressive Madvise: 1` in the same report).
 
+Without the space-efficient mode, xzone (macOS 26 on) puts the spans it frees into a deferred-reclamation ring it
+shares with the kernel, and a process with one makes Mach trap 63 at its first free 10 s or more after the ring's last
+sample, and MIG routines that resize and flush the ring; neither Firecracker profile allows any of them (each a
+denial under each profile, `test_neither_profile_allows_the_ring_s_calls`; a process with a ring under either profile
+killed by its first free after the period, `test_a_ring_under_either_profile_is_killed_after_the_period`). In the
+space-efficient mode xzone makes no ring (libmalloc-812.100.31 xzone_malloc.c :8576 and :9124; measured on macOS 27.2:
+no ring with `MallocSpaceEfficient=1`, one of 1016 entries without), so Firecracker and its API process never make
+these calls (`test_firecracker_s_allocator_has_no_reclamation_ring`), and both refuse to apply their profile when the
+kernel records a ring for the process, or cannot be asked on macOS 26 or later
+(`SandboxError::ReclamationRing`, `test_a_process_with_a_ring_is_refused_by_each_profile`): a `MallocSpaceEfficient=1`
+libmalloc did not honour ends the start, named, instead of a kill at the first idle free. The run phase had allowed
+trap 63 since d85ec7fb, measured in a boot test before Firecracker ran in the space-efficient mode (7fd38e70), and no
+longer does. From 26b9b3be (2026-11-11) to 7fd38e70 (2026-11-16) the jailed API process ran with a ring and its
+profile without the trap, so on macOS 26 or 27 its first free 10 s or more after the ring's last sample would have
+killed it (measured on 27.2 in the same configuration: "deny(1) syscall-mach 63"); no release holds that window. No
+run had kept the jailed API process serving past 10 s before `jailer-test jail` began to (requests before and after an
+idle of 11 s, the same API process throughout, on CI's macOS 15 and 26 runners).
+
 The configuration is checked on each launch: libmalloc's report on a direct launch, without the variables (two
 reports, the second with them) and with them (one) (`test_a_direct_launch_starts_again_with_libmallocs_configuration`,
 `test_a_launch_with_the_configuration_runs_without_starting_again`), another value refused before any of
