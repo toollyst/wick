@@ -201,9 +201,11 @@ pub const MIG_ROUTINES_IF_DEFINED: &[(&str, &str)] =
     &[("mach_vm_reallocate", "libmalloc grows a large block (realloc), measured as the traps are")];
 
 /// libmalloc's deferred reclamation: the kernel's accounting trap, allowed
-/// where this macOS defines it (`MSC_` name). xnu-12377 (macOS 26) on has it
-/// (osfmk/kern/syscall_sw.c :173, trap 63; `kern_invalid` in xnu-11417,
-/// macOS 15), and from that release libmalloc's xzone allocator defers the
+/// where this macOS's libsandbox knows its `MSC_` name, which macOS 15.8.2's
+/// already does (CI run 44384853363). xnu-12377 (macOS 26) on has the trap
+/// (osfmk/kern/syscall_sw.c :173, trap 63); xnu-11417 (macOS 15) answers it
+/// `kern_invalid`, so there the rule allows a trap that does nothing and that
+/// no allocator of macOS 15 makes. From xnu-12377 libmalloc's xzone allocator defers the
 /// reclamation of the spans it frees by default on macOS (libmalloc-792.80.2
 /// and 812.100.31 xzone_malloc.h `XZM_DEFERRED_RECLAIM_ENABLED_DEFAULT`; its
 /// ring is allocated at malloc's start, before the profile, 1016 entries
@@ -226,10 +228,14 @@ pub const MACH_TRAPS_IF_DEFINED: &[(&str, &str)] = &[(
 /// rules of [`MIG_ROUTINES_WITH_RECLAMATION`] also wait on.
 pub const RECLAMATION_TRAP: &str = "mach_vm_reclaim_update_kernel_accounting_trap";
 
-/// The MIG routines of the same ring, allowed where the kernel defines the
-/// accounting trap above (the releases whose libmalloc makes a ring) and
-/// the routine: xnu-11417.101.15 (macOS 15.4) on defines both routines, but
-/// no allocator of macOS 15 makes a ring, so there the rule is not emitted.
+/// The MIG routines of the same ring, allowed where libsandbox knows the
+/// accounting trap's name above and the routine's. xnu-11417.101.15 (macOS
+/// 15.4) on defines both routines, and macOS 15.8.2's libsandbox binds all
+/// three names (CI run 44384853363), so its profile has these rules too:
+/// there no allocator makes a ring, and on a process without one the
+/// kernel refuses both (xnu-11417.140.69 osfmk/vm/vm_reclaim.c :1237 flush,
+/// KERN_INVALID_ARGUMENT; :1297 resize, KERN_INVALID_TASK), as it refuses
+/// another task's.
 pub const MIG_ROUTINES_WITH_RECLAMATION: &[(&str, &str)] = &[
     (
         "mach_vm_deferred_reclamation_buffer_resize",
@@ -612,17 +618,20 @@ mod tests {
     /// security/mac_policy.h from xnu-12377.1.9 (macOS 26.0), not in
     /// xnu-11417.140.69 (macOS 15); the routine `mach_vm_reallocate` is in
     /// osfmk/mach/mach_vm.defs from xnu-12377.101.15, not in xnu-12377.81.4
-    /// or any earlier release; the trap `mach_vm_reclaim_update_kernel_accounting_trap`
-    /// is osfmk/kern/syscall_sw.c's trap 63 from xnu-12377.1.9, `kern_invalid`
-    /// in xnu-11417.140.69; the routines `mach_vm_deferred_reclamation_buffer_flush`
+    /// or any earlier release; the routines `mach_vm_deferred_reclamation_buffer_flush`
     /// and `_resize` are in mach_vm.defs from xnu-11417.101.15 (macOS 15.4),
     /// not in xnu-11215.81.4 (whose routines of the ring are `_init`,
-    /// `_synchronize` and `_update_reclaimable_bytes`).
+    /// `_synchronize` and `_update_reclaimable_bytes`). The trap's name
+    /// `MSC_mach_vm_reclaim_update_kernel_accounting_trap` is libsandbox's,
+    /// not the kernel's: macOS 15.8.2's libsandbox (xnu-11417.140) binds it
+    /// (CI run 44384853363, macos-15), although its kernel has trap 63 as
+    /// `kern_invalid` (xnu-11417.140.69 osfmk/kern/syscall_sw.c), so it is
+    /// bound from there; earlier releases of macOS 15 are not measured.
     const DEFINED_SINCE_XNU: &[(&str, (u32, u32))] = &[
         ("file-graft", (12377, 1)),
         ("file-ungraft", (12377, 1)),
         ("mach_vm_reallocate", (12377, 101)),
-        ("MSC_mach_vm_reclaim_update_kernel_accounting_trap", (12377, 1)),
+        ("MSC_mach_vm_reclaim_update_kernel_accounting_trap", (11417, 140)),
         ("mach_vm_deferred_reclamation_buffer_flush", (11417, 101)),
         ("mach_vm_deferred_reclamation_buffer_resize", (11417, 101)),
     ];
@@ -704,6 +713,19 @@ mod tests {
             );
         }
         assert_eq!(since.len(), optional.len(), "DEFINED_SINCE_XNU names one the profile does not emit");
+        // On record past libtest's capture, passing or not: which of the
+        // deferred-reclamation names this macOS's libsandbox binds, and so
+        // which of their rules the profile has here.
+        use std::io::Write;
+        let names = [MACH_TRAPS_IF_DEFINED[0].0, MIG_ROUTINES_WITH_RECLAMATION[0].0, MIG_ROUTINES_WITH_RECLAMATION[1].0];
+        let binding: Vec<String> = names
+            .iter()
+            .map(|n| {
+                let symbol = if *n == RECLAMATION_TRAP { format!("MSC_{n}") } else { (*n).to_string() };
+                format!("{symbol} {}", if bound(&symbol) { "bound" } else { "unbound" })
+            })
+            .collect();
+        let _ = writeln!(std::io::stderr(), "record: xnu-{}.{}: {}", xnu.0, xnu.1, binding.join(", "));
     }
 
     /// The whole text, pinned for a read-write and a read-only share

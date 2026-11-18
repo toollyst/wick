@@ -1369,9 +1369,12 @@ it means layer 1 let the request through.
     measured on macOS 27.2, the first READ of 1 MiB after an idle of 11 s (crash report: the trap ←
     `mach_vm_reclaim_update_kernel_accounting` ← `_xzm_reclaim_mark_free` ← `xzm_segment_group_free_chunk` ← the
     reply frame's buffer dropped in `Session::handle`). No test saw it, as every test's server ended within 10 s, and
-    neither did the discovery runs, for the same reason. The trap is listed where defined (xnu-12377 on; macOS 15's
-    trap 63 is `kern_invalid`, and its libmalloc-715 has no deferred reclamation on macOS), on that measurement. The
-    same ring's MIG routines are listed where the trap is defined, by source and not measured: libmalloc resizes a full
+    neither did the discovery runs, for the same reason. The trap is listed where libsandbox knows its name, on that
+    measurement. That is macOS 15.8.2 too (CI run 44384853363 bound the name there): its kernel answers trap 63
+    `kern_invalid` and its libmalloc-715 has no deferred reclamation on macOS, so on 15 the rule allows a trap that does
+    nothing and that nothing makes. The same ring's MIG routines are listed where the trap's name and theirs are known
+    (15.8.2 binds both; there the kernel refuses them for a process without a ring, xnu-11417.140.69 vm_reclaim.c
+    :1237, :1297), by source and not measured: libmalloc resizes a full
     ring when it frees a span (`mach_vm_deferred_reclamation_buffer_resize`, xzone_segment.c :345, :300) and flushes it
     when that fails or when taking back a span loses a race with the kernel's reclamation
     (`mach_vm_deferred_reclamation_buffer_flush`, xzone_segment.c :305, :260; xzone_malloc.c :447, :612, :689, :6904);
