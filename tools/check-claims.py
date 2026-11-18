@@ -659,7 +659,7 @@ def main():
     ci_results = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ci_results)
     claim_errors, claim_warnings = ci_results.check_run_claims(
-        ROOT, repo, {d: (ROOT / d).read_text() for d in documents})
+        ROOT, repo, {d: (ROOT / d).read_text() for d in documents}, strict_windows=strict_windows)
     for line in claim_errors:
         print(f"error: {line}")
         errors += 1

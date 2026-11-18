@@ -1493,25 +1493,28 @@ jobs:
       - name: Compatibility crate tests
         working-directory: lib/firecracker
         run: |
+          # Each run's output is kept too, for the results step (libtest's
+          # lines: tools/ci-results.py add libtest).
+          t() { cargo test --locked "$@" 2>&1 | tee -a "$RUNNER_TEMP/compat-tests.log"; }
           for c in os std libc polling vmm-sys-util memfd event-manager micro-http userfaultfd; do
-            cargo test --locked --manifest-path "../../crates/compat/$c/Cargo.toml"
+            t --manifest-path "../../crates/compat/$c/Cargo.toml"
           done
           # These two make several partitions with guest memory in one
           # process; they run in the WHP step, each in a process of its own
           # (on the runner every map after one refused beside another
           # partition's memory failed, run 43277608081).
-          cargo test --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- \
+          t --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml -- \
             --skip whp::vm::tests::test_vms_one_after_another_map_their_memory \
             --skip whp::vm::tests::test_one_partition_of_a_process_maps_memory
           # The gdb stub's guest debugging and connection, which only
           # Firecracker's gdb feature builds (whp/debug.rs checks that a build
           # without it makes the partition as before).
-          cargo test --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml --features gdb -- \
+          t --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml --features gdb -- \
             whp::debug
-          cargo test --locked --manifest-path ../../crates/compat/os/Cargo.toml --features gdbstub -- gdb
-          cargo test --locked --manifest-path ../../crates/compat/vm-memory/Cargo.toml \
+          t --manifest-path ../../crates/compat/os/Cargo.toml --features gdbstub -- gdb
+          t --manifest-path ../../crates/compat/vm-memory/Cargo.toml \
             --features backend-mmap,backend-bitmap,backend-atomic
-          cargo test --locked --manifest-path ../../crates/compat/vhost/Cargo.toml \
+          t --manifest-path ../../crates/compat/vhost/Cargo.toml \
             --features vhost-user-frontend,vhost-user-backend
       # Every step from here to the kit's upload runs whatever failed before
       # it (success() || failure()), as the steps after the upload do: a
@@ -1787,6 +1790,7 @@ jobs:
             tools/windows/memory-partition-probe.exe
             tools/windows/vmm-memory-record.py
             tools/windows/README.md
+            tools/ci-results.py
           if-no-files-found: error
           retention-days: 14
       # Every package's unit tests, as upstream's CI runs them on Linux (one
@@ -2600,6 +2604,32 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/stdio-console.log"
           test "${PIPESTATUS[0]}" -eq 0
           grep -q "1 passed" "$RUNNER_TEMP/stdio-console.log"
+      # Every test's result in one format (tools/ci-results.py, results.tsv),
+      # for the docs' run claims, as the Linux and macOS jobs give theirs: the
+      # compatibility crates' tests, the unit tests against their listed
+      # differences (tests.tsv: a listed failure is xfail), each WHP test run
+      # alone and the console's. A step that did not run gives no rows. The
+      # host and processor come from the registry (ci-results.py).
+      - name: Results in one format
+        if: always() && steps.setup.outcome == 'success'
+        env:
+          WICK_RESULTS_JOB: windows
+        run: |
+          r="$RUNNER_TEMP/results.tsv"
+          for f in "$RUNNER_TEMP/compat-tests.log" "$RUNNER_TEMP"/whp-logs/*.log "$RUNNER_TEMP/stdio-console.log"; do
+            if [ -f "$f" ]; then python -I tools/ci-results.py add libtest "$f" --out "$r"; fi
+          done
+          f="$RUNNER_TEMP/unit/tests.tsv"
+          if [ -f "$f" ]; then python -I tools/ci-results.py add unit-tsv "$f" --out "$r"; fi
+          if [ -f "$r" ]; then python -I tools/ci-results.py validate "$r"; else echo "no results: no test step wrote its output"; fi
+      - name: Upload the results
+        if: always() && steps.setup.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-windows
+          path: ${{ runner.temp }}/results.tsv
+          if-no-files-found: ignore
+          retention-days: 14
 
   # The Windows scenario tests with a guest, on the hosted runner: it has
   # WHP and boots Linux (run 43377614564, the windows job's memory record).
@@ -2993,4 +3023,35 @@ jobs:
           name: windows-guest-logs
           path: ${{ runner.temp }}/guest-logs
           if-no-files-found: warn
+          retention-days: 14
+      # Every stage's result in one format (tools/ci-results.py, from the
+      # kit), for the docs' run claims: each boot-test.ps1 run's summary.txt
+      # (one directory per run under wbt, the hugepages logon's and each
+      # x2apic round's included) and each jailer-test.ps1 work directory's.
+      # A stage's row is its PASS or FAIL line, the first 200 characters of
+      # its detail; a stage not applicable here (N/A) has none. The fs-probe
+      # records print and assert nothing, and give no rows.
+      - name: Results in one format
+        if: always() && steps.kit.outcome == 'success'
+        env:
+          WICK_RESULTS_JOB: windows-guest
+        run: |
+          $r = Join-Path $env:RUNNER_TEMP 'results.tsv'
+          foreach ($f in @(Get-Item -Path "$env:WBT\results-*\summary.txt" -ErrorAction SilentlyContinue)) {
+            python -I tools\ci-results.py add summary $f.FullName --suite tools/windows/boot-test.ps1 --out $r
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          foreach ($f in @(Get-Item -Path "$env:WJT*\summary.txt" -ErrorAction SilentlyContinue)) {
+            python -I tools\ci-results.py add summary $f.FullName --suite tools/windows/jailer-test.ps1 --out $r
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          if (Test-Path $r) { python -I tools\ci-results.py validate $r; exit $LASTEXITCODE }
+          Write-Host 'no results: no stage wrote its summary'
+      - name: Upload the results
+        if: always() && steps.kit.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-windows-guest
+          path: ${{ runner.temp }}/results.tsv
+          if-no-files-found: ignore
           retention-days: 14

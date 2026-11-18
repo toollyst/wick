@@ -23,7 +23,9 @@ test that runs its binary again as a child has the child's lines in the
 same output (results_of).
 
 Each package's output is kept in DIR (default: a temporary directory) as
-<package>.log.
+<package>.log, and every test's result in DIR/tests.tsv (crate, test, result,
+started), as tools/macos/check-unit-tests.py writes it, for
+tools/ci-results.py's unit-tsv reader.
 """
 
 import argparse
@@ -342,6 +344,7 @@ def main():
 
     problems = []
     counts = []
+    rows = []
     holds, words = False, ""
     if any(k == "xsave-template" for (k, _, _) in entries):
         holds, words = host_xsave_template()
@@ -366,6 +369,12 @@ def main():
         for test, result in sorted(results.items()):
             n[result] += 1
             kind = listed.get(test)
+            # tests.tsv's word, as tools/macos/check-unit-tests.py writes it:
+            # a failure of a listed test is fail-listed (whether its entry's
+            # kind allows the failure on this host is judged below), any
+            # other failure fail-unlisted.
+            word = {"ok": "pass", "ignored": "ignored"}.get(result) or ("fail-listed" if kind else "fail-unlisted")
+            rows.append(f"{package}\t{test}\t{word}\tyes")
             if kind == "xsave-template":
                 if output is None:
                     output = (out_dir / f"{package}.log").read_bytes().decode("utf-8", errors="replace")
@@ -388,6 +397,11 @@ def main():
         counts.append((package, n))
         print(f"{package}: {n['ok']} passed, {n['FAILED']} failed, {n['ignored']} ignored", flush=True)
 
+    # Every test's result (crate, test, result, started), the format
+    # tools/ci-results.py's unit-tsv reader takes. libtest printed each one's
+    # line: a test with no line has no result here (results_of).
+    (out_dir / "tests.tsv").write_text("crate\ttest\tresult\tstarted\n" + "".join(r + "\n" for r in rows),
+                                       encoding="utf-8")
     lines = ["## Windows unit tests" + (" (WHP)" if opts.whp else ""), ""]
     lines += [f"- {p}: {n['ok']} passed, {n['FAILED']} failed, {n['ignored']} ignored" for p, n in counts]
     if words:

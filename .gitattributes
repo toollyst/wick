@@ -1,6 +1,8 @@
 tools/guest-health.txt text eol=lf
 # Cuts of real CI logs: trailing whitespace in them is data (tools/ci-results.py --selftest).
 tools/ci-results-fixtures/** -whitespace
+# Windows PowerShell's summary.txt as it writes it, byte order mark and CRLF: stored as is (-text).
+tools/ci-results-fixtures/summary-windows-* -text
 # Rows collect writes: a field left empty (a detail, an alias) at a line's end is a trailing tab, data.
 docs/evidence/*.tsv -whitespace
 # Patches tools/patches.sh export writes: an empty context line of a hunk is a single space, the patch format.

@@ -36,3 +36,9 @@ severity	warning
 # landed with the push of 36ef73da, whose run 43800980377 is the first with
 # results-<job> artifacts; 43795832946 (47ee7bc2) is the run before it.
 evidence-since	43795832946
+# Windows: the windows and windows-guest jobs upload results-windows and
+# results-windows-guest from the commit whose ci.yml has that upload. A
+# sentence about Windows naming a Windows stage with a run of such a commit
+# needs the stage's row in it (tools/ci-results.py, uploads_windows_results);
+# a run of an earlier commit is log-only for Windows. No line here: the run's
+# own commit says which it is.

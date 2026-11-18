@@ -18,7 +18,9 @@ Readers, one per output shape (no job's output changes for them):
 - pytest-json: pytest-json-report's test-report.json
   (tools/linux/integration-tests.sh);
 - summary: a scenario script's summary.txt, as tools/macos/boot-test.py and
-  jailer-test.py write it (`PASS  stage: detail`) or tools/linux/boot-test.sh
+  jailer-test.py, and tools/windows/boot-test.ps1 and jailer-test.ps1 (with
+  a byte order mark), write it (`PASS  stage: detail`; a stage not applicable
+  on the host, `N/A`, has no row) or tools/linux/boot-test.sh
   (`<vm> <check> PASS <detail>`);
 - unit-tsv: tools/macos/check-unit-tests.py's tests.tsv (fail-listed is
   `xfail`, a failure the listed differences give);
@@ -149,7 +151,10 @@ LINUX_SUMMARY = re.compile(r"^(\S+)\s+(.+?)\s+(PASS|FAIL)(?: (.*))?$")
 
 def read_summary(path, suite):
     rows = []
-    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+    # utf-8-sig: Windows PowerShell 5.1's Set-Content -Encoding UTF8 writes a
+    # byte order mark (tools/windows/boot-test.ps1's and jailer-test.ps1's
+    # summary.txt), which would hide the first line's PASS.
+    for line in Path(path).read_text(encoding="utf-8-sig", errors="replace").splitlines():
         m = MAC_SUMMARY.match(line)
         if m:
             rows.append((suite, m.group(2), "pass" if m.group(1) == "PASS" else "fail", m.group(3)))
@@ -208,6 +213,13 @@ def host_and_cpu():
             except OSError:
                 pass
             host = f"{name or 'Linux'} {platform.release()}"
+        elif system == "Windows":
+            # The edition and the build with its update revision, as
+            # tools/windows/boot-test.ps1 names the host ("Windows Server 2025
+            # Datacenter build 26100.33674"). ProductName says "Windows 10" on
+            # Windows 11; the build tells them apart (22000 and up is 11).
+            v = windows_value(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "ProductName", "CurrentBuild", "UBR")
+            host = f"{v[0] or 'Windows'} build {v[1] or platform.version()}" + (f".{v[2]}" if v[2] != "" else "")
         else:
             host = f"{system} {platform.version()}"
     if not cpu:
@@ -219,8 +231,28 @@ def host_and_cpu():
                             if line.startswith("model name")), "")
             except OSError:
                 cpu = ""
+        elif system == "Windows":
+            cpu = windows_value(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0", "ProcessorNameString")[0].strip()
         cpu = cpu or platform.machine()
     return host, cpu
+
+
+def windows_value(key, *names):
+    """The values `names` of HKEY_LOCAL_MACHINE\\`key`, as strings ("" for
+    one that is not there)."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
+            out = []
+            for n in names:
+                try:
+                    out.append(str(winreg.QueryValueEx(k, n)[0]))
+                except OSError:
+                    out.append("")
+            return out
+    except (ImportError, OSError):
+        return [""] * len(names)
 
 
 def context():
@@ -535,11 +567,30 @@ def claim_units(subs, rows):
     return units
 
 
-def check_run_claims(root, repo, documents, evidence_since=None):
+WINDOWS_UPLOAD = "name: results-windows-guest"
+
+
+def uploads_windows_results(repo, commit, cache):
+    """Whether the CI of `commit` uploads the Windows jobs' results: its
+    .github/workflows/ci.yml has the windows-guest job's results-windows-guest
+    upload. A run of an earlier commit is log-only for Windows: its stages'
+    results are in the job's log, and no row stands for them."""
+    if commit not in cache:
+        out = subprocess.run(["git", "-C", str(repo), "show", f"{commit}:.github/workflows/ci.yml"],
+                             capture_output=True, text=True)
+        cache[commit] = out.returncode == 0 and WINDOWS_UPLOAD in out.stdout
+    return cache[commit]
+
+
+def check_run_claims(root, repo, documents, evidence_since=None, strict_windows=True):
     """(errors, warnings) of the documents' run claims against the evidence:
     a not-run claim on a test a run after the sentence ran, and a historical
     claim against its run's rows; a run cited after evidence_since must be in
-    the evidence."""
+    the evidence. A sentence about Windows that names a Windows stage
+    (`jailer-test.ps1 shared`) with a run whose CI uploads the Windows
+    results needs that stage's row in the run, whatever its words (an error
+    with strict_windows, else a warning); a run before that upload is
+    log-only."""
     g = load_grammar(root)
     if evidence_since is None:
         evidence_since = int(g["evidence-since"][0])
@@ -547,6 +598,7 @@ def check_run_claims(root, repo, documents, evidence_since=None):
     warnings = []
     aliases = {r["alias"] for r in rows if r["alias"]}
     blame_cache = {}
+    uploads = {}
     for name, text in documents.items():
         for cited in sorted(set(RUN_ID.findall(text)), key=int):
             if int(cited) > evidence_since and cited not in runs:
@@ -594,6 +646,16 @@ def check_run_claims(root, repo, documents, evidence_since=None):
                             elif not right:
                                 errors.append(f"{name}:{n} says {said} {verb} in run {run}, "
                                               f"which has it {', '.join(sorted(results))}")
+            stages = sorted(s for s in subs if s[0] == "stage" and s[1].startswith("tools/windows/"))
+            if stages and "Windows" in hosts:
+                for run in sorted(set(RUN_ID.findall(sentence))):
+                    if run not in runs or not uploads_windows_results(repo, runs[run], uploads):
+                        continue
+                    for s in stages:
+                        if not any(r["run"] == run and row_is(r, s) for r in rows):
+                            (errors if strict_windows else warnings).append(
+                                f"{name}:{n} names {subject_label(s)} with run {run}, whose Windows results have no "
+                                f"row for it (the run uploads them: the claim needs its row, not the log)")
     return errors, warnings
 
 
@@ -723,6 +785,11 @@ def selftest():
     expect("pytest", sorted(got.values()), ["pass", "pass", "skip"])
     got = rows_of("summary", "summary-macos-jailer-43784960688.txt", "tools/macos/jailer-test.py")
     expect("macOS summary", (len(got), got.get(("tools/macos/jailer-test.py", "freeze"))), (6, "pass"))
+    # Windows' jailer-test.ps1 writes its summary with a byte order mark and
+    # CRLF: its first stage is a row as the others are.
+    got = rows_of("summary", "summary-windows-jailer-44207018536.txt", "tools/windows/jailer-test.ps1")
+    expect("Windows summary", (len(got), got.get(("tools/windows/jailer-test.ps1", "refuse")),
+                               got.get(("tools/windows/jailer-test.ps1", "shared"))), (23, "pass", "pass"))
     got = rows_of("summary", "summary-linux-boot-43784960688.txt", "tools/linux/boot-test.sh")
     expect("Linux summary", got.get(("tools/linux/boot-test.sh", "boot/seccomp filter on every thread")), "pass")
     got = rows_of("unit-tsv", "tests-macos-43790310601.tsv")
@@ -901,6 +968,39 @@ def claims_selftest(expect):
                   "z.md:1 says test_claimed passed in run 43900000001, which has no row for it"])):
             errors, _ = check_run_claims(repo, repo, {"z.md": text}, 43688550565)
             expect(f"zero rows, subjects one by one: {text[:50]}", sorted(errors), sorted(want))
+        # A Windows stage named with a run whose CI uploads the Windows
+        # results needs its row there, whatever the sentence's words; a run
+        # of a commit before that upload is log-only.
+        (repo / ".github/workflows").mkdir(parents=True)
+        (repo / ".github/workflows/ci.yml").write_text(f"jobs:\n  windows-guest:\n    - {WINDOWS_UPLOAD}\n")
+        git("add", "-A", cwd=repo)
+        git("commit", "-q", "-m", "the Windows jobs upload their results", cwd=repo)
+        wcommit = git("rev-parse", "HEAD", cwd=repo)
+        win = repo / "results-win.tsv"
+        write_rows(win, ("43900000004", wcommit, "windows-guest", "Windows Server 2025 Datacenter build 26100.33674",
+                         "AMD EPYC 7763 64-Core Processor"), "wick", "stage",
+                   [("tools/windows/jailer-test.ps1", "shared", "pass", "a file hard-linked into three jails"),
+                    ("tools/windows/jailer-test.ps1", "drives", "pass", "")])
+        wdoc = {"w.md": "| | Linux | Windows |\n| --- | --- | --- |\n"
+                        "| a | b | one entry per jail (`jailer-test.ps1 shared` in CI run 43900000004) |\n"}
+        kept, _ = collect(repo, "43900000004", [win], wdoc.values())
+        expect("collect keeps the cited Windows stage", kept, 1)
+        for text, strict, want in (
+                (wdoc["w.md"], True, ([], [])),
+                (wdoc["w.md"].replace("shared", "handoff"), True,
+                 (["w.md:3 names jailer-test.ps1 handoff with run 43900000004, whose Windows results have no row "
+                   "for it (the run uploads them: the claim needs its row, not the log)"], [])),
+                (wdoc["w.md"].replace("shared", "handoff"), False,
+                 ([], ["w.md:3 names jailer-test.ps1 handoff with run 43900000004, whose Windows results have no "
+                       "row for it (the run uploads them: the claim needs its row, not the log)"])),
+                # Run 43900000003's commit uploads no Windows results: log-only.
+                (wdoc["w.md"].replace("shared` in CI run 43900000004", "handoff` in CI run 43900000003"), True,
+                 ([], [])),
+                # A Linux cell naming the Windows stage asks for no row.
+                ("| | Linux | Windows |\n| --- | --- | --- |\n| a | `jailer-test.ps1 handoff`, run 43900000004 | b |\n",
+                 True, ([], []))):
+            got = check_run_claims(repo, repo, {"w.md": text}, 43688550565, strict_windows=strict)
+            expect(f"Windows stage rows: {text[-60:]!r} strict={strict}", got, want)
         # A row edited by hand fails its run's hash.
         ev = repo / EVIDENCE
         ev.write_text(ev.read_text().replace("\tfail\t", "\tpass\t"))

@@ -141,9 +141,13 @@ and the main checkout use; they never set the variable.
   tree is checked too: the patch and file counts by `tools/patches.sh check`,
   COMPATIBILITY's counts by `tools/compat-counts.py`, README's line count and
   PORTING row 1's sandbox counts by `tools/check-derived.py` (a new derived
-  number gets its extractor there). Every CI job on Linux and macOS uploads
-  its tests' results in one format (`results-<job>`, `tools/ci-results.py`):
-  a test with no row there did not run in that job. A stage a job expects to
+  number gets its extractor there). Every CI job on Linux, macOS and Windows
+  uploads its tests' results in one format (`results-<job>`,
+  `tools/ci-results.py`): a test with no row there did not run in that job.
+  The Windows jobs' rows are the compatibility crates' and WHP tests', the
+  unit tests against their listed differences, and each `boot-test.ps1` and
+  `jailer-test.ps1` stage's PASS or FAIL line (`results-windows`,
+  `results-windows-guest`). A stage a job expects to
   fail on its host is recorded `xfail` (`add --xfail NAME=REASON`), the
   reason the line the job itself printed (macos-15-root-vmnet's
   `kern.hv_support`), never `fail` in a green job. A probe that once showed something is
@@ -199,7 +203,12 @@ collects it, and a sentence citing an older run names only tests that run
 kept. A run no sentence cites keeps its line in `runs-index.tsv` with no
 rows: it was collected (collect refuses it again), and a sentence citing it
 later finds no row and fails. A sentence naming several tests is checked
-for each (an alias and the test it names are one).
+for each (an alias and the test it names are one). A sentence about Windows
+that names a Windows stage (`jailer-test.ps1 shared`) together with a run
+whose commit's CI uploads `results-windows-guest` needs that stage's row in
+the run, whatever its words (with `--strict-windows` an error, else a
+warning); a run of an earlier commit is log-only for Windows, its stages'
+results in the job's log alone.
 Artifacts last 14 days: a run older than that can no longer be collected,
 and a document cannot cite it (the rows already collected stay, checked
 against the hash collect recorded in `docs/evidence/runs-index.tsv`). The
