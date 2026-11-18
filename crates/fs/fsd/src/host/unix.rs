@@ -87,7 +87,10 @@ fn err(e: sys::HostErrno) -> DirError {
 }
 
 /// An open's error: a link or an escape refused by the beneath flags is a
-/// layer-2 refusal, anything else the guest's errno.
+/// layer-2 refusal, anything else the guest's errno. On macOS 15 an escape
+/// is EACCES, a permission refusal's errno, so it is the guest's EACCES and
+/// not counted (`sys::errno::BENEATH_REFUSAL`): the answer is the same, and
+/// a guest name never escapes past layer 1 (one component, never `..`).
 fn open_err(e: sys::HostErrno) -> DirError {
     if e.0 == sys::errno::ELOOP || e.0 == sys::errno::BENEATH_REFUSAL {
         DirError::Refused {

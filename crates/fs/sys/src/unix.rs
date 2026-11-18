@@ -70,7 +70,10 @@ pub mod errno {
     pub const BENEATH_REFUSAL: i32 = libc::EXDEV;
     /// What an open that would leave its directory returns: Linux's
     /// `openat2(RESOLVE_BENEATH)` EXDEV, macOS's `O_RESOLVE_BENEATH`
-    /// ENOTCAPABLE.
+    /// ENOTCAPABLE, from macOS 26 (xnu-12377). macOS 15 (xnu-11417, the
+    /// first with the flag) gives EACCES instead, which is also a plain
+    /// permission refusal's ([`super::probe_beneath`]): there a refusal by
+    /// the flag is not told apart, and the guest gets EACCES either way.
     #[cfg(target_os = "macos")]
     pub const BENEATH_REFUSAL: i32 = libc::ENOTCAPABLE;
     /// macOS's "no such attribute".
@@ -338,13 +341,28 @@ pub fn create_file(dir: BorrowedFd<'_>, name: &[u8], exclusive: bool, mode: u32)
 }
 
 /// Whether this host's beneath-resolution is there: an open of `..` beneath
-/// `dir` must be refused with [`errno::BENEATH_REFUSAL`]. Linux before 5.6
-/// (or a seccomp filter without `openat2`) gives ENOSYS; a macOS without
+/// `dir` must be refused. The error it is refused with is returned:
+/// [`errno::BENEATH_REFUSAL`], or on macOS 15 EACCES. Linux before 5.6 (or
+/// a seccomp filter without `openat2`) gives ENOSYS; a macOS without
 /// `O_RESOLVE_BENEATH` ignores the flag and opens the parent, which is
 /// returned as EINVAL here. Either way the caller refuses to serve.
-pub fn probe_beneath(dir: BorrowedFd<'_>) -> Result<()> {
-    match open_beneath(dir, b"..", libc::O_RDONLY | libc::O_DIRECTORY, 0) {
-        Err(e) if e.0 == errno::BENEATH_REFUSAL => Ok(()),
+///
+/// xnu-11417 (macOS 15) refuses `..` at the starting directory, an absolute
+/// path and a link to one with EACCES; xnu-12377 (macOS 26) made each
+/// ENOTCAPABLE (bsd/vfs/vfs_lookup.c, `lookup` and `namei`) [src]. EACCES
+/// for `..` could also be a permission refusal, so on macOS 15 the flag is
+/// confirmed by an absolute path, which `namei` refuses before it looks
+/// anything up or checks any permission: an EACCES there is the flag's.
+pub fn probe_beneath(dir: BorrowedFd<'_>) -> Result<i32> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY;
+    match open_beneath(dir, b"..", flags, 0) {
+        Err(e) if e.0 == errno::BENEATH_REFUSAL => Ok(e.0),
+        #[cfg(target_os = "macos")]
+        Err(e) if e.0 == libc::EACCES => match open_beneath(dir, b"/", flags, 0) {
+            Err(abs) if abs.0 == libc::EACCES => Ok(libc::EACCES),
+            Err(abs) => Err(abs),
+            Ok(_) => Err(HostErrno(libc::EINVAL)),
+        },
         Err(e) => Err(e),
         Ok(_) => Err(HostErrno(libc::EINVAL)),
     }
@@ -1739,13 +1757,29 @@ mod tests {
         OwnedFd::from(std::fs::File::open(p).unwrap())
     }
 
+    /// The error an escape gets on this host, by its kernel's source: Linux
+    /// EXDEV; macOS EACCES on Darwin 24 (macOS 15, xnu-11417), ENOTCAPABLE
+    /// from Darwin 25 (macOS 26, xnu-12377).
+    fn expected_beneath_refusal() -> i32 {
+        #[cfg(target_os = "linux")]
+        return libc::EXDEV;
+        #[cfg(target_os = "macos")]
+        {
+            let out = std::process::Command::new("/usr/bin/uname").arg("-r").output().unwrap();
+            let release = String::from_utf8(out.stdout).unwrap();
+            let darwin: u32 = release.split('.').next().unwrap().trim().parse().unwrap();
+            if darwin <= 24 { libc::EACCES } else { libc::ENOTCAPABLE }
+        }
+    }
+
     #[test]
     fn test_open_never_follows_a_link_or_leaves_the_directory() {
         let p = tmp("beneath");
         std::fs::create_dir(p.join("d")).unwrap();
         std::fs::write(p.join("f"), b"x").unwrap();
         let d = dirfd(&p.join("d"));
-        probe_beneath(d.as_fd()).unwrap();
+        let refusal = probe_beneath(d.as_fd()).unwrap();
+        assert_eq!(refusal, expected_beneath_refusal());
         symlinkat(b"../f", d.as_fd(), b"up").unwrap();
         symlinkat(b"/", d.as_fd(), b"root").unwrap();
         for name in [&b"up"[..], b"root"] {
@@ -1753,9 +1787,11 @@ mod tests {
             assert_eq!(e.0, libc::ELOOP, "{}", String::from_utf8_lossy(name));
         }
         let e = open_dir(d.as_fd(), b"..").unwrap_err();
-        assert_eq!(e.0, errno::BENEATH_REFUSAL);
+        assert_eq!(e.0, refusal);
         let e = open_file(d.as_fd(), b"../f", true, false).unwrap_err();
-        assert_eq!(e.0, errno::BENEATH_REFUSAL);
+        assert_eq!(e.0, refusal);
+        let e = open_dir(d.as_fd(), b"/").unwrap_err();
+        assert_eq!(e.0, refusal);
         std::fs::remove_dir_all(&p).unwrap();
     }
 
