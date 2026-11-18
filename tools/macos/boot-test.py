@@ -246,7 +246,7 @@ class Vm:
         try:
             self.proc.wait(self.EXIT_BOUND)
         except subprocess.TimeoutExpired:
-            self.kill()
+            self.kill(cleanup=True)
             raise Failure(f"Firecracker said it was exiting and did not within {self.EXIT_BOUND} s; "
                           f"killed by the harness while alive; {self.exit_reason()}") from None
         self.pump.join(5)
@@ -396,19 +396,25 @@ class Vm:
         code = self.wait_exit()
         check(code == 0, f"exit status {code} after guest reset ({self.exit_reason()})")
 
-    def kill(self):
+    def kill(self, cleanup=False):
         """Ends the process. One still running is killed, which its log
         records after the last line it wrote, so that a log cut short says
-        why (`killed_alive`; a failed stage's summary names it too)."""
+        why. A stage ends a process it is done with (a control, a VM whose
+        test is over) with kill(); the cleanup after a stage, and a wait
+        that ran out, with cleanup=True: only those are `killed_alive`, the
+        ones a failed stage's summary names, since their logs end where the
+        stage did not expect."""
         alive = self.proc.poll() is None
         if alive:
             self.proc.kill()
             self.proc.wait()
-            self.killed_alive = True
-            KILLED_ALIVE.append(self.name)
+            if cleanup:
+                self.killed_alive = True
+                KILLED_ALIVE.append(self.name)
         self.pump.join(5)
         if alive and not self.log.closed:
-            self.log.write("boot-test: killed by the harness while alive (SIGKILL); its output ends above\n")
+            self.log.write("boot-test: killed by the harness while alive (SIGKILL); its output ends above\n"
+                           if cleanup else "boot-test: ended by its stage (SIGKILL), done with it\n")
         self.log.close()
 
 
@@ -2987,7 +2993,7 @@ class Context:
         """Kills the stage's VMs; returns the names of those the harness
         killed while they ran, now or earlier in the stage."""
         for vm in self.vms:
-            vm.kill()
+            vm.kill(cleanup=True)
         killed = [vm.name for vm in self.vms if vm.killed_alive]
         self.vms = []
         return killed
@@ -3147,6 +3153,23 @@ def selftest():
             fails.append(f"stuck: killed {killed!r}, log:\n{log}")
         if with_kills("a\nb", killed) != "a; killed by the harness while alive: stuck\nb":
             fails.append("with_kills does not name the kill on the summary's line")
+        # A process the stage ends itself, alive (a control it is done with),
+        # is not one the cleanup killed: its log says so and no summary
+        # names it (jailer-test vmnet's control, CI run 44414358364).
+        go, gofd = fifo("done.go")
+        os.environ["WICK_BT_SELFTEST_GO"] = go
+        ctx = types.SimpleNamespace(out=tmp, sock=tmp, firecracker=standin, vms=[])
+        before = len(KILLED_ALIVE)
+        vm = Vm(ctx, "done", [], wait=False)
+        alive = vm.proc.poll() is None
+        vm.kill()
+        killed = Context.cleanup(ctx)
+        os.close(gofd)
+        with open(os.path.join(tmp, "done.log")) as f:
+            log = f.read()
+        if not alive or killed or KILLED_ALIVE[before:] or "boot-test: ended by its stage (SIGKILL)" not in log:
+            fails.append(f"done: alive {alive}, cleanup's {killed!r}, KILLED_ALIVE {KILLED_ALIVE[before:]!r}, "
+                         f"log:\n{log}")
     if fails:
         sys.exit("boot-test: selftest failed:\n  " + "\n  ".join(fails))
     print("boot-test: selftest ok")

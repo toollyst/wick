@@ -471,6 +471,7 @@ impl Interface {
             }
         }
         let mut subnet = None;
+        let mut legacy = false;
         let started = (|| {
             let raw = match (mode, network_api()) {
                 (Mode::Shared | Mode::Host, Some(api)) => {
@@ -500,6 +501,7 @@ impl Interface {
                             );
                         }
                     }
+                    legacy = true;
                     // SAFETY: valid dictionary, queue and block.
                     unsafe { vmnet_start_interface(desc, queue, block.as_ptr()) }
                 }
@@ -519,7 +521,13 @@ impl Interface {
             return Err(io::Error::from(io::ErrorKind::TimedOut));
         };
         if status != VMNET_SUCCESS {
-            return Err(vmnet_error("vmnet: starting the interface", status));
+            let err = vmnet_error("vmnet: starting the interface", status);
+            // SAFETY: geteuid has no preconditions.
+            let euid = unsafe { libc::geteuid() };
+            if legacy && euid != 0 {
+                return Err(not_root(err, mode, euid));
+            }
+            return Err(err);
         }
         iface.iface = raw;
         iface.mtu = params.mtu;
@@ -637,6 +645,27 @@ impl Interface {
     }
 }
 
+/// `vmnet_start_interface` needs root or the `com.apple.vm.networking`
+/// entitlement (vmnet.h), and answers a process with neither
+/// `VMNET_FAILURE`, which names nothing: measured on macOS 15.8.2 (CI's
+/// macos-15-root-vmnet, vmnet-shared started as root and refused to a
+/// jailed Firecracker as uid 4271) and on macOS 27.2 (vmnet-br-en0 as a
+/// user). The error says why, so a jailed or unprivileged Firecracker's
+/// refusal names its cause; whatever vmnet answered is kept in front.
+fn not_root(err: io::Error, mode: &Mode, euid: libc::uid_t) -> io::Error {
+    let which = match mode {
+        Mode::Bridged(_) => "bridged mode, on every macOS",
+        _ => "shared and host mode before macOS 26",
+    };
+    io::Error::new(
+        err.kind(),
+        format!(
+            "{err}; vmnet_start_interface ({which}) needs root or the com.apple.vm.networking \
+             entitlement, and this process runs as uid {euid} (a jailed Firecracker runs as its --uid)"
+        ),
+    )
+}
+
 fn einval() -> io::Error {
     io::Error::from_raw_os_error(libc::EINVAL)
 }
@@ -668,5 +697,38 @@ impl Drop for Interface {
         }
         // SAFETY: the queue was created here and has no work left.
         unsafe { dispatch_release(self.queue) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vmnet_start_interface_refusal_names_root() {
+        // Bridged mode uses vmnet_start_interface on every macOS. As a user
+        // vmnet answers VMNET_FAILURE (macOS 15.8.2 and 27.2), and the error
+        // names the cause; as root it starts, or fails for another reason,
+        // without that clause.
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        let got = Interface::start(&Mode::Bridged("en0".into()));
+        let clause = format!(
+            "vmnet_start_interface (bridged mode, on every macOS) needs root or the \
+             com.apple.vm.networking entitlement, and this process runs as uid {euid} (a jailed \
+             Firecracker runs as its --uid)"
+        );
+        match got {
+            Err(e) if euid != 0 => {
+                let text = e.to_string();
+                assert!(
+                    text.starts_with("vmnet: starting the interface: ") && text.ends_with(&clause),
+                    "{text}"
+                );
+            }
+            Ok(_) if euid != 0 => panic!("bridged vmnet started as uid {euid}"),
+            Err(e) => assert!(!e.to_string().contains("needs root"), "{e}"),
+            Ok(_) => {}
+        }
     }
 }

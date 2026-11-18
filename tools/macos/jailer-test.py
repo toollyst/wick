@@ -1421,9 +1421,14 @@ def stage_vmnet(ctx):
             m = vm.wait_for(r"vmnet: network (\d+\.\d+\.\d+\.\d+/\d+)", 10)
             done.append(f"{mode} started in the jail ({m.group(1)})")
         else:
+            # vmnet answers VMNET_FAILURE, which names nothing; Firecracker
+            # names the cause (vmnet.rs, not_root).
             r = put_vmnet(vm, mode, (400,))
-            check("vmnet_start_interface" in json.dumps(r), f"{mode} in the jail: {r}")
-            done.append(f"{mode} refused in the jail (vmnet_start_interface needs root before macOS 26)")
+            text = r.get("fault_message", "") if isinstance(r, dict) else str(r)
+            check("vmnet: starting the interface: " in text and "vmnet_start_interface (shared and host mode "
+                  f"before macOS 26) needs root" in text and f"runs as uid {UID} " in text,
+                  f"{mode} in the jail: not refused by name: {r}")
+            done.append(f"{mode} refused in the jail by name ({text.split('vmnet: starting the interface: ')[1]})")
         vm.kill()
     # In the jail's network (--netns), vmnet, the host's network, is refused.
     net = os.path.join(ctx.base, "vmnet-netns")
@@ -1645,7 +1650,7 @@ class Context:
 
     def cleanup(self):
         for vm in self.vms:
-            vm.kill()
+            vm.kill(cleanup=True)
         self.vms = []
 
 
@@ -1699,6 +1704,10 @@ def main():
                 results.append((name, False, str(e)))
             except Exception:
                 results.append((name, False, traceback.format_exc()))
+            finally:
+                # What the stage left running ends with it (a failed check
+                # leaves its VM), as boot-test's stages do.
+                ctx.cleanup()
             if not results[-1][1]:
                 # The stage's VMs the harness killed while they ran: their
                 # logs end at the kill (bt.Vm.kill).

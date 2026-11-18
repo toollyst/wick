@@ -1324,7 +1324,10 @@ upstream Firecracker and its jailer.
   bsd/kern/syscalls.master, have no `unshare`, `setns` or `clone`): IP networking is denied by the sandbox; a
   jailed VMM uses Unix socket endpoints in the jail or in the directory `--netns` names, the jail's network.
   vmnet is the host's network, so it is refused with `--netns`. Without `--netns`, vmnet's bridged mode, and every
-  mode before macOS 26, needs root, which a jailed VMM does not have; shared and host mode on macOS 26 need only
+  mode before macOS 26, needs root, which a jailed VMM does not have: vmnet answers it `VMNET_FAILURE`, which names
+  nothing, and Firecracker's API error adds that `vmnet_start_interface` needs root and the uid it runs as
+  (`test_vmnet_start_interface_refusal_names_root`; `jailer-test vmnet` asserts that refusal on macOS 15, as root in
+  CI's macos-15-root-vmnet job, whose control as root not jailed starts the interface); shared and host mode on macOS 26 need only
   the virtualization entitlement (`vmnet_network_create`): a jailed Firecracker starts both (`jailer-test vmnet`, as
   root in CI's macos job on macOS 26.7.2, e7de455, no guest); a jailed guest on vmnet (`jailer-test vmnet-guest`)
   is written, not yet run. A vmnet interface is started only while the microVM is built: its start
