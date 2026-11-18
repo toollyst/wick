@@ -27,13 +27,19 @@
 //!   reverts to the lockdown token first thing (`vmm::ext::jail`), the
 //!   pattern of the Chromium sandbox.
 //! - **Each jail has a SID of its own** (random), the Windows counterpart of a
-//!   per-microVM uid: the token's only restricting SID that its directory
-//!   grants. The other restricting SIDs are groups every process of the
-//!   session has (Everyone, Users, Authenticated Users, Interactive). Not the
-//!   logon SID: the default DACL of the user's processes grants it read and
-//!   execute, which for a process includes `PROCESS_TERMINATE`, so with it a
-//!   jailed process could end any process of the user (measured); only the
-//!   initial impersonation token has it, for process start-up.
+//!   per-microVM uid, and it is the lockdown token's only restricting SID
+//!   (option P, docs/windows-jail-reach.md): a jailed process reaches only
+//!   what grants the jail's SID (its directory, the files the jailer shares
+//!   with it) and objects with no DACL, not what the system grants every
+//!   process of the session (Everyone, Users, Authenticated Users,
+//!   Interactive: [`INITIAL_GROUPS`]), nor the logon SID's grants (the
+//!   default DACL of the user's processes grants it read and execute, which
+//!   for a process includes `PROCESS_TERMINATE`: with it a jailed process
+//!   could end any process of the user, measured). The initial
+//!   impersonation token, for process start-up only, has those groups, the
+//!   logon SID and the user's: the loader, the preload and WHP's device
+//!   need them, and Firecracker reverts before it reads anything of the
+//!   operator's.
 //! - **No other process is in reach**, as in a PID namespace: the token opens
 //!   no process or thread outside the jail (the user's, another jail's, the
 //!   jailer, SYSTEM's), and a process snapshot shows a process below medium
@@ -199,12 +205,16 @@ const HANDOVER_MARK: &[u8] = b"wick-jail-handover:v1\0";
 /// there on Windows (crates/compat/memfd); on Linux they are kernel objects.
 const JAIL_TMP: &str = "tmp";
 
-/// Restricting SIDs of the lockdown token besides the jail's own
-/// ([`vm_sid`]): groups any process of the session has, never the user's own
-/// SID nor the logon SID (module documentation). Each grants only what every
-/// process of the session is granted anyway; the jail's SID is the only one
-/// its directory grants.
-const RESTRICTING_SIDS: [&str; 4] = [
+/// Restricting SIDs of the initial token, the start-up one, besides the
+/// jail's own ([`vm_sid`]), the logon SID and the user's: groups any process
+/// of the session has, so that the loader, the preload and WHP's device open
+/// as for a process of the user (`vmm::ext::jail`). Not the lockdown
+/// token's, whose only restricting SID is the jail's: a group every process
+/// has let a jailed process reach whatever the system grants it (87 device
+/// objects, 147 RPC endpoints, 17 service pipes, the Windows directory and
+/// HKLM, measured: docs/windows-jail-reach.md); with the jail's SID alone it
+/// reaches what grants that SID, and objects with no DACL (option P).
+const INITIAL_GROUPS: [&str; 4] = [
     "S-1-1-0",      // Everyone
     "S-1-5-32-545", // Users
     "S-1-5-11",     // Authenticated Users
@@ -1895,18 +1905,16 @@ fn tokens() -> Result<Tokens, HostError> {
     // SAFETY: the buffer holds a TOKEN_USER.
     let user_sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
 
-    let sids: Vec<Sid> = RESTRICTING_SIDS
-        .iter()
-        .copied()
-        .chain(Some(vm_sid()))
-        .map(Sid::new)
-        .collect::<Result<_, _>>()?;
+    let jail = Sid::new(vm_sid())?;
+    let groups: Vec<Sid> = INITIAL_GROUPS.iter().copied().map(Sid::new).collect::<Result<_, _>>()?;
+    // The lockdown token: the jail's SID its only restricting SID (option
+    // P). The initial token, for start-up only (the loader, the preload,
+    // the partition parked: `vmm::ext::jail`, which checks after its revert
+    // that the jail's SID is the process token's only restricting SID):
+    // the jail's SID, the session's groups, the logon SID and the user's.
+    let primary = restricted(process_h, &[SID_AND_ATTRIBUTES { Sid: jail.0, Attributes: 0 }])?;
     let mut restricting: Vec<SID_AND_ATTRIBUTES> =
-        sids.iter().map(|s| SID_AND_ATTRIBUTES { Sid: s.0, Attributes: 0 }).collect();
-    // The lockdown token without the logon SID, which would open the user's
-    // processes for termination (module documentation); the initial token,
-    // for start-up only, with it and the user's SID.
-    let primary = restricted(process_h, &restricting)?;
+        groups.iter().chain(Some(&jail)).map(|s| SID_AND_ATTRIBUTES { Sid: s.0, Attributes: 0 }).collect();
     restricting.push(SID_AND_ATTRIBUTES { Sid: logon, Attributes: 0 });
     restricting.push(SID_AND_ATTRIBUTES { Sid: user_sid, Attributes: 0 });
     let initial = restricted(process_h, &restricting)?;

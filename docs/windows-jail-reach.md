@@ -24,7 +24,7 @@ In short:
 - **Host.** Windows Server 2022 build 20348 on a GCP VM (8 vCPUs). The host has no Hyper-V, so WHP's own devices
   are not on it; they are measured on CI's runner ("WHP under the jail's SID alone").
 - **Jailer.** A debug build of the jailer from the Windows jail code as it is on main. The jail's token construction
-  (overlay/jailer/platform/windows/mod.rs, `RESTRICTING_SIDS`, `vm_sid`) has not changed since it was built.
+  (overlay/jailer/platform/windows/mod.rs, `RESTRICTING_SIDS` then, `vm_sid`) had not changed since it was built.
 - **The probe.** `tools/windows/fs-probe.rs` (commit 803121f6) carries the jailer's handover mark, as
   `tools/windows/jail-probe.rs` does, so the jailer starts it as the jailed binary: the same token, mandatory label,
   Job Object, jail drive and directory as Firecracker's. It reverts to the jail's lockdown token first, as Firecracker
@@ -224,8 +224,9 @@ I/O control: it answered 0xC0000010, 0xC000000D or 0xC0000002, or completed it.
 - As SECURITY.md describes, no process of the user's, no other jail, and no file of the user's.
 
 **Why.**
-- The jail's lockdown token has five restricting SIDs: the jail's own, and Everyone, Users, Authenticated Users and
-  Interactive, which every process of the session has (overlay/jailer/platform/windows/mod.rs, `RESTRICTING_SIDS`).
+- The jail's lockdown token had five restricting SIDs until option P's step C: the jail's own, and Everyone, Users,
+  Authenticated Users and Interactive, which every process of the session has (overlay/jailer/platform/windows/mod.rs,
+  `RESTRICTING_SIDS` then, `INITIAL_GROUPS` now, the initial token's only).
   For a restricted token, "the system performs two access checks: one using the token's enabled SIDs, and another
   using the list of restricting SIDs. Access is granted only if both access checks allow the requested access rights"
   ([Microsoft Learn, Restricted Tokens](https://learn.microsoft.com/windows/win32/secauthz/restricted-tokens); the same
@@ -240,6 +241,56 @@ I/O control: it answered 0xC0000010, 0xC000000D or 0xC0000002, or completed it.
 - The jail's integrity level (`S-1-16-6144`, below medium) does not stop the writes above: the serial ports, the
   spooler's pipe, the counters section, and the names it makes. Why the mandatory label does not apply there is not
   determined.
+
+### The first record under the jailer: more than the above
+
+`jailer-test.ps1 reach`'s first record ran under the token as shipped: the jail's SID plus the session's four
+groups, the logon SID and the user's as restricting SIDs. It ran in CI's windows-guest job at 87e4aaab, on Windows
+Server 2025 build 26100, as the built-in Administrator in session 2. The record reached 762 of the 2428 names the
+operator listed:
+
+| Kind | Listed | Reached |
+| --- | --- | --- |
+| ALPC ports | 274 | 249: 173 in `\RPC Control`, 68 in the global `\BaseNamedObjects`, 3 AppContainer CoreUI ports |
+| Symbolic links | 233 | 217 |
+| Sections | 274 | 103 |
+| Devices | 208 | 95: 62 with `FILE_DEVICE_SECURE_OPEN`, 33 without; 44 opened with write |
+| Events | 254 | 46 |
+| Directories | 57 | 23 |
+| Pipes | 38 | 18 |
+| Mutexes | 351 | 9 |
+| Key, keyed event | 1, 1 | 1, 1 |
+| Semaphores, drivers, types, callbacks, filter ports, jobs, window stations, sessions, partitions | 1155 | 0 |
+
+The other checks were all allowed: a DLL loaded after the revert, HKLM read, TCP to loopback, to the link-local
+metadata address and to 8.8.8.8:53, an AF_UNIX bind, a pipe and a mailslot made, and 38 pipe names listed.
+
+Where this record shows more than the earlier tables (`devjail` on Windows Server 2022, a host without Hyper-V):
+- **Create access in the global namespaces.** `\BaseNamedObjects`, `\BaseNamedObjects\Restricted` and
+  `\RPC Control` granted `0x2000f`: query, traverse, create object and create subdirectory. The jail can make a
+  name there before the service that expects it does, an RPC endpoint name included. The earlier tables gave
+  directories their names only.
+- **The text input (CTF) surface of the session's user.** Each item below was granted to the jail:
+  - a connection to the ALPC port `\BaseNamedObjects\msctf.serverDefault2`;
+  - `MUTANT_ALL_ACCESS` (`0x1f0001`) on `MSCTF.CtfServerMutexDefault2`, `MSCTF.CtfMonitorInstMutexDefault2`,
+    `MSCTF.Asm.MutexDefault2` and `CicLoadWinStaWinSta0`;
+  - `EVENT_ALL_ACCESS` (`0x1f0003`) on the three `MSCTF.Ctf…` events of the session's user, the built-in
+    Administrator (`-500`).
+
+  The earlier tables gave events as wait-only and mutexes as hold-only.
+- **Sections that can be mapped to write.** 81 KnownDlls sections (`\KnownDlls`, `\KnownDlls32`) granted `0x2000f`,
+  which includes `SECTION_MAP_WRITE`, as does `windows_shell_global_counters`. The earlier tables gave KnownDlls as
+  read-only. What a writable view of an image section shares with other processes that map it is not measured.
+- **Pipes with write.** `lsass`, `srvsvc` and `wkssvc` granted `0x12019b`. The rest granted `0x120089`, read and
+  attributes, two `dotnet-diagnostic-…` pipes among them.
+- **Devices with all access.** `\Device\PEAuth` and `\Device\00000033` granted `0x1f01ff`. The devices without
+  `FILE_DEVICE_SECURE_OPEN`, the ones whose namespace beneath them is the driver's to guard: FatCdrom, Fat, Ntfs,
+  the file system recognizers, LanmanDatagramReceiver, RdpDrPort, NamedPipe, Mailslot, HarddiskVolume1, 3 and 4,
+  RawCdRom, RawDisk, RawTape, PointerClass0, FsWrap, Mup, RdpBus, MQAC, Srv2, Afd and seven numbered devices.
+  `jail-probe smb` records what the jail opens through Mup and RdpDrPort.
+
+Step C, the jail's SID as the only restricting SID, is meant to take this away. The next record of the same stage,
+under that token, is the measurement (first run: CI).
 
 ## Against Linux
 
@@ -649,6 +700,13 @@ to when the partition is made. What it brings, and what the next record (`jail-v
    network directory is crossed by the traversal privilege the jail keeps), `shared`, `restart` and `bindlink`
    (a file hard-linked into the root gets an entry for the jail's SID from the jailer); every other stage hands the
    jail only paths in its root.
+   The jailer change is option P's step C (first run: CI): the lockdown token's only restricting SID is the jail's;
+   the initial token keeps the session's four groups, the logon SID and the user's for the loader, the preload and
+   the parked partition; after the revert Firecracker and its API process check that the process token's only
+   restricting SID is a jail's (`jail_preload.rs`, `jail_sid_alone`) and end, named, if not; `isolation` asserts
+   it with the SID on the jail's root, and `C:\Windows\win.ini` denied. `reach` stays a record in it: the stage's
+   assertion, its allowlist, is written from the record CI prints under that token, after one record under each
+   token, not from fs-probe's imitation (the fourth record).
 4. This page and SECURITY.md updated with the commit that fixes it and the numbers measured again.
 
 ## Not measured yet

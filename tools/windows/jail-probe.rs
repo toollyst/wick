@@ -30,7 +30,7 @@
 //!                               dacl:<path> owner:<path> deleteopen:<path>
 //!                               reachlist:<file>
 //!                               reach:<file>:<port>:<ip>:<port> smb:0 smb:<share>
-//!                               waitfor:<path>
+//!                               waitfor:<path> restricted:0
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
@@ -1269,6 +1269,11 @@ fn check(c: &str) -> String {
             unsafe { CloseHandle(h) };
             out
         }
+        // The process token's restricting SIDs: `allowed <n> <SID>,...`.
+        "restricted" => match preload::restricting_sids() {
+            Ok(sids) => format!("allowed {} {}", sids.len(), sids.join(",")),
+            Err(e) => format!("denied {e}"),
+        },
         // Waits up to 60 s for the file `arg` to exist: the operator's
         // go-ahead, made once it changed something for this jail (a file
         // outside the jail given an entry for the jail's SID, which only
@@ -1455,7 +1460,8 @@ fn main() {
     // with the jailer's WICK_JAIL only, as Firecracker's, and failing as
     // Firecracker fails (its line, exit 1); then drop the initial
     // impersonation token, which outside a jail does nothing.
-    if std::env::var_os("WICK_JAIL").is_some() {
+    let jailed = std::env::var_os("WICK_JAIL").is_some();
+    if jailed {
         if let Err(e) = preload::preload() {
             eprintln!("jail-probe: {e}");
             std::process::exit(1);
@@ -1463,6 +1469,14 @@ fn main() {
     }
     // SAFETY: plain call.
     unsafe { RevertToSelf() };
+    // Then Firecracker's check that the jail's SID is the process token's
+    // only restricting SID, failing as Firecracker fails.
+    if jailed {
+        if let Err(e) = preload::jail_sid_alone() {
+            eprintln!("jail-probe: {e}");
+            std::process::exit(1);
+        }
+    }
     std::hint::black_box(&HANDOVER_MARK);
     for c in checks(&args) {
         println!("{c} {}", check(c));

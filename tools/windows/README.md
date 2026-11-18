@@ -51,7 +51,7 @@
   an elevated PowerShell),
   `api` (the jail runs Firecracker and its API server's process, the latter
   under the whole mitigation profile; each one's end ends the other) and
-  `reach` (a record, nothing asserted yet: every named object, pipe and
+  `reach` (a record, nothing asserted yet, with the token's restricting SIDs: every named object, pipe and
   mailslot of the host, listed by the operator, is opened by `jail-probe.rs`
   in the jail as the jailer makes it, with the checks that are not names, a
   DLL loaded after the revert, HKLM, TCP and AF_UNIX; one `reach` line per
@@ -76,8 +76,9 @@
   may not read the user's files or SAM, write files outside its jail, reach another
   jail's files, API socket or process, or open the operator's; it reads a file
   outside the jail the operator gave its SID (the control, which holds under a
-  token restricted to the jail's SID alone too) and its read of
-  `C:\Windows\win.ini` is recorded; the operator reaches the API socket), `boot` (a 2 vCPU guest in the jail), `restart` (a start with a file that is not a
+  token restricted to the jail's SID alone too), not `C:\Windows\win.ini`,
+  and its token's only restricting SID is the jail's, the one on its root; the
+  operator reaches the API socket), `boot` (a 2 vCPU guest in the jail), `restart` (a start with a file that is not a
   kernel fails after its VM is made, and the second, with the kernel, boots in the same jailed Firecracker on the
   partition it parked before the jail's token and got back: 2 CPUs, init and its shell, its clock against the host's,
   SendCtrlAltDel ending the jailer with 0; its serial input is not read, as upstream's code leaves it, and the

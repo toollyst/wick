@@ -847,7 +847,7 @@ function Grant-JailRead([string]$f, [string]$sid) {
 # process may read (Users, Everyone) is not the jail's. The jail's SID is
 # read from its root's DACL once the jailer set it; the probe's first check,
 # `waitfor:/go`, holds its checks until the operator's go. Returns @(exit
-# code, output).
+# code, output, the jail's SID).
 function Invoke-JailedWithGrant([string]$base, [string]$id, [string[]]$grant, [string[]]$checks, [int]$ms = 30000) {
     $probe = Get-Probe
     $root = Join-Path $base "jail-probe.exe\$id\root"
@@ -871,7 +871,7 @@ function Invoke-JailedWithGrant([string]$base, [string]$id, [string[]]$grant, [s
     } finally {
         if (-not $p.HasExited) { Stop-Jailers @($p) }
     }
-    @($p.ExitCode, ((Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join ''))
+    @($p.ExitCode, ((Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join ''), $sid)
 }
 
 function Stage-Isolation {
@@ -899,6 +899,7 @@ function Stage-Isolation {
             "read:$secret"                                  = $false   # the user's files
             'read:C:\Windows\System32\config\SAM'           = $false
             "read:$granted"                                 = $true    # a file outside given to the jail's SID
+            'read:C:\Windows\win.ini'                       = $false   # what every process of the session may read
             "write:$outside"                                = $false   # outside the jail
             'write:C:\Users\Public\wick-jailer-test.txt'    = $false
             'write:own.txt'                                 = $true    # its own jail
@@ -909,14 +910,14 @@ function Stage-Isolation {
             "open:$PID"                                     = $false   # the operator
         }
         if ($explorer) { $expect["open:$explorer"] = $false }
-        # What every process of the session may read: the jail's token today
-        # reads it through its Users and Everyone (SECURITY.md, the Windows
-        # jailer's reach), a token restricted to the jail's SID alone
-        # (option P) does not. Recorded here, asserted by neither: the
-        # control that the probe reads at all is the file given to the
-        # jail's SID, which holds under both.
-        $system = 'read:C:\Windows\win.ini'
-        $r = Invoke-JailedWithGrant $base 'probe' @($granted) (@($expect.Keys) + $system)
+        # The jail's SID is the probe's only restricting SID (option P): it
+        # does not read what the system grants every process of the session
+        # (win.ini, through Users and Everyone, which the token gave before),
+        # and the probe, failing as Firecracker fails, would not have run
+        # with another (preload::jail_sid_alone). The SID the token holds is
+        # the one on its root's DACL.
+        $restricted = 'restricted:0'
+        $r = Invoke-JailedWithGrant $base 'probe' @($granted) (@($expect.Keys) + $restricted)
         $lines = $r[1] -split "`r?`n"
         $bad = @()
         foreach ($k in $expect.Keys) {
@@ -926,8 +927,8 @@ function Stage-Isolation {
             if ($allowed -ne $expect[$k]) { $bad += $l }
         }
         Check ($bad.Count -eq 0) "jailed: $($bad -join '; ')"
-        $systemLine = $lines | Where-Object { $_.StartsWith("$system ") } | Select-Object -First 1
-        Check ($null -ne $systemLine) "jailed: no answer to $system ($($r[1].Trim()))"
+        $sole = $lines | Where-Object { $_.StartsWith("$restricted ") } | Select-Object -First 1
+        Check ($sole -and $sole.Trim() -eq "$restricted allowed 1 $($r[2])") "jailed: the token's restricting SIDs are not the jail's ($($r[2])) alone: $sole"
         # The operator reaches the jailed API socket.
         $op = & $probe "connect:$sock"
         Check ($op -match ' allowed$') "operator: $op"
@@ -935,7 +936,7 @@ function Stage-Isolation {
         # Its Firecracker: the jailer then exits and removes the drive.
         Stop-Alive (Get-Process firecracker | Where-Object { $_.Path -like "$base*\api\root*" })
         [void]$api.WaitForExit(10000)
-        "jailed: no user files, nothing outside its jail but the file given to its SID, no other jail, API socket or process (the operator's, another microVM's); the operator reaches the API socket ($($expect.Count) checks); recorded: $($systemLine.Trim())"
+        "jailed: no user files, nothing outside its jail but the file given to its SID, no other jail, API socket or process (the operator's, another microVM's); the operator reaches the API socket ($($expect.Count) checks); its token's only restricting SID the jail's ($($r[2]))"
     } finally {
         Remove-Item $secret, $outside, $granted, 'C:\Users\Public\wick-jailer-test.txt' -ErrorAction SilentlyContinue
         Stop-Jailed
@@ -1035,8 +1036,10 @@ function Get-SmbAll([string[]]$ls, [string]$prefix, [string]$who, [string]$share
 }
 
 # What a jailed process reaches of the host's named objects, a record under
-# the jail's token as the jailer makes it today (docs/windows-jail-reach.md;
-# option P, step A): jail-probe `reachlist`, run by the operator, lists
+# the jail's token as the jailer makes it (docs/windows-jail-reach.md; option
+# P: step A recorded it under the token with the session's groups, step C
+# under the jail's SID alone, the record the allowlist is to be written
+# from): jail-probe `reachlist`, run by the operator, lists
 # every named object of the object manager's namespace, every named pipe and
 # every mailslot into the jail's root; jail-probe `reach`, the jailer's own
 # spawn, after Firecracker's preload and RevertToSelf as every jailed check
@@ -1045,7 +1048,8 @@ function Get-SmbAll([string[]]$ls, [string]$prefix, [string]$who, [string]$share
 # DLL loaded after the revert, HKLM read, TCP to loopback (a listener of
 # this stage), the link-local metadata address and -External, an AF_UNIX
 # bind, a pipe and a mailslot made, the pipes listed (tools/windows/
-# jail-reach.rs). Its lines (`reach <type> <path> <how>`, `reach-check
+# jail-reach.rs), and the token's restricting SIDs (`restricted:0`). Its
+# lines (`reach <type> <path> <how>`, `reach-check
 # <name> <result>`, `reach-summary <type> tried <n> reached <m>`) are
 # printed here whole: the format the allowlist will read. Then jail-probe
 # `smb`: this host's files and pipes through the network redirectors
@@ -1130,7 +1134,7 @@ function Stage-Reach([string]$External = '8.8.8.8:53') {
         }
         $record += $connLines[-1]
         $t0 = Get-Date
-        $r = Invoke-Jailer (@('--id', 'r', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--') + (Get-SmbChecks $shareName @("reach:/objects.txt:${port}:$External"))) 900000
+        $r = Invoke-Jailer (@('--id', 'r', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', 'restricted:0') + (Get-SmbChecks $shareName @("reach:/objects.txt:${port}:$External"))) 900000
         $lines = @($r[1] -split "`r?`n" | Where-Object { $_ })
         $record += $lines
         $record += Get-SmbServerRecord 'the jailed run' $t0 (Get-Date)
@@ -1167,7 +1171,8 @@ function Stage-Reach([string]$External = '8.8.8.8:53') {
         $summary = @($lines | Where-Object { $_.StartsWith('reach-summary ') } | ForEach-Object { $_.Substring('reach-summary '.Length) })
         Check ($summary.Count -gt 0) 'the jailed record has no reach-summary line'
         $checks = @($lines | Where-Object { $_.StartsWith('reach-check ') })
-        "a record under today's token, nothing asserted: the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks; SMB ($serverState; $shares; $($shareLines -join '; ')), in this order: jailed with --netns $smbNet; jailed $smbJailed; low integrity $smbLow; the operator $smbControl; $($connLines -join '; ')"
+        $sids = $lines | Where-Object { $_.StartsWith('restricted:0 ') } | Select-Object -First 1
+        "a record, nothing asserted, under a token whose restricting SIDs are $($sids -replace '^restricted:0 allowed ', ''): the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks; SMB ($serverState; $shares; $($shareLines -join '; ')), in this order: jailed with --netns $smbNet; jailed $smbJailed; low integrity $smbLow; the operator $smbControl; $($connLines -join '; ')"
     } finally {
         $listener.Stop()
         Stop-Jailed

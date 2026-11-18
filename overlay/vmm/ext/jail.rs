@@ -740,10 +740,12 @@ mod imp {
 /// (the same with the user's SID) on the main thread so the loader can start
 /// the process, and the jail's root as the current directory (a drive of its
 /// own). Entering the jail is preloading what the lockdown token may not
-/// open later ([`preload`]), reverting to the process token, then checking
-/// that the thread impersonates no more and that the process token is the
-/// jailer's restricted one: a process [`ENV`] reaches otherwise fails instead
-/// of running with the user's identity.
+/// open later ([`preload`]), parking the VM's partition (the VMM process),
+/// reverting to the process token, then checking that the thread
+/// impersonates no more, that the process token is the jailer's restricted
+/// one and that its only restricting SID is the jail's
+/// (`preload::jail_sid_alone`): a process [`ENV`] reaches otherwise fails
+/// instead of running with the user's identity or the session's reach.
 ///
 /// The API server's HTTP side is a process of its own
 /// ([`super::api_process`]). The jailer makes it as it makes Firecracker,
@@ -859,6 +861,11 @@ mod imp {
                 "the process token is not restricted: not started by the jailer".into(),
             ));
         }
+        // The jail's SID the process token's only restricting SID (option
+        // P, docs/windows-jail-reach.md): with the session's groups beside
+        // it the process would reach what the system grants every process.
+        // Firecracker and its API process alike, before either serves.
+        super::preload::jail_sid_alone().map_err(JailError::StillPrivileged)?;
         ROOT.set(PathBuf::from(root)).expect("the jail is entered once");
         if let Some(netns) = netns {
             // SAFETY: as above, before any other thread.

@@ -1409,14 +1409,15 @@ upstream Firecracker and its jailer.
 - **Windows jailer: the jail's token does not confine devices or the system's services.** It confines files,
   processes and, given a network (`--netns`), IP. On Linux the chroot leaves the host's files out of reach. A
   Windows jail is a drive letter of its own: every other path stays reachable, and only the jail's token confines
-  it. Its restricting SIDs are the jail's own SID and four groups every process of the session has: Everyone,
-  Users, Authenticated Users and Interactive (overlay/jailer/platform/windows/mod.rs, `RESTRICTING_SIDS`). A
-  restricted token is granted only what both its enabled SIDs and its restricting SIDs are granted (Microsoft,
-  CreateRestrictedToken), so a jailed Firecracker reaches what those groups are granted:
+  it. Until option P's step C its restricting SIDs were the jail's own SID and four groups every process of the
+  session has: Everyone, Users, Authenticated Users and Interactive (overlay/jailer/platform/windows/mod.rs,
+  `INITIAL_GROUPS`, now the initial token's only). A restricted token is granted only what both its enabled SIDs
+  and its restricting SIDs are granted (Microsoft, CreateRestrictedToken), so a jailed Firecracker reached what
+  those groups are granted, measured under that token:
   - **Files and registry.** It reads the Windows directory, Program Files, files under ProgramData,
     `C:\Users\Public` or a data volume, and HKLM registry keys that grant one of the four groups read. Its integrity
     level, below medium, keeps it from writing those files and keys, and the user's own files stay denied
-    (`jailer-test.ps1 isolation`, which records its read of `C:\Windows\win.ini`).
+    (`jailer-test.ps1 isolation`, which now asserts `C:\Windows\win.ini` denied: first run: CI).
   - **Devices, services and names, measured from inside a real jail on Windows Server 2022** (`fs-probe devjail`
     under the jailer):
     - 87 of the host's 174 device objects open, each driver's I/O-control code reached. Windows has no counterpart of
@@ -1427,12 +1428,31 @@ upstream Firecracker and its jailer.
       17 service pipes, the spooler's with write.
     - It maps 97 shared memory sections, Microsoft Defender's among them.
     - It makes named pipes and mailslots in the session's namespace.
+  - **More than that, under the jailer on CI's runner** (`jailer-test.ps1 reach`'s first record, at 87e4aaab, the
+    token as shipped; Windows Server 2025 build 26100, the built-in Administrator in session 2): 762 of 2428 names.
+    - It may create objects and subdirectories (`0x2000f`) in `\BaseNamedObjects`, `\BaseNamedObjects\Restricted`
+      and `\RPC Control`, so it can take a name a service expects there, an RPC endpoint's among them.
+    - It reaches the text input (CTF) surface of the session's user: it connects to `msctf.serverDefault2`, holds
+      four of its mutexes with full access (`MSCTF.CtfServerMutexDefault2` among them) and sets its three events.
+    - 249 ALPC ports (173 in `\RPC Control`), 95 devices (44 with write), 18 pipes (`lsass`, `srvsvc` and `wkssvc`
+      with write), 103 sections (81 KnownDlls sections with map-write), 46 events, 9 mutexes.
+    - Step C is meant to remove this; the next record shows it (first run: CI).
   - **What it does not reach.** Raw disk and volume reads and physical memory are refused.
   - **Not measured.** No step out of the jail was found, but none was looked for: the drivers' and services' own
     checks were not attacked.
   - **Linux, for comparison.** A Linux jail has `/dev/kvm`, `/dev/net/tun`, `/dev/urandom` and `/dev/userfaultfd`
     behind a list of allowed I/O-control numbers.
-  - **Not done yet: the jail's own SID as the only restricting SID.** Measured under that token: 13 device namespaces
+  - **Changed, not yet measured under the jailer: the jail's own SID as the only restricting SID** (option P's step
+    C, the commit that adds this paragraph). The lockdown token's only restricting SID is the jail's; the session's
+    four groups, the logon SID and the user's are the initial token's alone, which the process drops at its revert
+    (`vmm::ext::jail`), after the preload and, in the VMM, the parked partition. After the revert Firecracker and
+    its API process check that the jail's SID is the process token's only restricting SID, and a start that finds
+    another ends, named (`jail_preload.rs`, `jail_sid_alone`; jail-probe fails the same way). `jailer-test.ps1
+    isolation` asserts it, with the SID on the jail's root, and asserts win.ini denied; `jailer-test.ps1 reach`
+    records what the token reaches under the jailer, the record the allowlist will be written from; every other
+    stage runs under it. First run: CI. Until that run, the jail's SID alone has been measured only under fs-probe's
+    imitation of the jailer, below.
+  - **The jail's own SID as the only restricting SID, under fs-probe's imitation.** Measured under that token: 13 device namespaces
     (those without `FILE_DEVICE_SECURE_OPEN`) and no RPC endpoint, service pipe, section or name of its own making.
     It needs every DLL and registry key Firecracker uses to be loaded before `RevertToSelf` (in place: the preload
     step 1's trace found runs before the revert, and a step that fails stops the start, named), and WHP to work

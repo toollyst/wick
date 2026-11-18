@@ -5,11 +5,13 @@
 //! jail's lockdown token (`vmm::ext::jail`), as Chromium's sandbox warms up
 //! before it locks down.
 //!
-//! Firecracker starts on the jail's lockdown token with an initial
-//! impersonation token on its main thread, which may read what the four
-//! session groups, the logon SID and the user's SID are granted, and
-//! reverts to the lockdown token first thing in `main`. What Windows loads
-//! or reads lazily after that is checked against the lockdown token only.
+//! Firecracker starts on the jail's lockdown token, whose only restricting
+//! SID is the jail's, with an initial impersonation token on its main
+//! thread, which may read what the session's four groups (Everyone, Users,
+//! Authenticated Users, Interactive), the logon SID and the user's SID are
+//! granted, and reverts to the lockdown token first thing in `main`. What
+//! Windows loads or reads lazily after that is checked against the lockdown
+//! token only.
 //! Each step below is something Firecracker or its API process does later,
 //! done once now, so that the DLL, registry key or message file stays loaded
 //! or cached: each was found by a kernel trace of a jail whose lockdown token
@@ -36,6 +38,12 @@
 //! its code rendered here, before the revert, so that showing it later needs
 //! no message file. Nothing is skipped: a jail that could not be prepared
 //! does not run.
+//!
+//! After the revert, [`jail_sid_alone`] checks that the process token's only
+//! restricting SID is a jail's (the resource manager authority, S-1-9, where
+//! the jailer makes it): a process started by a jailer that still gave the
+//! session's groups, or by something else, fails by name instead of running
+//! with their reach.
 //!
 //! Shared by Firecracker (`vmm::ext::jail`) and tools/windows/jail-probe.rs,
 //! which includes this file by its path: the standard library and system
@@ -90,6 +98,17 @@ unsafe extern "system" {
     fn GetLastError() -> u32;
     fn GetCurrentProcessId() -> u32;
     fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn GetTokenInformation(token: *mut c_void, class: i32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+    fn ConvertSidToStringSidW(sid: *mut c_void, text: *mut *mut u16) -> i32;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LocalFree(mem: *mut c_void) -> *mut c_void;
 }
 
 #[link(name = "ws2_32")]
@@ -346,5 +365,76 @@ mod tests {
         // 0x2000_0000: the customer bit, which no system message has.
         let text = message(0x2000_0000 | 12345);
         assert!(text.starts_with("no text for this code"), "{text}");
+    }
+}
+
+/// `TokenRestrictedSids` (`TOKEN_INFORMATION_CLASS`).
+const TOKEN_RESTRICTED_SIDS: i32 = 11;
+/// `GetCurrentProcessToken()`: the pseudo handle of the process token, which
+/// may always query it (a jailed process may not open its own token).
+const PROCESS_TOKEN: *mut c_void = -4isize as *mut c_void;
+
+/// The process token's restricting SIDs, as strings, or the system's error
+/// and its text.
+pub(crate) fn restricting_sids() -> Result<Vec<String>, String> {
+    let fail = || {
+        // SAFETY: plain call.
+        let code = unsafe { GetLastError() };
+        format!("{} (os error {code})", message(code))
+    };
+    let mut len = 0u32;
+    // SAFETY: a size query: no buffer, an out-pointer.
+    unsafe { GetTokenInformation(PROCESS_TOKEN, TOKEN_RESTRICTED_SIDS, std::ptr::null_mut(), 0, &mut len) };
+    if len == 0 {
+        return Err(fail());
+    }
+    // TOKEN_GROUPS: a u32 count, then (at 8) SID_AND_ATTRIBUTES of 16 bytes
+    // each, a pointer and a u32; 8-aligned here.
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    // SAFETY: a buffer of at least `len` bytes; an out-pointer.
+    if unsafe { GetTokenInformation(PROCESS_TOKEN, TOKEN_RESTRICTED_SIDS, buf.as_mut_ptr().cast(), len, &mut len) } == 0 {
+        return Err(fail());
+    }
+    // SAFETY: the buffer's first four bytes, the count.
+    let count = unsafe { buf.as_ptr().cast::<u32>().read() } as usize;
+    let room = (buf.len() * 8).saturating_sub(8) / 16;
+    if count > room {
+        return Err(format!("a TOKEN_GROUPS of {count} entries in {len} bytes"));
+    }
+    (0..count)
+        .map(|i| {
+            // SAFETY: entry `i`'s SID pointer, at byte 8 + 16 i, within the
+            // buffer (`room`) and 8-aligned.
+            let sid = unsafe { buf.as_ptr().add(1 + 2 * i).cast::<*mut c_void>().read() };
+            let mut text: *mut u16 = std::ptr::null_mut();
+            // SAFETY: a SID of the buffer the system filled; an out-pointer.
+            if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+                return Err(fail());
+            }
+            // SAFETY: the NUL-terminated string the call allocated, freed
+            // once read.
+            let s = unsafe {
+                let n = (0..).take_while(|&k| *text.add(k) != 0).count();
+                let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
+                LocalFree(text.cast());
+                s
+            };
+            Ok(s)
+        })
+        .collect()
+}
+
+/// After the revert: the jail's SID when it is the process token's only
+/// restricting SID (one SID, in the resource manager authority, S-1-9,
+/// where the jailer makes a jail's), else what the token has instead.
+pub(crate) fn jail_sid_alone() -> Result<String, String> {
+    let sids = restricting_sids().map_err(|e| format!("the process token's restricting SIDs could not be read: {e}"))?;
+    match sids.as_slice() {
+        [one] if one.starts_with("S-1-9-") => Ok(one.clone()),
+        _ => Err(format!(
+            "the process token's restricting SIDs are {} where the jail's SID alone is expected (a jailer that gives \
+             the session's groups too, or not a jailer's token)",
+            if sids.is_empty() { "none".to_string() } else { sids.join(", ") }
+        )),
     }
 }
