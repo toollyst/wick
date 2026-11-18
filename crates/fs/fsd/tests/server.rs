@@ -362,8 +362,59 @@ fn refused_when(tag: &str, deny: &[(std::ffi::c_long, Option<(u32, u32)>)], errn
             }
             assert!(err.contains(step), "expected a refusal naming {step:?}: {err}");
             assert!(err.contains("does not serve unconfined"), "{err}");
+            no_confined_child_left(&server, &s.share, step);
         }
     }
+}
+
+/// After its waiting parent's refusal, no process of the server is left:
+/// the confined child, forked before the parent's step, ended with it. As
+/// root the parent may die after its drop to --uid while the child is still
+/// root (before `lock`): the kernel refuses the parent-death signal then
+/// (`kill_ok_by_cred`, kernel/signal.c: neither id of the sender matches
+/// the target's, and the sender has no `CAP_KILL`), and the child ends at
+/// its own check of the parent's pipe when it arms the signal again after
+/// its drop (confine/linux.rs, `lock`). Which of the two ended it is on
+/// record.
+fn no_confined_child_left(server: &Server, share: &std::path::Path, step: &str) {
+    let named = share.to_str().unwrap();
+    let live = || {
+        let mut rows = Vec::new();
+        for e in std::fs::read_dir("/proc").unwrap().flatten() {
+            let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let (Ok(cmd), Ok(stat)) = (
+                std::fs::read(format!("/proc/{pid}/cmdline")),
+                std::fs::read_to_string(format!("/proc/{pid}/stat")),
+            ) else {
+                continue;
+            };
+            let state = stat.rfind(')').and_then(|i| stat[i + 2..].chars().next());
+            let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
+            if cmd.contains(named) && !matches!(state, Some('Z' | 'X') | None) {
+                rows.push((pid, state));
+            }
+        }
+        rows
+    };
+    let start = std::time::Instant::now();
+    let mut left = live();
+    while !left.is_empty() && start.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        left = live();
+    }
+    assert!(left.is_empty(), "{step}: the server's processes outlived its waiting parent: {left:?}");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let err = server.stderr_now();
+    let how = if err.contains("PR_SET_PDEATHSIG after the id drop") {
+        "at its own check of the parent's pipe (the parent-death signal was refused or not yet armed again)"
+    } else if err.matches("does not serve unconfined").count() > 1 {
+        "at a refusal of its own"
+    } else {
+        "by the parent-death signal, or before it forked"
+    };
+    eprintln!("{step}: no process left; the confined child ended {how}");
 }
 
 const EPERM: i32 = 1;

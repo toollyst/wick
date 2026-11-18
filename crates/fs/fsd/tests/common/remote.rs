@@ -222,6 +222,13 @@ impl Server {
         (status, self.stderr.lock().unwrap().clone())
     }
 
+    /// What the server's processes wrote to stderr so far (a confined child
+    /// may write after its waiting parent ended).
+    #[cfg(target_os = "linux")]
+    pub fn stderr_now(&self) -> String {
+        self.stderr.lock().unwrap().clone()
+    }
+
     /// The pid of the confined process: the child the server forked.
     #[cfg(target_os = "linux")]
     pub fn confined_pid(&self) -> Option<i32> {
