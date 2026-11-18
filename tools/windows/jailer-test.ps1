@@ -1824,7 +1824,18 @@ function Stage-Vhost-User {
 # jail of a running jail's id is refused and the first keeps its endpoint;
 # the operator reaches every endpoint (the control); IP is denied to a jail
 # with a network and allowed to one without (the control), and a jailer that
-# is not elevated refuses the flag. Needs no guest; needs an elevated
+# is not elevated refuses the flag. The jail's token alone does not stop IP:
+# since option P's step C, Winsock's first AF_INET socket in a jailed process
+# fails (os error 5: the TCP/IP transport's first use reads what the jail's
+# SID may not), but that is Winsock's own step in the process, which a process
+# that has taken it before its revert does not take again, and the TCP/IP
+# stack itself is not refused (fs-probe on Windows Server 2022: a socket made
+# before the revert, a new one after it connects). So every IP check here is
+# made by a probe that took that step before its revert (jail-probe
+# inetwarm:0, the probe's alone; Firecracker's preload does not take it):
+# the control must then connect, or the stage fails; the jails with a
+# network must not. The refusal without it, and Winsock's keys as the jail
+# opens them (wsreg:0), are recorded. Needs no guest; needs an elevated
 # PowerShell.
 function Stage-Netns {
     $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -1859,9 +1870,11 @@ function Stage-Netns {
         # name in the network directory itself, where it could take a later
         # jail's name or directory first; it makes one in its own directory
         # (the control). No IP at all (the operator's TCP port, a UDP
-        # datagram); a jailed process without a network reaches IP (the
-        # control).
+        # datagram) for a probe that took Winsock's first AF_INET step before
+        # its revert; a jailed process without a network that took it reaches
+        # IP (the control).
         $expect = [ordered]@{
+            'inetwarm:0'                                       = $true
             "connect:$($ep['a'])"                              = $false
             "delete:$($ep['a'])"                               = $false
             "bind:$(Join-Path $nets['a'] 'tapc')"              = $false
@@ -1880,9 +1893,17 @@ function Stage-Netns {
             if ($l.Substring($k.Length + 1).StartsWith('allowed') -ne $expect[$k]) { $bad += $l }
         }
         Check ($bad.Count -eq 0) "jailed in network a: $($bad -join '; ')"
-        $ctl = Invoke-Jailer @('--id', 'control', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', "tcp:127.0.0.1:$port", 'udp:127.0.0.1:9') 30000
-        $ctlBad = @(($ctl[1] -split "`r?`n") | Where-Object { $_ -match '^(tcp|udp):' -and $_ -notmatch ' allowed' })
-        Check ($ctlBad.Count -eq 0) "the control (a jail without a network) was denied IP, so the test proves nothing: $($ctlBad -join '; ')"
+        $ctl = Invoke-Jailer @('--id', 'control', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', 'inetwarm:0', "tcp:127.0.0.1:$port", 'udp:127.0.0.1:9') 30000
+        $ctlLines = @(($ctl[1] -split "`r?`n") | Where-Object { $_ -match '^(inetwarm|tcp|udp):' })
+        $ctlBad = @($ctlLines | Where-Object { $_ -notmatch '^\S+ allowed' })
+        Check ($ctlLines.Count -eq 3 -and $ctlBad.Count -eq 0) "the control (a jail without a network, Winsock's AF_INET step taken before its revert) was denied IP or did not answer, so the test proves nothing: $(if ($ctlBad.Count) { $ctlBad -join '; ' } else { $ctl[1].Trim() })"
+        # Recorded, not asserted: a jail without a network that did not take
+        # that step (Firecracker's case), and Winsock's keys as it opens them.
+        $cold = Invoke-Jailer @('--id', 'cold', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', 'wsreg:0', "tcp:127.0.0.1:$port", 'udp:127.0.0.1:9') 30000
+        $coldLines = @(($cold[1] -split "`r?`n") | Where-Object { $_ -match '^(wsreg|tcp|udp):' })
+        foreach ($l in $coldLines) { Write-Host "     cold: $l" }
+        $opKeys = (& $probe 'wsreg:0') -join ' '
+        Write-Host "     operator: $opKeys"
         Check (Test-Path $ep['a']) "jail a's endpoint went while a jailed process of its network tried it"
         # Jail c, given network a after the probe tried c's names there: its
         # endpoint is made, in its own directory.
@@ -1908,9 +1929,10 @@ function Stage-Netns {
         Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$base*medium*" })) 'a jailer that is not elevated started Firecracker'
         # Ending the jailers ends their filter sessions: IP is back for the jail's binary.
         Stop-Jailed
-        $after = Invoke-Jailer @('--id', 'after', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', "tcp:127.0.0.1:$port") 30000
-        Check ($after[1] -match 'tcp:.* allowed') "after the jailers ended, the jail's binary is still denied IP: $($after[1])"
-        "two jails, each with a network of its own, and a jail and a probe given the first's: each endpoint in its jail's own directory of the network; the probe could not connect to, delete or take the name of another jail's endpoint, nor make a name in the network directory, and made one in its own (control); a second jail of a running id refused, the first keeping its endpoint; the operator reaches every endpoint (control); no IP (TCP, UDP) with a network and IP without (control); the filters end with the jailer; an unelevated jailer refuses --netns"
+        $after = Invoke-Jailer @('--id', 'after', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', 'inetwarm:0', "tcp:127.0.0.1:$port") 30000
+        Check ($after[1] -match 'inetwarm:0 allowed' -and $after[1] -match 'tcp:\S+ allowed') "after the jailers ended, the jail's binary is still denied IP: $($after[1])"
+        $coldTcp = $coldLines | Where-Object { $_.StartsWith('tcp:') } | Select-Object -First 1
+        "two jails, each with a network of its own, and a jail and a probe given the first's: each endpoint in its jail's own directory of the network; the probe could not connect to, delete or take the name of another jail's endpoint, nor make a name in the network directory, and made one in its own (control); a second jail of a running id refused, the first keeping its endpoint; the operator reaches every endpoint (control); no IP (TCP, UDP) with a network and IP without (control), each probe having taken Winsock's AF_INET step before its revert; the filters end with the jailer; an unelevated jailer refuses --netns; recorded: without that step, $coldTcp; Winsock's keys, jailed: $(($coldLines | Where-Object { $_.StartsWith('wsreg:') }) -replace '^wsreg:0 record ', ''); the operator's: $($opKeys -replace '^wsreg:0 record ', '')"
     } finally {
         $listener.Stop()
         Stop-Jailed

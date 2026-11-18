@@ -285,6 +285,36 @@ pub(super) fn list(file: &str) -> String {
     }
 }
 
+/// The `wsreg` check: Winsock's keys an `AF_INET` socket's first use reads
+/// (the TCP/IP transports' helper keys, Winsock's catalogue and transports)
+/// and, for contrast, the `AF_UNIX` helper's, which Firecracker's preload
+/// reads before its revert; each opened for `KEY_READ`, with the error each
+/// open gives (0: opened). A record, `record` and one `<key> <error>` per key.
+pub(super) fn winsock_keys() -> String {
+    let keys = [
+        r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Winsock",
+        r"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Winsock",
+        r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
+        r"SYSTEM\CurrentControlSet\Services\WinSock\Parameters",
+        r"SYSTEM\CurrentControlSet\Services\WinSock2\Parameters",
+        r"SYSTEM\CurrentControlSet\Services\WinSock2\Parameters\Protocol_Catalog9",
+        r"SYSTEM\CurrentControlSet\Services\AFD\Parameters",
+        r"SYSTEM\CurrentControlSet\Services\afunix\Parameters\Winsock",
+    ];
+    let mut out = Vec::new();
+    for sub in keys {
+        let mut k = 0usize;
+        // SAFETY: a NUL-terminated subkey; KEY_READ; an out-pointer.
+        let e = unsafe { RegOpenKeyExW(HKLM, wide(sub).as_ptr(), 0, KEY_READ, &mut k) };
+        if e == 0 {
+            // SAFETY: the key just opened.
+            unsafe { RegCloseKey(k) };
+        }
+        out.push(format!("{} {e}", sub.trim_start_matches(r"SYSTEM\CurrentControlSet\Services\")));
+    }
+    format!("record {}", out.join("; "))
+}
+
 /// `smb:0`: the host's own files and pipes through the network
 /// redirectors, opened by their NT names as a jailed process may name them
 /// (`\Device\Mup` and `\Device\RdpDrPort` have no

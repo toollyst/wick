@@ -289,8 +289,63 @@ Where this record shows more than the earlier tables (`devjail` on Windows Serve
   RawCdRom, RawDisk, RawTape, PointerClass0, FsWrap, Mup, RdpBus, MQAC, Srv2, Afd and seven numbered devices.
   `jail-probe smb` records what the jail opens through Mup and RdpDrPort.
 
-Step C, the jail's SID as the only restricting SID, is meant to take this away. The next record of the same stage,
-under that token, is the measurement (first run: CI).
+### The record under the jail's SID alone (step C)
+
+`jailer-test.ps1 reach` at f4fb55c4, in CI's windows-guest job (Windows Server 2025 build 26100, the built-in
+Administrator in session 2), under a token whose only restricting SID was the jail's (`restricted:0`): 9 of the 2420
+names the operator listed.
+
+| Kind | Listed | Reached |
+| --- | --- | --- |
+| Devices | 208 | 9, each beneath its name: Afd, Fat, FatCdrom, Ntfs, LanmanDatagramReceiver, RawCdRom, RawDisk, RawTape, MQAC |
+| ALPC ports | 273 | 0 |
+| Pipes | 38 | 0 |
+| Sections | 273 | 0 |
+| Events, mutexes, semaphores | 254, 349, 386 | 0 |
+| Symbolic links, directories | 233, 57 | 0 |
+| Drivers, types, callbacks, filter ports, jobs, window stations, sessions, partitions, keys | 349 | 0 |
+
+- **The nine devices.** None has `FILE_DEVICE_SECURE_OPEN`, and each was opened beneath its name, where the I/O
+  manager does not check the device object's security and the restricting SIDs are not asked; what the driver
+  checks there is its own. Each answered the probe's unknown I/O-control code, its read and its zero-length write
+  with an error: `0xc0000010` for most; `0xc0000002` from LanmanDatagramReceiver; `0xc000000d` for Ntfs's I/O
+  control; `0xc0000140` for Afd's read and write. Afd is the one Firecracker uses (Winsock). The allowlist is to be
+  written from this record.
+- **The other checks.** A DLL loaded after the revert was refused (126), HKLM read (5), a pipe and a mailslot made
+  (5); the pipes were listed (38 names); an `AF_UNIX` bind was allowed. TCP to loopback, to the link-local metadata
+  address and to an external address stopped at Winsock's `socket` (5): see "IP without `--netns`" below.
+- **SMB.** The jail, with `--netns` and without, opened none of the 12 forms and none of the share's 5, each refused
+  with `0xc0000022`, and the server listed no session after either run. The computer's name was not readable in the
+  jail (5), so the two forms by that name were tried with no name in them. The low-integrity run and the operator's
+  control were as under the first token: `0xc0000201` after sessions and tree connects as the administrator, and 9
+  of 12 and 5 of 5.
+
+### IP without `--netns`
+
+Under the jail's SID alone, Winsock's first `AF_INET` socket in a jailed process fails with os error 5 (the record
+above, and `jailer-test.ps1 netns`'s control at f4fb55c4, which failed for it). Winsock's first use of the TCP/IP
+transport in a process is done in the process, by `mswsock.dll`, and reads what the jail's SID may not;
+Firecracker's preload does it for `AF_UNIX` only (`jail_preload.rs`, its `winsock` step). `jailer-test.ps1 netns`
+records which of Winsock's keys the jail opens (`jail-probe wsreg:0`; first run: CI); until then the refusal is not
+located to the key.
+
+It is not a refusal by the TCP/IP stack. Measured with a warmed helper: on fc-win (Windows Server 2022 build
+20348), under fs-probe's imitation (the jail's SID alone, medium integrity), a process that made an `AF_INET` socket
+before its revert made new ones after it and connected them to loopback and to the link-local metadata address
+(`preload-tcp-socket`, `tcp-loopback allowed`, `tcp-link-local-metadata allowed`), where one that had made only an
+`AF_UNIX` socket was refused with 5. So without `--netns` a jailed process's IP reach is not denied by the jail's
+token. `--netns`'s Windows Filtering Platform filters are what deny it: `jailer-test.ps1 netns` now makes every IP
+check from a probe that took Winsock's `AF_INET` step before its revert (`jail-probe inetwarm:0`, a step of the
+probe binary alone, which Firecracker's preload does not take), fails if the jail without a network does not then
+connect, and asserts the jails with a network refused (first run: CI).
+
+Firecracker makes no IP socket on Windows. Its API socket (`ext::api_process`, `UnixListener::bind`), its network
+endpoint (`platform::windows::net`, `UnixListener::bind`), vsock's (`vsock/unix/muxer.rs`), vhost-user's
+(`virtio/vhost_user.rs`; the vhost crate's own, `wick_os::unix::net`) and the uffd handler's (`persist.rs`) are
+`std::os::unix::net`, which on Windows is wick-os's, whose sockets are `AF_UNIX` (`crates/compat/os/src/windows/
+net.rs`, `new_socket`); wick-os's `dup` and the received sockets of `sock_ctrl_msg` are made from the protocol
+information of sockets it already holds; the polling crate opens Afd and asks existing sockets for their base handle.
+The `AF_INET` sockets in the compatibility crates are in their tests and in the NOFILEREC record.
 
 ## Against Linux
 
@@ -696,11 +751,12 @@ to when the partition is made. What it brings, and what the next record (`jail-v
    one every process may read, so that they hold under both tokens; `isolation` records the read of
    `C:\Windows\win.ini` without asserting it; `nofile`'s probe opens a file of its own in its root, not `NUL`, a
    device the jail's SID alone did not open in the fourth record. Checked in the code and holding under both already: `handoff` (the
-   file the jailed process holds is in its root), `netns` (each jail's directory of the network grants its SID, the
-   network directory is crossed by the traversal privilege the jail keeps), `shared`, `restart` and `bindlink`
+   file the jailed process holds is in its root), `netns`'s endpoints (each jail's directory of the network grants its SID, the
+   network directory is crossed by the traversal privilege the jail keeps; its IP control did not hold, see "IP
+   without `--netns`"), `shared`, `restart` and `bindlink`
    (a file hard-linked into the root gets an entry for the jail's SID from the jailer); every other stage hands the
    jail only paths in its root.
-   The jailer change is option P's step C (first run: CI): the lockdown token's only restricting SID is the jail's;
+   The jailer change is option P's step C (f4fb55c4; its record is above): the lockdown token's only restricting SID is the jail's;
    the initial token keeps the session's four groups, the logon SID and the user's for the loader, the preload and
    the parked partition; after the revert Firecracker and its API process check that the process token's only
    restricting SID is a jail's (`jail_preload.rs`, `jail_sid_alone`) and end, named, if not; `isolation` asserts

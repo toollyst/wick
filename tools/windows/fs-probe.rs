@@ -3307,6 +3307,10 @@ fn jail_checks(c: &Child, revert: bool, list: &str, port: u16, ext: ([u8; 4], u1
         // SAFETY: plain call.
         let ok = unsafe { RevertToSelf() };
         c.out("revert-to-lockdown-token", if ok != 0 { "allowed".into() } else { last() });
+        // Firecracker's check after its revert (jail_preload.rs, the same
+        // code): whether this variant's token has a jail's SID as its only
+        // restricting SID, as the jailer's has since option P's step C.
+        c.out("jail-sid-alone", match preload::jail_sid_alone() { Ok(sid) => format!("allowed {sid}"), Err(e) => format!("denied {e}") });
     }
     c.token();
     c.mitigate();

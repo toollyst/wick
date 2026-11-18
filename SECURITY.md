@@ -1424,8 +1424,9 @@ upstream Firecracker and its jailer.
   (a jailed guest's frames through its endpoint), both passed in CI run 43442912128 (861d365; Windows Server 2025
   10.0.26100.33674 on an AMD EPYC 7763, elevated). Not run elevated on a PC: the PC's run at 861d365 was
   unelevated, where both stages stop at the elevation they need.
-- **Windows jailer: the jail's token does not confine devices or the system's services.** It confines files,
-  processes and, given a network (`--netns`), IP. On Linux the chroot leaves the host's files out of reach. A
+- **Windows jailer: the jail's token does not confine devices or the system's services.** It confines files
+  and processes; IP is confined by `--netns` only: without it a jailed process's IP reach is not denied by the
+  jail's token (below, "IP without `--netns`"). On Linux the chroot leaves the host's files out of reach. A
   Windows jail is a drive letter of its own: every other path stays reachable, and only the jail's token confines
   it. Until option P's step C its restricting SIDs were the jail's own SID and four groups every process of the
   session has: Everyone, Users, Authenticated Users and Interactive (overlay/jailer/platform/windows/mod.rs,
@@ -1435,7 +1436,8 @@ upstream Firecracker and its jailer.
   - **Files and registry.** It reads the Windows directory, Program Files, files under ProgramData,
     `C:\Users\Public` or a data volume, and HKLM registry keys that grant one of the four groups read. Its integrity
     level, below medium, keeps it from writing those files and keys, and the user's own files stay denied
-    (`jailer-test.ps1 isolation`, which now asserts `C:\Windows\win.ini` denied: first run: CI).
+    (`jailer-test.ps1 isolation`, which asserts `C:\Windows\win.ini` denied under the jail's SID alone: passed in
+    CI's windows-guest job at f4fb55c4).
   - **Devices, services and names, measured from inside a real jail on Windows Server 2022** (`fs-probe devjail`
     under the jailer):
     - 87 of the host's 174 device objects open, each driver's I/O-control code reached. Windows has no counterpart of
@@ -1454,22 +1456,40 @@ upstream Firecracker and its jailer.
       four of its mutexes with full access (`MSCTF.CtfServerMutexDefault2` among them) and sets its three events.
     - 249 ALPC ports (173 in `\RPC Control`), 95 devices (44 with write), 18 pipes (`lsass`, `srvsvc` and `wkssvc`
       with write), 103 sections (81 KnownDlls sections with map-write), 46 events, 9 mutexes.
-    - Step C is meant to remove this; the next record shows it (first run: CI).
+    - Step C removed this: the record under the jail's SID alone is below.
   - **What it does not reach.** Raw disk and volume reads and physical memory are refused.
   - **Not measured.** No step out of the jail was found, but none was looked for: the drivers' and services' own
     checks were not attacked.
   - **Linux, for comparison.** A Linux jail has `/dev/kvm`, `/dev/net/tun`, `/dev/urandom` and `/dev/userfaultfd`
     behind a list of allowed I/O-control numbers.
-  - **Changed, not yet measured under the jailer: the jail's own SID as the only restricting SID** (option P's step
-    C, the commit that adds this paragraph). The lockdown token's only restricting SID is the jail's; the session's
+  - **The jail's own SID as the only restricting SID, under the jailer** (option P's step C, f4fb55c4). The lockdown token's only restricting SID is the jail's; the session's
     four groups, the logon SID and the user's are the initial token's alone, which the process drops at its revert
     (`vmm::ext::jail`), after the preload and, in the VMM, the parked partition. After the revert Firecracker and
     its API process check that the jail's SID is the process token's only restricting SID, and a start that finds
     another ends, named (`jail_preload.rs`, `jail_sid_alone`; jail-probe fails the same way). `jailer-test.ps1
     isolation` asserts it, with the SID on the jail's root, and asserts win.ini denied; `jailer-test.ps1 reach`
     records what the token reaches under the jailer, the record the allowlist will be written from; every other
-    stage runs under it. First run: CI. Until that run, the jail's SID alone has been measured only under fs-probe's
-    imitation of the jailer, below.
+    stage runs under it. In CI's windows-guest job at f4fb55c4 (Windows Server 2025 build 26100): `isolation` passed;
+    every stage that boots a guest, restores a snapshot or serves vsock, a network endpoint or the API process
+    passed; `reach` recorded 9 of 2420 names (762 under the token before), each a device without
+    `FILE_DEVICE_SECURE_OPEN` opened beneath its name (Afd, Fat, FatCdrom, Ntfs, LanmanDatagramReceiver, RawCdRom,
+    RawDisk, RawTape, MQAC), and none of the 273 ALPC ports, 38 pipes or 273 sections; a DLL loaded after the
+    revert, HKLM read and a pipe or mailslot made were refused, an `AF_UNIX` bind allowed; through SMB the jail
+    opened nothing, with `--netns` and without (docs/windows-jail-reach.md, the record under the jail's SID alone).
+    `netns` failed, at its IP control: below.
+  - **IP without `--netns`: not denied by the jail's token.** Under the jail's SID alone Winsock's first `AF_INET`
+    socket in a jailed process fails with os error 5 (f4fb55c4: `reach`'s TCP checks and `netns`'s control):
+    Winsock's first use of the TCP/IP transport is done in the process, by `mswsock.dll`, and reads what the jail's
+    SID may not, and Firecracker's preload does it for `AF_UNIX` only. Which key it is refused is recorded by
+    `jailer-test.ps1 netns` (`jail-probe wsreg:0`; first run: CI) and not located until then. The TCP/IP stack does
+    not refuse the token, measured with a warmed helper: on fc-win (Windows Server 2022 build 20348), under
+    fs-probe's imitation of the jail's SID alone at medium integrity, a process that made an `AF_INET` socket before
+    its revert made new ones after it and connected them to loopback and to the link-local metadata address
+    (`preload-tcp-socket`). So the jail's token does not deny IP; `--netns`'s Windows Filtering Platform filters do,
+    and `jailer-test.ps1 netns` now checks them against a control that took Winsock's `AF_INET` step before its
+    revert (`jail-probe inetwarm:0`, the probe binary's alone) and fails if that control does not connect (first
+    run: CI). Firecracker itself makes no IP socket: its API socket, network endpoint, vsock, vhost-user and uffd
+    sockets are `AF_UNIX` (docs/windows-jail-reach.md, "IP without `--netns`", by source).
   - **The jail's own SID as the only restricting SID, under fs-probe's imitation.** Measured under that token: 13 device namespaces
     (those without `FILE_DEVICE_SECURE_OPEN`) and no RPC endpoint, service pipe, section or name of its own making.
     It needs every DLL and registry key Firecracker uses to be loaded before `RevertToSelf` (in place: the preload

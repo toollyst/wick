@@ -47,8 +47,11 @@
   user), `netns` (two jails with a network each, and a jail and a probe
   given the first's: each endpoint in its jail's own directory of the
   network, which no other jail reaches; a second jail of a running id
-  refused; TCP and UDP denied; an unelevated jailer refused the flag; needs
-  an elevated PowerShell),
+  refused; TCP and UDP denied, checked against a jail without a network that
+  must connect, each probe having taken Winsock's `AF_INET` step before its
+  revert (`jail-probe inetwarm:0`), since the jail's token alone stops only
+  that step; Winsock's keys as the jail opens them recorded; an unelevated
+  jailer refused the flag; needs an elevated PowerShell),
   `api` (the jail runs Firecracker and its API server's process, the latter
   under the whole mitigation profile; each one's end ends the other) and
   `reach` (a record, nothing asserted yet, with the token's restricting SIDs: every named object, pipe and

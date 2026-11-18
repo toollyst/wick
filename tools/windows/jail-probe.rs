@@ -30,13 +30,18 @@
 //!                               dacl:<path> owner:<path> deleteopen:<path>
 //!                               reachlist:<file>
 //!                               reach:<file>:<port>:<ip>:<port> smb:0 smb:<share>
-//!                               waitfor:<path> restricted:0
+//!                               waitfor:<path> restricted:0 wsreg:0
+//!                               inetwarm:0
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
 //!
 //! Prints one line per check: `<check> allowed` or `<check> denied <error>`;
 //! `reach` and `smb` print their records' lines before their own (jail-reach.rs).
+//! `inetwarm:0`, given under the jailer, also makes this probe create and close
+//! an `AF_INET` TCP and UDP socket after the preload and before its revert, a
+//! step Firecracker does not take (this binary's alone: Firecracker's preload
+//! makes an `AF_UNIX` socket only); the check says whether it did.
 //! No dependencies: `rustc -O jail-probe.rs` builds it.
 
 #![allow(non_snake_case, clippy::upper_case_acronyms)]
@@ -1269,6 +1274,11 @@ fn check(c: &str) -> String {
             unsafe { CloseHandle(h) };
             out
         }
+        // Winsock's keys for an AF_INET socket's first use, opened (a record).
+        "wsreg" => reach::winsock_keys(),
+        // Whether the AF_INET sockets were made before the revert
+        // (`inet_warm`): only under the jailer, and only when asked.
+        "inetwarm" => INET_WARM.get().cloned().unwrap_or_else(|| "denied not made: only under the jailer, before the revert".into()),
         // The process token's restricting SIDs: `allowed <n> <SID>,...`.
         "restricted" => match preload::restricting_sids() {
             Ok(sids) => format!("allowed {} {}", sids.len(), sids.join(",")),
@@ -1467,6 +1477,13 @@ fn main() {
             std::process::exit(1);
         }
     }
+    // The probe's own step, never Firecracker's: AF_INET sockets made and
+    // closed under the initial token, when asked (`inetwarm:0`), so that
+    // Winsock's first use of the TCP/IP transport is done before the revert,
+    // as the AF_UNIX one is by the preload.
+    if jailed && checks(&args).iter().any(|c| c == "inetwarm:0") {
+        let _ = INET_WARM.set(inet_warm());
+    }
     // SAFETY: plain call.
     unsafe { RevertToSelf() };
     // Then Firecracker's check that the jail's SID is the process token's
@@ -1481,6 +1498,30 @@ fn main() {
     for c in checks(&args) {
         println!("{c} {}", check(c));
     }
+}
+
+/// `inet_warm`'s result, for the `inetwarm` check.
+static INET_WARM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// An `AF_INET` TCP and an `AF_INET` UDP socket made and closed: Winsock's
+/// first use of the TCP/IP transport in this process. `allowed`, or `denied`
+/// with each socket's Winsock error.
+fn inet_warm() -> String {
+    let mut data = [0u8; 512];
+    let mut bad = Vec::new();
+    // SAFETY: room for WSADATA; then sockets made and closed here.
+    unsafe {
+        WSAStartup(0x0202, data.as_mut_ptr());
+        for (ty, name) in [(1, "tcp"), (2, "udp")] {
+            let s = socket(2, ty, 0); // AF_INET, SOCK_STREAM / SOCK_DGRAM
+            if s == usize::MAX {
+                bad.push(format!("{name} socket {}", WSAGetLastError()));
+            } else {
+                closesocket(s);
+            }
+        }
+    }
+    if bad.is_empty() { "allowed".into() } else { format!("denied {}", bad.join(", ")) }
 }
 
 /// The arguments the jailer puts before the operator's, each with its value
