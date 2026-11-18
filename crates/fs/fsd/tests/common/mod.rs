@@ -345,23 +345,38 @@ impl Image {
         let dir = scratch(&format!("img-{tag}"));
         let img = dir.join("i.dmg");
         let mount = dir.join("mnt");
-        let ok = std::process::Command::new("hdiutil")
-            .args(["create", "-quiet", "-size", "32m", "-fs", fs, "-volname", "wicktest"])
-            .arg(&img)
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok, "hdiutil create -fs {fs}");
-        let ok = std::process::Command::new("hdiutil")
-            .args(["attach", "-quiet", "-nobrowse", "-mountpoint"])
-            .arg(&mount)
-            .arg(&img)
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok, "hdiutil attach");
+        let mut create = std::process::Command::new("hdiutil");
+        create.args(["create", "-size", "32m", "-fs", fs, "-volname", "wicktest"]).arg(&img);
+        hdiutil(create, &format!("hdiutil create -fs {fs}"), &dir);
+        let mut attach = std::process::Command::new("hdiutil");
+        attach.args(["attach", "-nobrowse", "-mountpoint"]).arg(&mount).arg(&img);
+        hdiutil(attach, "hdiutil attach", &dir);
         Image { mount, dir }
     }
+}
+
+/// Runs an hdiutil command; a failure panics with what it said and the
+/// host's state around it: the images attached (`hdiutil info`) and the
+/// space left where the image is made and on the root volume.
+#[cfg(target_os = "macos")]
+fn hdiutil(mut command: std::process::Command, what: &str, dir: &Path) {
+    let out = command.output().unwrap_or_else(|e| panic!("{what}: cannot run hdiutil: {e}"));
+    if out.status.success() {
+        return;
+    }
+    let run = |program: &str, args: &[&std::ffi::OsStr]| match std::process::Command::new(program).args(args).output() {
+        Ok(o) => format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)),
+        Err(e) => format!("cannot run {program}: {e}"),
+    };
+    panic!(
+        "{what}: {}\nstdout: {}\nstderr: {}\n--- hdiutil info\n{}--- df -h {} /\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        run("hdiutil", &["info".as_ref()]),
+        dir.display(),
+        run("df", &["-h".as_ref(), dir.as_os_str(), "/".as_ref()]),
+    );
 }
 
 #[cfg(target_os = "macos")]
