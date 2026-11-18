@@ -269,10 +269,11 @@ mod macos {
     }
 
     /// Many blocks of the server's large sizes held at once, then freed
-    /// (frames of every length, READDIR buffers): more than libmalloc's
-    /// large cache keeps (16 entries, or 64 with 32 GiB of memory or more,
-    /// libmalloc-715 thresholds.h), so it gives its oldest back, [`REPEAT`] / 4
-    /// times: 1.
+    /// (frames of every length, READDIR buffers): more than one of macOS
+    /// 15's medium regions holds (each new region a mapping, see `SHAPES`),
+    /// and more than a large cache keeps where these sizes are large (16
+    /// entries, or 64 with 32 GiB of memory or more, libmalloc-715
+    /// thresholds.h), so it gives its oldest back, [`REPEAT`] / 4 times: 1.
     fn many_large_blocks() -> i32 {
         let span = wick_fs_frame::MAX_FRAME_LEN - (40 << 10);
         let mut done = true;
@@ -309,14 +310,17 @@ mod macos {
     /// On record: this process's allocator, from a copy of it started with
     /// `MallocReportConfig` (libmalloc-715 malloc.c :1523: it reports the
     /// magazine allocator's configuration, and nothing of the other, xzone),
-    /// the zone of a 3 MiB block and its version (16: magazine or nano,
-    /// magazine_malloc.c :1781, nanov2_malloc.c :3197), and the memory size,
-    /// which decides the magazine's large threshold (32 KiB, or 8 MiB with
-    /// the medium allocator at 32 GiB or more, thresholds.h).
+    /// which allocator libmalloc engaged (`probe::engaged_allocator`), and the
+    /// memory size and architecture, which decide the magazine's size
+    /// classes: a block past 32 KiB is medium up to 8 MiB where the medium
+    /// allocator is engaged (always on arm64, wick's only macOS host; on
+    /// x86_64 at 32 GiB of memory or more; libmalloc-715 malloc.c :357,
+    /// thresholds.h) and large past that or without it.
     fn allocator_on_record() {
         if std::env::var_os("WICK_FS_PROBE_ALLOCATOR").is_some() {
-            let (name, version) = probe::zone_of_a_large_block(3 << 20);
-            println!("the zone of a 3 MiB block: {name}, version {version}");
+            let (secure, nano) = probe::engaged_allocator();
+            let which = if secure != 0 { "xzone" } else { "magazine" };
+            println!("engaged: {which} (malloc_engaged_secure_allocator {secure}), nano version {nano}");
             probe::exit_now(0);
         }
         let out = std::process::Command::new(std::env::current_exe().unwrap())
@@ -327,9 +331,9 @@ mod macos {
         for line in String::from_utf8_lossy(&out.stdout).lines().chain(String::from_utf8_lossy(&out.stderr).lines()) {
             println!("allocator: {line}");
         }
-        if let Ok(m) = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize", "kern.osversion"]).output() {
+        if let Ok(m) = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize", "kern.osversion", "hw.machine"]).output() {
             let said: Vec<String> = String::from_utf8_lossy(&m.stdout).split_whitespace().map(String::from).collect();
-            println!("allocator: hw.memsize, kern.osversion: {}", said.join(", "));
+            println!("allocator: hw.memsize, kern.osversion, hw.machine: {}", said.join(", "));
         }
     }
 
@@ -554,11 +558,14 @@ mod macos {
         }
         // What the server's own allocations make, at the sizes and in the
         // ways it makes them, must be allowed: each shape done, confined.
-        // The calls depend on the allocator (macOS 27.2's xzone; macOS 15's
-        // magazine grows a large block in place with `vm_allocate` and frees
-        // one with `madvise` and `mach_vm_deallocate`, libmalloc-715
-        // magazine_large.c), so each runs again reporting them, on record,
-        // and so does a realloc past 2 MiB, which is not checked.
+        // The calls depend on the allocator and its size classes (macOS
+        // 27.2's xzone; macOS 15's magazine on arm64 serves these sizes from
+        // its medium allocator, whose new region is mapped and, when it lands
+        // above the entropic limit, given back with `mach_vm_deallocate` and
+        // mapped again lower, libmalloc-715 vm.c :245; its large allocator,
+        // past 8 MiB, grows a block in place with `vm_allocate`), so each
+        // runs again reporting them, on record, and
+        // so does a realloc past 2 MiB, which is not checked.
         let mut reported = Vec::new();
         for &(name, act) in SHAPES {
             let got = case(name, &share, &outside, act);

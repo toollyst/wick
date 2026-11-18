@@ -87,10 +87,10 @@ pub const SYSCALLS: &[(u16, &str, &str)] = &[
         75,
         "madvise",
         "libmalloc clears a large block it hands out again zeroed (READ's reply buffer, `vec![0; n]`: xzone's \
-         `_xzm_segment_group_clear_chunk`, MADV_ZERO) and gives a freed one's pages back (MADV_FREE_REUSABLE; \
-         macOS 15's magazine MADV_CAN_REUSE): measured on macOS 27.2, killed `deny(1) syscall-unix 75` in \
-         `Session::read` (requests.rs `test_a_confined_server_answers_large_reads_again_and_again`, crash report) and \
-         reported by confine_probe's allocator shapes; the advice cannot be filtered (no such Seatbelt filter), and \
+         `_xzm_segment_group_clear_chunk`, MADV_ZERO) and gives a freed one's pages back (MADV_FREE_REUSABLE, \
+         as macOS 15's magazine does for a medium region's freed pages, vm.c `mvm_madvise_free`): measured on \
+         macOS 27.2, killed `deny(1) syscall-unix 75` in `Session::read` (requests.rs \
+         `test_a_confined_server_answers_large_reads_again_and_again`, crash report) and reported by confine_probe's allocator shapes; the advice cannot be filtered (no such Seatbelt filter), and \
          xnu's madvise acts on the caller's own map only (bsd/kern/kern_mman.c, `current_map()`)",
     ),
     (92, "fcntl", "the commands of FCNTL_COMMANDS, each checked (`system-fcntl`)"),
@@ -142,9 +142,23 @@ pub const FCNTL_COMMANDS: &[(&str, &str)] = &[
 /// libmalloc's, measured on macOS 27.2 by a C program allocating, growing and
 /// freeing small to 600 MB blocks under a profile that kills every other
 /// trap (c15/sbx/alloc.c): each one named in the kill's report, then
-/// allowed, until it ran. wick-fsd makes them for a frame (up to 2 MiB) and
-/// the node and handle tables (LINK's names beyond what a node keeps).
+/// allowed, until it ran; and on macOS 15 by confine_probe's allocator shapes
+/// and the confined tests in CI (docs/design-fs.md §6.2, the table of each
+/// major's allocator). wick-fsd makes them for a frame (up to 2 MiB) and
+/// the node and handle tables (LINK's names beyond what a node keeps). Each
+/// `MSC_` name is defined on every major the profile runs on (Firecracker's
+/// profile lists the same names unconditionally, overlay/vmm/ext/sandbox.rs).
 pub const MACH_TRAPS: &[(&str, &str)] = &[
+    (
+        "_kernelrpc_mach_vm_deallocate_trap",
+        "macOS 15's magazine gives back a new medium region's mapping that landed above its entropic limit and maps \
+         it again lower (libmalloc-715.140.5 vm.c :245, `mvm_allocate_plat`; a medium region, magazine_medium.c :2448, \
+         holds every block of 32 KiB to 8 MiB on arm64): measured on macOS 15.8.2 in CI run 44362564244, killed \
+         `deny(1) syscall-mach 12` in `Session::read`'s `vec![0u8; want]` (a confined server of requests.rs, crash \
+         report: `mach_vm_deallocate` ← `mvm_allocate_pages_plat` ← `medium_malloc_should_clear`) and in four of \
+         confine_probe's allocator shapes, reported by all five; the trap acts on the caller's own task only (xnu-11417 osfmk/ipc/mach_kernelrpc.c :77, \
+         `port_name_to_current_task_noref`)",
+    ),
     ("_kernelrpc_mach_vm_map_trap", "libmalloc maps a large block (trap 15)"),
     ("mach_msg2_trap", "libmalloc's MIG call to grow a large block in place (trap 47; the routine is below)"),
 ];
@@ -157,12 +171,16 @@ pub const MIG_ROUTINES: &[(&str, &str)] = &[];
 /// release) on, and a profile naming it does not compile on an older kernel
 /// (macOS 15, as Firecracker's profile found, and macOS 26 before that
 /// release). Where it is not defined libmalloc cannot call it; there
-/// (libmalloc-715.140.5, macOS 15) a large block grows in place with
-/// `vm_allocate` at a fixed address (magazine_large.c
-/// `large_try_realloc_in_place`) or moves with `memcpy` (`vm_copy` only past
-/// 2 MiB of data, magazine_malloc.c :592, which no buffer of the server
-/// holds: a frame is at most 1 MiB + 4 KiB, and the node and handle tables
-/// are hash tables that grow by a new allocation, never by realloc).
+/// (libmalloc-715.140.5, macOS 15) the server's blocks of 32 KiB to 8 MiB
+/// are medium on Apple silicon, wick's only macOS host (the medium allocator
+/// is always engaged on arm64, malloc.c :357), and grow within their region
+/// or move; a large block (past 8 MiB, which the server never asks) grows in
+/// place with `vm_allocate` at a fixed address (magazine_large.c
+/// `large_try_realloc_in_place`, trap 10, not in the profile: no run has
+/// reported it) or moves with `memcpy` (`vm_copy` only past 2 MiB of data,
+/// magazine_malloc.c :592, which no buffer of the server holds: a frame is
+/// at most 1 MiB + 4 KiB, and the node and handle tables are hash tables
+/// that grow by a new allocation, never by realloc).
 /// confine_probe's allocator shapes (a frame's block, a buffer grown to it,
 /// a realloc to it, the node tables at their cap, many large blocks freed)
 /// check each major's way, and report on record what each calls.
@@ -592,7 +610,7 @@ mod tests {
 (allow file-write* file-write-create file-write-data file-write-mode file-write-times file-write-unlink file-write-xattr file-link (subpath "/private/tmp/share"))
 (deny file-mount file-mount-update file-unmount (subpath "/private/tmp/share") (with send-signal SIGKILL))
 (allow syscall-unix (syscall-number 29 53 73 75 92 95 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
-(allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
+(allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_deallocate_trap MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
 (when (defined? 'mach_vm_reallocate) (allow syscall-mig (kernel-mig-routine mach_vm_reallocate)))
 (deny system-fcntl (with send-signal SIGKILL))
 (allow system-fcntl (fcntl-command F_GETFD F_SETFD F_FULLFSYNC F_PREALLOCATE F_PUNCHHOLE))
@@ -614,7 +632,7 @@ mod tests {
 (allow file-read* file-read-data file-read-metadata file-read-xattr file-test-existence (subpath "/private/tmp/share"))
 (deny file-mount file-mount-update file-unmount file-write* file-write-create file-write-data file-write-mode file-write-times file-write-unlink file-write-xattr file-link (subpath "/private/tmp/share") (with send-signal SIGKILL))
 (allow syscall-unix (syscall-number 29 53 73 75 92 95 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
-(allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
+(allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_deallocate_trap MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
 (when (defined? 'mach_vm_reallocate) (allow syscall-mig (kernel-mig-routine mach_vm_reallocate)))
 (deny system-fcntl (with send-signal SIGKILL))
 (allow system-fcntl (fcntl-command F_GETFD F_SETFD F_FULLFSYNC F_PREALLOCATE F_PUNCHHOLE))

@@ -1833,7 +1833,12 @@ virtio-fs item of roadmap M7). wick-fsd confines itself on Linux and macOS befor
 start on Windows, whose confinement is not built ([docs/design-fs.md](docs/design-fs.md) §6.1, §6.2). Until the commit that lists `madvise`
 in its profile, a guest could end its own share's server on macOS by a large read (each READ's zeroed reply buffer is
 a large block the allocator clears with `madvise`; never in a release: the device is behind a feature); the profile
-now allows `madvise`, which acts on the server's own memory only (design-fs.md §6.2).
+now allows `madvise`, which acts on the server's own memory only (design-fs.md §6.2). On macOS 15 a confined server
+was killed on ordinary requests (a READ whenever its allocator made a new region, which it trims with
+`mach_vm_deallocate`) until the commit that lists that Mach trap, which also acts on the server's own memory only.
+Still open at this commit: on macOS 15 and macOS 26.0 to 26.3, libc's `fdopendir` reads a sysctl once per process
+(Libc before 1752), so a confined server is killed at its first READDIR, or its first search of a directory for a
+name a node no longer keeps (design-fs.md §6.2).
 
 The device adds no rule or system call to the VMM's sandbox, connects to its server before the sandbox narrows and
 never again, and never blocks the event loop on the server (`test_server_hang_never_blocks_the_loop`); the reply

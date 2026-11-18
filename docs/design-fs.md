@@ -1098,30 +1098,39 @@ it means layer 1 let the request through.
     dies loudly (the VMM sees the connection close). System calls, Mach traps, MIG routines and Sandbox
     mac-syscalls are killed unless listed, and so are generated code (`dynamic-code-generation`) and the issue of
     sandbox extensions. The lists are by number or name, each entry with why (table below): `SYSCALLS`,
-    `MACH_TRAPS` (libmalloc's `_kernelrpc_mach_vm_map_trap` and `mach_msg2_trap`, for a frame of up to 2 MiB and
-    the node tables), and `mach_vm_reallocate` where the kernel defines it (`(when (defined? ...))`: the routine is in
+    `MACH_TRAPS` (libmalloc's `_kernelrpc_mach_vm_map_trap`, `mach_msg2_trap` and, for macOS 15's magazine,
+    `_kernelrpc_mach_vm_deallocate_trap`, for a frame of up to 2 MiB and the node tables), and `mach_vm_reallocate` where the kernel defines it (`(when (defined? ...))`: the routine is in
     xnu from xnu-12377.101.15, so macOS 15 and the macOS 26 releases before it do not compile the name;
     `test_every_name_of_the_profile_is_defined_on_this_macos` checks each such name bound exactly from its first
-    xnu). Those traps were measured on macOS 27.2, whose allocator for wick-fsd is xzone (the zone's version is 10,
-    not the magazine's 16, and `MallocReportConfig` reports no magazine). macOS 15's libmalloc-715.140.5 picks the
-    magazine allocator for a binary that is not the platform's unless its `SecureAllocator` feature flags say
-    otherwise (malloc.c :700 to :727), and there a block is large past 32 KiB (8 MiB with the medium allocator,
-    engaged at 32 GiB of memory or more; thresholds.h, magazine_zone.h :750), mapped with
-    `_kernelrpc_mach_vm_map_trap` (15). Its other paths make further calls (magazine_large.c):
-    a large block grows in place with `vm_allocate` at the address after it (`_kernelrpc_mach_vm_allocate_trap`, 10;
-    `large_try_realloc_in_place`, libsyscall mach_vm.c); a freed one is marked with `madvise(MADV_CAN_REUSE)`
-    (system call 75) and kept in a cache of 16 entries (64 at 32 GiB or more), whose oldest is given back with
-    `mach_vm_deallocate` (12) when it is full (`free_large`); the table of large blocks grows by a new mapping and
-    gives the old one back with `mach_vm_deallocate` (`large_entries_grow_no_lock`); and a realloc that moves a
-    block copies with `vm_copy` past 2 MiB of data (magazine_malloc.c :592). CI run 44347657778's macos-15 job
-    killed a confined realloc of 3 MiB to 8 MiB at trap 12 (`deny(1) syscall-mach 12`; no crash report of that
-    process was kept, so not which path). confine_probe now checks the server's own shapes, each done confined:
+    xnu). Those traps were measured on macOS 27.2, whose allocator for wick-fsd is xzone (crash reports of a killed
+    server show `_xzm_*` frames; the probe's `malloc_engaged_secure_allocator()` is 1). A zone found by a block's
+    address does not say which: `malloc_zone_from_ptr` gives the default zone's wrapper, `virtual_default_zone`
+    (version 10, libmalloc malloc.c), on every major, so the probe's first record line, "DefaultMallocZone, version
+    10" on both 27.2 and 15, named the wrapper; it now prints the engaged allocator instead. macOS 15's
+    libmalloc-715.140.5 picks the magazine allocator for a binary that is not the platform's unless its
+    `SecureAllocator` feature flags say otherwise (malloc.c :700 to :727), and CI's crash reports on macOS 15.8.2
+    show it (`szone_malloc_should_clear`). There a block past 32 KiB is medium up to 8 MiB where the medium
+    allocator is engaged, which on arm64 is always (malloc.c :357; on x86_64 only at 32 GiB of memory or more,
+    thresholds.h), so every block of the server's (a frame is at most 1 MiB + 4 KiB) is medium on the Apple silicon
+    Macs wick runs on, and large (past 32 KiB, magazine_large.c) only on an x86_64 Mac, which wick does not run on.
+    A medium block comes from a region of 128 MiB (magazine_medium.c :2448, `mvm_allocate_pages` aligned to
+    2^27), mapped with `_kernelrpc_mach_vm_map_trap` (15); when the mapping lands above the entropic limit, libmalloc
+    gives it back with `mach_vm_deallocate` (`_kernelrpc_mach_vm_deallocate_trap`, 12) and maps again 256 MiB lower
+    (vm.c :245, `mvm_allocate_plat`): so trap 12 comes with a new region, whenever one is made, not with a free.
+    The large paths make further calls (magazine_large.c): a large block grows in place with `vm_allocate` at the
+    address after it (`_kernelrpc_mach_vm_allocate_trap`, 10; `large_try_realloc_in_place`, libsyscall mach_vm.c);
+    a freed one is marked with `madvise(MADV_CAN_REUSE)` (system call 75) and kept in a cache of 16 entries (64 at
+    32 GiB or more), whose oldest is given back with `mach_vm_deallocate` (12) when it is full (`free_large`); the
+    table of large blocks grows by a new mapping and gives the old one back with `mach_vm_deallocate`
+    (`large_entries_grow_no_lock`); and a realloc that moves a block copies with `vm_copy` past 2 MiB of data
+    (magazine_malloc.c :592). CI run 44347657778's macos-15 job killed a confined realloc of 3 MiB to 8 MiB at trap
+    12 (`deny(1) syscall-mach 12`; no crash report of that process was kept, so not which path). confine_probe now checks the server's own shapes, each done confined:
     a zeroed block of the largest frame (1 MiB + 4 KiB) allocated and freed, a buffer grown by appends to it (the last
     growth to 2 MiB), a realloc of 256 KiB to it, the node tables grown entry by entry to their cap (2^18 nodes,
     each growth a new table and the old one freed: the largest, the node map, is 2^19 buckets of its entry), and
     96 large blocks of the server's sizes held and freed (past the cache); each runs again under the profile with
     every unlisted call allowed and reported, and the probe prints Seatbelt's reports by the case's pid, with the
-    allocator on record (the zone of a 3 MiB block, its version, `MallocReportConfig`'s lines, the memory size).
+    allocator on record (the engaged allocator, `MallocReportConfig`'s lines, the memory size and architecture).
     The realloc of 3 MiB to 8 MiB is on record only. On macOS 27.2 (xzone) a zeroed block of the largest frame was
     killed at `madvise` (`deny(1) syscall-unix 75`) in 7 of 8 runs, and its reporting run reported `allow
     syscall-unix 75`; the control (`task_info`, an unlisted MIG routine) reports `allow syscall-mig 195`. What
@@ -1140,8 +1149,32 @@ it means layer 1 let the request through.
     times under the reporting profile, the union of what they report printed.
     `test_a_confined_server_answers_large_reads_again_and_again` (requests.rs) reads 1 MiB 64 times from a confined
     server, which must stay up and answer each with the file's bytes; without the entry it was killed at its second
-    READ. macOS 15's report (its magazine also calls `vm_allocate` and `mach_vm_deallocate`, traps 10 and 12) comes
-    from CI, and those traps go into the profile only with it. Seatbelt does not check the number of some calls at all (Firecracker's
+    READ. macOS 15's report came from CI run 44362564244 (95ea43f9, macOS 15.8.2, an arm64 runner of 7.5 GiB): every
+    allocator shape reported trap 12 and nothing else unlisted, in 1 to 4 of its 4 runs (the node tables in all 4),
+    and four of the five were killed at it confined; the realloc past 2 MiB reported it too; a confined server of
+    requests.rs was killed at it in `Session::read`'s `vec![0u8; want]` (crash report: `mach_vm_deallocate` ←
+    `mvm_allocate_pages_plat` ← `medium_malloc_should_clear`). So `_kernelrpc_mach_vm_deallocate_trap` (12) is in
+    `MACH_TRAPS`, by its `MSC_` name, on every major: the name is defined on macOS 15, 26 and 27 (Firecracker's
+    profile lists it unconditionally and compiles in the macos-seatbelt jobs on macos-15 and macos-26, and here on
+    27.2), and the trap acts on the caller's own task only (xnu-11417 osfmk/ipc/mach_kernelrpc.c :77,
+    `port_name_to_current_task_noref`, as every `_kernelrpc_mach_vm_*_trap`). `vm_allocate` (10) is not: no run has
+    reported it (the server's blocks are not large on Apple silicon). What each major's allocator was measured to
+    call, beyond `_kernelrpc_mach_vm_map_trap` and `mach_msg2_trap`:
+
+    | macOS | Allocator, and the class of the server's blocks | Calls the server's shapes make | Measured by |
+    | --- | --- | --- | --- |
+    | 15.8.2 (24H232), arm64, 7.5 GiB (CI's macos-15) | magazine (crash reports' `szone_*` frames); medium, as on every Apple silicon Mac whatever its memory | trap 12 (a new medium region); `madvise` not on record (allowed before the run) | CI run 44362564244: confine_probe's reports, crash reports of the probe and of confined servers |
+    | 26.7.2 (CI's macos-latest) | not on record yet | not on record yet (its fs job passed at de8805f4, before the allocator shapes) | the next CI run's confine_probe |
+    | 27.2, arm64 (here) | xzone (crash reports' `_xzm_*` frames) | `madvise` (75, `MADV_ZERO` on a reused zeroed block); `mach_vm_reallocate` where defined | the C allocation program (c15/sbx/alloc.c), confine_probe, requests.rs |
+
+    The size class depends on the machine (architecture and memory, above), so a user's Mac and a runner can
+    differ; the probe prints both with its reports. The same run's crash reports show a second kill on macOS 15,
+    not an allocator's, which the probe's shapes do not make: `deny(1) syscall-unix 202` (`sysctl`) in
+    `fdopendir` (`__sysctl` ← `sysctlbyname` ← `__opendir_common`), in links.rs and requests.rs. Libc's
+    `__opendir_common` reads `kern.secure_kernel` once per process (`__kernel_supports_unionfs`, a static filled on
+    first use; gen/FreeBSD/opendir.c in Libc-1669 to 1725, macOS 15 and macOS 26.0 to 26.3; gone from Libc-1752,
+    macOS 26.4 on, and from 27.2 here). Not handled at this commit: there a confined server is killed at its first
+    READDIR, or its first search of a directory for a name a node no longer keeps (`HostDir::search`). Seatbelt does not check the number of some calls at all (Firecracker's
     `UNFILTERED_SYSCALLS` in `overlay/vmm/ext/sandbox.rs`: `openat`, `close`, `write`, `pwrite`, `fchmod`,
     `fsetxattr`, `fremovexattr`, `linkat`, `unlinkat` among those wick-fsd makes); for those the file rules decide.
     `fcntl`'s command is checked too (`system-fcntl`, below).

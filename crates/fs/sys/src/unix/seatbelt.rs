@@ -370,38 +370,20 @@ pub mod probe {
         if kr == 0 { Ok(()) } else { Err(HostErrno(kr)) }
     }
 
-    /// The malloc zone a block of `len` bytes comes from: its name and
-    /// version (`malloc_zone_from_ptr`, `malloc_get_zone_name`, <malloc/malloc.h>;
-    /// the version is the field after the 13 pointers that begin
-    /// `malloc_zone_t`). The block is freed again.
-    pub fn zone_of_a_large_block(len: usize) -> (String, u32) {
-        #[repr(C)]
-        struct Zone {
-            fields: [*const libc::c_void; 13],
-            version: u32,
-        }
+    /// Which allocator libmalloc engaged in this process:
+    /// `malloc_engaged_secure_allocator()` (1 for xzone, 0 for the magazine)
+    /// and `malloc_engaged_nano()` (the nano version, 0 for none), both
+    /// exported by libsystem_malloc (malloc.c, libmalloc-715.140.5 and
+    /// 812.100.31). A zone found by a block's address cannot tell: for the
+    /// default zone's blocks `malloc_zone_from_ptr` gives the wrapper
+    /// `virtual_default_zone` (version 10) whatever allocator it wraps.
+    pub fn engaged_allocator() -> (c_int, c_int) {
         unsafe extern "C" {
-            fn malloc_zone_from_ptr(ptr: *const libc::c_void) -> *const Zone;
-            fn malloc_get_zone_name(zone: *const Zone) -> *const c_char;
+            fn malloc_engaged_secure_allocator() -> c_int;
+            fn malloc_engaged_nano() -> c_int;
         }
-        let block = vec![1u8; len];
-        // SAFETY: a live block; the zone, when found, is libmalloc's, valid
-        // for the process's life, and its name a C string or null.
-        let (name, version) = unsafe {
-            let zone = malloc_zone_from_ptr(block.as_ptr().cast());
-            if zone.is_null() {
-                return ("none".into(), 0);
-            }
-            let name = malloc_get_zone_name(zone);
-            let name = if name.is_null() {
-                "unnamed".to_string()
-            } else {
-                std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
-            };
-            (name, (*zone).version)
-        };
-        drop(std::hint::black_box(block));
-        (name, version)
+        // SAFETY: neither takes an argument; each reads libmalloc's state.
+        unsafe { (malloc_engaged_secure_allocator(), malloc_engaged_nano()) }
     }
 
     /// `bootstrap_look_up` of `service` from launchd: a message to the
