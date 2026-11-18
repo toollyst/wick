@@ -1174,6 +1174,23 @@ has the per-control details and results.
 Until these are done, **do not run untrusted multi-tenant workloads on macOS or Windows hosts.** On Linux, wick is
 upstream Firecracker and its jailer.
 
+- **Windows: the guest may be given a userfaultfd page while its fill is in progress (a known defect, not fixed).**
+  Measured: in CI's windows job on 2f5decff, SWAPSTRESS round 87
+  (`test_a_chunk_swapped_under_a_vcpu_and_a_host_writer_keeps_their_memory`; docs/COMPATIBILITY.md, the
+  `mem_backend: Uffd` row), the guest read 0 from a page whose fill a host thread's fault had begun, with no vCPU
+  exit at that page, where the page could only hold the fill's content or the host thread's write. By source: a
+  fill commits the page through the guest's view with `PAGE_NOACCESS` before it writes the content through the
+  range's alias, and opens the guest's view after (`windows_uffd::fill`, `windows_mm::uffd_commit`, since 74108a7b);
+  the measurement that WHP honours `PAGE_NOACCESS` (docs/ROADMAP.md) covered pages closed by `VirtualProtect`, and
+  SECTREC-h, which settled the order, read a page committed no-access through one view by `VirtualQuery` alone,
+  with no access through that view and none by a guest. Not measured yet: whether WHP maps such a page in that
+  window, whether a guest write made there is lost under the fill's content, and whether a host thread's access
+  through the guest's view is held (`test_an_access_during_a_fill_waits_for_the_pages_content`, which holds a fill
+  between its commit and its content, and `test_a_page_committed_closed_through_the_guests_view_on_record`; first
+  run: CI). On Linux `UFFDIO_COPY` copies the page before it sets the page's entry (v6.1 mm/userfaultfd.c
+  `mcopy_atomic_pte`), and an access to it waits in `handle_userfault` until then. Affected: Windows hosts only; a
+  snapshot restored with `mem_backend: Uffd`, and the pages a discard (balloon inflation, free page reporting) makes
+  missing again on such a guest. No wick release contains it. The fix is chosen once those two tests have run.
 - **Windows: the page tables of a userfaultfd fill are charged to the VMM's job, where Linux charges them to the
   filling process's cgroup.** Measured on Linux 7.0.0-1017-gcp (Ubuntu 24.04, cgroup v2, the VMM's cgroup at memory.max 64M and
   memory.swap.max 0, a 64 GiB registered mapping filled by a handler process with `UFFDIO_COPY`, three runs of each
