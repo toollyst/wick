@@ -257,8 +257,22 @@ names: the operator's, and other jails'. So is a bind link's backing file, which
 - **What stays after a jail, on every name of a hard-linked file.** This is a standing property, the operator's name
   included:
   - The last jail directory's inherited entries stay: the system, the administrators and the user. The jails'
-    entries of their own are gone, and the file's own entries are as before.
-  - The jail's label, integrity level `0x1800` with no write, read or execute up, stays as well.
+    entries of their own are gone, and the file's own entries are as before. Measured on the operator's name
+    (`jailer-test.ps1 shared`'s first CI run; docs/COMPATIBILITY.md, `--chroot-base-dir` row): `(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)` after, where the file had the `files`
+    directory's `(A;ID;FA;;;BA)(A;ID;FA;;;SY)(A;ID;0x1200a9;;;BU)` before (`jailer-test.ps1 shared`).
+  - The jail's label, integrity level `0x1800` with no write, read or execute up, is expected to stay as well: the
+    jail's root passes it down (`OICI`). Not measured yet. The stage's first run recorded no label: the stage
+    looked for icacls's `Mandatory` line, and icacls names a label by its level's account name, which `0x1800`
+    (`S-1-16-6144`) is not a well-known one to have, so the line cannot tell an unnamed label from none. The stage
+    now reads the label as SDDL with `GetNamedSecurityInfoW` before, while all three jails run, and after, and
+    prints the label read while they run beside the integrity level of A's and B's tokens (first run: CI).
+  - Why it matters: the jails wrote the file in that run (the guest through its drive, A and B from inside), and a
+    file without a label counts as medium, which a process below medium may not write
+    ([Microsoft Learn, Mandatory Integrity Control](https://learn.microsoft.com/windows/win32/secauthz/mandatory-integrity-control)).
+    The record tells the cases apart. A label of `S-1-16-6144` with the tokens at 6144: the root's label reached
+    the file, and the write passed MIC at an equal level. No label with the tokens at 6144: MIC did not stop a write
+    up to this file, for a reason not known yet, and the bind-link note below, that the jail cannot write a backing
+    file without a label, loses its ground too. Tokens above 6144: the jail's level is not what the jailer sets.
 
   On Linux, too, a hard-linked inode has one owner and one mode for all its names, so an operator's chown to a
   jail's uid holds for every name. What differs is the label. Mandatory Integrity Control is checked before the DACL,
@@ -277,8 +291,8 @@ names: the operator's, and other jails'. So is a bind link's backing file, which
   after the jail (`jailer-test.ps1 bindlink`, never run). A read-write drive through a bind link probably cannot
   work: the backing file keeps its own label (none, so it is treated as medium), and the jail's token, below medium,
   cannot write up to it. Not measured: the bindlink stage has never run, and its drives are read-only.
-- **Test: `jailer-test.ps1 shared`, in CI's windows-guest job.** Not run yet. One file is hard-linked into three
-  jails at once:
+- **Test: `jailer-test.ps1 shared`, in CI's windows-guest job.** Passed on its first run (Windows Server 2025
+  Datacenter build 26100.33674; the run is in docs/COMPATIBILITY.md's `--chroot-base-dir` row). One file is hard-linked into three jails at once:
   - V, a jailed guest's read-write drive;
   - A and B, two jailed probes, started while V runs.
 
@@ -287,11 +301,16 @@ names: the operator's, and other jails'. So is a bind link's backing file, which
     SID;
   - the guest writes the file before A and B start, and writes and reads it after;
   - from inside A and B, writing is allowed, and opening the file for `WRITE_DAC`, for `WRITE_OWNER`, and for
-    `DELETE` through the operator's name are refused. The stage's line quotes the codes. `DELETE` through the jail's
-    own name is printed and not checked: Windows grants it through the root's `FILE_DELETE_CHILD`, and it removes the
-    jail's name only;
+    `DELETE` through the operator's name are refused. `DELETE` through the jail's own name is printed and not
+    checked: Windows grants it through the root's `FILE_DELETE_CHILD`, and it removes the jail's name only;
   - after all three end, no jail SID is left and the file's own entries and owner are as before. The stage's line
     records the inherited entries and the label as they are then.
+
+  That run measured, in A and in B alike: writing allowed; `WRITE_DAC` denied, `WRITE_OWNER` denied and
+  `DELETE` by the operator's name denied, each "Access is denied. (os error 5)"; `DELETE` by the jail's own name
+  (not checked) allowed. While all three ran, one `0x12019f` entry per jail SID and no inherited entry of a jail
+  SID; after, no jail SID left. The guest's writes before and after A's and B's starts reached the file and read
+  back.
 
 **WHP under the jail's SID alone.** `fs-probe whp-token` in CI's windows-guest job (Windows Server 2025 build 26100;
 the runs are in docs/COMPATIBILITY.md's `--chroot-base-dir` row, the first record and the variants record; the

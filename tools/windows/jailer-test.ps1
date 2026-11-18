@@ -1677,7 +1677,30 @@ function Stage-Boot {
 # a chroot the jail owns. After all three end, no entry of any jail's SID is
 # left and the file's own entries are as before; its inherited entries and
 # its label are the last jail directory's, on every name of it (recorded in
-# the stage's line, docs/windows-jail-reach.md).
+# the stage's line, docs/windows-jail-reach.md). The label is read as SDDL,
+# and the one read while the jails run is printed beside A's and B's token
+# integrity levels: whether the jails' writes passed MIC at the label's level
+# or the file had none.
+# A file's mandatory label as SDDL (`S:...`), read with GetNamedSecurityInfoW
+# (LABEL_SECURITY_INFORMATION, which needs READ_CONTROL alone), or the error.
+# icacls names a label by its level's account name, and the jail's level,
+# S-1-16-6144, is not a well-known one (Microsoft Learn, Well-known SIDs).
+Add-Type -Namespace WickJailerTest -Name Label -MemberDefinition @'
+[DllImport("advapi32.dll", CharSet = CharSet.Unicode)] public static extern uint GetNamedSecurityInfoW(string name, int type, uint info, System.IntPtr owner, System.IntPtr group, System.IntPtr dacl, System.IntPtr sacl, out System.IntPtr sd);
+[DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(System.IntPtr sd, uint revision, uint info, out System.IntPtr text, out uint len);
+[DllImport("kernel32.dll")] public static extern System.IntPtr LocalFree(System.IntPtr p);
+public static string Of(string path) {
+    System.IntPtr sd;
+    uint rc = GetNamedSecurityInfoW(path, 1, 0x10, System.IntPtr.Zero, System.IntPtr.Zero, System.IntPtr.Zero, System.IntPtr.Zero, out sd);
+    if (rc != 0) { return "GetNamedSecurityInfoW error " + rc; }
+    try {
+        System.IntPtr text;
+        uint len;
+        if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, 0x10, out text, out len)) { return "ConvertSecurityDescriptorToStringSecurityDescriptorW error " + Marshal.GetLastWin32Error(); }
+        try { string s = Marshal.PtrToStringUni(text); return s.Length == 0 ? "none" : s; } finally { LocalFree(text); }
+    } finally { LocalFree(sd); }
+}
+'@
 function Stage-Shared {
     $base = New-Base 'shared'
     $probe = Get-Probe
@@ -1689,6 +1712,7 @@ function Stage-Shared {
     $owner = { param($sddl) ($sddl -replace 'D:.*$', '') }
     $jailSid = 'S-1-9-\d+-\d+-\d+-\d+'
     $before = (Get-Acl $data).Sddl
+    $labelBefore = [WickJailerTest.Label]::Of($data)
     # Reads `n` bytes of the file at `at` as text, beside the jails that hold it.
     $peek = { param($at, $n)
         $s = [IO.File]::Open($data, 'Open', 'Read', 'ReadWrite'); $b = New-Object byte[] $n
@@ -1705,12 +1729,13 @@ function Stage-Shared {
         Check ((& $peek 0 11) -eq "V1-$tag") "the guest's first write did not reach the file: '$(& $peek 0 11)'"
         # A and B: jailed probes on the same file, started one after the other.
         $results = [ordered]@{}
+        $tokens = [ordered]@{}
         foreach ($id in 'a', 'b') {
             $root = Join-Path $base "jail-probe.exe\$id\root"
             New-Item -ItemType Directory -Force -Path $root | Out-Null
             New-Item -ItemType HardLink -Path (Join-Path $root 'data.img') -Target $data | Out-Null
             $out = Join-Path $WorkDir "shared-$id.txt"
-            $checks = "write:/data.img dacl:/data.img owner:/data.img `"deleteopen:$data`" deleteopen:/data.img wait:120"
+            $checks = "token write:/data.img dacl:/data.img owner:/data.img `"deleteopen:$data`" deleteopen:/data.img wait:120"
             $j = Start-Process $Jailer -ArgumentList "--id $id --exec-file `"$probe`" --uid 0 --gid 0 --chroot-base-dir `"$base`" -- $checks" -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
             $null = $j.Handle
             $jailers += $j
@@ -1727,11 +1752,13 @@ function Stage-Shared {
                 $r = & $got $c
                 Check ($r -match '^denied ') "jail ${id}: $c is $r (refused expected)"
             }
+            $tokens[$id] = & $got 'token'
             $results[$id] = "WRITE_DAC $(& $got 'dacl:/data.img'); WRITE_OWNER $(& $got 'owner:/data.img'); DELETE by the operator's name $(& $got "deleteopen:$data"); DELETE by the jail's own name (not checked) $(& $got 'deleteopen:/data.img')"
         }
         # All three run: one entry of its own per jail, 0x12019f, and no
         # inherited entry of any jail's SID.
         $during = (Get-Acl $data).Sddl
+        $labelDuring = [WickJailerTest.Label]::Of($data)
         $mine = @(& $own $during | Where-Object { $_ -match ";;;$jailSid$" })
         $sids = @($mine | ForEach-Object { ($_ -split ';')[5] } | Sort-Object -Unique)
         Check ($mine.Count -eq 3 -and $sids.Count -eq 3) "while V, A and B run, the file holds $($mine.Count) entries of their own for $($sids.Count) jail SIDs, not one each for three: $during"
@@ -1753,9 +1780,8 @@ function Stage-Shared {
         $after = (Get-Acl $data).Sddl
         Check ($after -notmatch $jailSid) "an entry of a jail's SID is left on the file after the jails: $after"
         Check (((& $own $after) -join '') -eq ((& $own $before) -join '') -and (& $owner $after) -eq (& $owner $before)) "the file's own entries or owner changed: before [$before] after [$after]"
-        $label = ((icacls $data) | Where-Object { $_ -match 'Mandatory' }) -join ' '
-        if (-not $label) { $label = 'icacls printed no label line' }
-        "a file hard-linked into three jails at once (a guest's read-write drive, two probes): one entry of its own per jail SID, 0x12019f, no inherited jail entry while all run; the guest wrote it before and wrote and read it after the others started; A: $($results['a']); B: $($results['b']); after: no jail SID left, own entries as before; inherited entries and label now the last jail directory's on every name: $after label [$label] (before: $before)"
+        $labelAfter = [WickJailerTest.Label]::Of($data)
+        "a file hard-linked into three jails at once (a guest's read-write drive, two probes): one entry of its own per jail SID, 0x12019f, no inherited jail entry while all run; the guest wrote it before and wrote and read it after the others started; A: $($results['a']); B: $($results['b']); after: no jail SID left, own entries as before; inherited entries and label now the last jail directory's on every name: $after label $labelAfter (before: $before label $labelBefore); while all ran, the file's label $labelDuring beside the jails' tokens (A: $($tokens['a']); B: $($tokens['b']))"
     } finally {
         Stop-Jailers $jailers
         Stop-Jailed

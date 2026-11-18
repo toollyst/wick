@@ -1401,10 +1401,11 @@ upstream Firecracker and its jailer.
     file. By the documented check of restricted tokens, a jail could then have rewritten the DACL of a file that
     other jails and the operator hold, taken ownership of it or deleted it. Not exercised.
   - **What stays after a jail.** A hard-linked file keeps the last jail directory's inherited entries (the system,
-    the administrators, the user) and the jail's label, integrity level `0x1800`, on every name of it, the
-    operator's included. On Linux, an inode's owner and mode are likewise one for all its names. Copy what must keep
+    the administrators, the user), on every name of it, the operator's included (`jailer-test.ps1 shared`; docs/COMPATIBILITY.md,
+    `--chroot-base-dir` row). The jail's label, integrity level `0x1800`, is expected to stay too; not measured yet (first run
+    of the stage's label record: CI). On Linux, an inode's owner and mode are likewise one for all its names. Copy what must keep
     its security; hard-link only what is the jails' to share.
-  - **Test:** `jailer-test.ps1 shared` (three jails on one file; not run yet) and
+  - **Test:** `jailer-test.ps1 shared` (three jails on one file; passed on its first CI run: from inside two jails `WRITE_DAC`, `WRITE_OWNER` and `DELETE` by the operator's name each "Access is denied. (os error 5)") and
     `test_a_file_shared_by_two_jails_keeps_both`.
   - **Details:** [docs/windows-jail-reach.md](docs/windows-jail-reach.md), "Files a jail shares".
 - **Windows jailer: a parent cgroup's name is not the jail's to take.** A `--parent-cgroup` is a named Job Object
