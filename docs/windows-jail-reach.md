@@ -62,20 +62,24 @@ In short:
 - **In CI, the record stage.** `jailer-test.ps1 reach` makes the same record with the jailer's own spawn on CI's
   windows-guest runner (Windows Server 2025 build 26100, with Hyper-V): `jail-probe reachlist` (the operator) lists
   every named object, pipe and mailslot into the jail's root, and `jail-probe reach`, after Firecracker's preload and
-  `RevertToSelf`, opens each as `devjail` does (`tools/windows/jail-reach.rs`, the same code) and runs the checks
-  that are not names (a DLL loaded and HKLM read after the revert, TCP to loopback, the link-local metadata address
-  and 8.8.8.8:53, an AF_UNIX bind, a pipe and a mailslot made, the pipes listed). Its output, one `reach` line per
-  name reached and a `reach-summary` per type, is the format the fix's allowlist will read; it asserts nothing yet;
-  the fix makes it an assertion against one exact allowlist. Then `jail-probe smb` opens this host's own files and
-  pipes through the network redirectors, which no device security guards beneath their names (`\Device\Mup` and
+  `RevertToSelf`, opens each as `devjail` does (`tools/windows/jail-reach.rs`, the same code) and runs the checks that
+  are not names (a DLL loaded and HKLM read after the revert, TCP to loopback, the link-local metadata address and
+  8.8.8.8:53, an AF_UNIX bind, a pipe and a mailslot made, the pipes listed). Its output, one `reach` line per name
+  reached and a `reach-summary` per type, is the format the fix's allowlist will read; it asserts nothing yet; the fix
+  makes it an assertion against one exact allowlist. Then `jail-probe smb` opens this host's own files and pipes
+  through the network redirectors, which no device security guards beneath their names (`\Device\Mup` and
   `\Device\RdpDrPort` have no `FILE_DEVICE_SECURE_OPEN`): `C$\Windows\win.ini` by 127.0.0.1, `localhost` and the
-  computer's name, `ADMIN$`, `IPC$` and its `srvsvc` pipe, the same through `\Device\LanmanRedirector` and a UNC
-  name, and the RDP client drives (`tsclient`), each line the NTSTATUS or the access granted and a read. It runs as
-  the operator (the control: which of them this host serves itself), in the jail, and in the jail with `--netns`,
-  whose filters are the jail's token's while the redirector's connection is the system's; with the server service's
-  state and the shares. Whether a redirector carries the jail's open to the host's shares with the user's
-  credentials is what it records, under each token. The records are kept for CI's upload (`reach-record.txt`,
-  `reach-objects.txt`). First run: CI.
+  computer's name, `ADMIN$`, `IPC$` and its `srvsvc` pipe, the same through `\Device\LanmanRedirector` and a UNC name,
+  and the RDP client drives (`tsclient`), each line the NTSTATUS or the access granted and a read. It runs in the jail
+  with `--netns` first, whose filters are the jail's token's while the redirector's connection is the system's, then
+  in the jail, then as the operator, the control, last (which of them this host serves itself), with the server
+  service's state and the shares. A restricted token shares the operator's logon session, so a jailed open could reuse
+  an SMB connection the operator's made; the order keeps any run from finding one this stage made, and the client's
+  connections are recorded before each run and after the `--netns` run and the control: a reused connection, or one a
+  `--netns` run made, is on the record. The record of the first order (the operator first) could not tell a jailed
+  open that made its own connection from one that reused the operator's. Whether a redirector carries the jail's open
+  to the host's shares with the user's credentials is what it records, under each token. The records are kept for CI's
+  upload (`reach-record.txt`, `reach-objects.txt`). First run: CI.
 
 ## What the jail reaches
 
@@ -577,7 +581,15 @@ to when the partition is made. What it brings, and what the next record (`jail-v
    unknown of correctness, not of isolation.
 3. The jailer change, and a stage of `tools/windows/jailer-test.ps1` that fails when the jailed token opens a device
    outside an explicit list, any ALPC port or service pipe, or can make a pipe or a mailslot. Every jailer-test
-   configuration is run again.
+   configuration is run again. Before it, the stages whose controls read a file outside the jail read one the
+   operator gave the jail's SID alone (`isolation`, `links`: jailer-test.ps1's `Invoke-JailedWithGrant`), not
+   one every process may read, so that they hold under both tokens; `isolation` records the read of
+   `C:\Windows\win.ini` without asserting it; `nofile`'s probe opens a file of its own in its root, not `NUL`, a
+   device the jail's SID alone did not open in the fourth record. Checked in the code and holding under both already: `handoff` (the
+   file the jailed process holds is in its root), `netns` (each jail's directory of the network grants its SID, the
+   network directory is crossed by the traversal privilege the jail keeps), `shared`, `restart` and `bindlink`
+   (a file hard-linked into the root gets an entry for the jail's SID from the jailer); every other stage hands the
+   jail only paths in its root.
 4. This page and SECURITY.md updated with the commit that fixes it and the numbers measured again.
 
 ## Not measured yet

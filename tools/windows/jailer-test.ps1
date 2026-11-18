@@ -794,12 +794,56 @@ function Test-Probe([string[]]$prefix, $expect) {
     $bad
 }
 
+# Runs the jailed probe (`--id id` under `base`) with `checks`, after the
+# operator gave each file of `grant`, outside the jail, a read entry for that
+# jail's SID and a protected DACL with no other entry a jail's token is
+# granted by (SYSTEM, the administrators and the user besides): a file of the
+# operator's that the jail may read, under the jail's token today and under
+# one restricted to the jail's SID alone (option P), where a file every
+# process may read (Users, Everyone) is not the jail's. The jail's SID is
+# read from its root's DACL once the jailer set it; the probe's first check,
+# `waitfor:/go`, holds its checks until the operator's go. Returns @(exit
+# code, output).
+function Invoke-JailedWithGrant([string]$base, [string]$id, [string[]]$grant, [string[]]$checks, [int]$ms = 30000) {
+    $probe = Get-Probe
+    $root = Join-Path $base "jail-probe.exe\$id\root"
+    $out = Join-Path $WorkDir "grant-$id.txt"
+    $argv = @('--id', $id, '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', 'waitfor:/go') + $checks
+    $line = ($argv | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
+    $p = Start-Process $Jailer -ArgumentList $line -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+    $null = $p.Handle
+    try {
+        $sid = $null
+        $t = [DateTime]::Now.AddSeconds(15)
+        while (-not $sid -and -not $p.HasExited -and [DateTime]::Now -lt $t) {
+            Start-Sleep -Milliseconds 100
+            $sddl = try { (Get-Acl $root -ErrorAction Stop).Sddl } catch { '' }
+            if ($sddl -match ';;;(S-1-9-\d+-\d+-\d+-\d+)\)') { $sid = $Matches[1] }
+        }
+        Check ($null -ne $sid) "the jail's SID did not appear on ${root}: $((Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join '')"
+        $user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        foreach ($f in $grant) {
+            $r = icacls $f /inheritance:r /grant:r "*${user}:(F)" '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' "*${sid}:(R)" 2>&1
+            Check ($LASTEXITCODE -eq 0) "giving $f a read entry for the jail's SID: $r"
+            $kept = (Get-Acl $f).Sddl
+            Check ($kept -notmatch ';;;(WD|BU|AU|IU|S-1-1-0|S-1-5-32-545|S-1-5-11|S-1-5-4)\)') "$f still grants a group of the jail's token: $kept"
+        }
+        Set-Content (Join-Path $root 'go') 'go'
+        if (-not $p.WaitForExit($ms)) { throw [Failure]::new("jailer did not exit: $line") }
+    } finally {
+        if (-not $p.HasExited) { Stop-Jailers @($p) }
+    }
+    @($p.ExitCode, ((Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join ''))
+}
+
 function Stage-Isolation {
     $probe = Get-Probe
     $base = New-Base 'isolation'
     $secret = Join-Path $env:USERPROFILE "wick-jailer-test-$PID.txt"
     Set-Content $secret 'secret'
     $outside = Join-Path $WorkDir "outside-$PID.txt"
+    $granted = Join-Path $WorkDir "granted-$PID.txt"
+    Set-Content $granted 'granted'
     try {
         $other = Start-JailedVm $base 'other'
         Wait-Shell $other
@@ -816,7 +860,7 @@ function Stage-Isolation {
         $expect = [ordered]@{
             "read:$secret"                                  = $false   # the user's files
             'read:C:\Windows\System32\config\SAM'           = $false
-            'read:C:\Windows\win.ini'                       = $true    # what every process may read
+            "read:$granted"                                 = $true    # a file outside given to the jail's SID
             "write:$outside"                                = $false   # outside the jail
             'write:C:\Users\Public\wick-jailer-test.txt'    = $false
             'write:own.txt'                                 = $true    # its own jail
@@ -827,16 +871,25 @@ function Stage-Isolation {
             "open:$PID"                                     = $false   # the operator
         }
         if ($explorer) { $expect["open:$explorer"] = $false }
-        $r = Invoke-Jailer (@('--id', 'probe', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--') + @($expect.Keys)) 30000
+        # What every process of the session may read: the jail's token today
+        # reads it through its Users and Everyone (SECURITY.md, the Windows
+        # jailer's reach), a token restricted to the jail's SID alone
+        # (option P) does not. Recorded here, asserted by neither: the
+        # control that the probe reads at all is the file given to the
+        # jail's SID, which holds under both.
+        $system = 'read:C:\Windows\win.ini'
+        $r = Invoke-JailedWithGrant $base 'probe' @($granted) (@($expect.Keys) + $system)
         $lines = $r[1] -split "`r?`n"
         $bad = @()
         foreach ($k in $expect.Keys) {
             $l = $lines | Where-Object { $_.StartsWith("$k ") } | Select-Object -First 1
-            if (-not $l) { $bad += "${k}: no answer"; continue }
+            if (-not $l) { $bad += "${k}: no answer ($($r[1].Trim()))"; continue }
             $allowed = $l.Substring($k.Length + 1).StartsWith('allowed')
             if ($allowed -ne $expect[$k]) { $bad += $l }
         }
         Check ($bad.Count -eq 0) "jailed: $($bad -join '; ')"
+        $systemLine = $lines | Where-Object { $_.StartsWith("$system ") } | Select-Object -First 1
+        Check ($null -ne $systemLine) "jailed: no answer to $system ($($r[1].Trim()))"
         # The operator reaches the jailed API socket.
         $op = & $probe "connect:$sock"
         Check ($op -match ' allowed$') "operator: $op"
@@ -844,9 +897,9 @@ function Stage-Isolation {
         # Its Firecracker: the jailer then exits and removes the drive.
         Stop-Alive (Get-Process firecracker | Where-Object { $_.Path -like "$base*\api\root*" })
         [void]$api.WaitForExit(10000)
-        "jailed: no user files, nothing outside its jail, no other jail, API socket or process (the operator's, another microVM's); the operator reaches the API socket ($($expect.Count) checks)"
+        "jailed: no user files, nothing outside its jail but the file given to its SID, no other jail, API socket or process (the operator's, another microVM's); the operator reaches the API socket ($($expect.Count) checks); recorded: $($systemLine.Trim())"
     } finally {
-        Remove-Item $secret, $outside, 'C:\Users\Public\wick-jailer-test.txt' -ErrorAction SilentlyContinue
+        Remove-Item $secret, $outside, $granted, 'C:\Users\Public\wick-jailer-test.txt' -ErrorAction SilentlyContinue
         Stop-Jailed
     }
 }
@@ -868,9 +921,16 @@ function Stage-Isolation {
 # `smb`: this host's files and pipes through the network redirectors
 # (\Device\Mup, \Device\LanmanRedirector, a UNC name, the RDP client drives
 # through \Device\RdpDrPort), which no device security guards beneath their
-# names: run by the operator (the control: which shares this host serves
-# itself), in the jail, and in the jail with --netns (elevated only: its
-# filters), with the server service's state and the shares, all recorded.
+# names. Three runs, in this order, so that none finds an SMB connection
+# another made (a restricted token shares the operator's logon session, so a
+# jailed open could reuse a connection the operator's made): in
+# the jail with --netns (elevated only: its filters) while this stage has
+# made no connection, then in the jail, then by the operator, the control,
+# last (which shares this host serves itself, so that a refusal is told from
+# a share it does not have). The SMB client's connections are recorded
+# before each run and after the --netns run and the control, so that a
+# connection a run reused, or one a --netns run made, is on the record, not
+# inferred. The server service's state and the shares are recorded too.
 # The records are kept as reach-record.txt and reach-objects.txt in the
 # work directory, which CI's upload takes. It asserts nothing of what is
 # reached, only that the record is whole: the list made, the jailed probe's
@@ -888,28 +948,56 @@ function Stage-Reach([string]$External = '8.8.8.8:53') {
     $listener.Start()
     try {
         $port = $listener.LocalEndpoint.Port
-        # The SMB control, outside any jail: whether this host serves its
-        # administrative shares to itself, so that a refusal in the jail is
-        # told from a share it does not have.
-        $server = try { "LanmanServer $((Get-Service LanmanServer -ErrorAction Stop).Status)" } catch { "LanmanServer: $($_.Exception.Message)" }
-        $shares = try { "shares: $(@(Get-SmbShare -ErrorAction Stop | ForEach-Object { $_.Name }) -join ', ')" } catch { "shares: $($_.Exception.Message)" }
-        $control = @(& $probe 'smb:0' | Where-Object { $_ } | ForEach-Object { "operator: $_" })
-        $r = Invoke-Jailer @('--id', 'r', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', 'smb:0', "reach:/objects.txt:${port}:$External") 900000
-        $lines = @($r[1] -split "`r?`n" | Where-Object { $_ })
-        foreach ($l in $lines) { Write-Host "     $l" }
-        # The same SMB opens in a jail with a network of its own: --netns's
-        # filters are the jail's token's, and a redirector's connection is
-        # the system's.
-        $netLines = if ($elevated) {
+        $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        # The SMB client's connections now, by Get-SmbConnection, or by
+        # `net use` where that cmdlet fails.
+        $conns = {
+            param([string]$when)
+            try {
+                $c = @(Get-SmbConnection -ErrorAction Stop | ForEach-Object { "\\$($_.ServerName)\$($_.ShareName) as $($_.UserName), dialect $($_.Dialect), $($_.NumOpens) opens" })
+                "smb-connections ${when}: $(if ($c.Count) { $c -join '; ' } else { 'none' }) (Get-SmbConnection)"
+            } catch {
+                $why = $_.Exception.Message
+                $u = @(net use 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -match '\\\\' } | ForEach-Object { ($_ -replace '\s+', ' ').Trim() })
+                "smb-connections ${when}: Get-SmbConnection: $why; net use: $(if ($u.Count) { $u -join '; ' } else { 'none' })"
+            }
+        }
+        # First, the jail with a network of its own: --netns's filters are
+        # the jail's token's, and a redirector's connection is the system's.
+        # The record is kept in the order things happened.
+        $record = @("smb-order: the jailed run with --netns, the jailed run, the operator's control")
+        $connLines = @()
+        if ($elevated) {
+            $connLines += & $conns 'before the --netns run'
+            $record += $connLines[-1]
             $net = Join-Path $base 'net'
             New-Item -ItemType Directory -Force -Path $net | Out-Null
             $n = Invoke-Jailer @('--id', 'n', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--netns', $net, '--', 'smb:0') 300000
-            @(@($n[1] -split "`r?`n" | Where-Object { $_ }) | ForEach-Object { "netns: $_" })
-        } else { @('netns: not run: not elevated (--netns adds Windows Filtering Platform filters)') }
+            $netLines = @(@($n[1] -split "`r?`n" | Where-Object { $_ }) | ForEach-Object { "netns: $_" })
+            $record += $netLines
+            $connLines += & $conns 'after the --netns run, before the jailed run'
+        } else {
+            $netLines = @('netns: not run: not elevated (--netns adds Windows Filtering Platform filters)')
+            $record += $netLines
+            $connLines += & $conns 'before the jailed run'
+        }
+        $record += $connLines[-1]
+        $r = Invoke-Jailer @('--id', 'r', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', 'smb:0', "reach:/objects.txt:${port}:$External") 900000
+        $lines = @($r[1] -split "`r?`n" | Where-Object { $_ })
+        $record += $lines
+        # Last, the control, outside any jail.
+        $connLines += & $conns "after the jailed run, before the operator's control"
+        $record += $connLines[-1]
+        $server = try { "LanmanServer $((Get-Service LanmanServer -ErrorAction Stop).Status)" } catch { "LanmanServer: $($_.Exception.Message)" }
+        $shares = try { "shares: $(@(Get-SmbShare -ErrorAction Stop | ForEach-Object { $_.Name }) -join ', ')" } catch { "shares: $($_.Exception.Message)" }
         $head = "operator: $server; $shares"
-        foreach ($l in @($head) + $control + $netLines) { Write-Host "     $l" }
+        $control = @(& $probe 'smb:0' | Where-Object { $_ } | ForEach-Object { "operator: $_" })
+        $record += @($head) + $control
+        $connLines += & $conns "after the operator's control"
+        $record += $connLines[-1]
+        foreach ($l in $record) { Write-Host "     $l" }
         # Kept for CI's upload (the stage's own directory goes when it passes).
-        Set-Content -Path (Join-Path $WorkDir 'reach-record.txt') -Value (@($head) + $control + $lines + $netLines)
+        Set-Content -Path (Join-Path $WorkDir 'reach-record.txt') -Value $record
         Copy-Item (Join-Path $root 'objects.txt') (Join-Path $WorkDir 'reach-objects.txt') -ErrorAction SilentlyContinue
         # Each SMB run's end line, and its opens, a form and a word each.
         $smbOf = {
@@ -927,7 +1015,7 @@ function Stage-Reach([string]$External = '8.8.8.8:53') {
         $summary = @($lines | Where-Object { $_.StartsWith('reach-summary ') } | ForEach-Object { $_.Substring('reach-summary '.Length) })
         Check ($summary.Count -gt 0) 'the jailed record has no reach-summary line'
         $checks = @($lines | Where-Object { $_.StartsWith('reach-check ') })
-        "a record under today's token, nothing asserted: the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks; SMB ($server; $shares): the operator $smbControl; jailed $smbJailed; jailed with --netns $smbNet"
+        "a record under today's token, nothing asserted: the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks; SMB ($server; $shares), in this order: jailed with --netns $smbNet; jailed $smbJailed; the operator $smbControl; $($connLines -join '; ')"
     } finally {
         $listener.Stop()
         Stop-Jailed
@@ -1078,16 +1166,18 @@ function Invoke-OnConsole([string]$cmd, [string]$out) {
 # files (the control); no entry in the directories above its root, so no
 # junction in place of the root or above. Needs no guest.
 function Stage-Links {
-    $probe = Get-Probe
     $base = New-Base 'links'
     $readable = Join-Path $WorkDir "links-readable-$PID.txt"
     try {
         $other = Start-ApiJail $base 'other'
         $otherFile = Join-Path $other.Root 'kernel.bin'
         Set-Content $otherFile "another jail's file"
+        # The operator's file the jail reads (given a read entry for the
+        # jail's SID, Invoke-JailedWithGrant: readable under the jail's token
+        # today and under one restricted to the jail's SID alone) and may
+        # not link, as Linux's protected_hardlinks refuses a link to a file
+        # its caller may read but not write (fs/namei.c, may_linkat).
         Set-Content $readable "the operator's file"
-        # Readable as C:\Windows\win.ini is: Users, Everyone, application packages.
-        icacls $readable /grant '*S-1-5-32-545:R' '*S-1-1-0:R' '*S-1-15-2-1:R' | Out-Null
         $root = Join-Path $base 'jail-probe.exe\probe\root'
         $parent = Split-Path -Parent $root
         $expect = [ordered]@{
@@ -1101,7 +1191,7 @@ function Stage-Links {
             "write:$(Split-Path -Parent $parent)\entry.txt"  = $false
             "write:$base\entry.txt"                          = $false   # the chroot base
         }
-        $r = Invoke-Jailer (@('--id', 'probe', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--') + @($expect.Keys)) 30000
+        $r = Invoke-JailedWithGrant $base 'probe' @($readable) @($expect.Keys)
         $lines = $r[1] -split "`r?`n"
         $bad = @()
         $denied = @()

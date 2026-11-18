@@ -1416,7 +1416,7 @@ upstream Firecracker and its jailer.
   - **Files and registry.** It reads the Windows directory, Program Files, files under ProgramData,
     `C:\Users\Public` or a data volume, and HKLM registry keys that grant one of the four groups read. Its integrity
     level, below medium, keeps it from writing those files and keys, and the user's own files stay denied
-    (`jailer-test.ps1 isolation`).
+    (`jailer-test.ps1 isolation`, which records its read of `C:\Windows\win.ini`).
   - **Devices, services and names, measured from inside a real jail on Windows Server 2022** (`fs-probe devjail`
     under the jailer):
     - 87 of the host's 174 device objects open, each driver's I/O-control code reached. Windows has no counterpart of

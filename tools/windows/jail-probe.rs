@@ -30,6 +30,7 @@
 //!                               dacl:<path> owner:<path> deleteopen:<path>
 //!                               reachlist:<file>
 //!                               reach:<file>:<port>:<ip>:<port> smb:0
+//!                               waitfor:<path>
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
@@ -517,13 +518,21 @@ fn check(c: &str) -> String {
             .and_then(|mut f| f.write_all(b"x"))),
         // A hard link (CreateHardLinkW), which needs write access to the
         // existing file's attributes.
-        // Opens <n> files (NUL) and keeps them, as many descriptors; says
-        // how many it opened, and why it stopped if it did.
+        // Opens <n> files and keeps them, as many descriptors; says how
+        // many it opened, and why it stopped if it did. One file of its
+        // own (in the current directory, a jail's root), opened <n> times,
+        // which holds under a token restricted to the jail's SID alone
+        // (option P): NUL, before, is a device, and the nine a token of the
+        // jail's SID alone opened in the fourth record do not include it
+        // (docs/windows-jail-reach.md).
         "files" => {
             let Ok(n) = arg.parse::<usize>() else { return "unknown check".into() };
+            if let Err(e) = std::fs::write("files.dat", b"files") {
+                return format!("denied making files.dat: {e}");
+            }
             let mut kept = Vec::new();
             for _ in 0..n {
-                match std::fs::File::open("NUL") {
+                match std::fs::File::open("files.dat") {
                     Ok(f) => kept.push(f),
                     Err(e) => return format!("denied after {}: {e}", kept.len()),
                 }
@@ -1259,6 +1268,20 @@ fn check(c: &str) -> String {
             // SAFETY: a handle we opened.
             unsafe { CloseHandle(h) };
             out
+        }
+        // Waits up to 60 s for the file `arg` to exist: the operator's
+        // go-ahead, made once it changed something for this jail (a file
+        // outside the jail given an entry for the jail's SID, which only
+        // exists once the jailer made it). `allowed` once it does.
+        "waitfor" => {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !std::path::Path::new(arg).exists() {
+                if std::time::Instant::now() > until {
+                    return "denied: not there after 60 s".into();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            "allowed".into()
         }
         // Waits `arg` seconds: a process for the others to act on.
         "wait" => {

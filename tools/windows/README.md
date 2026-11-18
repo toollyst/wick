@@ -58,15 +58,19 @@
   name reached and a `reach-summary` per type, the format the allowlist will
   read; then `jail-probe smb`, this host's administrative shares, `IPC$` and
   the `srvsvc` pipe through `\Device\Mup`, the LanMan redirector and a UNC
-  name, and the RDP client drives, opened by the operator, in the jail and in
-  the jail with `--netns`, each open's NTSTATUS or granted access recorded;
+  name, and the RDP client drives, opened in the jail with `--netns` first,
+  then in the jail, then by the operator (the control, last), each open's
+  NTSTATUS or granted access recorded, with the SMB client's connections
+  before each run and after the `--netns` run and the control;
   the records kept as `reach-record.txt` and `reach-objects.txt` in the work
   directory for CI's upload; `jail-reach.rs`). With a
   guest: `netguest` (frames through the endpoint in the jail's own directory of the network),
   `isolation` (`jail-probe.rs`, run through the jailer as the jailed binary,
   may not read the user's files or SAM, write files outside its jail, reach another
-  jail's files, API socket or process, or open the operator's; the operator
-  reaches the API socket), `boot` (a 2 vCPU guest in the jail), `restart` (a start with a file that is not a
+  jail's files, API socket or process, or open the operator's; it reads a file
+  outside the jail the operator gave its SID (the control, which holds under a
+  token restricted to the jail's SID alone too) and its read of
+  `C:\Windows\win.ini` is recorded; the operator reaches the API socket), `boot` (a 2 vCPU guest in the jail), `restart` (a start with a file that is not a
   kernel fails after its VM is made, and the second, with the kernel, boots in the same jailed Firecracker on the
   partition it parked before the jail's token and got back: 2 CPUs, init and its shell, its clock against the host's,
   SendCtrlAltDel ending the jailer with 0; its serial input is not read, as upstream's code leaves it, and the
