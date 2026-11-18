@@ -1397,7 +1397,12 @@ upstream Firecracker and its jailer.
     hypervisor's own translation caches, cannot be compared. A parked partition is only ever used again inside the
     same Firecracker process: the same jail, the same operator-given guest images and devices, the same principal.
     It is never handed between processes or jails, so whatever the hypervisor keeps inside it stays within one
-    trust domain; that is an unknown of correctness, not of isolation. Firecracker does not park yet.
+    trust domain; that is an unknown of correctness, not of isolation. A jailed Firecracker parks it in
+    `jail::enter`, before the revert, in the VMM process only (the API process makes no VM), and a park that fails
+    ends the start, named; without a jail it parks when it takes its API socket (`api_process::split`), and with
+    `--no-api` it makes its one VM's partition at the VM's creation, as before (a failed build ends the process).
+    Tests: `jailer-test.ps1 restart` and `boot-test.ps1 restart`, a start with a file that is not a kernel, then
+    one with the kernel, in the same Firecracker (first run: CI).
   - **The plan this replaces cannot be done.** ALL APPLICATION PACKAGES in place of the four groups:
     `CreateRestrictedToken` refuses it, ALL RESTRICTED APPLICATION PACKAGES and the `hypervisorPlatform`
     capability SID as restricting SIDs with error 87 (`fs-probe jail-variants`, `fs-probe whp-token`). WHP refuses

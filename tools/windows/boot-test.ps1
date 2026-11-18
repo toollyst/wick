@@ -4460,8 +4460,43 @@ function Stage-MemoryHotplug {
     return ("virtio-mem: MemTotal $base -> $($base + 512) MiB and back and again, 600 MiB written and read back while plugged, $numbers")
 }
 
+# A start that failed, tried again in the same Firecracker, as upstream
+# allows (PrebootApiController::start_microvm keeps the controller after a
+# failed InstanceStart). A file that is not a kernel fails at load_kernel,
+# after the VM, its vCPUs and its memory are made (vmm/src/builder.rs,
+# build_microvm_for_boot), so the VM is dropped: its partition, parked when
+# Firecracker took its API socket (vmm::ext::api_process::split; kvm-ioctls
+# whp/park.rs), is given back and checked against itself as parked, and the
+# second InstanceStart, with the kernel, boots on it. A partition that could
+# not be given back is said on a line (`wick: whp: ...`) and makes the
+# second start an error: either fails the stage. The jailed run of the same
+# is jailer-test.ps1's `restart`.
+function Stage-Restart {
+    $cfg = Base-Config 2
+    $vm = Start-Vm 'restart' $null -Api
+    $bad = Join-Path (Join-Path $Results 'restart') 'not-a-kernel'
+    [IO.File]::WriteAllBytes($bad, [byte[]]::new(65536))
+    Invoke-Api $vm 'PUT' '/boot-source' ([ordered]@{ kernel_image_path = $bad; boot_args = $cfg['boot-source'].boot_args }) | Out-Null
+    Invoke-Api $vm 'PUT' '/drives/rootfs' $cfg['drives'][0] | Out-Null
+    Invoke-Api $vm 'PUT' '/machine-config' $cfg['machine-config'] | Out-Null
+    $status = 0
+    $out = Invoke-ApiCall $vm 'PUT' '/actions' '{"action_type":"InstanceStart"}' 120000 ([ref]$status)
+    Check ($status -eq 400 -and $out -match 'kernel') "the start with a file that is not a kernel: $status $out"
+    $said = $vm.Output + "`n" + (Get-Content -Raw $vm.LogPath -ErrorAction SilentlyContinue)
+    $lines = @($said -split "`n" | Where-Object { $_ -match 'wick: whp: (the partition made at|this process)' })
+    Check ($lines.Count -eq 0) "the partition after the failed start: $($lines -join ' | ')"
+    Invoke-Api $vm 'PUT' '/boot-source' $cfg['boot-source'] | Out-Null
+    Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'InstanceStart' }) | Out-Null
+    Wait-Shell $vm
+    $out = $vm.Sh('echo $((6*7)) $(nproc)')
+    Check ($out -eq '42 2') "the guest of the second start: '$out'"
+    $vm.Reboot()
+    return 'a start with a file that is not a kernel failed (400) after its VM was made; the second, with the kernel, booted 2 vCPUs in the same Firecracker on the partition given back'
+}
+
 $Stages = [ordered]@{
     boot     = { Stage-Boot }
+    restart  = { Stage-Restart }
     smp      = { Stage-Smp }
     block    = { Stage-Block }
     vsock    = { Stage-Vsock }

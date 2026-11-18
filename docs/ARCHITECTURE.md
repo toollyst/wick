@@ -306,7 +306,13 @@ next VM, as upstream lets a failed `InstanceStart` be tried again: its vCPUs del
 running, the four properties written back, then every property and the mapped-page counters read back and compared
 with the partition as parked. A difference, or a step that fails, deletes it, and the next VM is a named error
 saying to start the process again, as is a second VM while the first holds it. The partition is never handed to
-another process or jail. Firecracker does not park yet.
+another process or jail. A jailed Firecracker parks in `jail::enter`, before the revert, in the VMM process only;
+without a jail, when it takes its API socket (`api_process::split`), after its arguments are parsed. With `--no-api`
+and no jail it makes its one VM's partition when the VM is made, as before: a failed build ends that process, so it
+never makes a second. Parking moves work earlier and adds none to a VM that boots: the register probe and the
+partition, about 6 ms, which a process that never boots pays (`fs-probe whp-token`'s option P record; in CI's WHP
+step, PARKREC, and the idle jailed Firecracker against its API process, PARKIDLE in `jailer-test.ps1 restart`;
+first run: CI).
 
 ## The POSIX layer on Windows
 

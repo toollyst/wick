@@ -138,6 +138,9 @@ pub enum JailError {
     StillPrivileged(String),
     /// Failed to revert to the jail's token: {0}
     Revert(std::io::Error),
+    /// Failed to make the VM's partition before the jail locks down ({0}): a jailed Firecracker cannot make one after; the line before says why
+    #[cfg(windows)]
+    Park(String),
     /// Failed to prepare the jail ({step}) before it locks down: {text} (os error {code})
     #[cfg(windows)]
     Preload {
@@ -817,6 +820,18 @@ mod imp {
             // WHP's DLLs, for the VMM only (the API process makes no VM); a
             // DLL that does not load is reported by `Kvm::new`, as before.
             kvm_ioctls::preload_whp();
+            // The VM's partition, made now: the jail's token cannot open
+            // WHP's device, so no partition can be made after the revert
+            // (kvm-ioctls' whp/park.rs; docs/windows-jail-reach.md, option
+            // P). The VMM process only: the API process makes no VM. A
+            // failure ends the start, named; where WHP is absent, `Kvm::new`
+            // says so first, with the cause and how to turn it on.
+            if let Err(err) = kvm_ioctls::park_partition() {
+                if err.errno() == libc::ENODEV {
+                    let _ = kvm_ioctls::Kvm::new();
+                }
+                return Err(JailError::Park(err.to_string()));
+            }
         }
         // SAFETY: plain call.
         if unsafe { RevertToSelf() } == 0 {

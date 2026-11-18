@@ -4806,7 +4806,7 @@ mod fpu_tests {
 
     /// The process's commit charge (`PagefileUsage`, which the job's
     /// memory limit counts) and working set, in bytes.
-    fn process_memory() -> Option<(usize, usize)> {
+    pub(super) fn process_memory() -> Option<(usize, usize)> {
         #[repr(C)]
         #[derive(Default)]
         struct Counters {
@@ -16339,9 +16339,34 @@ mod park_tests {
         assert!(!super::super::park::partition_parked());
         let kvm = Kvm::new().unwrap();
         let fresh = observe(&kvm);
+        // What a parked partition costs an idle process, against the same
+        // process just before: the time, the commit charge (which a job's
+        // memory limit counts), the working set and the handles. The
+        // register probe ran with the fresh VM above, once a process, so
+        // this is the partition alone (a Firecracker process pays the probe
+        // here too, which every process that makes a VM pays once).
+        let handles = || {
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+            let mut n = 0u32;
+            // SAFETY: our own process's pseudo handle; an out-pointer.
+            let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) };
+            (ok != 0).then_some(n)
+        };
+        let (mem0, handles0) = (super::fpu_tests::process_memory(), handles());
         let before = std::time::Instant::now();
         super::super::park::park_partition().unwrap();
-        eprintln!("PARKREC parked in {} us (the register probe and the partition)", before.elapsed().as_micros());
+        let took = before.elapsed().as_micros();
+        let (mem1, handles1) = (super::fpu_tests::process_memory(), handles());
+        let delta = |a: Option<(usize, usize)>, b: Option<(usize, usize)>, f: fn((usize, usize)) -> usize| {
+            a.zip(b).map_or("unread".to_string(), |(a, b)| format!("{:+} KiB", (f(b) as i64 - f(a) as i64) / 1024))
+        };
+        eprintln!(
+            "PARKREC parked in {took} us (the partition; the register probe ran before); commit charge {}, working set \
+             {}, handles {}",
+            delta(mem0, mem1, |m| m.0),
+            delta(mem0, mem1, |m| m.1),
+            handles0.zip(handles1).map_or("unread".to_string(), |(a, b)| format!("{:+}", i64::from(b) - i64::from(a))),
+        );
         for line in run_a_guest(&kvm) {
             eprintln!("PARKREC a guest that ran: {line}");
         }

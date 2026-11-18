@@ -497,12 +497,18 @@ to when the partition is made. What it brings, and what the next record (`jail-v
    unmapped, partition time running, the four properties settable after set-up written back. Then every property
    and the mapped-page counters are read back and compared with the partition as parked; a difference or a failed
    step deletes it, and the process's next VM is an error that says to start it again. A second VM while the first
-   has the partition is that error too. Firecracker does not park yet. Test:
+   has the partition is that error too. A jailed Firecracker parks in `jail::enter` before the revert, in the VMM
+   process only, a failure ending the start, named; without a jail it parks when it takes its API socket. Tests:
+   `jailer-test.ps1 restart` and `boot-test.ps1 restart` (a start with a file that is not a kernel, failing after
+   its VM is made, then one with the kernel in the same Firecracker; first run: CI), and
    `test_a_recycled_partition_is_as_a_fresh_one` in CI's WHP step, alone in its process: a partition given back
    after a VM that ran a guest (an interrupt taken, dirty pages tracked, its memory unmapped and mapped again),
    compared with a fresh one by every property, the mapped pages, vCPUs 0 and 1 as made (every KVM getter, the MSRs
    but three running counters, InterruptControllerState2, the pending interruption, event and activity state) and
-   a read of the old memory (first run: CI). What WHP does not expose (the hypervisor's translation caches and
+   a read of the old memory (first run: CI). Upstream makes a second VM in one process only so, a failed
+   `InstanceStart` before its vCPUs start: a failed snapshot load ends the process, and a VM whose vCPUs started
+   lives as long as the process; no second VM follows one that ran guest code, so this comparison is the stricter
+   test. What WHP does not expose (the hypervisor's translation caches and
    objects of its own) cannot be compared: a parked partition is only ever used again by the same process, for the
    same jail, guest images, devices and principal, and never handed to another process or jail, so that is an
    unknown of correctness, not of isolation.

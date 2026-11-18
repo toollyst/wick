@@ -6,7 +6,7 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,shared,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user|x2storm] [-Bin <dir>] [-X2ApicFirecracker <exe>]
+#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,boot,restart,shared,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user|x2storm] [-Bin <dir>] [-X2ApicFirecracker <exe>]
 #
 # `refuse`, `freeze`, `cpuset`, `parent`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`
 # and `api` need no WHP; the others boot a guest. `pidns` needs a console (it types into it
@@ -31,7 +31,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$WorkDir,
-    [string[]]$Stage = @('refuse', 'freeze', 'cpuset', 'parent', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'shared', 'bindlink', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
+    [string[]]$Stage = @('refuse', 'freeze', 'cpuset', 'parent', 'weight', 'low', 'links', 'nofile', 'sections', 'daemonize', 'handles', 'pidns', 'handoff', 'netns', 'netguest', 'api', 'isolation', 'boot', 'restart', 'shared', 'bindlink', 'limits', 'memory', 'cpu', 'hugepages', 'uffd', 'vhost-user'),
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = '',
@@ -1656,6 +1656,54 @@ function Stage-Boot {
         Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after the guest rebooted'
         Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
         "a 2 vCPU microVM boots in the jail (WHP under the restricted token), its $looked processes with no console host, and the jailer exits 0 with it"
+    } finally { Stop-Jailed }
+}
+
+# A start that failed, tried again in the same jailed Firecracker, as
+# upstream allows (PrebootApiController::start_microvm keeps the controller
+# after a failed InstanceStart). The jailed Firecracker parked its partition
+# before the jail's token (vmm::ext::jail::enter; kvm-ioctls whp/park.rs),
+# under which none can be made once the jail's own SID is the only
+# restricting SID (docs/windows-jail-reach.md, option P). A file that is not
+# a kernel fails at load_kernel, after the VM, its vCPUs and its memory are
+# made (vmm/src/builder.rs, build_microvm_for_boot), so the VM is dropped
+# and the partition given back and checked against itself as parked; the
+# second InstanceStart, with the kernel, boots on it. A partition that could
+# not be given back is said on a line (`wick: whp: ...`) and makes the
+# second start an error: either fails the stage. Recorded (PARKIDLE): the
+# idle Firecracker with its partition parked, and its API process, a
+# process of the same binary that parks none: private bytes, working set,
+# handles and threads. The run without a jail is boot-test.ps1's `restart`.
+function Stage-Restart {
+    $base = New-Base 'restart'
+    $bad = Join-Path $base 'not-a-kernel'
+    [IO.File]::WriteAllBytes($bad, [byte[]]::new(65536))
+    $vm = Start-JailedVm $base 'r' @() 256 -Api -NoConfig -links @{ 'not-a-kernel' = $bad }
+    try {
+        $fcPid = [int](Get-Content (Join-Path $vm.Root 'firecracker.exe.pid') -Raw).Trim()
+        $procs = @(Get-Process firecracker | Where-Object { $_.Path -like "$($vm.Root)*" })
+        $idle = @($procs | Sort-Object { $_.Id -ne $fcPid } | ForEach-Object {
+                $what = if ($_.Id -eq $fcPid) { 'Firecracker (parked)' } else { 'API process' }
+                '{0}: private {1} KiB, working set {2} KiB, handles {3}, threads {4}' -f $what, ($_.PrivateMemorySize64 / 1KB), ($_.WorkingSet64 / 1KB), $_.HandleCount, $_.Threads.Count
+            })
+        Write-Host "PARKIDLE $($idle -join '; ')"
+        $args0 = 'console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd root=/dev/vda ro rootfstype=squashfs init=/bin/sh'
+        Invoke-ApiOk $vm.Sock 'PUT' '/boot-source' ([ordered]@{ kernel_image_path = '/not-a-kernel'; boot_args = $args0 }) | Out-Null
+        Invoke-ApiOk $vm.Sock 'PUT' '/drives/rootfs' ([ordered]@{ drive_id = 'rootfs'; path_on_host = '/rootfs'; is_root_device = $true; is_read_only = $true }) | Out-Null
+        Invoke-ApiOk $vm.Sock 'PUT' '/machine-config' ([ordered]@{ vcpu_count = 2; mem_size_mib = 256 }) | Out-Null
+        $out = Invoke-Api $vm.Sock 'PUT' '/actions' ([ordered]@{ action_type = 'InstanceStart' })
+        Check ($out -match ' 400$' -and $out -match 'kernel') "the start with a file that is not a kernel: $out"
+        $lines = @($vm.Text() -split "`n" | Where-Object { $_ -match 'wick: whp: (the partition made at|this process)' })
+        Check ($lines.Count -eq 0) "the partition after the failed start: $($lines -join ' | ')"
+        Invoke-ApiOk $vm.Sock 'PUT' '/boot-source' ([ordered]@{ kernel_image_path = '/vmlinux'; boot_args = $args0 }) | Out-Null
+        Invoke-ApiOk $vm.Sock 'PUT' '/actions' ([ordered]@{ action_type = 'InstanceStart' }) | Out-Null
+        Wait-Shell $vm
+        $out = $vm.Sh('echo $((6*7)) $(nproc)', 10)
+        Check ($out -eq '42 2') "the guest of the second start: '$out'"
+        $vm.Send('reboot -ff')
+        Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after the guest rebooted'
+        Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
+        "a start with a file that is not a kernel failed (400) after its VM was made; the second, with the kernel, booted 2 vCPUs in the same jailed Firecracker on the partition given back (PARKIDLE $($idle -join '; '))"
     } finally { Stop-Jailed }
 }
 

@@ -2065,6 +2065,13 @@ mod windows {
         socket_path: &Path,
         payload_limit: usize,
     ) -> Result<ApiLink<UnixStream>, ApiProcessError> {
+        // Firecracker's partition, parked here, after its arguments are
+        // parsed, in this process, which runs the VMM (never in the API
+        // process): a start that failed and is tried again takes it back as
+        // in a jail, which parked it already (`jail::enter`; kvm-ioctls'
+        // whp/park.rs). Where WHP is absent, or the park fails, the VM's
+        // creation reports it, as before.
+        let _ = kvm_ioctls::park_partition();
         split_with(&[], kill_switch, socket_path, payload_limit)
     }
 

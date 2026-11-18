@@ -2804,7 +2804,7 @@ jobs:
         if: (success() || failure()) && steps.kit.outcome == 'success'
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir $env:WJT -Assets $env:WBT `
-            -Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,daemonize,handles,handoff,netns,netguest,api,isolation,boot,shared,limits,memory,cpu,uffd,vhost-user
+            -Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,daemonize,handles,handoff,netns,netguest,api,isolation,boot,restart,shared,limits,memory,cpu,uffd,vhost-user
           exit $LASTEXITCODE
       # memory.max and sections (docs/COMPATIBILITY.md, the memory.max row's
       # Windows cell; SECURITY.md, W2): the job refuses private memory, the
