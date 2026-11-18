@@ -1579,16 +1579,17 @@ jobs:
           }
           Write-Host "PowerShell $($PSVersionTable.PSVersion) parsed $($files.Count) scripts: $bad errors ($($files -join ', '))"
           if ($bad) { exit 1 }
-      # The test harness's own helpers, without a jailer, a probe or a guest
+      # The test harness's own helpers, without a jailer or a guest
       # (jailer-test.ps1 helpers: Grant-JailRead with a made-up jail SID,
-      # Stop-Jailers against a jailed process started after its first look),
-      # so that a helper's first run is a few seconds here and not the
-      # windows-guest job: B's grant through icacls failed there first (CI at
-      # de8805f4).
+      # Stop-Jailers against a jailed process started after its first look;
+      # with -ReachSmbShare, reach's share probe in its runs that need no
+      # jailer, jail-probe built by the image's rustc), so that a helper's
+      # first run is a minute here and not the windows-guest job: B's grant
+      # through icacls failed there first (CI at de8805f4).
       - name: jailer-test.ps1 helpers
         shell: powershell
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir "$env:RUNNER_TEMP\wjt-helpers" -Stage helpers
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir "$env:RUNNER_TEMP\wjt-helpers" -Stage helpers -ReachSmbShare
           exit $LASTEXITCODE
       # Upstream's tag from an earlier run's cache, or fetched (.github/actions/upstream).
       - uses: ./.github/actions/upstream
@@ -2942,11 +2943,13 @@ jobs:
         if: success() || failure()
         run: .\winprobe.exe hostwarp 3
       # The guest files are the boot test's (-Assets). pidns, bindlink,
-      # sections and hugepages have steps of their own.
+      # sections and hugepages have steps of their own. -ReachSmbShare: reach
+      # makes a share of its own for the run, read granted to Everyone, and
+      # removes it at the stage's end (a run on a PC makes none unless asked).
       - name: jailer-test.ps1
         if: (success() || failure()) && steps.kit.outcome == 'success'
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir $env:WJT -Assets $env:WBT `
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir $env:WJT -Assets $env:WBT -ReachSmbShare `
             -Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,daemonize,handles,handoff,netns,netguest,api,isolation,reach,boot,restart,shared,limits,memory,cpu,uffd,vhost-user
           exit $LASTEXITCODE
       # memory.max and sections (docs/COMPATIBILITY.md, the memory.max row's

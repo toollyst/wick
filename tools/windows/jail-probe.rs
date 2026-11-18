@@ -29,7 +29,7 @@
 //!                               namedjob:<object name> namespace:0
 //!                               dacl:<path> owner:<path> deleteopen:<path>
 //!                               reachlist:<file>
-//!                               reach:<file>:<port>:<ip>:<port> smb:0
+//!                               reach:<file>:<port>:<ip>:<port> smb:0 smb:<share>
 //!                               waitfor:<path>
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...

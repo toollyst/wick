@@ -59,9 +59,16 @@
   read; then `jail-probe smb`, this host's administrative shares, `IPC$` and
   the `srvsvc` pipe through `\Device\Mup`, the LanMan redirector and a UNC
   name, and the RDP client drives, opened in the jail with `--netns` first,
-  then in the jail, then by the operator (the control, last), each open's
-  NTSTATUS or granted access recorded, with the SMB client's connections
-  before each run and after the `--netns` run and the control;
+  then in the jail, then from `jail-probe low` (the operator's token at low
+  integrity, not restricted), then by the operator (the control, last), each
+  open's NTSTATUS or granted access recorded, with the SMB client's
+  connections before each run, the server's sessions and open files and the
+  SMB server's and client's event-log entries after each; with
+  `-ReachSmbShare` (elevated; CI passes it) also a share the stage makes for
+  the run, read granted to Everyone over a directory holding only a canary,
+  opened by the same forms in each run, its security and the canary's ACL
+  recorded, and removed at the stage's end (the stage fails if it is not;
+  `helpers -ReachSmbShare` runs its parts that need no jailer);
   the records kept as `reach-record.txt` and `reach-objects.txt` in the work
   directory for CI's upload; `jail-reach.rs`). With a
   guest: `netguest` (frames through the endpoint in the jail's own directory of the network),

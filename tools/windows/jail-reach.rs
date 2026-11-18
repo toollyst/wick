@@ -298,7 +298,12 @@ pub(super) fn list(file: &str) -> String {
 /// granted and, for a file, the bytes of a read. Records; asserts nothing.
 /// Run by the operator too, so a refusal is told from a share this host
 /// does not have (jailer-test.ps1 `reach`).
-pub(super) fn smb(_arg: &str) -> String {
+///
+/// `smb:<share>` (any argument but `0`) opens `<share>\canary.txt` instead,
+/// a share jailer-test.ps1 makes for the run when asked, by the same forms
+/// as `C$`: through `\Device\Mup` by 127.0.0.1, `localhost` and the
+/// computer's name, through `\Device\LanmanRedirector` and by a UNC name.
+pub(super) fn smb(arg: &str) -> String {
     let mut name = [0u16; 64];
     let mut len = name.len() as u32;
     // SAFETY: a buffer of `len` characters.
@@ -310,27 +315,37 @@ pub(super) fn smb(_arg: &str) -> String {
     println!("smb-computer-name {host}");
     let file = FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT;
     let any = FILE_SYNCHRONOUS_IO_NONALERT;
-    let forms: Vec<(&str, String, u32)> = vec![
-        ("c$-127.0.0.1", r"\Device\Mup\127.0.0.1\C$\Windows\win.ini".into(), file),
-        ("c$-localhost", r"\Device\Mup\localhost\C$\Windows\win.ini".into(), file),
-        ("c$-computer-name", format!(r"\Device\Mup\{host}\C$\Windows\win.ini"), file),
-        ("admin$-127.0.0.1", r"\Device\Mup\127.0.0.1\ADMIN$\win.ini".into(), file),
-        ("ipc$-127.0.0.1", r"\Device\Mup\127.0.0.1\IPC$".into(), any),
-        ("pipe-srvsvc-127.0.0.1", r"\Device\Mup\127.0.0.1\PIPE\srvsvc".into(), file),
-        ("pipe-srvsvc-localhost", r"\Device\Mup\localhost\PIPE\srvsvc".into(), file),
-        ("c$-lanmanredirector", r"\Device\LanmanRedirector\127.0.0.1\C$\Windows\win.ini".into(), file),
-        ("c$-unc", r"\??\UNC\127.0.0.1\C$\Windows\win.ini".into(), file),
-        ("tsclient-mup", r"\Device\Mup\tsclient\C".into(), any),
-        ("tsclient-rdpdrport", r"\Device\RdpDrPort\tsclient\C".into(), any),
-        ("rdpdrport-beneath", r"\Device\RdpDrPort\x".into(), any),
-    ];
+    let forms: Vec<(&str, String, u32)> = if arg != "0" {
+        vec![
+            ("share-127.0.0.1", format!(r"\Device\Mup\127.0.0.1\{arg}\canary.txt"), file),
+            ("share-localhost", format!(r"\Device\Mup\localhost\{arg}\canary.txt"), file),
+            ("share-computer-name", format!(r"\Device\Mup\{host}\{arg}\canary.txt"), file),
+            ("share-lanmanredirector", format!(r"\Device\LanmanRedirector\127.0.0.1\{arg}\canary.txt"), file),
+            ("share-unc", format!(r"\??\UNC\127.0.0.1\{arg}\canary.txt"), file),
+        ]
+    } else {
+        vec![
+            ("c$-127.0.0.1", r"\Device\Mup\127.0.0.1\C$\Windows\win.ini".into(), file),
+            ("c$-localhost", r"\Device\Mup\localhost\C$\Windows\win.ini".into(), file),
+            ("c$-computer-name", format!(r"\Device\Mup\{host}\C$\Windows\win.ini"), file),
+            ("admin$-127.0.0.1", r"\Device\Mup\127.0.0.1\ADMIN$\win.ini".into(), file),
+            ("ipc$-127.0.0.1", r"\Device\Mup\127.0.0.1\IPC$".into(), any),
+            ("pipe-srvsvc-127.0.0.1", r"\Device\Mup\127.0.0.1\PIPE\srvsvc".into(), file),
+            ("pipe-srvsvc-localhost", r"\Device\Mup\localhost\PIPE\srvsvc".into(), file),
+            ("c$-lanmanredirector", r"\Device\LanmanRedirector\127.0.0.1\C$\Windows\win.ini".into(), file),
+            ("c$-unc", r"\??\UNC\127.0.0.1\C$\Windows\win.ini".into(), file),
+            ("tsclient-mup", r"\Device\Mup\tsclient\C".into(), any),
+            ("tsclient-rdpdrport", r"\Device\RdpDrPort\tsclient\C".into(), any),
+            ("rdpdrport-beneath", r"\Device\RdpDrPort\x".into(), any),
+        ]
+    };
     let mut opened = 0;
     for (form, path, opts) in &forms {
         let r = match nt_open(path, MAXIMUM_ALLOWED, *opts) {
             Ok(h) => {
                 opened += 1;
                 let mut line = format!("allowed granted {:#x}", granted(h.0));
-                if *opts & FILE_NON_DIRECTORY_FILE != 0 && path.ends_with(".ini") {
+                if *opts & FILE_NON_DIRECTORY_FILE != 0 && (path.ends_with(".ini") || path.ends_with(".txt")) {
                     let mut io = IO_STATUS_BLOCK { status: 0, info: 0 };
                     let mut buf = [0u8; 64];
                     // SAFETY: a synchronous handle; a buffer of its length.

@@ -6,12 +6,13 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,reach,boot,restart,shared,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user|x2storm] [-Bin <dir>] [-X2ApicFirecracker <exe>]
+#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,reach,boot,restart,shared,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user|x2storm] [-Bin <dir>] [-X2ApicFirecracker <exe>] [-ReachSmbShare]
 #
 # `refuse`, `freeze`, `cpuset`, `parent`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`,
 # `api` and `reach` need no WHP; the others boot a guest. `helpers` (not in
-# the default list; CI's windows job runs it) needs no jailer, probe or WHP:
-# it runs the harness's own helpers (Stage-Helpers). `pidns` needs a console (it types into it
+# the default list; CI's windows job runs it) needs no jailer or WHP, and
+# the probe only with -ReachSmbShare: it runs the harness's own helpers
+# (Stage-Helpers). `pidns` needs a console (it types into it
 # and reads it): run with other stages, it is run alone in a console of
 # its own, as CI's step runs it (<WorkDir>-pidns); `netns` needs an elevated PowerShell (the jailer adds Windows Filtering
 # Platform filters). `hugepages` needs the account to hold "Lock pages in memory" (it
@@ -20,7 +21,10 @@
 # (not in the default list, about 10 minutes) needs the x2APIC record build
 # (-X2ApicFirecracker, default the build's x2apic\release\firecracker.exe,
 # which CI's kit has) and an AMD host; on another it is not applicable, and
-# the script's exit code is 3 if no stage failed.
+# the script's exit code is 3 if no stage failed. -ReachSmbShare lets
+# `reach` make a share of its own for the run, read granted to Everyone,
+# removed at the stage's end (elevated only; without it no share is made),
+# and `helpers` run that share probe's parts that need no jailer.
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build),
 # `examples\uffd_on_demand_handler.exe` for `uffd` and, for `vhost-user`,
@@ -37,7 +41,8 @@ param(
     [string]$Bin = '',
     [string]$Assets = 'C:\wbt',
     [string]$Probe = '',
-    [string]$X2ApicFirecracker = ''
+    [string]$X2ApicFirecracker = '',
+    [switch]$ReachSmbShare
 )
 $ErrorActionPreference = 'Stop'
 # Firecracker, the jailer and the probes write UTF-8 (Rust's strings,
@@ -937,6 +942,98 @@ function Stage-Isolation {
     }
 }
 
+# The SMB client's connections now, by Get-SmbConnection, or by `net use`
+# where that cmdlet fails (reach; helpers runs it too).
+function Get-SmbConns([string]$when) {
+    try {
+        $c = @(Get-SmbConnection -ErrorAction Stop | ForEach-Object { "\\$($_.ServerName)\$($_.ShareName) as $($_.UserName), dialect $($_.Dialect), $($_.NumOpens) opens" })
+        "smb-connections ${when}: $(if ($c.Count) { $c -join '; ' } else { 'none' }) (Get-SmbConnection)"
+    } catch {
+        $why = $_.Exception.Message
+        $u = @(net use 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -match '\\\\' } | ForEach-Object { ($_ -replace '\s+', ' ').Trim() })
+        "smb-connections ${when}: Get-SmbConnection: $why; net use: $(if ($u.Count) { $u -join '; ' } else { 'none' })"
+    }
+}
+
+# The server's side after a run (its sessions and open files), and the SMB
+# event-log entries of the run's window: a channel that is not there or not
+# enabled is said so, and nothing is enabled. One line each, $SmbChannels.Count
+# + 2 in all.
+$SmbChannels = @('Microsoft-Windows-SMBServer/Security', 'Microsoft-Windows-SMBServer/Operational', 'Microsoft-Windows-SMBClient/Security', 'Microsoft-Windows-SMBClient/Connectivity')
+function Get-SmbServerRecord([string]$who, [datetime]$from, [datetime]$to) {
+    $out = @()
+    $out += try { "smb-sessions after ${who}: $(@(Get-SmbSession -ErrorAction Stop | ForEach-Object { "$($_.SessionId) $($_.ClientComputerName) $($_.ClientUserName) dialect $($_.Dialect) $($_.NumOpens) opens" }) -join '; ')" } catch { "smb-sessions after ${who}: Get-SmbSession: $($_.Exception.Message)" }
+    $out += try { "smb-open-files after ${who}: $(@(Get-SmbOpenFile -ErrorAction Stop | ForEach-Object { "$($_.ClientUserName) $($_.ShareRelativePath) on $($_.Path)" }) -join '; ')" } catch { "smb-open-files after ${who}: Get-SmbOpenFile: $($_.Exception.Message)" }
+    foreach ($ch in $SmbChannels) {
+        $log = Get-WinEvent -ListLog $ch -ErrorAction SilentlyContinue
+        if (-not $log) { $out += "smb-events $who ${ch}: no such channel"; continue }
+        if (-not $log.IsEnabled) { $out += "smb-events $who ${ch}: channel not enabled"; continue }
+        $ev = @(Get-WinEvent -FilterHashtable @{ LogName = $ch; StartTime = $from; EndTime = $to } -ErrorAction SilentlyContinue)
+        $out += "smb-events $who ${ch}: $(if ($ev.Count) { @($ev | ForEach-Object { $m = "$($_.Message)" -split "`r?`n" | Select-Object -First 1; "$($_.Id) $($_.LevelDisplayName): $m" }) -join ' | ' } else { 'none' })"
+    }
+    $out
+}
+
+# The share of reach's SMB probe (elevated; New-SmbShare is for
+# administrators): a name of this run's, temporary (gone at a reboot), over
+# `dir`, made here and holding the canary alone, read granted to Everyone by
+# the share and by the canary's ACL. Returns its record lines (its access
+# and the canary's ACL). The caller holds the name before the call, so that
+# its cleanup (Remove-ReachShare) removes a share made before a later line
+# here failed.
+$SmbCanary = 'wick reach canary'
+function New-ReachShareName { "wick-reach-$PID-$(Get-Random -Maximum 100000)" }
+function New-ReachShare([string]$name, [string]$dir) {
+    $everyone = ([Security.Principal.SecurityIdentifier]'S-1-1-0').Translate([Security.Principal.NTAccount]).Value
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $canary = Join-Path $dir 'canary.txt'
+    Set-Content -Path $canary -Value $SmbCanary
+    & icacls $dir /inheritance:r /grant:r '*S-1-1-0:(OI)(CI)R' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
+    Check ($LASTEXITCODE -eq 0) "icacls on the share's directory: exit $LASTEXITCODE"
+    & icacls $canary /inheritance:r /grant:r '*S-1-1-0:R' '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+    Check ($LASTEXITCODE -eq 0) "icacls on the canary: exit $LASTEXITCODE"
+    New-SmbShare -Name $name -Path $dir -ReadAccess $everyone -Temporary -ErrorAction Stop | Out-Null
+    "smb-share $name over $dir, temporary"
+    "smb-share-access: $(@(Get-SmbShareAccess -Name $name | ForEach-Object { "$($_.AccountName) $($_.AccessControlType) $($_.AccessRight)" }) -join '; ')"
+    "smb-share-canary-acl: $((Get-Acl $canary).Sddl)"
+}
+
+# Removes New-ReachShare's share and directory, and fails if the share is
+# still there: a share left behind would serve its directory to the network.
+function Remove-ReachShare([string]$name, [string]$dir) {
+    Remove-SmbShare -Name $name -Force -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force -LiteralPath $dir -ErrorAction SilentlyContinue
+    $left = Get-SmbShare -Name $name -ErrorAction SilentlyContinue
+    Check ($null -eq $left) "the share $name is still there after the stage (Remove-SmbShare did not remove it): remove it by hand"
+}
+
+# The SMB checks of a run: C$ and the rest, the share when there is one,
+# and `more`.
+function Get-SmbChecks([string]$share, [string[]]$more) {
+    $c = @('smb:0')
+    if ($share) { $c += "smb:$share" }
+    foreach ($m in $more) { $c += $m }
+    $c
+}
+
+# One SMB check's end line in a run's lines `ls` (each prefixed `prefix`),
+# and its opens, a form and a word each (the share's forms are named
+# share-...); fails if the check's record did not end.
+function Get-SmbEnd([string[]]$ls, [string]$prefix, [string]$who, [string]$check) {
+    $end = $ls | Where-Object { $_ -match "^$([regex]::Escape("$prefix$check")) done \d+ of \d+ opened$" } | Select-Object -First 1
+    Check ($null -ne $end) "the SMB record ($who, $check) did not end: $(($ls | Select-Object -Last 3) -join ' | ')"
+    $share = $check -ne 'smb:0'
+    $each = @($ls | Where-Object { $_.StartsWith("${prefix}smb-open ") } | ForEach-Object { $f = $_ -split "`t"; $form = ($f[0] -split ' ')[-1]; if ($form.StartsWith('share-') -eq $share) { "$form $(@(($f[2] -replace '^allowed granted ', 'allowed ') -split ' ')[0..1] -join ' ')" } })
+    "$($end -replace "^$([regex]::Escape("$prefix$check")) done ", '') ($($each -join ', '))"
+}
+
+# A run's SMB records summed: C$ and the rest, and the share when there is one.
+function Get-SmbAll([string[]]$ls, [string]$prefix, [string]$who, [string]$share) {
+    $parts = @("C$ and the rest $(Get-SmbEnd $ls $prefix $who 'smb:0')")
+    if ($share) { $parts += "the share $(Get-SmbEnd $ls $prefix $who "smb:$share")" }
+    $parts -join '; '
+}
+
 # What a jailed process reaches of the host's named objects, a record under
 # the jail's token as the jailer makes it today (docs/windows-jail-reach.md;
 # option P, step A): jail-probe `reachlist`, run by the operator, lists
@@ -964,6 +1061,20 @@ function Stage-Isolation {
 # before each run and after the --netns run and the control, so that a
 # connection a run reused, or one a --netns run made, is on the record, not
 # inferred. The server service's state and the shares are recorded too.
+# With -ReachSmbShare (elevated; CI passes it, a run on a PC makes no share
+# unless asked) the stage makes a share of its own for the run, read
+# granted to Everyone, over a directory of its own holding only a canary
+# that Everyone may read, and opens the canary by every form C$ is opened
+# by: in the jail with --netns, in the jail, from jail-probe's
+# low-integrity mode (the operator's token at low integrity, not
+# restricted) and by the operator, in that order. Token A's restricting
+# SIDs hold Everyone, so the share tells a refusal by the share's security
+# (C$ grants administrators) from one by the client or by the token itself
+# (docs/windows-jail-reach.md: what each outcome means). After each run
+# the server's sessions and open files (Get-SmbSession, Get-SmbOpenFile)
+# and the SMB server's and client's event-log entries of the run's window
+# are recorded. The share and its directory are removed when the stage
+# ends, and the stage fails if the share is still there.
 # The records are kept as reach-record.txt and reach-objects.txt in the
 # work directory, which CI's upload takes. It asserts nothing of what is
 # reached, only that the record is whole: the list made, the jailed probe's
@@ -979,79 +1090,89 @@ function Stage-Reach([string]$External = '8.8.8.8:53') {
     Check ($made -match ' allowed (\d+) names') "the operator's list: $made"
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
     $listener.Start()
+    $shareName = $null
+    $shareDir = Join-Path $base 'share'
     try {
         $port = $listener.LocalEndpoint.Port
         $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        # The SMB client's connections now, by Get-SmbConnection, or by
-        # `net use` where that cmdlet fails.
-        $conns = {
-            param([string]$when)
-            try {
-                $c = @(Get-SmbConnection -ErrorAction Stop | ForEach-Object { "\\$($_.ServerName)\$($_.ShareName) as $($_.UserName), dialect $($_.Dialect), $($_.NumOpens) opens" })
-                "smb-connections ${when}: $(if ($c.Count) { $c -join '; ' } else { 'none' }) (Get-SmbConnection)"
-            } catch {
-                $why = $_.Exception.Message
-                $u = @(net use 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -match '\\\\' } | ForEach-Object { ($_ -replace '\s+', ' ').Trim() })
-                "smb-connections ${when}: Get-SmbConnection: $why; net use: $(if ($u.Count) { $u -join '; ' } else { 'none' })"
-            }
+        # The share, only when asked, and only elevated (New-ReachShare).
+        $shareLines = @()
+        if (-not $ReachSmbShare) {
+            $shareLines += 'smb-share probe not run: not asked (-ReachSmbShare)'
+        } elseif (-not $elevated) {
+            $shareLines += 'smb-share probe not run: not elevated (New-SmbShare is for administrators)'
+        } else {
+            # The name first, so that the finally removes a share made
+            # before a later line of New-ReachShare failed.
+            $shareName = New-ReachShareName
+            $shareLines += New-ReachShare $shareName $shareDir
         }
         # First, the jail with a network of its own: --netns's filters are
         # the jail's token's, and a redirector's connection is the system's.
         # The record is kept in the order things happened.
-        $record = @("smb-order: the jailed run with --netns, the jailed run, the operator's control")
+        $record = @("smb-order: the jailed run with --netns, the jailed run, the low-integrity run, the operator's control") + $shareLines
         $connLines = @()
         if ($elevated) {
-            $connLines += & $conns 'before the --netns run'
+            $connLines += Get-SmbConns 'before the --netns run'
             $record += $connLines[-1]
             $net = Join-Path $base 'net'
             New-Item -ItemType Directory -Force -Path $net | Out-Null
-            $n = Invoke-Jailer @('--id', 'n', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--netns', $net, '--', 'smb:0') 300000
+            $t0 = Get-Date
+            $n = Invoke-Jailer (@('--id', 'n', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--netns', $net, '--') + (Get-SmbChecks $shareName @())) 300000
             $netLines = @(@($n[1] -split "`r?`n" | Where-Object { $_ }) | ForEach-Object { "netns: $_" })
             $record += $netLines
-            $connLines += & $conns 'after the --netns run, before the jailed run'
+            $record += Get-SmbServerRecord 'the --netns run' $t0 (Get-Date)
+            $connLines += Get-SmbConns 'after the --netns run, before the jailed run'
         } else {
             $netLines = @('netns: not run: not elevated (--netns adds Windows Filtering Platform filters)')
             $record += $netLines
-            $connLines += & $conns 'before the jailed run'
+            $connLines += Get-SmbConns 'before the jailed run'
         }
         $record += $connLines[-1]
-        $r = Invoke-Jailer @('--id', 'r', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', 'smb:0', "reach:/objects.txt:${port}:$External") 900000
+        $t0 = Get-Date
+        $r = Invoke-Jailer (@('--id', 'r', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--') + (Get-SmbChecks $shareName @("reach:/objects.txt:${port}:$External"))) 900000
         $lines = @($r[1] -split "`r?`n" | Where-Object { $_ })
         $record += $lines
-        # Last, the control, outside any jail.
-        $connLines += & $conns "after the jailed run, before the operator's control"
+        $record += Get-SmbServerRecord 'the jailed run' $t0 (Get-Date)
+        # Then jail-probe's low-integrity mode: the operator's token at low
+        # integrity, not restricted, outside any jail.
+        $connLines += Get-SmbConns 'after the jailed run, before the low-integrity run'
         $record += $connLines[-1]
-        $server = try { "LanmanServer $((Get-Service LanmanServer -ErrorAction Stop).Status)" } catch { "LanmanServer: $($_.Exception.Message)" }
+        $t0 = Get-Date
+        $lowLines = @(& $probe low @(Get-SmbChecks $shareName @()) | Where-Object { $_ } | ForEach-Object { "low: $_" })
+        $record += $lowLines
+        $record += Get-SmbServerRecord 'the low-integrity run' $t0 (Get-Date)
+        # Last, the control, outside any jail.
+        $connLines += Get-SmbConns "after the low-integrity run, before the operator's control"
+        $record += $connLines[-1]
+        $serverState = try { "LanmanServer $((Get-Service LanmanServer -ErrorAction Stop).Status)" } catch { "LanmanServer: $($_.Exception.Message)" }
         $shares = try { "shares: $(@(Get-SmbShare -ErrorAction Stop | ForEach-Object { $_.Name }) -join ', ')" } catch { "shares: $($_.Exception.Message)" }
-        $head = "operator: $server; $shares"
-        $control = @(& $probe 'smb:0' | Where-Object { $_ } | ForEach-Object { "operator: $_" })
+        $head = "operator: $serverState; $shares"
+        $t0 = Get-Date
+        $control = @(& $probe @(Get-SmbChecks $shareName @()) | Where-Object { $_ } | ForEach-Object { "operator: $_" })
         $record += @($head) + $control
-        $connLines += & $conns "after the operator's control"
+        $record += Get-SmbServerRecord "the operator's control" $t0 (Get-Date)
+        $connLines += Get-SmbConns "after the operator's control"
         $record += $connLines[-1]
         foreach ($l in $record) { Write-Host "     $l" }
         # Kept for CI's upload (the stage's own directory goes when it passes).
         Set-Content -Path (Join-Path $WorkDir 'reach-record.txt') -Value $record
         Copy-Item (Join-Path $root 'objects.txt') (Join-Path $WorkDir 'reach-objects.txt') -ErrorAction SilentlyContinue
-        # Each SMB run's end line, and its opens, a form and a word each.
-        $smbOf = {
-            param([string[]]$ls, [string]$prefix, [string]$who)
-            $end = $ls | Where-Object { $_ -match "^${prefix}smb:0 done \d+ of \d+ opened$" } | Select-Object -First 1
-            Check ($null -ne $end) "the SMB record ($who) did not end: $(($ls | Select-Object -Last 3) -join ' | ')"
-            $each = @($ls | Where-Object { $_.StartsWith("${prefix}smb-open ") } | ForEach-Object { $f = $_ -split "`t"; "$(($f[0] -split ' ')[-1]) $(@(($f[2] -replace '^allowed granted ', 'allowed ') -split ' ')[0..1] -join ' ')" })
-            "$($end -replace "^${prefix}smb:0 done ", '') ($($each -join ', '))"
-        }
-        $smbControl = & $smbOf $control 'operator: ' 'the operator'
-        $smbJailed = & $smbOf $lines '' 'jailed'
-        $smbNet = if ($elevated) { & $smbOf $netLines 'netns: ' 'jailed with --netns' } else { 'not run, not elevated' }
+        $smbControl = Get-SmbAll $control 'operator: ' 'the operator' $shareName
+        $smbJailed = Get-SmbAll $lines '' 'jailed' $shareName
+        $smbLow = Get-SmbAll $lowLines 'low: ' 'the low-integrity run' $shareName
+        $smbNet = if ($elevated) { Get-SmbAll $netLines 'netns: ' 'jailed with --netns' $shareName } else { 'not run, not elevated' }
         $done = $lines | Where-Object { $_ -match '^reach:\S+ done \d+ of \d+ names reached$' } | Select-Object -First 1
         Check ($r[0] -eq 0 -and $done) "the jailed record did not end: exit $($r[0]): $(($lines | Select-Object -Last 3) -join ' | ')"
         $summary = @($lines | Where-Object { $_.StartsWith('reach-summary ') } | ForEach-Object { $_.Substring('reach-summary '.Length) })
         Check ($summary.Count -gt 0) 'the jailed record has no reach-summary line'
         $checks = @($lines | Where-Object { $_.StartsWith('reach-check ') })
-        "a record under today's token, nothing asserted: the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks; SMB ($server; $shares), in this order: jailed with --netns $smbNet; jailed $smbJailed; the operator $smbControl; $($connLines -join '; ')"
+        "a record under today's token, nothing asserted: the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks; SMB ($serverState; $shares; $($shareLines -join '; ')), in this order: jailed with --netns $smbNet; jailed $smbJailed; low integrity $smbLow; the operator $smbControl; $($connLines -join '; ')"
     } finally {
         $listener.Stop()
         Stop-Jailed
+        # The share goes with the stage, whatever happened.
+        if ($shareName) { Remove-ReachShare $shareName $shareDir }
     }
 }
 
@@ -2930,6 +3051,15 @@ $OwnConsole = @('pidns')
 #   Stop-Jailers' first look, and exits when that process ends. Stop-Jailers
 #   must find the late process and the stand-in exit by itself, not be
 #   killed at the 10 s.
+# - With -ReachSmbShare (elevated; CI's windows job passes it), reach's
+#   share probe in the runs of it that need no jailer: the share made by
+#   New-ReachShare, its access and the canary's ACL checked to grant
+#   Everyone, the SMB client's connections, jail-probe low and the
+#   operator's jail-probe opening it and C$ by every form (each record must
+#   end; what opens is printed, not asserted), the operator's own read of
+#   the canary through \\127.0.0.1 (asserted: the share is served), the
+#   server's record of the window, and Remove-ReachShare. jail-probe is the
+#   kit's or built with rustc (Get-Probe).
 function Stage-Helpers {
     $base = New-Base 'helpers'
     $rnd = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -2955,7 +3085,37 @@ function Stage-Helpers {
     $killed = @($KilledAlive | Select-Object -Skip $before)
     Check ($j.HasExited -and $killed -notcontains $standIn) "Stop-Jailers: the stand-in jailer was killed or still runs after $took s (killed: $($killed -join ', '))"
     Check (@($killed | Where-Object { $_ -like 'jail-probe pid *' }).Count -eq 1) "Stop-Jailers: the late jailed process was not found and killed once (killed: $($killed -join ', '))"
-    "Grant-JailRead gave $sid read alone ($sddl); Stop-Jailers found the jailed process started after its first look and the stand-in jailer exited by itself, in $took s"
+    $msg = "Grant-JailRead gave $sid read alone ($sddl); Stop-Jailers found the jailed process started after its first look and the stand-in jailer exited by itself, in $took s"
+
+    # reach's SMB share probe, the runs of it that need no jailer.
+    if (-not $ReachSmbShare) { return "$msg; reach's share probe not run: not asked (-ReachSmbShare)" }
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Check $elevated 'helpers -ReachSmbShare needs an elevated PowerShell (New-SmbShare is for administrators)'
+    $probe = Get-Probe
+    $dir = Join-Path $base 'share'
+    $name = New-ReachShareName
+    try {
+        $record = @(New-ReachShare $name $dir)
+        # The share grants read (to Everyone, named in the system's
+        # language), and the canary's DACL allows Everyone (WD) something.
+        Check ($record[1] -match ' Allow Read(;|$)' -and $record[2] -match '\(A;;[^;]+;;;WD\)') "the share's access or the canary's ACL: $($record[1..2] -join ' | ')"
+        $record += Get-SmbConns 'before the low-integrity run'
+        $t0 = Get-Date
+        $low = @(& $probe low @(Get-SmbChecks $name @()) | Where-Object { $_ } | ForEach-Object { "low: $_" })
+        $op = @(& $probe @(Get-SmbChecks $name @()) | Where-Object { $_ } | ForEach-Object { "operator: $_" })
+        $read = try { "$(Get-Content -LiteralPath "\\127.0.0.1\$name\canary.txt" -ErrorAction Stop)" } catch { "refused: $($_.Exception.Message)" }
+        $server = @(Get-SmbServerRecord 'the low-integrity run and the operator' $t0 (Get-Date))
+        $record += $low + $op + $server
+        $record += Get-SmbConns 'after the operator'
+        foreach ($l in $record) { Write-Host "     $l" }
+        Check ($read -eq $SmbCanary) "the operator's read of \\127.0.0.1\$name\canary.txt: $read"
+        Check ($server.Count -eq $SmbChannels.Count + 2) "Get-SmbServerRecord gave $($server.Count) lines, not $($SmbChannels.Count + 2): $($server -join ' | ')"
+        $sumLow = Get-SmbAll $low 'low: ' 'the low-integrity run' $name
+        $sumOp = Get-SmbAll $op 'operator: ' 'the operator' $name
+    } finally {
+        Remove-ReachShare $name $dir
+    }
+    "$msg; reach's share probe without a jailer, nothing asserted of what opens: $name made and removed, its access and the canary's ACL as reach makes them, the operator read the canary through \\127.0.0.1; jail-probe low $sumLow; the operator $sumOp"
 }
 
 # --- run ----------------------------------------------------------------------

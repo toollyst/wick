@@ -80,6 +80,65 @@ In short:
   open that made its own connection from one that reused the operator's. Whether a redirector carries the jail's open
   to the host's shares with the user's credentials is what it records, under each token. The records are kept for CI's
   upload (`reach-record.txt`, `reach-objects.txt`). First run: CI.
+- **The SMB record's first run, and what it could not tell.** In CI's windows-guest job at c54303cd (the token as
+  shipped, the operator's run first), the operator opened 9 of the 12 forms: `C$` by all three names, `ADMIN$`,
+  `IPC$`, both `srvsvc` pipes, `C$` through `\Device\LanmanRedirector` and by a UNC name, each granted `0x1f01ff`, and
+  `win.ini` read; `tsclient` was refused (`0xc0000022`, no RDP session) and `\Device\RdpDrPort\x` not found
+  (`0xc0000039`). The jail opened none: every form through Mup, the LanMan redirector and a UNC name was refused with
+  `0xc0000022`. The `--netns` run did not happen (the stage tested whether it was elevated without asking; fixed
+  since). The jail opened `\Device\Mup` itself by name (`0x1200a0`, traverse among it), so the device's security did
+  not refuse it. But `0xc0000022` (`STATUS_ACCESS_DENIED`) is what a server answers when a share's security refuses
+  the session's user (MS-SMB2 3.3.5.7, "Receiving an SMB2 TREE_CONNECT Request") as well as what a refusal on the
+  client's side gives, so the record does not say where the jail was refused, and `C$` and `ADMIN$` grant
+  administrators, which none of the jail's restricting SIDs is.
+- **The second run, in the order above.** In CI's windows-guest job at de8805f4 (the token as shipped) the SMB client
+  listed no connection before the `--netns` run, none after it, and none after the jailed run (`Get-SmbConnection`);
+  both jailed runs opened none of the 12 forms, each Mup, LanMan redirector and UNC form refused with `0xc0000022` as
+  before; the operator's control, last, opened 9 of 12 as before and left connections to `\\127.0.0.1\ADMIN$`, `C$`
+  and `IPC$` and `\\localhost\C$` as the runner's administrator, SMB 3.1.1. So the jail was refused with no connection
+  there to reuse, and neither of its runs left one: it did not reach a share through a connection of the operator's,
+  and `--netns` changed nothing. That points to a refusal on the client's side, before a connection is made, but does
+  not prove it: `Get-SmbConnection` lists the connections established (Microsoft Learn, Get-SmbConnection), and an
+  attempt the server refused at its session set-up or its tree connect would not be listed either. The share probe
+  below adds what tells the two apart: the server's sessions and its event channels for each run's window, and a share
+  the jail's restricting SIDs may read. Left for the record under the jail's SID alone (step C): the same opens and
+  the share probe under that token. Left for the PC: a share on another machine, which authenticates the user's
+  credentials and which CI cannot reach, a medium-integrity user and an account that is not the runner's, and an RDP
+  session with a client drive for `tsclient`.
+- **The share probe, and what each outcome means.** With `-ReachSmbShare` (CI passes it; elevated only; a run on a
+  PC makes no share unless asked) the stage makes a share of its own for the run, temporary, read granted to
+  Everyone, over a directory holding only a canary whose ACL grants Everyone read, records the share's security
+  (`Get-SmbShareAccess`) and the canary's ACL, and opens the canary by every form `C$` is opened by (Mup by
+  127.0.0.1, `localhost` and the computer's name, the LanMan redirector, a UNC name) in the jail with `--netns`, in
+  the jail, from `jail-probe low` (the operator's token at low integrity, not restricted) and as the operator, in
+  that order. After each run it records the server's sessions and open files (`Get-SmbSession`, `Get-SmbOpenFile`)
+  and the entries of the run's window in `Microsoft-Windows-SMBServer/Security` and `/Operational` and
+  `Microsoft-Windows-SMBClient/Security` and `/Connectivity`, saying so where a channel is missing or not enabled
+  (nothing is enabled). The share and its directory are removed when the stage ends, and the stage fails if the
+  share is still there. What each outcome means, written before the first result:
+  - Under the token as shipped (restricting SIDs: the jail's, Everyone, Users, Authenticated Users, Interactive;
+    integrity below medium):
+    - The jail opens the canary: the `C$` refusal was the share's security at the server, which evaluated a token
+      without the administrators. Any share the user's groups may read is then reachable from a jail, a remote one
+      included, and this is a finding.
+    - The jail is refused and the low-integrity run opens it: the token's restriction is what is refused, and the
+      server's sessions and events say where: a session or an entry of the server's for the jail's run means the
+      server refused it; none means the client did, before the server was asked.
+    - The jail and the low-integrity run are both refused and the operator opens it: integrity below medium is
+      refused as well (or first), at the place the server's records show.
+    - The `--netns` run differs from the jail's: `--netns`'s filters reach the redirector's connection; a connection
+      that appears in the client's list during the `--netns` run is that answer by itself.
+  - Under the jail's SID alone (step C), the same share: the jail opening it means the server saw a token that holds
+    Everyone, which is not the jail's, and is an escape; a refusal is read against the first token's outcome above.
+  - The operator refused: the share was not served, and the record shows nothing about a jail.
+  - What CI cannot show either way: a share on another machine that authenticates the user's credentials. That stays
+    the PC test (a share on another machine, a medium-integrity user, an account that is not the runner's), unless
+    the outcome locates the refusal at the client for every token.
+  - The probe's parts that need no jailer (the share made and removed, its access and the canary's ACL, the
+    low-integrity run and the operator's, the operator's own read of the canary through `\\127.0.0.1`, the server's
+    record) also run in CI's windows job, before its build (`jailer-test.ps1 helpers -ReachSmbShare`), so that a
+    failure of the share's own is seen there first; that run asserts the operator's read and that each record ended,
+    nothing of what opens, and its record is not this record. First run: CI.
 
 ## What the jail reaches
 
