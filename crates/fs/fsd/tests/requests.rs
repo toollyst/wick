@@ -231,12 +231,21 @@ fn statfs<L: Link>(g: &mut G<L>) -> ([u64; 5], [u32; 3]) {
     ([wide(0), wide(1), wide(2), wide(3), wide(4)], [narrow(0), narrow(1), narrow(2)])
 }
 
-/// STATFS confined answers as STATFS in this process over the same share:
-/// the sizes equal, and each count between two in-process answers taken
-/// just before and just after (the volume is in use; a count the
-/// confinement changed, as Seatbelt rounds the free blocks without
-/// `vfs.disk-space`, falls outside unless the volume moved by as much
-/// between them, and then the next try decides).
+/// STATFS confined answers as STATFS in this process: the sizes equal, and
+/// each count between two in-process answers taken just before and just
+/// after (the volume is in use; a count the confinement changed, as
+/// Seatbelt rounds the free blocks without `vfs.disk-space`, falls outside
+/// unless the volume moved by as much between them, and then the next try
+/// decides).
+///
+/// `near` is a session that served the same requests as `confined`, over a
+/// directory of the same volume: the free and available blocks a session
+/// answers are the host's or what its byte budget leaves, whichever is less
+/// (`Session::statfs`), and the budget is the session's own. A fresh session
+/// over the share answered the whole budget, 64 GiB (16777216 blocks of 4
+/// KiB), where the confined one had spent 8 KiB of it on the requests'
+/// writes, so on a host with more than 64 GiB free (CI run 44296604010's
+/// Linux runners) the two differed by 2 blocks every time.
 fn statfs_alike<A: Link, B: Link>(near: &mut G<A>, confined: &mut G<B>) {
     let mut last = None;
     for _ in 0..50 {
@@ -274,9 +283,9 @@ fn test_every_request_confined_answered_as_unconfined() {
     std::fs::create_dir(&host).unwrap();
     host_made(&host);
     let dir = HostDir::new(sys::open_root(&host).unwrap(), Options { case_insensitive_ok: true, ..Options::default() }).unwrap();
-    let mut g = G::new(dir);
-    let mut unconfined = every_request(&mut g);
-    special_modes(&mut unconfined, &mut g, &host);
+    let mut near = G::new(dir);
+    let mut unconfined = every_request(&mut near);
+    special_modes(&mut unconfined, &mut near, &host);
     expected(&unconfined);
 
     let share = base.join("share");
@@ -286,8 +295,7 @@ fn test_every_request_confined_answered_as_unconfined() {
         let mut g = G::over(r);
         let mut confined = every_request(&mut g);
         special_modes(&mut confined, &mut g, &share);
-        let near = HostDir::new(sys::open_root(&share).unwrap(), Options { case_insensitive_ok: true, ..Options::default() }).unwrap();
-        statfs_alike(&mut G::new(near), &mut g);
+        statfs_alike(&mut near, &mut g);
         remote::finish_clean(&mut g.s);
         assert_eq!(confined, unconfined, "the confined server answered otherwise");
     }
