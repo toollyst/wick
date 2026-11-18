@@ -2160,9 +2160,10 @@ mod tests {
     // A vCPU's XSAVE state is read and written whole on every host: into
     // an area of the size `KVM_CAP_XSAVE2` reports, as upstream does it,
     // the state written back reading the same; `KVM_GET_XSAVE`, whose area
-    // is 4096 bytes, gives the same bytes where the state fits them and
-    // EINVAL where it does not (a processor with AMX: CI run 43359525691,
-    // where Firecracker did not start). The XSAVETEST lines are each run's
+    // is 4096 bytes, gives its first 4096 bytes before any KVM_SET_CPUID2
+    // and EINVAL after one that gives the guest AMX tile data, as Linux's
+    // (a processor with AMX: CI run 43359525691, where Firecracker did not
+    // start, and run 44317533490, where a test read it before any CPUID). The XSAVETEST lines are each run's
     // record of its processor: WHP's XSAVE features (bit 27 is AMX tile:
     // WHV_PROCESSOR_XSAVE_FEATURES), CPUID leaf 0xD's sizes, and the bytes
     // WHP wrote; then what WHP does with an area three pages longer than
@@ -2240,17 +2241,45 @@ mod tests {
         // SAFETY: as above.
         unsafe { vcpu.get_xsave2(&mut again) }.unwrap();
         assert!(bytes_of(&first) == bytes_of(&again), "the state written back reads otherwise");
+        // KVM_GET_XSAVE before any KVM_SET_CPUID2: Linux's uabi_size is
+        // 4096 then, and a new vCPU's state in use ends within 4096 bytes
+        // on every host (CET last on CI's AMX processor: 2472), so it is
+        // read, the first 4096 bytes of KVM_GET_XSAVE2's, and written back.
+        let end = regs::in_use_end(&bytes_of(&first)).unwrap();
+        assert!(end <= 4096, "a new vCPU's state in use ends at {end}");
         // SAFETY: plain calls.
-        let legacy = unsafe { vcpu.get_xsave() };
-        if written <= 4096 {
-            let legacy = legacy.unwrap();
-            // SAFETY: the region's 4096 bytes.
-            let bytes = unsafe { std::slice::from_raw_parts(legacy.region.as_ptr().cast::<u8>(), 4096) };
-            assert!(bytes == &bytes_of(&first)[..4096], "KVM_GET_XSAVE reads otherwise than KVM_GET_XSAVE2");
-            // SAFETY: the state just read.
-            unsafe { vcpu.set_xsave(&legacy) }.unwrap();
+        let legacy = unsafe { vcpu.get_xsave() }.unwrap();
+        // SAFETY: the region's 4096 bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(legacy.region.as_ptr().cast::<u8>(), 4096) };
+        assert!(bytes == &bytes_of(&first)[..4096], "KVM_GET_XSAVE reads otherwise than KVM_GET_XSAVE2");
+        // SAFETY: the state just read.
+        unsafe { vcpu.set_xsave(&legacy) }.unwrap();
+        let mut back = Xsave::new(len).unwrap();
+        // SAFETY: as above.
+        unsafe { vcpu.get_xsave2(&mut back) }.unwrap();
+        assert!(bytes_of(&back) == bytes_of(&first), "the 4096 bytes written back read otherwise");
+        // After a KVM_SET_CPUID2 with the host's leaf 0xD: on a processor
+        // with AMX its tile data is the guest's, and KVM_GET_XSAVE is
+        // refused with EINVAL, as Linux's once kvm_check_cpuid grew the
+        // vCPU's uabi_size; on one without, read as before.
+        let leaf_d = regs::supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .unwrap()
+            .as_slice()
+            .iter()
+            .copied()
+            .find(|e| e.function == 0xd && e.index == 0)
+            .unwrap();
+        vcpu.set_cpuid2(&kvm_bindings::CpuId::from_entries(&[leaf_d]).unwrap()).unwrap();
+        // SAFETY: plain calls.
+        let legacy = unsafe { vcpu.get_xsave() }.map(|_| ()).map_err(|e| e.errno());
+        eprintln!(
+            "XSAVETEST KVM_GET_XSAVE: a new vCPU's state in use ends at {end}, read; with the host's leaf 0xD (AMX tile data {}): {legacy:?}",
+            leaf_d.eax >> 18 & 1
+        );
+        if leaf_d.eax & 1 << 18 != 0 {
+            assert_eq!(legacy, Err(libc::EINVAL), "KVM_GET_XSAVE with AMX tile data in the CPUID");
         } else {
-            assert_eq!(legacy.unwrap_err().errno(), libc::EINVAL, "KVM_GET_XSAVE of a state of {written} bytes");
+            assert_eq!(legacy, Ok(()), "KVM_GET_XSAVE without AMX tile data in the CPUID");
         }
         // An area smaller than the state is refused, not overrun: one
         // without its flexible array on a host whose state passes 4096.

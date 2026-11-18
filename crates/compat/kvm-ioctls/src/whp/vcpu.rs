@@ -331,6 +331,11 @@ pub(crate) struct VcpuShared {
     pub(crate) run: KvmRunPage,
     inner: Arc<VmInner>,
     cpuid: Mutex<Vec<kvm_cpuid_entry2>>,
+    /// Whether a `KVM_SET_CPUID2` gave the guest a dynamic XSAVE component
+    /// (leaf 0xD.0's AMX tile data, bit 18), after which `KVM_GET_XSAVE` is
+    /// refused ([`VcpuFd::get_xsave`]); never cleared, as Linux's
+    /// `uabi_size` only grows.
+    xsave_dynamic: std::sync::atomic::AtomicBool,
     /// The CR4 bits the CPUID of the last `KVM_SET_CPUID2` reserves, as
     /// KVM's `cr4_guest_rsvd_bits` (`cr4`): none before one, as KVM's.
     cr4_guest_rsvd: AtomicU64,
@@ -662,6 +667,7 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
         run: KvmRunPage::new(),
         inner: inner.clone(),
         cpuid: Mutex::new(Vec::new()),
+        xsave_dynamic: std::sync::atomic::AtomicBool::new(false),
         cr4_guest_rsvd: AtomicU64::new(0),
         before_run: Mutex::new(Some(regs::BeforeRun::new())),
         lapic_before_the_mark: AtomicBool::new(false),
@@ -1137,14 +1143,48 @@ impl VcpuFd {
 
     /// # Safety
     /// Matches kvm-ioctls: the XSAVE region must be a valid XSAVE image.
-    /// `KVM_GET_XSAVE`: `EINVAL` on a host whose state is larger than
-    /// `struct kvm_xsave`, as on Linux (`regs::get_xsave`). The area has
-    /// wick's mark in its software-available bytes ([`XSAVE_MARK`]).
+    /// `KVM_GET_XSAVE`, Linux's answer (v6.1 arch/x86/kvm/x86.c,
+    /// `KVM_GET_XSAVE`: `r = -EINVAL;` when `guest_fpu.uabi_size >
+    /// sizeof(struct kvm_xsave)`): refused with `EINVAL` once a
+    /// `KVM_SET_CPUID2` gave the guest AMX tile data, the one dynamic
+    /// component (`kvm_check_cpuid` grows `uabi_size` to the whole state,
+    /// [`VcpuShared::xsave_dynamic`]); before, 4096 bytes, as
+    /// `fpu_alloc_guest_fpstate` makes `uabi_size` 4096. WHP's area of a
+    /// processor with AMX is larger than 4096 bytes for every vCPU (10752 on
+    /// CI's, its tile data last): it is cut at 4096 bytes where the state
+    /// in use ends within them (`regs::in_use_end`), and refused with
+    /// `EINVAL` where it does not, which on Linux no vCPU without tile data
+    /// in its CPUID can have. `KVM_SET_XSAVE` of the cut area gives WHP the
+    /// rest as zeros, the initial state of what is not in use
+    /// (`regs::set_xsave`). The area has wick's mark in its
+    /// software-available bytes ([`XSAVE_MARK`]).
     pub unsafe fn get_xsave(&self) -> Result<kvm_xsave> {
         let mut out = kvm_xsave { region: [0; 1024], extra: Default::default() };
         // SAFETY: the region's 4096 bytes, as bytes.
         let bytes = unsafe { std::slice::from_raw_parts_mut(out.region.as_mut_ptr().cast::<u8>(), regs::KVM_XSAVE_LEN) };
-        regs::get_xsave(self.part(), self.vp(), bytes)?;
+        let (area, written) = regs::read_xsave(self.part(), self.vp())?;
+        if written > regs::KVM_XSAVE_LEN {
+            let dynamic = self.shared.xsave_dynamic.load(Ordering::Acquire);
+            let end = regs::in_use_end(&area);
+            if dynamic || end.is_none_or(|end| end > regs::KVM_XSAVE_LEN) {
+                let why = if dynamic {
+                    "its CPUID gave the guest AMX tile data, as Linux's uabi_size then passes 4096".to_string()
+                } else {
+                    format!("the state in use ends at {end:?}, past 4096 bytes")
+                };
+                super::ffi::report(
+                    log::Level::Error,
+                    &format!(
+                        "whp: KVM_GET_XSAVE of vp {} refused (EINVAL): {why}; its state is {written} bytes, which \
+                         KVM_GET_XSAVE2 reads (KVM_CAP_XSAVE2 reports {})",
+                        self.vp(),
+                        regs::xsave_area_len()
+                    ),
+                );
+                return err(libc::EINVAL);
+            }
+        }
+        bytes.copy_from_slice(&area[..regs::KVM_XSAVE_LEN]);
         if let Some(image) = self.shared.before_run.lock().unwrap().as_ref() {
             image.as_linux_reads(bytes);
         }
@@ -1696,6 +1736,13 @@ impl VcpuFd {
         }
         self.shared.cr4_guest_rsvd.store(super::cr4::reserved_bits(|l, i, r, b| cpuid_has(table, l, i, r, b)), Ordering::Release);
         *self.shared.cpuid.lock().unwrap() = table.to_vec();
+        // Linux v6.1 `kvm_check_cpuid` (arch/x86/kvm/cpuid.c): the leaf's
+        // XFEATURE_MASK_USER_DYNAMIC bits enabled for the guest
+        // (`fpu_enable_guest_xfd_features`), which make its `uabi_size` the
+        // whole state's.
+        if leaf.is_some_and(|(eax, _)| eax & 1 << 18 != 0) {
+            self.shared.xsave_dynamic.store(true, Ordering::Release);
+        }
         Ok(())
     }
     pub fn get_cpuid2(&self, num_entries: usize) -> Result<CpuId> {
@@ -16628,6 +16675,20 @@ mod park_tests {
         .unwrap();
     }
 
+    /// The vCPU's whole XSAVE state, read as Firecracker reads it:
+    /// `KVM_GET_XSAVE2` into an area of `KVM_CAP_XSAVE2`'s size. Read with
+    /// `KVM_GET_XSAVE`'s 4096 bytes it was refused on a processor with AMX
+    /// (CI run 44317533490: WHP's area 10752 bytes), and would have left
+    /// the tile state out of the comparison.
+    fn xsave_bytes(vcpu: &VcpuFd) -> Vec<u8> {
+        let mut x = kvm_bindings::Xsave::new((regs::xsave_area_len() - 4096).div_ceil(4)).unwrap();
+        // SAFETY: an area of the capability's size.
+        unsafe { vcpu.get_xsave2(&mut x) }.unwrap();
+        let p = x.as_fam_struct_ptr();
+        // SAFETY: the wrapper's `kvm_xsave` and the `len` entries after it.
+        unsafe { std::slice::from_raw_parts((&raw const (*p).xsave).cast::<u8>(), 4096 + 4 * (*p).len) }.to_vec()
+    }
+
     /// Everything WHP and the backend read back of a new vCPU, by name; the
     /// counters that run from its creation left out: the TSC (MSR 0x10),
     /// MPERF and APERF (0xE7, 0xE8).
@@ -16641,8 +16702,7 @@ mod park_tests {
             ("debugregs".to_string(), format!("{:?}", vcpu.get_debug_regs().unwrap())),
             ("mp_state".to_string(), format!("{:?}", vcpu.get_mp_state().unwrap())),
             ("vcpu_events".to_string(), format!("{:?}", vcpu.get_vcpu_events().unwrap())),
-            // SAFETY: a vCPU of a live VM.
-            ("xsave".to_string(), format!("{:?}", unsafe { vcpu.get_xsave() }.unwrap().region)),
+            ("xsave".to_string(), format!("{:?}", xsave_bytes(vcpu))),
         ];
         let indices: Vec<kvm_msr_entry> = kvm
             .get_msr_index_list()

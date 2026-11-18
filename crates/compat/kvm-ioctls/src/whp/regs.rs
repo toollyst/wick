@@ -422,6 +422,39 @@ pub(crate) fn get_xsave(part: WHV_PARTITION_HANDLE, vp: u32, out: &mut [u8]) -> 
     Ok(written)
 }
 
+/// Where the last state component `area` has in use (its header's
+/// `XSTATE_BV`) ends, in the area's own format: compacted (`XCOMP_BV` bit
+/// 63), its components in `XCOMP_BV`'s order, or the standard one; the
+/// header's end when none past SSE is in use; `None` for an area too short
+/// for its header. `KVM_GET_XSAVE` gives an area cut at 4096 bytes only
+/// where this is within them (`VcpuFd::get_xsave`).
+pub(crate) fn in_use_end(area: &[u8]) -> Option<usize> {
+    use core::arch::x86_64::__cpuid_count;
+    in_use_end_by(area, |i| {
+        let r = __cpuid_count(0xd, i);
+        (r.eax, r.ebx, r.ecx)
+    })
+}
+
+/// [`in_use_end`] for a processor whose CPUID leaf 0xD, sub-leaf `i`, is
+/// `leaf(i)` ([`xsave_size_by`]).
+fn in_use_end_by(area: &[u8], leaf: impl Fn(u32) -> (u32, u32, u32)) -> Option<usize> {
+    const COMPACTED: u64 = 1 << 63;
+    let (bv, comp) = (xstate_bv(area)?, xcomp_bv(area)?);
+    // Every component up to the last in use: bits 0 and 1 are in the
+    // legacy area, which the sizes start after.
+    let upto = match (bv & !COMPACTED).checked_ilog2() {
+        Some(top) => (1u64 << (top + 1)) - 1,
+        None => 0,
+    };
+    let end = if comp & COMPACTED != 0 {
+        xsave_size_by(comp & !COMPACTED & upto, true, leaf)
+    } else {
+        xsave_size_by(bv & upto, false, leaf)
+    };
+    Some(end as usize)
+}
+
 /// The XSAVE header's `XSTATE_BV` (bytes 512 to 519 of an area, in both
 /// formats: Intel SDM volume 1, 13.4.2), or `None` for an area that ends
 /// before its header does.
@@ -1673,6 +1706,37 @@ mod tests {
         assert!(len >= 4096 && len >= xsave_size(user, false) as usize);
         assert!(len >= xsave_size(user | supervisor, true) as usize);
         assert_eq!(super::super::cap::supported(u64::from(kvm_bindings::KVM_CAP_XSAVE2)), i32::try_from(len).unwrap());
+    }
+
+    // Where an area's last component in use ends, in its format: WHP's
+    // compacted area of a new vCPU on a processor with AMX (CI's: XCOMP_BV
+    // 0x80000000000618e7, XSTATE_BV 0x1800, CET in use, 10752 bytes) ends
+    // within 4096 bytes, one with AMX tile data in use does not; so
+    // `KVM_GET_XSAVE` gives the first cut at 4096 bytes and refuses the
+    // second (`VcpuFd::get_xsave`).
+    #[test]
+    fn test_the_end_of_an_xsave_areas_state_in_use() {
+        let comp = 0x8000_0000_0006_18e7u64;
+        let area = |bv: u64, comp: u64| {
+            let mut a = vec![0u8; 12288];
+            a[512..520].copy_from_slice(&bv.to_le_bytes());
+            a[520..528].copy_from_slice(&comp.to_le_bytes());
+            a
+        };
+        // Nothing past SSE: the header's end.
+        assert_eq!(in_use_end_by(&area(0, comp), amx_leaf), Some(576));
+        assert_eq!(in_use_end_by(&area(3, comp), amx_leaf), Some(576));
+        // CET_S last: AVX to 832, opmask 896, ZMM_Hi256 1408, Hi16_ZMM
+        // 2432, CET_U 2448, CET_S 2472.
+        assert_eq!(in_use_end_by(&area(0x1800, comp), amx_leaf), Some(2472));
+        // TILECFG aligned to 2496, to 2560; TILEDATA from there: WHP's 10752.
+        assert_eq!(in_use_end_by(&area(1 << 17, comp), amx_leaf), Some(2560));
+        assert_eq!(in_use_end_by(&area(0x1800 | 1 << 18, comp), amx_leaf), Some(10752));
+        // The standard format: each at its fixed offset.
+        assert_eq!(in_use_end_by(&area(1 << 2, 0), amx_leaf), Some(832));
+        assert_eq!(in_use_end_by(&area(1 << 18 | 7, 0), amx_leaf), Some(11008));
+        // No header.
+        assert_eq!(in_use_end_by(&[0u8; 520], amx_leaf), None);
     }
 
     // An area is refused, as `KVM_SET_XSAVE` refuses it with EINVAL, when
