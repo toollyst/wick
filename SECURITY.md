@@ -222,26 +222,35 @@ has the per-control details and results.
   stack guarantee when it starts (a TLS callback, `windows_mm::at_thread_start`, for the main thread, Rust's,
   `CreateThread`'s, the pool's and the system's alike): the exception's context as this host sizes it
   (`InitializeContext2` for every XSAVE feature the system enables), the dispatcher's own 4 KiB, and 16 KiB for the
-  handler (`windows_mm::HANDLER_STACK_BUDGET`), and the guard region that guarantee sizes (the guarantee and a page) is
-  committed below its stack at once, as guard pages (`windows_mm::make_the_guard_region`): the system raises only the
-  thread's GuaranteedStackBytes and makes the region at the stack's next growth, which for a thread that first grows
-  at the memory limit would be refused, leaving one guard page to run the overflow on (edea8e38 touched the guard page
-  instead and took that touch to size the region; its test's reading could not show it, and the touch, a growth, could
-  itself be refused at the limit inside the loader's callback); a thread the system cannot give the guarantee or its
-  region to is said by its ID at its start, and runs on with the guard pages it has, which the line counts: its start
-  does not fail. The stack filter writes its line and the frames
+  handler (`windows_mm::HANDLER_STACK_BUDGET`). The guard region below the stack, which the system runs an overflow on
+  when the stack cannot grow, was there by the return of `SetThreadStackGuarantee`: on a `CreateThread` thread
+  and a pool thread, 28672 bytes of guard pages below StackLimit right after the call for a guarantee of 24576 (the
+  guarantee and a page, `windows_mm::guard_region_for`), and the same on those and a Rust thread at their own start
+  and after they grew 64 KiB (CI's STACKGUARANTEE, Windows Server 2025; Learn's page for the call names no
+  mechanism). This entry said twice what was not measured: edea8e38 touched the guard page to make the region, and
+  12c8e7d8 committed it explicitly, saying the system makes it only at the stack's next growth; neither was needed
+  on the threads measured, and the explicit commit, which did nothing there, is gone. Not known yet: whether the
+  call makes the region or the thread had it before the call (12c8e7d8 read it only after); the region right after
+  the call on a Rust thread (12c8e7d8's reading, kept in thread-local storage, said 0 bytes before its commit and
+  after it, while the guarantee was set and the thread had 28672 at its own start); both now recorded before and
+  after the call, outside the thread's storage, by thread ID (GUARDSEEN); and the main thread's, given the guarantee at the process's attach (now listed, and under
+  what an overflow needs a failure). A thread the system cannot give the guarantee is said by its ID at its start,
+  which does not fail; a guarantee raised with no room left in the job is either refused by the call or given with
+  its region, never set without it (`test_a_stack_guarantee_raised_at_the_limit_is_given_or_refused`, first run: CI).
+  The stack filter writes its line and the frames
   of a VMM that ends only with room for them, so it cannot fault before its exit with 137. The tests hold the room on every runner and kind of
   thread (STACKASK: at least the budget left under the handler; STACKUSE: at most the budget used), also with a
   larger XSAVE area simulated on a runner without AMX (8256 bytes, as AMX adds, and 16384:
   `WICK_TEST_XSAVE_EXTRA`); a runner with AMX remains the measured record, and GitHub assigns the windows job's
   runner at random (`test_every_thread_has_the_stack_guarantee`: the guard pages walked down from each kind of
-  thread's StackLimit at its start and after it grew 64 KiB, at least the context, the dispatcher's and the handler's
-  bytes; `test_a_stack_guarantee_that_cannot_be_set_is_said`, `test_a_guard_region_that_cannot_be_committed_is_said`).
-  What it costs: each thread has the guarantee and one page more committed below its stack from its start, untouched,
-  as guard pages: by the sizes, 28 KiB a thread on a host
-  without AMX and 40 KiB with it (Rust's threads had 20 KiB of it before, Rust's own guarantee, made at their first
-  guard-page hit), charged to the job's commit and so to `memory.max`
-  (`test_the_guard_region_is_charged_at_the_threads_start`: the process's commit grows by what the callback committed). A Firecracker has 5 threads and one a vCPU
+  thread's StackLimit right after the call, at its start and after it grew 64 KiB, at least the context, the
+  dispatcher's and the handler's bytes; `test_a_stack_guarantee_that_cannot_be_set_is_said`).
+  What it costs: each thread has the guarantee and one page more below its stack from its start, untouched, as guard
+  pages: by the sizes, 28 KiB a thread on a host without AMX and 40 KiB with it (Rust's threads had Rust's own
+  guarantee of 20 KiB before, set by Rust's runtime at their start); that the region is charged to the job's commit,
+  and so to `memory.max`, when the guarantee is set, is to be measured
+  (`test_a_stack_guarantee_is_charged_when_it_is_set`: a thread's guarantee raised by 64 KiB grows the process's
+  commit by what its guard pages grew, within a page; first run: CI). A Firecracker has 5 threads and one a vCPU
   (the event loop, the API thread, the PIT's timer, the TSC-deadline timer, the irqfd watcher), 2 in its API process,
   and one each, when they run, for the userfaultfd server and the reclaimer (a registration), the fifo relay, and an
   epoll's pipe or nested epoll: 224, 252 and 644 KiB with 1, 2 and 16 vCPUs without AMX, 320, 360 and 920 KiB with
