@@ -4469,8 +4469,24 @@ function Stage-MemoryHotplug {
 # whp/park.rs), is given back and checked against itself as parked, and the
 # second InstanceStart, with the kernel, boots on it. A partition that could
 # not be given back is said on a line (`wick: whp: ...`) and makes the
-# second start an error: either fails the stage. The jailed run of the same
-# is jailer-test.ps1's `restart`.
+# second start an error: either fails the stage.
+# The second guest's serial input is not read, by upstream's code on every
+# host: DeviceManager::new, before load_kernel, adds the serial device to
+# the event manager with stdin (device_manager/mod.rs setup_serial_device),
+# the failed start leaves it there, and the second's add of stdin is
+# event-manager's FdAlreadyRegistered, which upstream logs as a warning
+# (devices/legacy/serial.rs: "Failed to register serial input fd"); the
+# first start's device takes the input (run 44274141226, both restart
+# stages: the guests reached their shells, which never saw a line).
+# Upstream's tests retry a start only after one that failed before the
+# serial device is made (test_api_machine_config, at the memory), and read
+# no guest input after it: not tested upstream. So the warning is asserted,
+# as the cause; the guest is checked without input: both vCPUs up, its init
+# and shell started, its kernel's log read for tools/guest-health.txt's
+# patterns, its clock against the host's across 3 s idle, and
+# SendCtrlAltDel (the i8042's interrupt, the kernel's restart, reboot=k)
+# ending Firecracker with 0. The jailed run of the same is jailer-test.ps1's
+# `restart`.
 function Stage-Restart {
     $cfg = Base-Config 2
     $vm = Start-Vm 'restart' $null -Api
@@ -4486,12 +4502,36 @@ function Stage-Restart {
     $lines = @($said -split "`n" | Where-Object { $_ -match 'wick: whp: (the partition made at|this process)' })
     Check ($lines.Count -eq 0) "the partition after the failed start: $($lines -join ' | ')"
     Invoke-Api $vm 'PUT' '/boot-source' $cfg['boot-source'] | Out-Null
+    $from = $vm.Length
     Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'InstanceStart' }) | Out-Null
-    Wait-Shell $vm
-    $out = $vm.Sh('echo $((6*7)) $(nproc)')
-    Check ($out -eq '42 2') "the guest of the second start: '$out'"
-    $vm.Reboot()
-    return 'a start with a file that is not a kernel failed (400) after its VM was made; the second, with the kernel, booted 2 vCPUs in the same Firecracker on the partition given back'
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $init = $vm.WaitFor('\[\s*(\d+\.\d+)\] Run /bin/sh as init process', $TimeoutSec * 1000, $from)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $vm.WaitFor("can't access tty; job control turned off", 10000, $from) | Out-Null
+    $smp = $vm.WaitFor('smp: Brought up 1 node, (\d+) CPUs?', 1000, $from)
+    Check ($smp.Groups[1].Value -eq '2') "the guest of the second start brought up $($smp.Groups[1].Value) CPUs, not 2"
+    $log = Get-Content -Raw $vm.LogPath -ErrorAction SilentlyContinue
+    $warned = 'Failed to register serial input fd: event_manager: file descriptor has already been registered'
+    Check ($log -match [regex]::Escape($warned)) "the second start's serial input: no `"$warned`" in Firecracker's log, the cause of its unread input in run 44274141226; the partition is suspect again"
+    Start-Sleep -Seconds 3
+    $sent = $clock.Elapsed.TotalSeconds
+    Invoke-Api $vm 'PUT' '/actions' ([ordered]@{ action_type = 'SendCtrlAltDel' }) | Out-Null
+    $restart = $vm.WaitFor('\[\s*(\d+\.\d+)\] reboot: Restarting system', 30000, $from)
+    $seen = $clock.Elapsed.TotalSeconds
+    $guest = [double]::Parse($restart.Groups[1].Value, $inv) - [double]::Parse($init.Groups[1].Value, $inv)
+    $numbers = 'guest {0:F3} s from init to the restart, host {1:F3} s from init seen to SendCtrlAltDel, {2:F3} s to the restart seen' -f $guest, $sent, $seen
+    Check ($guest -ge 0.9 * $sent -and $guest -le $seen + 2) "the second guest's clock against the host's: $numbers"
+    # The guest's health without its shell: its kernel's log is the console's
+    # (console=ttyS0), read for tools/guest-health.txt's patterns.
+    $console = $vm.Output.Substring([Math]::Min($from, $vm.Length))
+    $sick = @($console -split "`n" | Where-Object { $l = $_; @($healthPatterns | Where-Object { $l.Contains($_) }).Count -gt 0 } | Select-Object -First 5)
+    Check ($sick.Count -eq 0) "the second guest's kernel reports:`n    $($sick -join "`n    ")"
+    $until = [DateTime]::UtcNow.AddSeconds(30)
+    while (-not $vm.Exited -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+    Check $vm.Exited "Firecracker did not exit within 30 s of SendCtrlAltDel ($($vm.ExitReason()))"
+    $vm.Drain(5000)
+    Check ($vm.ExitCode -eq 0) "exit status $($vm.ExitCode) after SendCtrlAltDel ($($vm.ExitReason()))"
+    return "a start with a file that is not a kernel failed (400) after its VM was made; the second, with the kernel, on the partition given back in the same Firecracker: 2 CPUs up, init and its shell, $numbers, SendCtrlAltDel ended Firecracker with 0; its serial input not read, as upstream's code leaves it (`"$warned`")"
 }
 
 $Stages = [ordered]@{

@@ -1670,7 +1670,12 @@ function Stage-Boot {
 # and the partition given back and checked against itself as parked; the
 # second InstanceStart, with the kernel, boots on it. A partition that could
 # not be given back is said on a line (`wick: whp: ...`) and makes the
-# second start an error: either fails the stage. Recorded (PARKIDLE): the
+# second start an error: either fails the stage. The second guest's serial
+# input is not read, by upstream's code on every host (boot-test.ps1's
+# `restart` says where): the warning that says so is asserted, as the cause,
+# and the guest is checked without input: both vCPUs up, its init and shell
+# started, its clock against the host's across 3 s idle, and SendCtrlAltDel
+# ending the jailer with 0. Recorded (PARKIDLE): the
 # idle Firecracker with its partition parked, and its API process, a
 # process of the same binary that parks none: private bytes, working set,
 # handles and threads. The run without a jail is boot-test.ps1's `restart`.
@@ -1696,14 +1701,32 @@ function Stage-Restart {
         $lines = @($vm.Text() -split "`n" | Where-Object { $_ -match 'wick: whp: (the partition made at|this process)' })
         Check ($lines.Count -eq 0) "the partition after the failed start: $($lines -join ' | ')"
         Invoke-ApiOk $vm.Sock 'PUT' '/boot-source' ([ordered]@{ kernel_image_path = '/vmlinux'; boot_args = $args0 }) | Out-Null
+        $from = $vm.Text().Length
         Invoke-ApiOk $vm.Sock 'PUT' '/actions' ([ordered]@{ action_type = 'InstanceStart' }) | Out-Null
-        Wait-Shell $vm
-        $out = $vm.Sh('echo $((6*7)) $(nproc)', 10)
-        Check ($out -eq '42 2') "the guest of the second start: '$out'"
-        $vm.Send('reboot -ff')
-        Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after the guest rebooted'
+        $tail = { (($vm.Text() -split "`n" | Select-Object -Last 5) -join ' | ') }
+        $at = { param($re) $t = $vm.Text(); $t = $t.Substring([Math]::Min($from, $t.Length)); if ($t -match $re) { $Matches[1] } else { $null } }
+        $initRe = '\[\s*(\d+\.\d+)\] Run /bin/sh as init process'
+        Check ($vm.WaitFor($initRe, 60)) "the second guest did not reach init: $(& $tail)"
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $init = & $at $initRe
+        Check ($vm.WaitFor("can't access tty; job control turned off", 10)) "the second guest's shell did not start: $(& $tail)"
+        $cpus = & $at 'smp: Brought up 1 node, (\d+) CPUs?'
+        Check ($cpus -eq '2') "the guest of the second start brought up '$cpus' CPUs, not 2"
+        $warned = 'Failed to register serial input fd: event_manager: file descriptor has already been registered'
+        Check ($vm.Text().Contains($warned)) "the second start's serial input: no `"$warned`" in Firecracker's output, the cause of its unread input in run 44274141226; the partition is suspect again"
+        Start-Sleep -Seconds 3
+        $sent = $clock.Elapsed.TotalSeconds
+        Invoke-ApiOk $vm.Sock 'PUT' '/actions' ([ordered]@{ action_type = 'SendCtrlAltDel' }) | Out-Null
+        $restartRe = '\[\s*(\d+\.\d+)\] reboot: Restarting system'
+        Check ($vm.WaitFor($restartRe, 30)) "the second guest did not restart within 30 s of SendCtrlAltDel: $(& $tail)"
+        $seen = $clock.Elapsed.TotalSeconds
+        $inv = [Globalization.CultureInfo]::InvariantCulture
+        $guest = [double]::Parse((& $at $restartRe), $inv) - [double]::Parse($init, $inv)
+        $numbers = 'guest {0:F3} s from init to the restart, host {1:F3} s from init seen to SendCtrlAltDel, {2:F3} s to the restart seen' -f $guest, $sent, $seen
+        Check ($guest -ge 0.9 * $sent -and $guest -le $seen + 2) "the second guest's clock against the host's: $numbers"
+        Check ($vm.P.WaitForExit(15000)) 'the jailer did not exit after SendCtrlAltDel'
         Check ($vm.P.ExitCode -eq 0) "jailer exit $($vm.P.ExitCode)"
-        "a start with a file that is not a kernel failed (400) after its VM was made; the second, with the kernel, booted 2 vCPUs in the same jailed Firecracker on the partition given back (PARKIDLE $($idle -join '; '))"
+        "a start with a file that is not a kernel failed (400) after its VM was made; the second, with the kernel, on the partition given back in the same jailed Firecracker: 2 CPUs up, init and its shell, $numbers, SendCtrlAltDel ended the jailer with 0; its serial input not read, as upstream's code leaves it (PARKIDLE $($idle -join '; '))"
     } finally { Stop-Jailed }
 }
 

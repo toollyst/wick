@@ -156,7 +156,7 @@ Every endpoint in upstream's `firecracker.yaml`. Host-side values differ where t
 | Endpoint | macOS | Windows |
 | --- | --- | --- |
 | `GET /` | 🟢 `test_describe_instance` | 🟢 `test_describe_instance` |
-| `PUT /actions` `InstanceStart` | 🟢 `test_api_happy_start`, every `boot-test` stage | 🟢 `test_api_happy_start`, every `boot-test.ps1` stage |
+| `PUT /actions` `InstanceStart` | 🟢 `test_api_happy_start`, every `boot-test` stage | 🟢 `test_api_happy_start`, every `boot-test.ps1` stage; a start that failed after its VM was made, tried again in the same Firecracker, boots on the partition given back (`boot-test.ps1 restart`, `jailer-test.ps1 restart`: 2 CPUs, init, the guest's clock against the host's, SendCtrlAltDel ending Firecracker with 0; first run: CI), the second guest's serial input not read, as upstream's code leaves it on every host: the first start's serial device keeps stdin (`setup_serial_device`, event-manager's `FdAlreadyRegistered`, logged as "Failed to register serial input fd"), not tested upstream |
 | `PUT /actions` `SendCtrlAltDel` | ⚪ x86's i8042 only; upstream skips it on aarch64 (`test_send_ctrl_alt_del` [arch]) | 🟢 `test_send_ctrl_alt_del` |
 | `PUT /actions` `FlushMetrics` | 🟢 `test_flush_metrics` | 🟢 `test_flush_metrics` |
 | `/balloon` GET, PUT, PATCH | 🟢 `test_api_balloon`, `boot-test devices` | 🟢 `test_api_balloon`, `boot-test.ps1 devices`. In CI run 43442912128 (861d365; Windows Server 2025 10.0.26100.33674 on an AMD EPYC 7763, elevated): `boot-test.ps1 devices` passed. |

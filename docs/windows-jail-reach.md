@@ -534,7 +534,7 @@ to when the partition is made. What it brings, and what the next record (`jail-v
    has the partition is that error too. A jailed Firecracker parks in `jail::enter` before the revert, in the VMM
    process only, a failure ending the start, named; without a jail it parks when it takes its API socket. Tests:
    `jailer-test.ps1 restart` and `boot-test.ps1 restart` (a start with a file that is not a kernel, failing after
-   its VM is made, then one with the kernel in the same Firecracker; first run: CI), and
+   its VM is made, then one with the kernel in the same Firecracker), and
    `test_a_recycled_partition_is_as_a_fresh_one` in CI's WHP step, alone in its process: a partition given back
    after a VM that ran a guest (an interrupt taken, dirty pages tracked, its memory unmapped and mapped again),
    compared with a fresh one by every property, the mapped pages, vCPUs 0 and 1 as made (every KVM getter, the MSRs
@@ -542,7 +542,18 @@ to when the partition is made. What it brings, and what the next record (`jail-v
    a read of the old memory (first run: CI). Upstream makes a second VM in one process only so, a failed
    `InstanceStart` before its vCPUs start: a failed snapshot load ends the process, and a VM whose vCPUs started
    lives as long as the process; no second VM follows one that ran guest code, so this comparison is the stricter
-   test. What WHP does not expose (the hypervisor's translation caches and
+   test. The two `restart` stages' first run on CI failed on the second guest's serial input, not
+   on the partition: both guests reached their shells, which never saw a line, and both Firecrackers logged
+   "Failed to register serial input fd: event_manager: file descriptor has already been registered". That is
+   upstream's code on every host: `DeviceManager::new`, before `load_kernel`, adds the serial device to the event
+   manager with stdin (`device_manager/mod.rs` `setup_serial_device`), the failed start leaves it there, and the
+   second's add of stdin is event-manager's `FdAlreadyRegistered`, which upstream only logs
+   (`devices/legacy/serial.rs`); the first start's device takes the input. Upstream's tests try a start again only
+   after one that failed before the serial device is made (`test_api_machine_config`, at the memory) and read no
+   input after it: not tested upstream. The stages now assert that warning as the cause and check the second guest
+   without input: `smp` brought up 2 CPUs, init and its shell started, its clock from init to its restart against
+   the host's across 3 s idle, and SendCtrlAltDel (the i8042's interrupt reaching the guest, the kernel's restart)
+   ending Firecracker with 0 (first run: CI). What WHP does not expose (the hypervisor's translation caches and
    objects of its own) cannot be compared: a parked partition is only ever used again by the same process, for the
    same jail, guest images, devices and principal, and never handed to another process or jail, so that is an
    unknown of correctness, not of isolation.
