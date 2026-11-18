@@ -1039,9 +1039,14 @@ it means layer 1 let the request through.
       (`mach_vm_reallocate` alone is listed): `task_info` of its own task, `deny(1) syscall-mig 195` in the crash
       report of a C program under the same profile (macOS 27.2). A bootstrap lookup through libxpc is killed before
       any message, at `mach_port_mod_refs` (`deny(1) syscall-mach 19`, the same program). Both are `confine_probe`
-      cases, killed confined and working unconfined. Not measured: a lookup message built by hand and sent with
-      `mach_msg2_trap` alone, which reaches launchd; launchd asks Seatbelt `mach-lookup` for its sender, which the
-      default denies, and answers with an error (that denial is launchd's own check of the sender, not a kill).
+      cases, killed confined and working unconfined. A lookup built by hand and sent with `mach_msg` alone (the
+      request libxpc sends, captured unconfined: an XPC pipe message, id 0x400000cf, carrying the bootstrap port; a
+      reply port allocated before the profile) reaches launchd, which asks Seatbelt `mach-lookup` for its sender:
+      the default's kill ends the process inside `mach_msg2_trap` (sandboxd: `deny(1) mach-lookup
+      com.apple.system.notification_center`; crash report code 1, no details) and no port comes back. Unconfined the
+      same message is answered with the service's port (macOS 27.2; the program is not in the repository). No
+      `confine_probe` case: the request's format is libxpc's own and may change with it, and a reply port is
+      allocated by a Mach trap the profile kills, so the case would need one made before the profile.
 
     The share's file operations, each named, inside `(subpath "<share>")` only:
     - allowed: `file-read-data`, `file-read-metadata`, `file-read-xattr`, `file-test-existence`, and, read-write,
