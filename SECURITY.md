@@ -268,17 +268,21 @@ has the per-control details and results.
   epoll's pipe or nested epoll: 224, 252 and 644 KiB with 1, 2 and 16 vCPUs without AMX, 320, 360 and 920 KiB with
   it, against the 128 MiB `memory.max` of jailer-test's limits stage (2 vCPUs) and a VMM's 3.3 to 6.2 MiB working
   set; the working set (docs/COMPATIBILITY.md's VMMMEM) gains at most the one page a thread, to be re-measured: first
-  run CI. Threads the callback does not reach: those made before the process's callback runs (two of the test
-  binary's, starting in ntdll with the guarantee 0 and 12288 bytes of guard pages) and those the loader never attaches
-  (made with `THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH`, or the loader's own workers, which may be started after the
-  callback too: one of the test binary's was such a thread or one listed before its attach ran, which CI's
-  listing could not tell apart). No TLS callback runs on a thread the loader does not attach, so none of wick's;
-  an overflow on one ends as before this fix. The test now reads each thread's TEB SameTebFlags (SkipThreadAttach,
-  LoaderWorker; ntdll's public symbols, not documented by Microsoft, its reading checked by the main thread's
-  InitialThread bit) and reads a thread without the guarantee again for up to 2 s; one the loader attaches that
-  still has none, or one it never attaches that starts outside ntdll, fails the test. Firecracker's own threads, as
-  the release build runs a booted guest with 1, 2 and 16 vCPUs, are checked the same way by CI's windows job
-  (`vmm-memory-record.py --check-stacks`, VMMSTACK GUARANTEE). First run of both: CI.
+  run CI. Threads the callback does not reach are the loader's own workers: their TEB says LoaderWorker
+  (SameTebFlags 0x2000, ntdll's public symbols, not documented by Microsoft; its reading checked by the main
+  thread's InitialThread bit, 0x400), they start in ntdll (one start address, ntdll.dll+0x845d0, in the same
+  run), and they keep the default of 3 guard pages, 12288 bytes, and no guarantee: three made before the test
+  binary's callback ran, and 9 of the release Firecracker's 46 threads as it ran a booted guest with 1, 2 and 16
+  vCPUs, where every other thread (main, each `fc_vcpu`, `whp-tsc-deadline`, `wick-epoll-pipe`, the pool's)
+  has the guarantee and its 28672 bytes of guard pages (CI's STACKGUARANTEE and VMMSTACK GUARANTEE lines, Windows
+  Server 2025). The loader never attaches them, so no TLS callback runs on them, wick's included, and they run the
+  loader's own work in ntdll, no code of wick's or Firecracker's; an overflow on one ends as before this fix. Seen
+  once and not decided: a thread of the test binary made after the callback, starting in ntdll, with no guarantee
+  and 12288 bytes of guard pages, before the test read SameTebFlags: a loader worker made later, or a thread
+  listed before its attach ran. The test now tells them apart: it reads a thread without the guarantee again for up
+  to 2 s, and one the loader attaches that still has none, or one it never attaches that starts outside ntdll,
+  fails it (`test_every_thread_has_the_stack_guarantee`); CI's windows job fails the same way on a thread of the
+  release Firecracker (`vmm-memory-record.py --check-stacks`, VMMSTACK GUARANTEE).
 - **Windows: a write into memory that a userfaultfd register was moving could be lost, and an access to it at the
   wrong moment could end the process** (since the register moves the memory into sections,
   `windows_mm::uffd_alias`; fixed in the commit that adds this entry). The register copies the mapping's resident
