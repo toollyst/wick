@@ -481,7 +481,10 @@ corpus and link sequences against it): as a user it makes a user
 namespace, and where the host restricts those (Ubuntu's
 `kernel.apparmor_restrict_unprivileged_userns`) the tests check its refusal
 only; run the test binaries as root as well (it then drops to uid 65534),
-as CI's sudo step does. CI's fs job also loads an AppArmor profile that
+as CI's sudo step does. `WICK_FS_TEST_SIMULATE_USERNS_RESTRICTED=1` (not
+root) runs the tests' refusal-only branch on a host without the
+restriction: every server they start is refused its setgroups write, as
+Ubuntu's restriction refuses it. CI's fs job also loads an AppArmor profile that
 grants the built wick-fsd and `confine_probe` user namespaces and runs them
 as its user with `WICK_FS_TEST_USERNS_GRANTED=1`, which tells the tests that
 user namespaces are granted (a refusal then fails them); it removes the

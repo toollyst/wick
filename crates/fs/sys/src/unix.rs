@@ -1313,6 +1313,84 @@ pub fn maxfilesperproc() -> Result<u64> {
     u64::try_from(v).map_err(|_| HostErrno(libc::EINVAL))
 }
 
+/// Makes the program `cmd` runs start with its standard streams and no
+/// other descriptor, whatever this process holds or was left by its own
+/// launcher: in the child, after std has set up 0 to 2 and before the exec,
+/// every descriptor above 2 is marked close-on-exec (std's own pipe for an
+/// exec failure is already). For a test whose bound is on the process's
+/// descriptor table (Linux: `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`, each
+/// descriptor below the soft limit where the kernel has no `close_range`;
+/// macOS: each below `getdtablesize()`, which is at most
+/// `kern.maxfilesperproc`).
+pub fn command_with_only_stdio(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    let closure = || {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: no pointer; marks the range close-on-exec.
+            if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, libc::CLOSE_RANGE_CLOEXEC) } == 0 {
+                return Ok(());
+            }
+        }
+        // SAFETY: async-signal-safe calls on descriptor numbers only.
+        let top = unsafe { libc::getdtablesize() };
+        for fd in 3..top {
+            // SAFETY: as above; a descriptor not open is EBADF, skipped.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 {
+                continue;
+            }
+            // SAFETY: as above, on a descriptor that is open.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    };
+    // SAFETY: the closure makes only async-signal-safe system calls and
+    // allocates nothing.
+    unsafe {
+        cmd.pre_exec(closure);
+    }
+}
+
+/// What descriptor `fd` of this process is, for a message: its file type
+/// and where the host can say it, its path (macOS `F_GETPATH`, Linux the
+/// `/proc/self/fd` link, which names a pipe or socket by its inode).
+pub fn descriptor_described(fd: c_int) -> String {
+    // SAFETY: an output buffer of the right type.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::fstat(fd, &mut st) } < 0 {
+        return format!("{fd}: {:?}", last());
+    }
+    let kind = match st.st_mode & libc::S_IFMT {
+        libc::S_IFREG => "file",
+        libc::S_IFDIR => "directory",
+        libc::S_IFCHR => "character device",
+        libc::S_IFBLK => "block device",
+        libc::S_IFIFO => "pipe",
+        libc::S_IFSOCK => "socket",
+        libc::S_IFLNK => "link",
+        _ => "other",
+    };
+    #[cfg(target_os = "macos")]
+    let path = {
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most MAXPATHLEN bytes, the buffer's.
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+            format!("no path ({:?})", last())
+        } else {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            String::from_utf8_lossy(&buf[..end]).into_owned()
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let path = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        .map_or_else(|e| format!("no path ({e})"), |p| p.display().to_string());
+    format!("{fd}: {kind} {path}")
+}
+
 /// Sets the soft `RLIMIT_NOFILE` to `soft` (at most the hard limit). The
 /// caller reads [`nofile`] back: on macOS the kernel keeps a value above
 /// `kern.maxfilesperproc` and enforces the lower one.
@@ -1336,6 +1414,42 @@ pub fn set_nofile(soft: u64) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
+
+    #[test]
+    fn test_a_command_with_only_stdio_inherits_nothing_else() {
+        // A descriptor this process would pass on (dup's copy is not
+        // close-on-exec), well above the low ones as a CI runner's are.
+        // SAFETY: plain descriptor calls on a descriptor this test owns.
+        let fd = unsafe { libc::dup(std::io::stdin().as_fd().as_raw_fd()) };
+        assert!(fd >= 0);
+        // SAFETY: as above.
+        let high = unsafe { libc::fcntl(fd, libc::F_DUPFD, 140) };
+        assert!(high >= 140);
+        // SAFETY: as above.
+        unsafe { libc::close(fd) };
+        let listed = |only: bool| {
+            let mut cmd = std::process::Command::new("/bin/ls");
+            cmd.arg("/dev/fd/");
+            if only {
+                command_with_only_stdio(&mut cmd);
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap().split_whitespace().map(|n| n.parse::<i32>().unwrap()).collect::<Vec<_>>()
+        };
+        let plain = listed(false);
+        let only = listed(true);
+        // SAFETY: as above.
+        unsafe { libc::close(high) };
+        assert!(plain.contains(&high), "{plain:?}");
+        // The standard streams and what ls opens itself (the lowest free
+        // descriptors, from 3 up): nothing inherited, which would stand
+        // apart, as 140 does.
+        let dense: Vec<i32> = (0..i32::try_from(only.len()).unwrap()).collect();
+        assert!(only == dense && only.len() <= 6, "{only:?}");
+        assert!(descriptor_described(0).starts_with("0: "));
+        assert!(descriptor_described(-1).contains(&format!("{}", libc::EBADF)), "{}", descriptor_described(-1));
+    }
 
     fn tmp(tag: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("wick-fs-sys-{tag}-{}", std::process::id()));

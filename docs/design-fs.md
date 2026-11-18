@@ -521,7 +521,8 @@ server's only unsafe code, `wick-fsd` itself forbids it):
     descriptor), all inside `SPARE_FDS` and so inside `limits::descriptors`
     (`test_a_chain_deeper_than_the_cache_is_walked_within_one_spare_descriptor`: a cache of 2, a chain of 8 all let
     go, walked under a soft `RLIMIT_NOFILE` of the descriptors open and one more, then one more for CREATE's
-    handle, in a process of its own). An identity is `(st_dev, st_ino)`, as a leaf's (below, Inode numbers reused). A
+    handle, in a process of its own that starts with its standard streams alone, whatever its launcher left open: a
+    CI runner leaves descriptors far above them, 131 to 146 on macos-latest in run 44225041771). An identity is `(st_dev, st_ino)`, as a leaf's (below, Inode numbers reused). A
     directory the cache still holds is served wherever the host moved it, as before
     (`test_a_held_directory_the_host_moved_is_served`).
   - Any other object is one *leaf* per identity, which keeps the names it is known by, as (directory node, name),
@@ -776,9 +777,15 @@ it means layer 1 let the request through.
       ([Canonical, 2023-10-09](https://canonical.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces);
       [spec](https://discourse.ubuntu.com/t/spec-unprivileged-user-namespace-restrictions-via-apparmor-in-ubuntu-23-10/37626))
       [doc], and 24.04 turns it on by default ([LP #2046477](https://bugs.launchpad.net/bugs/2046477)) [doc].
-      GitHub's ubuntu-latest has it on: as the runner's user, wick-fsd refuses and `confine_probe` says "ran nothing
-      confined: kernel.apparmor_restrict_unprivileged_userns = 1" (CI run 44207018536's fs job), so CI runs the
-      user-namespace path's refusal only (`test_userns_restricted_refused`) and the root path for everything else.
+      GitHub's ubuntu-latest (Ubuntu 26.04 now) and ubuntu-24.04-arm have it on: as the runner's user, the `unshare`
+      succeeds and the write of `/proc/self/setgroups` in the new namespace is refused (EACCES), so wick-fsd refuses
+      naming that file, and `confine_probe` says "ran nothing confined:
+      kernel.apparmor_restrict_unprivileged_userns = 1" (CI run 44225041771's fs jobs). There, as a user without the
+      profile below, every confined test checks that refusal instead (a user namespace's step named, nothing served,
+      no confined child: `is_userns_refusal` in `tests/common/remote.rs`); the confined child's own steps are reached
+      as root (the sudo step) and under the profile (the AppArmor step). `WICK_FS_TEST_SIMULATE_USERNS_RESTRICTED=1`
+      runs that branch on a host without the restriction: each server the tests start does so under a filter that
+      refuses its setgroups write with EACCES, as the restriction does.
     - Debian: its own kernel patch's `kernel.unprivileged_userns_clone`, 0 (off) before bullseye (11) and 1 since
       ([bubblewrap's README.Debian](https://sources.debian.org/src/bubblewrap/0.11.0-2/debian/README.Debian)) [doc].
     - RHEL and others: upstream's `user.max_user_namespaces`, 0 disables them

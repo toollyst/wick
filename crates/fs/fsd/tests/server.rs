@@ -24,7 +24,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use common::drive::G;
-use common::remote::{Remote, Server, base_args, give_share, userns_restricted};
+use common::remote::{Remote, Server, base_args, give_share, is_userns_refusal, userns_restricted};
 use common::*;
 use wick_fs_sys::confine::{self as c, nr};
 
@@ -61,8 +61,8 @@ fn confined(s: &Setup, extra: &[&str]) -> Option<Remote> {
         Err((mut server, why)) => {
             let (status, err) = server.wait();
             if let Some(restricted) = userns_restricted() {
-                assert!(!status.success() && err.contains("confinement"), "{status:?}: {err}");
-                eprintln!("ran nothing confined: {restricted}; the server refused as it must: {err}");
+                assert!(!status.success() && is_userns_refusal(&err), "{restricted}: not a user namespace's refusal: {err}");
+                eprintln!("ran nothing confined: {restricted}; refused at its user namespace, as it must: {err}");
                 return None;
             }
             panic!("no confined server ({why}; {status:?}): {err}");
@@ -261,7 +261,7 @@ fn refused_when(tag: &str, deny: &[(std::ffi::c_long, Option<(u32, u32)>)], errn
                 && !err.contains(step)
             {
                 // The user namespace failed first, as this host restricts it.
-                assert!(err.contains("confinement"), "{err}");
+                assert!(is_userns_refusal(&err), "{restricted}: not a user namespace's refusal: {err}");
                 eprintln!("{restricted}: refused before {step}: {err}");
                 return;
             }
@@ -369,11 +369,18 @@ fn in_the_child(tag: &str, call: (std::ffi::c_long, Option<(u32, u32)>), nth: Op
         }
     };
     let (calls, nnp_before) = supervisor.unwrap().join().unwrap();
-    if !served && let Some(restricted) = userns_restricted() && err.contains("unshare of the namespaces") {
-        eprintln!("ran nothing confined: {restricted}: {err}");
+    let child_calls = calls.iter().filter(|c| c.nested).count();
+    // A host that restricts user namespaces (as a user, without the CI
+    // profile's grant): the server is refused at a step of its user
+    // namespace, before any child exists. That refusal is what is checked
+    // there; the child's step is reached as root and under the grant.
+    if let Some(restricted) = userns_restricted() {
+        assert!(!served, "served although {restricted}: {err}");
+        assert!(is_userns_refusal(&err), "{restricted}: not a user namespace's refusal: {err}");
+        assert_eq!(child_calls, 0, "{restricted}: a child made the call: {err}");
+        eprintln!("ran nothing confined: {restricted}; refused at its user namespace, as it must: {err}");
         return None;
     }
-    let child_calls = calls.iter().filter(|c| c.nested).count();
     Some(Seen {
         served,
         err,
@@ -509,8 +516,12 @@ fn test_refused_when_landlock_fails() {
         Err((mut server, _)) => {
             let (status, err) = server.wait();
             assert!(!status.success());
-            if userns_restricted().is_none() || err.contains("Landlock") {
-                assert!(err.contains("Landlock failed"), "{err}");
+            match userns_restricted() {
+                Some(restricted) if !err.contains("Landlock") => {
+                    assert!(is_userns_refusal(&err), "{restricted}: not a user namespace's refusal: {err}");
+                    eprintln!("{restricted}: refused before Landlock: {err}");
+                }
+                _ => assert!(err.contains("Landlock failed"), "{err}"),
             }
         }
     }
@@ -529,7 +540,8 @@ fn test_landlock_absent_is_logged() {
         Err((mut server, why)) => {
             let (status, err) = server.wait();
             if let Some(restricted) = userns_restricted() {
-                eprintln!("ran nothing confined: {restricted}: {err}");
+                assert!(!status.success() && is_userns_refusal(&err), "{restricted}: not a user namespace's refusal: {err}");
+                eprintln!("ran nothing confined: {restricted}; refused at its user namespace, as it must: {err}");
                 return;
             }
             panic!("{why} {status:?}: {err}");
@@ -558,5 +570,5 @@ fn test_userns_restricted_refused() {
     };
     let (status, err) = server.wait();
     assert!(!status.success());
-    assert!(err.contains("confinement") && err.contains("does not serve unconfined"), "{err}");
+    assert!(is_userns_refusal(&err), "{restricted}: not a user namespace's refusal: {err}");
 }

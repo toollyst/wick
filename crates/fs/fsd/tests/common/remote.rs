@@ -57,9 +57,17 @@ pub fn give_share(share: &Path) {
 /// profile grants the built wick-fsd and confine_probe user namespaces
 /// whatever the sysctl (the CI fs job's step): then nothing is restricted,
 /// and a refusal fails the test.
+///
+/// `WICK_FS_TEST_SIMULATE_USERNS_RESTRICTED=1` (not root) stands in for such
+/// a host where it has none: every server the tests start runs under
+/// `confine::simulated_userns_restriction`, which refuses its setgroups
+/// write with EACCES as Ubuntu's restriction does, and this says so.
 pub fn userns_restricted() -> Option<String> {
     if sys::euid() == 0 || std::env::var_os("WICK_FS_TEST_USERNS_GRANTED").is_some_and(|v| v == "1") {
         return None;
+    }
+    if simulated_restriction() {
+        return Some("simulated (WICK_FS_TEST_SIMULATE_USERNS_RESTRICTED=1: the setgroups write refused, EACCES)".into());
     }
     let read = |p: &str| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string());
     if read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").as_deref() == Some("1") {
@@ -74,6 +82,23 @@ pub fn userns_restricted() -> Option<String> {
     None
 }
 
+/// Whether the tests stand in for a host that restricts user namespaces
+/// ([`userns_restricted`]).
+fn simulated_restriction() -> bool {
+    sys::euid() != 0 && std::env::var_os("WICK_FS_TEST_SIMULATE_USERNS_RESTRICTED").is_some_and(|v| v == "1")
+}
+
+/// Whether `err` is the refusal of a host that restricts user namespaces:
+/// one of the user namespace's steps named (the `unshare`, or a write of
+/// its maps or of setgroups, which Ubuntu's AppArmor restriction refuses),
+/// and no serving unconfined.
+pub fn is_userns_refusal(err: &str) -> bool {
+    let step = ["unshare of the namespaces", "/proc/self/setgroups", "/proc/self/uid_map", "/proc/self/gid_map"]
+        .iter()
+        .any(|s| err.contains(&format!("confinement: {s} failed")));
+    step && err.contains("does not serve unconfined")
+}
+
 /// A confined server over `share` (given to 65534 as root), connected:
 /// `None`, said on stderr, where this host refuses the user namespace a
 /// server that is not root needs (the refusal itself is checked by
@@ -85,7 +110,8 @@ pub fn confined_over(share: &Path, socket: &Path) -> Option<Remote> {
         Err((mut server, why)) => {
             let (status, err) = server.wait();
             if let Some(restricted) = userns_restricted() {
-                eprintln!("ran nothing confined: {restricted}: {err}");
+                assert!(!status.success() && is_userns_refusal(&err), "{restricted}: not a user namespace's refusal: {err}");
+                eprintln!("ran nothing confined: {restricted}; refused at its user namespace, as it must: {err}");
                 return None;
             }
             panic!("no confined server ({why}; {status:?}): {err}");
@@ -115,6 +141,9 @@ impl Server {
     pub fn start(args: &[String], prepare: impl FnOnce(&mut Command)) -> Server {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_wick-fsd"));
         cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if simulated_restriction() {
+            sys::confine::command_with_filter(&mut cmd, sys::confine::simulated_userns_restriction());
+        }
         prepare(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         let stderr = Arc::new(Mutex::new(String::new()));

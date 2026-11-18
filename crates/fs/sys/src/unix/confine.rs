@@ -919,6 +919,20 @@ pub fn deny_program(deny: &[(c_long, Option<(u32, u32)>)], errno: i32) -> Vec<In
     matching_program(deny, bpf::ERRNO | (u32::try_from(errno).unwrap_or(1) & 0xffff))
 }
 
+/// The tests' stand-in for a host that restricts unprivileged user
+/// namespaces as Ubuntu's AppArmor does: there `unshare(CLONE_NEWUSER)`
+/// succeeds and the new namespace holds no capability, so the server's
+/// write of `/proc/self/setgroups` is refused with EACCES (CI's fs job on
+/// ubuntu-latest and ubuntu-24.04-arm). This filter refuses that write the
+/// same way: an `openat` for writing, creating and truncating (std's
+/// `fs::write`, wick-fsd's first such open) fails with EACCES. A process
+/// that is not root makes the write; a root one makes none and is not
+/// affected.
+pub fn simulated_userns_restriction() -> Vec<Insn> {
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC;
+    deny_program(&[(libc::SYS_openat, Some((2, u32::try_from(flags).unwrap_or(0))))], libc::EACCES)
+}
+
 /// A filter that tells a supervisor of each system call of `calls` (as in
 /// [`deny_program`]) and allows everything else: the supervisor
 /// ([`supervise`]) answers each, by the process that made it, so a test

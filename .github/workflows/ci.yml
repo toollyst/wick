@@ -1268,9 +1268,22 @@ jobs:
           persist-credentials: false
       - name: Clippy, warnings as errors
         run: cargo clippy --locked --all-targets -- -D warnings
+      # On record first: the descriptors this step's shell holds above the
+      # standard streams, which every test process inherits (stale.rs's walk
+      # starts its own process without them), and on Linux what a user
+      # namespace of the runner's user is here (design-fs §6.1).
       - name: Unit tests
         id: fs_units
-        run: cargo test --locked 2>&1 | tee "$RUNNER_TEMP/tests.log"
+        run: |
+          case "$RUNNER_OS" in
+            macOS) lsof -a -p $$ -d 3-65535 || true ;;
+            Linux)
+              ls -l /proc/$$/fd || true
+              sysctl kernel.apparmor_restrict_unprivileged_userns user.max_user_namespaces || true
+              unshare -U sh -c 'cat /proc/self/attr/apparmor/current 2>/dev/null || cat /proc/self/attr/current; echo deny > /proc/self/setgroups && echo "setgroups written"' || true
+              ;;
+          esac
+          cargo test --locked 2>&1 | tee "$RUNNER_TEMP/tests.log"
       # The host-directory tests a user cannot set up alone (CONTRIBUTING.md,
       # Tests): a casefold ext4 directory and a vfat mount for the ignored
       # tests, a device node (made as root) for the special-files test, and

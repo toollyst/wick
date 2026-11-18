@@ -180,7 +180,9 @@ fn test_an_unlinked_file_open_while_the_cache_lets_go_is_served() {
 
 /// A chain deeper than the cache, every ancestor let go, walked again from
 /// the root, in a process of its own (the descriptors and their limit are
-/// the process's, and this file's other tests run as threads of one): the
+/// the process's, and this file's other tests run as threads of one), which
+/// starts with its standard streams alone whatever its launcher left open
+/// (a CI runner leaves descriptors far above them in its steps): the
 /// soft `RLIMIT_NOFILE` is set to the descriptors open, the cache full, and
 /// one more, so a walk that kept a second descriptor beyond the cache would
 /// meet EMFILE; then one more for CREATE's handle. The bound is
@@ -191,11 +193,10 @@ fn test_a_chain_deeper_than_the_cache_is_walked_within_one_spare_descriptor() {
     const ALONE: &str = "WICK_FS_TEST_STALE_ALONE";
     const NAME: &str = "test_a_chain_deeper_than_the_cache_is_walked_within_one_spare_descriptor";
     if std::env::var_os(ALONE).is_none() {
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
-            .env(ALONE, "1")
-            .output()
-            .unwrap();
+        let mut alone = std::process::Command::new(std::env::current_exe().unwrap());
+        alone.args([NAME, "--exact", "--test-threads=1", "--nocapture"]).env(ALONE, "1");
+        sys::command_with_only_stdio(&mut alone);
+        let out = alone.output().unwrap();
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         assert!(out.status.success() && text.contains("1 passed"), "the walk in a process of its own:\n{text}");
         return;
@@ -221,7 +222,8 @@ fn test_a_chain_deeper_than_the_cache_is_walked_within_one_spare_descriptor() {
     // it (the listing's own is it), so the limit counts descriptors.
     let next = std::fs::File::open("/dev/null").map(|f| std::os::fd::AsRawFd::as_raw_fd(&f)).unwrap();
     let open: Vec<i32> = std::fs::read_dir("/dev/fd").unwrap().map(|e| e.unwrap().file_name().to_str().unwrap().parse().unwrap()).collect();
-    assert!(open.iter().all(|&fd| fd <= next), "descriptors open above the lowest free one {next}: {open:?}");
+    let above: Vec<String> = open.iter().filter(|&&fd| fd > next).map(|&fd| sys::descriptor_described(fd)).collect();
+    assert!(above.is_empty(), "descriptors open above the lowest free one {next} (of {open:?}): {above:?}");
     let next = u64::try_from(next).unwrap();
     let (soft, _) = sys::nofile().unwrap();
     let limits = wick_fsd::limits::Limits {
