@@ -2378,7 +2378,15 @@ jobs:
           # (SWAPSTRESS lines; a page read wrong, its "round N: page" line:
           # its value, the events around its read, the vCPU's exits).
           alone whp::vcpu::fpu_tests::test_a_chunk_swapped_under_a_vcpu_and_a_host_writer_keeps_their_memory
-          # The same chunk moved by the reclaim at a job's memory limit (its
+          # An access to a missing page whose fill is held after its commit
+          # and before its content (a host thread's read, the guest's read,
+          # the guest's write): in the fault until the fill ends, then the
+          # fill's content or the guest's write (FILLWINDOW lines; first
+          # run: CI). And what WHP gives the guest of a section page in the
+          # states a fill passes through (COMMITVIEW lines, a record).
+          alone whp::vcpu::fpu_tests::test_an_access_during_a_fill_waits_for_the_pages_content
+          alone whp::vcpu::fpu_tests::test_a_page_committed_closed_through_the_guests_view_on_record
+          # SWAPSTRESS's chunk moved by the reclaim at a job's memory limit (its
           # live pages copied into a new section) under the guest's reads and
           # then its writes, 20 rounds each in a child held at the limit with
           # no room left: no value lost, every round moved, the dirty log

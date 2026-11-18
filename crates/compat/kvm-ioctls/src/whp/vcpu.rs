@@ -8358,6 +8358,175 @@ mod fpu_tests {
         assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
     }
 
+    /// FILLWINDOW: an access to a missing userfaultfd page whose fill has
+    /// committed it and not yet written its content (the fill held there,
+    /// `libc::wick_uffd::test_hooks::set_fill_hook`) is not given the page:
+    /// it is in `wick_uffd::fault`, and once the fill ends it reads the
+    /// fill's content or keeps its own write over it. Linux's UFFDIO_COPY
+    /// copies the page before it sets the page's entry (v6.1 mm/userfaultfd.c
+    /// `mcopy_atomic_pte`, `copy_from_user` before `set_pte_at`), and an
+    /// access to the page until then waits in `handle_userfault`. The
+    /// guest's RAM (4 MiB) registered before the VM maps it, as SWAPSTRESS's;
+    /// three pages of its second 2 MiB, never written, so missing and
+    /// reserved (not committed). Each held fill is the test's own
+    /// `UFFDIO_COPY` (qwords `FILL`); while it is held:
+    /// - a host thread reads the first page;
+    /// - the vCPU reads the second (`mov rax, [P2]`, `out 0x85`);
+    /// - the vCPU writes `GUEST` to the third and reads it back (`mov [P3],
+    ///   rbx`, `mov rcx, [P3]`, `out 0x86`).
+    ///
+    /// Each access is decided by the first of two ends, both final while
+    /// the fill is held: in the fault (a waiter slot holds the page:
+    /// `test_hooks::in_fault`), or done (the thread ended, or the vCPU's run
+    /// returned: the page given before its content). Then the fill is let
+    /// go: the host thread reads `FILL`, RAX is `FILL`, and the third page
+    /// holds `GUEST` and RCX is `GUEST`. FILLWINDOW lines; asserted.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_an_access_during_a_fill_waits_for_the_pages_content() {
+        use std::sync::atomic::AtomicU8;
+        use std::time::{Duration, Instant};
+        const P1: u64 = 0x30_0000;
+        const P2: u64 = 0x30_1000;
+        const P3: u64 = 0x30_2000;
+        const FILL: u64 = 0xF111_F111_F111_F111;
+        const GUEST: u64 = 0x6E57_6E57_6E57_6E57;
+        // The fill's hold: 0 none, 1 held (its pages committed, their
+        // content not written), 2 let go.
+        static HOLD: AtomicU8 = AtomicU8::new(0);
+        fn hold() {
+            HOLD.store(1, Ordering::SeqCst);
+            let t = Instant::now();
+            while HOLD.load(Ordering::SeqCst) != 2 && t.elapsed() < Duration::from_secs(30) {
+                std::thread::yield_now();
+            }
+            HOLD.store(0, Ordering::SeqCst);
+        }
+        let mut program = Vec::new();
+        // mov rax, [P2]; out 0x85, al
+        program.extend_from_slice(&[0x48, 0x8B, 0x04, 0x25]);
+        program.extend_from_slice(&u32::try_from(P2).unwrap().to_le_bytes());
+        program.extend_from_slice(&[0xE6, 0x85]);
+        // mov rbx, GUEST; mov [P3], rbx; mov rcx, [P3]; out 0x86, al; hlt; jmp to the hlt
+        program.extend_from_slice(&[0x48, 0xBB]);
+        program.extend_from_slice(&GUEST.to_le_bytes());
+        program.extend_from_slice(&[0x48, 0x89, 0x1C, 0x25]);
+        program.extend_from_slice(&u32::try_from(P3).unwrap().to_le_bytes());
+        program.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x25]);
+        program.extend_from_slice(&u32::try_from(P3).unwrap().to_le_bytes());
+        program.extend_from_slice(&[0xE6, 0x86, 0xF4, 0xEB, 0xFD]);
+        let say = |l: String| eprintln!("FILLWINDOW {l}");
+        let mut uffd = None;
+        let (vm, vcpu, m) = mmio_guest_with(&program, |m| {
+            let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+            libc::wick_uffd::register(ctx, m as u64, MEM as u64).unwrap();
+            uffd = Some((ctx, user));
+        });
+        let (ctx, user) = uffd.unwrap();
+        let at = m as u64;
+        for p in [P1, P2, P3] {
+            assert!(libc::wick_uffd::is_missing(at + p), "{p:#x} is not missing before the test");
+        }
+        // The fill of `gpa`'s page started on a thread of its own and held
+        // once its page is committed: the filling thread.
+        let held_fill = |gpa: u64| {
+            libc::wick_uffd::test_hooks::set_fill_hook(Some(hold));
+            let page = at + gpa;
+            let filler = std::thread::spawn(move || {
+                let data: Vec<u8> = std::iter::repeat_n(FILL.to_le_bytes(), 512).flatten().collect();
+                // SAFETY: a page-sized buffer; the registered range's page.
+                unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), page, 4096, true) }
+            });
+            let t = Instant::now();
+            while HOLD.load(Ordering::SeqCst) != 1 {
+                assert!(t.elapsed() < Duration::from_secs(10), "the fill of {gpa:#x} was not held: {:?}", filler.is_finished());
+                std::thread::yield_now();
+            }
+            filler
+        };
+        // The first of the two ends of an access to `gpa`'s page made while
+        // its fill is held (`done`: the access was given the page).
+        let decide = |gpa: u64, done: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            loop {
+                if done() {
+                    return "done while the fill was held: the page was given before its content".to_string();
+                }
+                if libc::wick_uffd::test_hooks::in_fault(at + gpa) {
+                    return if done() { "in the fault, and done".to_string() } else { "in the fault".to_string() };
+                }
+                if t.elapsed() > Duration::from_secs(10) {
+                    return "neither within 10 s".to_string();
+                }
+                std::thread::yield_now();
+            }
+        };
+        let let_go = |filler: std::thread::JoinHandle<std::result::Result<u64, (libc::c_int, u64)>>| {
+            HOLD.store(2, Ordering::SeqCst);
+            filler.join().unwrap()
+        };
+        let finish = |what: &str, h: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            while !h() {
+                assert!(t.elapsed() < Duration::from_secs(20), "{what} did not end once the fill was let go");
+                std::thread::yield_now();
+            }
+        };
+        let mut wrong = Vec::new();
+
+        // A host thread's read.
+        let filler = held_fill(P1);
+        let reader = std::thread::spawn(move || {
+            // SAFETY: guest RAM, mapped until the end; a missing page faults
+            // and waits for its fill.
+            unsafe { std::ptr::read_volatile((at + P1) as *const u64) }
+        });
+        let decided = decide(P1, &|| reader.is_finished());
+        let filled = let_go(filler);
+        finish("the host thread's read", &|| reader.is_finished());
+        let read = reader.join().unwrap();
+        say(format!("a host thread's read, the fill held after its commit: {decided}; the fill {filled:?}; the thread read {read:#x} (the fill's {FILL:#x})"));
+        if decided != "in the fault" || filled != Ok(4096) || read != FILL {
+            wrong.push(format!("host read: {decided}, fill {filled:?}, read {read:#x}"));
+        }
+
+        // The vCPU's read, then its write.
+        let mut vcpu = vcpu;
+        for (gpa, what, out) in [(P2, "the guest's read", "out 0x85"), (P3, "the guest's write and its read back", "out 0x86")] {
+            let filler = held_fill(gpa);
+            let runner = std::thread::spawn(move || {
+                let mut reads = 0;
+                let e = one_run(&mut vcpu, &[], &mut reads);
+                let regs = vcpu.get_regs().unwrap();
+                (vcpu, e, regs)
+            });
+            let decided = decide(gpa, &|| runner.is_finished());
+            let filled = let_go(filler);
+            finish(what, &|| runner.is_finished());
+            let (back, e, regs) = runner.join().unwrap();
+            vcpu = back;
+            // SAFETY: guest RAM, mapped until the end; filled by now.
+            let holds = unsafe { std::ptr::read_volatile((at + gpa) as *const u64) };
+            let (seen, want) = if gpa == P2 { (regs.rax, FILL) } else { (regs.rcx, GUEST) };
+            say(format!(
+                "{what}, the fill held after its commit: {decided}; the fill {filled:?}; the run {e}; the guest's register {seen:#x}, \
+                 the page holds {holds:#x} (the fill's {FILL:#x}, the guest's write {GUEST:#x})"
+            ));
+            if decided != "in the fault" || filled != Ok(4096) || !e.starts_with(out) || seen != want || holds != want {
+                wrong.push(format!("{what}: {decided}, fill {filled:?}, run {e}, register {seen:#x}, page {holds:#x}"));
+            }
+        }
+        libc::wick_uffd::test_hooks::set_fill_hook(None);
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: closes the user end; the test's mapping, no VM left using it.
+        unsafe {
+            libc::close(user);
+            assert_eq!(libc::munmap(m.cast(), MEM), 0);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// Where the legacy page (`WHvGetVirtualProcessorInterruptControllerState`,
     /// the backend's) keeps the IRR and the ISR: eight words of 32 vectors,
     /// 4 bytes apart (vector `v` in the word at `+ 4 * (v / 32)`), where the
@@ -13210,6 +13379,201 @@ mod fpu_tests {
             assert_eq!(libc::munmap(m.cast(), MEM), 0);
         }
         drop(file);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// COMMITVIEW, for FILLWINDOW: what WHP gives the guest of a page of a
+    /// `SEC_RESERVE` section's view A, mapped in WHP, in the states a
+    /// userfaultfd fill puts it in (`wick_uffd`'s fill commits the page
+    /// through A with `PAGE_NOACCESS`, writes it through a second view B,
+    /// the alias, then opens A), against the protection `VirtualProtect`
+    /// gives, which WHP honours (docs/ROADMAP.md, measured). A page each:
+    /// 0. committed through A with `PAGE_NOACCESS`, nothing written (the
+    ///    fill's window);
+    /// 1. as 0, then 0x5A written through B (the fill's content, A not
+    ///    opened yet);
+    /// 2. as 0, then A's page made `PAGE_NOACCESS` again (`VirtualProtect`);
+    /// 3. committed through A read-write, 0x11 written through A, then made
+    ///    `PAGE_NOACCESS` (`VirtualProtect`): a page closed after use;
+    /// 4. reserved, never committed (a missing page before its fill).
+    ///
+    /// The guest reads each page's first byte: an exit at the page (the
+    /// protection honoured), counted, after which 0x5B is written through B
+    /// and A's page opened (committed read-write for 4, `VirtualProtect`
+    /// read-write for the rest) and the read runs again; or the byte read
+    /// with no exit. Then 0x5C is written through B and the guest reads the
+    /// byte again: 0x5C, or a page WHP kept from before. Each state's
+    /// `VirtualQuery` of A and B is printed with it. COMMITVIEW lines;
+    /// printed, asserted only that each read ended at its `out`.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_page_committed_closed_through_the_guests_view_on_record() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, VirtualAlloc, VirtualProtect, VirtualQuery, FILE_MAP_ALL_ACCESS,
+            MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MEM_COMMIT, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READWRITE,
+            SEC_RESERVE,
+        };
+        const PROGRAM: u64 = 0xB000;
+        const LEN: usize = 2 << 20;
+        const SECTION_GPA: u64 = 0x400_0000;
+        const STATES: [&str; 5] = [
+            "committed through A no-access, nothing written",
+            "committed through A no-access, 0x5A written through B",
+            "committed through A no-access, then A made no-access (VirtualProtect)",
+            "committed through A read-write, written 0x11 through A, then made no-access (VirtualProtect)",
+            "reserved, never committed",
+        ];
+        let say = |l: String| eprintln!("COMMITVIEW {l}");
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        put(m, 0x3000 + (SECTION_GPA >> 21) * 8, &(SECTION_GPA | 0x83).to_le_bytes());
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot: 0,
+                flags: 0,
+                guest_phys_addr: 0,
+                memory_size: MEM as u64,
+                userspace_addr: m as u64,
+            })
+        }
+        .unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+        let (part, vp) = (vcpu.part(), vcpu.vp());
+        // SAFETY: an unnamed pagefile-backed section, closed below.
+        let section = unsafe {
+            CreateFileMappingW(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_RESERVE, 0, LEN as u32, std::ptr::null())
+        };
+        assert!(!section.is_null());
+        // SAFETY: two views of the test's section, unmapped below.
+        let (a, b) = unsafe { (MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, LEN).Value as usize, MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, LEN).Value as usize) };
+        assert!(a != 0 && b != 0);
+        let rwx = whv::WHvMapGpaRangeFlagRead | whv::WHvMapGpaRangeFlagWrite | whv::WHvMapGpaRangeFlagExecute;
+        // SAFETY: view A stays mapped while the VM has it; unmapped below.
+        let hres = unsafe { whv::WHvMapGpaRange(part, a as *const _, SECTION_GPA, LEN as u64, rwx) };
+        assert_eq!(hres, 0, "WHvMapGpaRange of view A");
+        // SAFETY: pages of the test's views.
+        let commit = |at: usize, prot: PAGE_PROTECTION_FLAGS| !unsafe { VirtualAlloc(at as *const _, 4096, MEM_COMMIT, prot) }.is_null();
+        let protect = |at: usize, prot: PAGE_PROTECTION_FLAGS| {
+            let mut old = 0;
+            // SAFETY: as above.
+            unsafe { VirtualProtect(at as *const _, 4096, prot, &mut old) != 0 }
+        };
+        // SAFETY: a byte of a page of the test's views that is writable there.
+        let write = |at: usize, v: u8| unsafe { (at as *mut u8).write_volatile(v) };
+        let shows = |at: usize| {
+            // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            unsafe { VirtualQuery(at as *const _, &mut mbi, std::mem::size_of_val(&mbi)) };
+            format!("state {:#x} protection {:#x}", mbi.State, mbi.Protect)
+        };
+        // The guest's read of `gpa`'s byte (`mov al, [gpa]`, `out PORT, al`):
+        // the exits at its page, each followed by `on_exit`, and how the
+        // read ended (the byte, or what ended it instead).
+        let mut guest_read = |gpa: u64, on_exit: &dyn Fn()| {
+            let mut program = vec![0x8A, 0x04, 0x25];
+            program.extend_from_slice(&u32::try_from(gpa).unwrap().to_le_bytes());
+            program.extend_from_slice(&[0xE6, PORT as u8, 0xF4, 0xEB, 0xFD]);
+            put(m, PROGRAM, &program);
+            regs::set_rip(part, vp, PROGRAM).unwrap();
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let mut exits = 0;
+            let end = loop {
+                if exits > 4 {
+                    break Err("more than 4 exits at the page".to_string());
+                }
+                if vcpu.shared.immediate_exit.load(Ordering::SeqCst) != 0 {
+                    break Err("no end within 5 s (kicked)".to_string());
+                }
+                let ctx = match super::super::ffi::run_vp(part, vp) {
+                    Ok(c) => c,
+                    Err(e) => break Err(format!("run failed, errno {}", e.errno())),
+                };
+                match ctx.ExitReason {
+                    // SAFETY: the union arm matches the exit reason.
+                    whv::WHvRunVpExitReasonX64IoPortAccess => break Ok((unsafe { ctx.Anonymous.IoPortAccess.Rax } & 0xff) as u8),
+                    whv::WHvRunVpExitReasonMemoryAccess => {
+                        // SAFETY: the union arm matches the exit reason.
+                        let at = unsafe { ctx.Anonymous.MemoryAccess.Gpa };
+                        if (at & !0xfff) != gpa {
+                            break Err(format!("a memory exit at {at:#x}"));
+                        }
+                        exits += 1;
+                        on_exit();
+                    }
+                    reason => break Err(format!("exit reason {reason:#x} at RIP {:#x}", ctx.VpContext.Rip)),
+                }
+            };
+            drop(watchdog);
+            vcpu.set_kvm_immediate_exit(0);
+            (exits, end)
+        };
+        let mut wrong = Vec::new();
+        for (k, state) in STATES.iter().enumerate() {
+            let (pa, pb) = (a + k * 4096, b + k * 4096);
+            let made = match k {
+                0 => commit(pa, PAGE_NOACCESS),
+                1 => commit(pa, PAGE_NOACCESS) && {
+                    write(pb, 0x5A);
+                    true
+                },
+                2 => commit(pa, PAGE_NOACCESS) && protect(pa, PAGE_NOACCESS),
+                3 => commit(pa, PAGE_READWRITE) && {
+                    write(pa, 0x11);
+                    protect(pa, PAGE_NOACCESS)
+                },
+                _ => true,
+            };
+            let before = format!("A {}, B {}", shows(pa), shows(pb));
+            if !made {
+                say(format!("{k} ({state}): not made: {}", std::io::Error::last_os_error()));
+                wrong.push(format!("{k}: not made"));
+                continue;
+            }
+            let open = || {
+                if k == 4 {
+                    commit(pb, PAGE_READWRITE);
+                }
+                write(pb, 0x5B);
+                if k == 4 {
+                    commit(pa, PAGE_READWRITE);
+                } else {
+                    protect(pa, PAGE_READWRITE);
+                }
+            };
+            let gpa = SECTION_GPA + (k * 4096) as u64;
+            let first = guest_read(gpa, &open);
+            // B's page committed (the never-committed page's is only once
+            // its exit opened it), then written.
+            commit(pb, PAGE_READWRITE);
+            write(pb, 0x5C);
+            let again = guest_read(gpa, &|| {});
+            say(format!(
+                "{k} ({state}; {before}): the guest's read: {} exits at the page, then {:x?}; 0x5C written through B, read again: {} exits, then {:x?}",
+                first.0, first.1, again.0, again.1
+            ));
+            if first.1.is_err() || again.1.is_err() {
+                wrong.push(format!("{k}: {first:?} {again:?}"));
+            }
+        }
+        // SAFETY: the range mapped above, unmapped before the VM goes; then
+        // the test's views and section, and its memory.
+        unsafe {
+            whv::WHvUnmapGpaRange(part, SECTION_GPA, LEN as u64);
+        }
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: as above.
+        unsafe {
+            for v in [a, b] {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ });
+            }
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            assert_eq!(libc::munmap(m.cast(), MEM), 0);
+        }
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 

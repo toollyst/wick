@@ -2456,6 +2456,8 @@ fn fill(
             }
             bytes = fits;
         }
+        #[cfg(any(test, feature = "wick-test-hooks"))]
+        fill_hook();
         fill((alias + (at - base)) as *mut u8, bytes as usize, (at - dst) as usize);
         // Each page with the protection `mprotect` gave it (one filled while
         // `PROT_NONE` stays closed, as Linux's copy fills a page of a
@@ -2494,6 +2496,23 @@ fn fill(
         (0, _) => Ok(bytes),
         (e, 0) => Err((e, 0)),
         (_, n) => Err((crate::EAGAIN, n)),
+    }
+}
+
+/// The `fn()` a fill calls once, after its pages are committed and before
+/// their content is written through the alias ([`fill`]), on the filling
+/// thread with [`LOCK`] held; 0 for none, taken as it runs. For the WHP
+/// test of an access made in that window
+/// (`test_hooks::set_fill_hook`, FILLWINDOW).
+#[cfg(any(test, feature = "wick-test-hooks"))]
+static FILL_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(any(test, feature = "wick-test-hooks"))]
+fn fill_hook() {
+    let hook = FILL_HOOK.swap(0, Ordering::SeqCst);
+    if hook != 0 {
+        // SAFETY: only `fn()` values are stored.
+        unsafe { core::mem::transmute::<usize, fn()>(hook)() };
     }
 }
 
@@ -3997,6 +4016,21 @@ pub mod test_hooks {
     pub fn reclaim(need: usize) -> (usize, usize) {
         let r = super::reclaim_at_touch(need);
         (r.chunks, r.freed)
+    }
+
+    /// Sets the `fn()` the next fill calls once, between the commit of its
+    /// pages and the write of their content through the alias
+    /// (`super::fill`), on the filling thread with the userfaultfd's lock
+    /// held; `None` takes it away.
+    pub fn set_fill_hook(hook: Option<fn()>) {
+        super::FILL_HOOK.store(hook.map_or(0, |f| f as usize), core::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a thread's access to the page at `page` is in
+    /// [`super::fault`] (a waiter slot holds the page): it has not been
+    /// given the page, and waits for its fill once its record is posted.
+    pub fn in_fault(page: u64) -> bool {
+        super::WAITERS.iter().any(|w| w.page.load(core::sync::atomic::Ordering::SeqCst) == page)
     }
 }
 
