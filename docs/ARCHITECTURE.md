@@ -201,9 +201,11 @@ at or above its start) or `EINVAL` (the first mapping past its end), as Linux's 
 mapping is registered, as Linux's register splits the vma: the range is made over the whole private mapping that
 holds it (`windows_mm::uffd_mapping_of`), which the register moves into its sections whole, under the guards above,
 and only the part's pages get the userfaultfd as their owner and are missing if they hold no memory; every other page
-is in no registration, as after an unregister of that part. Outside the part, a page that holds memory is copied
-(resident, or committed, readable, out of the working set and not all zeros: read once after the move closes the
-mapping, so a page trimmed to the pagefile keeps its data), and any other is pending in the range's record, so its
+is in no registration, as after an unregister of that part. A page holds memory if it is in the working set, or
+committed, readable and not all zeros out of it (read once after the move closes the mapping, so a page trimmed to
+the pagefile keeps its data, as a swapped page on Linux is not missing:
+`test_a_written_page_out_of_the_working_set_is_not_missing_after_a_register`); such a page is copied, inside the part
+and out. Outside the part any other page is pending in the range's record, so its
 first access commits it, zeroed, and charges it, as a page Linux's split vma never faulted in. So a register of a part
 charges what a register of the whole mapping charges (`test_part_of_a_mapping_is_registered`,
 `test_memory_mapped_over_part_of_a_mapping_is_registered`,
@@ -211,9 +213,9 @@ charges what a register of the whole mapping charges (`test_part_of_a_mapping_is
 `test_parts_of_a_mapping_register_with_two_userfaultfds`,
 `test_an_munmap_of_a_registered_part_leaves_the_rest_of_the_mapping`,
 `test_a_part_registered_keeps_the_rest_of_the_mapping_out_of_the_working_set`; first run: CI). Its cost: one copy of
-each page of the mapping that holds memory, and one read of each committed page outside the part that is out of the
-working set. Not as Linux on Windows (SECURITY.md, "Not at parity yet"): inside the range, a page out of the working
-set (trimmed, or `PROT_NONE`) is taken as missing; a range across two mappings is `EINVAL`; `MAP_FIXED` over part of a
+each page of the mapping that holds memory, and one read of each committed page that is out of the working set. Not
+as Linux on Windows (SECURITY.md, "Not at parity yet"): a page out of the working set that cannot be read
+(`PROT_NONE`) or holds only zeros is taken as missing in the range; a range across two mappings is `EINVAL`; `MAP_FIXED` over part of a
 registered mapping is `EINVAL`; a register that overlaps a registered range without lying inside it, or holds a page
 of it that was unmapped or mapped over, is `EBUSY`; and a huge page mapping is not registered.
 

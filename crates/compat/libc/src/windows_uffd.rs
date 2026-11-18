@@ -2005,13 +2005,8 @@ fn register_range(ctx: usize, start: u64, len: u64) -> io::Result<()> {
     // ([`move_chunk`]); a vCPU's waits on [`LOCK`] (`with_registrations_still`).
     let _moving = MovingWindow::open(base, end_of_mapping);
     #[allow(clippy::cast_possible_truncation)]
-    let (alias, reserved) = crate::windows_mm::uffd_alias(
-        base as usize,
-        (end_of_mapping - base) as usize,
-        &mut resident,
-        (start as usize, end as usize),
-    )
-    .map_err(|e| undo(errno_err(e)))?;
+    let (alias, reserved) =
+        crate::windows_mm::uffd_alias(base as usize, (end_of_mapping - base) as usize, &mut resident).map_err(|e| undo(errno_err(e)))?;
     if reserved {
         crate::windows_mm::released_alias(record, alias);
     } else {
@@ -13357,6 +13352,91 @@ mod tests {
             assert_eq!(munmap_of(mem + 3 * PAGE, PAGE), 0, "{kind}");
             assert!(find(mem).is_none(), "{kind}: the range outlived its mapping");
         }
+    }
+
+    /// A page written and then trimmed from the working set (to the
+    /// modified list or the pagefile) before a register keeps its data and
+    /// is not missing, as on Linux, where only a page with no pte is missing
+    /// and a swapped page's pte holds its swap entry (v6.1 mm/memory.c
+    /// `handle_pte_fault` :4950 to :4952 against :4957 to :4958): the move
+    /// reads each committed, readable page out of the working set once and
+    /// copies those that are not all zeros. Pages 1 and 2 written, page 3
+    /// written with zeros, page 0 never touched; pages 1 to 3 trimmed with
+    /// `VirtualUnlock` (Learn, VirtualUnlock: a range that is not locked is
+    /// taken out of the working set), then, if any is still in it,
+    /// `EmptyWorkingSet`, then, for any still in it, the move told so
+    /// (`windows_mm::OUT_OF_THE_WORKING_SET`): TRIM lines say which did it,
+    /// MOVEREAD lines the pages read (the cost). Pages 1 and 2 hold their
+    /// data; pages 0 and 3 are missing, as a page never touched is on
+    /// Linux (page 3, written with zeros, is not missing there: the one
+    /// difference left, which reads the same once filled with zeros). For
+    /// both kinds. Before, a page out of the working set was missing: the
+    /// check "a written page out of the working set was taken as missing"
+    /// fails there.
+    #[test]
+    fn test_a_written_page_out_of_the_working_set_is_not_missing_after_a_register() {
+        let (code, text, _) = run_child_in_jobs("trimmed_page_child", &[], &[]);
+        for l in text.lines().filter(|l| l.starts_with("TRIM") || l.starts_with("MOVEREAD") || l.starts_with("WATCHDOG") || l.starts_with("wick:")) {
+            std::eprintln!("{l}");
+        }
+        assert_eq!(code, Some(0), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by test_a_written_page_out_of_the_working_set_is_not_missing_after_a_register in a process of its own"]
+    fn trimmed_page_child() {
+        use windows_sys::Win32::System::Memory::VirtualUnlock;
+        use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        watchdog(60);
+        let in_the_working_set = |at: u64| {
+            let mut v = [0u8; 1];
+            // SAFETY: one byte for one page of the test's mapping.
+            assert_eq!(unsafe { crate::mincore(at as *mut c_void, PAGE as usize, v.as_mut_ptr()) }, 0);
+            v[0] & 1 != 0
+        };
+        let mut c = Checks::new();
+        for kind in MEM_KINDS {
+            let (a, ua) = create(0, false, true).unwrap();
+            let mem = map_pages(kind, 4);
+            // SAFETY: the test's own read-write memory.
+            unsafe {
+                ptr::write_volatile((mem + PAGE + 8) as *mut u8, 7);
+                ptr::write_volatile((mem + 2 * PAGE + 16) as *mut u8, 9);
+                ptr::write_volatile((mem + 3 * PAGE) as *mut u8, 0);
+            }
+            let written = [mem + PAGE, mem + 2 * PAGE, mem + 3 * PAGE];
+            // SAFETY: pages of the test's mapping, not locked.
+            unsafe { VirtualUnlock((mem + PAGE) as *mut c_void, 3 * PAGE as usize) };
+            let by_unlock = written.iter().filter(|&&p| !in_the_working_set(p)).count();
+            if written.iter().any(|&p| in_the_working_set(p)) {
+                // SAFETY: the current process's pseudo handle.
+                unsafe { K32EmptyWorkingSet(GetCurrentProcess()) };
+            }
+            let by_empty = written.iter().filter(|&&p| !in_the_working_set(p)).count() - by_unlock;
+            let told: std::vec::Vec<u64> = written.iter().copied().filter(|&p| in_the_working_set(p)).collect();
+            std::println!("TRIM {kind}: of 3 written pages, {by_unlock} out of the working set by VirtualUnlock, {by_empty} more by EmptyWorkingSet, {} told to the move", told.len());
+            crate::windows_mm::OUT_OF_THE_WORKING_SET.lock().unwrap().extend(told.iter().map(|&p| p as usize));
+            let read_before = crate::windows_mm::PAGES_READ_AT_A_MOVE.load(Ordering::SeqCst);
+            let r = register(a, mem, 4 * PAGE);
+            let read = crate::windows_mm::PAGES_READ_AT_A_MOVE.load(Ordering::SeqCst) - read_before;
+            std::println!("MOVEREAD {kind}: {read} of 4 pages read at the register's move");
+            c.check(r.is_ok(), std::format!("{kind}: the register: {r:?}"));
+            c.check(
+                !is_missing(mem + PAGE) && !is_missing(mem + 2 * PAGE),
+                std::format!("{kind}: a written page out of the working set was taken as missing"),
+            );
+            if !is_missing(mem + PAGE) && !is_missing(mem + 2 * PAGE) {
+                // SAFETY: registered pages holding memory.
+                let (p1, p2) = unsafe { (ptr::read_volatile((mem + PAGE + 8) as *const u8), ptr::read_volatile((mem + 2 * PAGE + 16) as *const u8)) };
+                c.check(p1 == 7 && p2 == 9, std::format!("{kind}: the trimmed pages read {p1}, {p2}"));
+            }
+            c.check(is_missing(mem), std::format!("{kind}: the page never touched is not missing"));
+            c.check(is_missing(mem + 3 * PAGE), std::format!("{kind}: the page written with zeros is not missing"));
+            release(a, ua);
+            munmap_of(mem, 4 * PAGE);
+        }
+        c.done();
     }
 
     /// A register leaves each page the protection `mprotect` gave it, as

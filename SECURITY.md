@@ -203,6 +203,20 @@ has the per-control details and results.
 
 ## Fixed defects
 
+- **Windows: a page written and then trimmed from the working set before a userfaultfd register was taken as
+  missing, and its data lost** (since the register took residency from the working set, `mincore`; fixed in the
+  commit that adds this entry). The register took a page out of the working set (moved to the modified list or the
+  pagefile by Windows' trimming) as missing: it was not copied into the sections, and a fill or an access then found
+  the handler's bytes or zeros, where Linux keeps a swapped page, whose pte holds its swap entry, and takes as
+  missing only a page with no pte (v6.1 mm/memory.c `handle_pte_fault` :4950 to :4952 against :4957 to :4958). Now
+  the move reads each committed, readable page out of the working set once, after it closes the mapping, and copies
+  those that are not all zeros (`test_a_written_page_out_of_the_working_set_is_not_missing_after_a_register`, which
+  trims with `VirtualUnlock`, then `EmptyWorkingSet`, and says which did it; it fails on the code before at "a
+  written page out of the working set was taken as missing"). Its cost is that read: for an ordinary mapping whose
+  pages were never touched, every page, each brought in until the move gives the private allocation back; none for
+  Firecracker's guest memory, mapped `MAP_NORESERVE` and committed only where touched. A page that cannot be read or
+  holds only zeros is still taken as missing ("Not at parity yet"). Firecracker was not hit: it registers guest
+  memory it has just mapped. First run: CI.
 - **Windows, on a host with AMX: a stack overflow, or a stack that could not grow at the memory limit, on a thread
   with no stack guarantee ended the process with an access violation (0xC0000005) and no line of wick's** (every
   Windows release so far; found by the first CI windows job that ran on an Intel Xeon Platinum 8573C with AMX
@@ -1614,16 +1628,22 @@ upstream Firecracker and its jailer.
   first reader has gone it can take the log or metrics another jail of the same user wrote meanwhile (up to 64 KiB),
   if it knows the name; the fix planned there takes that right away from the jail. Run each jail's pipes under
   names the others cannot guess, or run tenants under different accounts.
-- **Windows: a resident page made `PROT_NONE` before a register is taken as missing.** The register takes a page's
-  residency from `mincore`, whose working-set query (`QueryWorkingSetEx`'s `Valid`) does not count a
-  `PAGE_NOACCESS` page, so such a page becomes missing, and its contents are not what a fill or an access then finds,
-  where Linux's `mincore` counts a present `PROT_NONE` pte (mm/mincore.c v6.1 :129 to :130; arch/x86 `pte_present`
-  :735 to :738) and the register changes no page
+- **Windows: a page out of the working set that cannot be read, or that holds only zeros, is taken as missing at a
+  register.** Linux's register takes as missing only a page with no pte: a page in memory, made `PROT_NONE` or not,
+  and a swapped page, whose pte holds its swap entry, are not missing (v6.1 mm/memory.c `handle_pte_fault` :4950 to
+  :4952 against :4957 to :4958; mm/mincore.c :129 to :130, arch/x86 `pte_present` :735 to :738). Windows shows no
+  pte: the register takes a page as holding memory if it is in the working set (`QueryWorkingSetEx`'s `Valid`), or,
+  out of it, if it is committed, readable and not all zeros (read once by the move, after the mapping is closed;
+  `test_a_written_page_out_of_the_working_set_is_not_missing_after_a_register`). What is left: a page out of the
+  working set that cannot be read, which a `PAGE_NOACCESS` page always is (the working-set query does not count it),
+  is taken as missing and its contents are not what a fill or an access then finds; opening it for the read would let
+  another thread read memory `mprotect` closed
   (`test_a_resident_page_made_prot_none_keeps_its_contents_through_a_register`, ignored citing this entry: "the
   resident PROT_NONE page is missing" on Windows Server 2022 20348; on main a33f5aba the same check, one line for
-  both pages then, failed: "a resident page is missing"). Firecracker registers guest memory it has just mapped
-  (src/vmm/src/persist.rs `guest_memory_from_uffd`: `memory::anonymous`, then `register` of each region), so no
-  page of it is resident and closed then.
+  both pages then, failed: "a resident page is missing"); and a page written with zeros only, out of the working set,
+  is taken as never touched (missing in the range), which reads the same once filled with zeros. Firecracker
+  registers guest memory it has just mapped (src/vmm/src/persist.rs `guest_memory_from_uffd`: `memory::anonymous`,
+  then `register` of each region), so no page of it holds data then.
 - **Windows: memory mapped over part of a registered mapping is not registered, and a range must lie in one
   mapping.** `MAP_FIXED` over part of a registered mapping is `EINVAL`, where Linux maps it
   (`test_a_page_mapped_over_and_registered_again_is_filled_in_the_new_memory`, ignored citing this entry); a register
@@ -1638,9 +1658,8 @@ upstream Firecracker and its jailer.
   `test_parts_of_a_mapping_register_with_two_userfaultfds`,
   `test_an_munmap_of_a_registered_part_leaves_the_rest_of_the_mapping`,
   `test_a_part_registered_keeps_the_rest_of_the_mapping_out_of_the_working_set`; first run: CI). Its cost: one copy
-  of each page of the mapping that holds memory, and one read of each committed page outside the range that is not
-  in the working set. Inside the range a page outside the working set is still taken as missing (the entry on a
-  resident `PROT_NONE` page above has the same root; open). Memory registered once registers again, with any
+  of each page of the mapping that holds memory, and one read of each committed page that is not in the working
+  set. Memory registered once registers again, with any
   userfaultfd, after an unregister of any part of it or a release (an owner a page, the range's slot kept until its
   memory is unmapped: the `mem_backend: Uffd` row of docs/COMPATIBILITY.md, `test_memory_unregistered_whole_registers_again`,
   `test_memory_replaced_while_registered_registers_anew`; before, `EINVAL` on Windows Server 2022 20348 and 2025

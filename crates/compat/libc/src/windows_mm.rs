@@ -4520,15 +4520,20 @@ fn spans_outside(s: usize, e: usize, done: &[(u64, u64)]) -> Vec<(usize, usize)>
 /// that was taken as missing and not copied, and the write was lost
 /// (`test_a_write_made_as_a_register_starts_its_move_is_kept`).
 ///
-/// `part` is the registered range, `[part.0, part.1)` within the mapping:
-/// the rest of the mapping is in no registration, and must keep what it
-/// holds, as the rest of a vma Linux's register splits does. A page there
-/// that is committed and readable but not in the working set (trimmed from
-/// it, or never touched) is read, and taken as holding memory, so copied,
-/// unless it is all zeros ([`written_out_of_the_working_set`]); a page
-/// taken as not holding memory reads zeros at its first access, as both
-/// would.
-pub(crate) fn uffd_alias(start: usize, len: usize, pages: &mut [u8], part: (usize, usize)) -> Result<(usize, bool), c_int> {
+/// A page holds memory if it is in the working set, or committed, readable
+/// and not all zeros though out of it (trimmed to the pagefile or the
+/// standby list: [`written_out_of_the_working_set`] reads it once); in the
+/// registered range any other page is missing, and outside it (the rest of
+/// the mapping, in no registration) it reads zeros at its first access. So
+/// a page that holds data is never missing, as Linux's register takes as
+/// missing only a page with no pte (v6.1 mm/memory.c `handle_pte_fault`
+/// :4950 to :4952, `do_anonymous_page`'s `userfaultfd_missing` at :4103),
+/// never a swapped one, whose pte holds its swap entry (:4957 to :4958,
+/// `do_swap_page`). What remains: a page out of the working set that
+/// cannot be read (`PROT_NONE`) is taken as missing (opening it for the
+/// read would let another thread read it meanwhile), and one that holds
+/// only zeros is taken as never touched, which reads the same.
+pub(crate) fn uffd_alias(start: usize, len: usize, pages: &mut [u8]) -> Result<(usize, bool), c_int> {
     let mut t = table().lock().unwrap();
     match t.get(&start) {
         Some(r)
@@ -4551,10 +4556,7 @@ pub(crate) fn uffd_alias(start: usize, len: usize, pages: &mut [u8], part: (usiz
             pages[(at - start) / PAGE] &= !1;
         }
     }
-    written_out_of_the_working_set(start, pages, |page| {
-        let at = start + page * PAGE;
-        at < part.0 || at >= part.1
-    });
+    written_out_of_the_working_set(start, pages);
     let moved = uffd_alias_closed(&mut t, start, len, pages);
     // The private allocation is still there if the move failed before it
     // was given back; after, the table holds placeholders there.
@@ -4596,17 +4598,18 @@ pub(crate) fn uffd_mapping_of(start: usize, len: usize) -> Option<(usize, usize)
     (b <= start && start + len <= b + r.len && matches!(r.kind, Kind::Private { file: None })).then_some((b, r.len))
 }
 
-/// Sets bit 0 of `pages[i]` (page `i` from `start`) for each page `which`
-/// picks that is not in the working set (bit 0 clear) but committed,
+/// Sets bit 0 of `pages[i]` (page `i` from `start`) for each page that is
+/// not in the working set (bit 0 clear) but committed,
 /// readable (bit 1 clear, no `PAGE_GUARD`) and not all zeros: a page that
 /// holds data the working set does not show (trimmed to the pagefile or the
 /// standby list), which a read brings back. A page never touched reads as
-/// zeros, as does one whose data is zeros, and is left clear: either reads
-/// zeros at its next access. One read of each such page, counted for the
-/// tests ([`PAGES_READ_AT_A_MOVE`]); a page read is brought into the working
-/// set until the private allocation is given back. Under the region table's
-/// lock, with the mapping closed to writes ([`uffd_alias`]).
-fn written_out_of_the_working_set(start: usize, pages: &mut [u8], which: impl Fn(usize) -> bool) {
+/// zeros, as does one whose data is zeros, and is left clear: missing in
+/// the registered range, zeros at its next access outside it. One read of
+/// each such page, counted for the tests ([`PAGES_READ_AT_A_MOVE`]); a page
+/// read is brought into the working set until the private allocation is
+/// given back. Under the region table's lock, with the mapping closed to
+/// writes ([`uffd_alias`]).
+fn written_out_of_the_working_set(start: usize, pages: &mut [u8]) {
     let end = start + pages.len() * PAGE;
     let mut at = start;
     while at < end {
@@ -4621,7 +4624,7 @@ fn written_out_of_the_working_set(start: usize, pages: &mut [u8], which: impl Fn
         if readable {
             for a in (at..run_end).step_by(PAGE) {
                 let i = (a - start) / PAGE;
-                if pages[i] & 1 != 0 || pages[i] & 2 != 0 || !which(i) {
+                if pages[i] & 1 != 0 || pages[i] & 2 != 0 {
                     continue;
                 }
                 #[cfg(test)]
