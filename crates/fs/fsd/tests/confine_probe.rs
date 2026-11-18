@@ -194,6 +194,54 @@ mod macos {
 
     const EPERM: i32 = 1;
 
+    /// This process's deferred-reclamation ring, found before the cases
+    /// fork (the children have it at the same address).
+    static RING: std::sync::OnceLock<Result<probe::ReclaimRing, String>> = std::sync::OnceLock::new();
+
+    /// One reclamation call on the ring, confined: 1 when it returned
+    /// (whatever the kernel answered), 3 with no ring.
+    fn reclaim(which: probe::Reclaim) -> i32 {
+        let Some(Ok(ring)) = RING.get() else { return 3 };
+        probe::reclaim(which, ring);
+        1
+    }
+
+    /// libmalloc's deferred-reclamation calls, each made by the call itself
+    /// on the process's own ring under the profile
+    /// (confine::macos::MACH_TRAPS_IF_DEFINED, MIG_ROUTINES_WITH_RECLAMATION),
+    /// so that none depends on the 10 s sampling period, a full ring or a
+    /// lost race: expected done where this macOS defines the trap (the
+    /// profile's rules wait on it) and the process has a ring; elsewhere on
+    /// record, saying which is missing.
+    fn reclamation_cases(share: &Path, outside: &Path, failed: &mut Vec<String>) {
+        let defined = |name: &str| sys::seatbelt::compile(&format!("(version 1)\n(define wick-probe-symbol {name})\n")).is_ok();
+        let trap = format!("MSC_{}", wick_fsd::confine::macos::RECLAMATION_TRAP);
+        if !defined(&trap) {
+            println!("record: deferred reclamation's calls: {trap} is not defined on this macOS: not made (no rule emitted)");
+            return;
+        }
+        let ring = RING.get_or_init(probe::reclaim_ring);
+        let ring = match ring {
+            Ok(r) => r,
+            Err(why) => {
+                println!("record: deferred reclamation's calls: {trap} is defined, but {why}: not made");
+                return;
+            }
+        };
+        println!("record: deferred reclamation's ring: {ring:?}");
+        let cases: &[(&str, Act)] = &[
+            ("the reclamation accounting trap (63), by the call", |_| reclaim(probe::Reclaim::Accounting)),
+            ("a flush of the reclamation ring (MIG), by the call", |_| reclaim(probe::Reclaim::Flush)),
+            ("a resize of the reclamation ring (MIG), by the call", |_| reclaim(probe::Reclaim::Resize)),
+        ];
+        for &(name, act) in cases {
+            let got = case(name, share, outside, act);
+            if got != 1 {
+                failed.push(format!("{name}: {got}, expected 1"));
+            }
+        }
+    }
+
     /// [`probe::fcntl_command`] on the share's file: 1 done, 0 not.
     fn fcntl_on_file(c: &Ctx<'_>, command: Fcntl) -> i32 {
         let Ok(f) = std::fs::File::open(c.inside) else { return 3 };
@@ -606,6 +654,7 @@ mod macos {
                 failed.push(format!("{name}: {got}, expected {want}"));
             }
         }
+        reclamation_cases(&share, &outside, &mut failed);
         // What the server's own allocations make, at the sizes and in the
         // ways it makes them, must be allowed: each shape done, confined.
         // The calls depend on the allocator and its size classes (macOS

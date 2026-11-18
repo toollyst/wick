@@ -392,6 +392,125 @@ pub mod probe {
         if kr == 0 { Ok(()) } else { Err(HostErrno(kr)) }
     }
 
+    /// One of the calls libmalloc's deferred reclamation makes on the
+    /// process's ring (xnu libsyscall/mach/vm_reclaim.c, xnu-12377.1.9):
+    /// the accounting trap (63) and the MIG routines that flush and resize
+    /// the ring.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Reclaim {
+        /// `mach_vm_reclaim_update_kernel_accounting_trap` (Mach trap 63),
+        /// which `mach_vm_reclaim_update_kernel_accounting` makes once the
+        /// ring's sampling period has passed.
+        Accounting,
+        /// `mach_vm_reclaim_ring_flush` of one entry: the MIG routine
+        /// `mach_vm_deferred_reclamation_buffer_flush`.
+        Flush,
+        /// `mach_vm_reclaim_ring_resize` to twice the ring's capacity: the
+        /// MIG routine `mach_vm_deferred_reclamation_buffer_resize`.
+        Resize,
+    }
+
+    type RingCall = unsafe extern "C" fn(usize, u32) -> c_int;
+
+    /// This process's deferred-reclamation ring (libmalloc's: a process
+    /// has at most one, and a second `mach_vm_reclaim_ring_allocate` is
+    /// refused) and libsystem_kernel's calls on it, resolved before the
+    /// profile: the ring is found with `mach_vm_reclaim_get_rings_for_task`
+    /// of this task, itself a MIG routine
+    /// (`mach_vm_deferred_reclamation_buffer_query`). A forked child has
+    /// the ring at the same address (the kernel copies its record at fork,
+    /// osfmk/vm/vm_reclaim.c `vm_deferred_reclamation_task_fork`).
+    #[derive(Debug, Clone, Copy)]
+    pub struct ReclaimRing {
+        ring: usize,
+        capacity: u32,
+        accounting_trap: unsafe extern "C" fn(u32, *mut u64, *mut u64) -> c_int,
+        flush: RingCall,
+        resize: RingCall,
+        round: unsafe extern "C" fn(u32) -> u32,
+    }
+
+    fn symbol(name: &CStr) -> Option<*mut c_void> {
+        // SAFETY: a NUL-terminated name, looked up in every loaded image.
+        let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        (!p.is_null()).then_some(p)
+    }
+
+    /// [`ReclaimRing`], or why there is none: libsystem_kernel without the
+    /// calls (before macOS 26, whose kernel has no trap 63 either), or no
+    /// ring in this process (an allocator that defers nothing).
+    pub fn reclaim_ring() -> std::result::Result<ReclaimRing, String> {
+        #[repr(C)]
+        struct Ref {
+            addr: u64,
+            size: u64,
+        }
+        unsafe extern "C" {
+            static mach_task_self_: u32;
+        }
+        let missing = |n: &str| format!("libsystem_kernel has no {n}");
+        let get = symbol(c"mach_vm_reclaim_get_rings_for_task").ok_or_else(|| missing("mach_vm_reclaim_get_rings_for_task"))?;
+        let capacity = symbol(c"mach_vm_reclaim_ring_capacity").ok_or_else(|| missing("mach_vm_reclaim_ring_capacity"))?;
+        let accounting = symbol(c"mach_vm_reclaim_update_kernel_accounting_trap")
+            .ok_or_else(|| missing("mach_vm_reclaim_update_kernel_accounting_trap"))?;
+        let flush = symbol(c"mach_vm_reclaim_ring_flush").ok_or_else(|| missing("mach_vm_reclaim_ring_flush"))?;
+        let resize = symbol(c"mach_vm_reclaim_ring_resize").ok_or_else(|| missing("mach_vm_reclaim_ring_resize"))?;
+        let round = symbol(c"mach_vm_reclaim_round_capacity").ok_or_else(|| missing("mach_vm_reclaim_round_capacity"))?;
+        // SAFETY: each pointer is libsystem_kernel's function of that name,
+        // with the signature of xnu-12377's libsyscall/mach/vm_reclaim.c
+        // (rings and counts are a pointer and a u32; the trap's third
+        // argument, macOS 27's, is ignored by macOS 26's two-argument trap).
+        unsafe {
+            let get = std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut Ref, *mut u32) -> c_int>(get);
+            let capacity = std::mem::transmute::<*mut c_void, unsafe extern "C" fn(usize, *mut u32) -> c_int>(capacity);
+            let mut r = Ref { addr: 0, size: 0 };
+            let mut n = 1u32;
+            let kr = get(mach_task_self_, &mut r, &mut n);
+            if kr != 0 {
+                return Err(format!("mach_vm_reclaim_get_rings_for_task: {kr:#x}"));
+            }
+            if n == 0 || r.addr == 0 {
+                return Err("no ring in this process (its allocator defers nothing)".into());
+            }
+            let ring = usize::try_from(r.addr).map_err(|_| "a ring beyond the address space".to_string())?;
+            let mut cap = 0u32;
+            let kr = capacity(ring, &mut cap);
+            if kr != 0 {
+                return Err(format!("mach_vm_reclaim_ring_capacity: {kr:#x}"));
+            }
+            Ok(ReclaimRing {
+                ring,
+                capacity: cap,
+                accounting_trap: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut u64, *mut u64) -> c_int>(
+                    accounting,
+                ),
+                flush: std::mem::transmute::<*mut c_void, RingCall>(flush),
+                resize: std::mem::transmute::<*mut c_void, RingCall>(resize),
+                round: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32) -> u32>(round),
+            })
+        }
+    }
+
+    /// `which` on `ring`, as libmalloc's free path makes it: the call's own
+    /// result once it returned (the kernel's answer, which may be an error:
+    /// what is probed is whether the sandbox lets the call through).
+    pub fn reclaim(which: Reclaim, ring: &ReclaimRing) -> c_int {
+        unsafe extern "C" {
+            static mach_task_self_: u32;
+        }
+        let (mut bytes, mut deadline) = (0u64, 0u64);
+        // SAFETY: the process's own ring and task, from [`reclaim_ring`];
+        // a flush of one entry and a resize within the ring's maximum
+        // (libmalloc's own calls when its ring is full or a race is lost).
+        unsafe {
+            match which {
+                Reclaim::Accounting => (ring.accounting_trap)(mach_task_self_, &mut bytes, &mut deadline),
+                Reclaim::Flush => (ring.flush)(ring.ring, 1),
+                Reclaim::Resize => (ring.resize)(ring.ring, (ring.round)(ring.capacity.saturating_mul(2))),
+            }
+        }
+    }
+
     /// Which allocator libmalloc engaged in this process:
     /// `malloc_engaged_secure_allocator()` (1 for xzone, 0 for the magazine)
     /// and `malloc_engaged_nano()` (the nano version, 0 for none), both

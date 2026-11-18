@@ -480,3 +480,43 @@ fn test_a_confined_server_answers_large_reads_again_and_again() {
     }
     remove(&base);
 }
+
+/// A confined server that answered large READs answers them again after an
+/// idle past the kernel's deferred-reclamation sampling period
+/// (docs/design-fs.md §6.2): libmalloc's xzone (macOS 26 on) puts each span
+/// it frees into its ring, which makes the accounting trap (63) at the
+/// first free once 10 s have passed since the ring's last sample
+/// (`vm_reclaim_sampling_period_ns`, xnu osfmk/vm/vm_reclaim.c), counted from
+/// the ring's allocation at the server's start; the profile killed that trap
+/// until it listed it (measured on macOS 27.2: the server killed at round
+/// 1's first READ). 11 s is the period and a second's margin; every other
+/// test's server ends before 10 s. confine_probe makes the call itself,
+/// which decides it; this is the request path that reaches it.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_a_confined_server_answers_again_after_the_reclamation_period() {
+    let base = scratch("idle-reads");
+    let share = base.join("share");
+    std::fs::create_dir(&share).unwrap();
+    let data: Vec<u8> = (0..2usize << 20).map(|i| u8::try_from(i % 251).unwrap()).collect();
+    std::fs::write(share.join("big"), &data).unwrap();
+    if let Some(r) = remote::confined_over(&share, &remote::socket_in(&base)) {
+        let mut g = G::over(r);
+        let node = g.lookup(1, b"big").unwrap();
+        let fh = g.open(node, 0).unwrap();
+        for round in 0..2u64 {
+            if round > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(11));
+            }
+            for i in 0..4u64 {
+                let offset = i * 4096;
+                let got = g.read(node, fh, offset, 1 << 20).unwrap_or_else(|e| panic!("round {round}, READ {i}: {e:?}"));
+                let at = usize::try_from(offset).unwrap();
+                assert!(got == data[at..at + (1 << 20)], "round {round}, READ {i}: not the file's bytes");
+            }
+        }
+        g.release(node, fh);
+        remote::finish_clean(&mut g.s);
+    }
+    remove(&base);
+}

@@ -1840,7 +1840,11 @@ On macOS 15 and macOS 26.0 to 26.3, where libc's first `fdopendir` in a process 
 a confined server was killed at its first READDIR until the commit that makes that first `fdopendir` before the
 profile; the profile still allows no sysctl (design-fs.md §6.2). On every macOS major a confined server could be
 killed at a wall-clock read (SETATTR of a time to now) with a probability of about one in a million per such
-request, where libc falls back to the `gettimeofday` system call, until the commit that lists it.
+request, where libc falls back to the `gettimeofday` system call, until the commit that lists it. On macOS 27.2,
+and on macOS 26 wherever its allocator is xzone, a confined server was killed at its first freed block 10 s or more
+after it started (libmalloc's deferred reclamation makes a Mach trap on a 10 s timer), until the commit that lists
+that trap and the reclamation ring's two MIG routines, which act on the server's own memory only (design-fs.md
+§6.2).
 
 The device adds no rule or system call to the VMM's sandbox, connects to its server before the sandbox narrows and
 never again, and never blocks the event loop on the server (`test_server_hang_never_blocks_the_loop`); the reply

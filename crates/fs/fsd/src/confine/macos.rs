@@ -200,6 +200,58 @@ pub const MIG_ROUTINES: &[(&str, &str)] = &[];
 pub const MIG_ROUTINES_IF_DEFINED: &[(&str, &str)] =
     &[("mach_vm_reallocate", "libmalloc grows a large block (realloc), measured as the traps are")];
 
+/// libmalloc's deferred reclamation: the kernel's accounting trap, allowed
+/// where this macOS defines it (`MSC_` name). xnu-12377 (macOS 26) on has it
+/// (osfmk/kern/syscall_sw.c :173, trap 63; `kern_invalid` in xnu-11417,
+/// macOS 15), and from that release libmalloc's xzone allocator defers the
+/// reclamation of the spans it frees by default on macOS (libmalloc-792.80.2
+/// and 812.100.31 xzone_malloc.h `XZM_DEFERRED_RECLAIM_ENABLED_DEFAULT`; its
+/// ring is allocated at malloc's start, before the profile, 1016 entries
+/// measured). macOS 15's libmalloc (715.140.5) has no deferred reclamation
+/// on macOS (platform.h `CONFIG_MAGAZINE_DEFERRED_RECLAIM` 0, its xzone none).
+pub const MACH_TRAPS_IF_DEFINED: &[(&str, &str)] = &[(
+    RECLAMATION_TRAP,
+    "measured: on macOS 27.2 a confined server was killed at its first READ 10 s or more after it started \
+     (`deny(1) syscall-mach 63`; crash report: the trap ← `mach_vm_reclaim_update_kernel_accounting` ← \
+     `_xzm_reclaim_mark_free` ← `xzm_segment_group_free_chunk` ← the reply frame's buffer dropped in \
+     `Session::handle`): each span libmalloc frees goes into the ring (`mach_vm_reclaim_try_enter`), which asks \
+     for this trap once the ring's sampling period has passed since its last sample (xnu-12377.1.9 \
+     libsyscall/mach/vm_reclaim.c :265, :417), and that period is 10 s on every macOS (osfmk/vm/vm_reclaim.c \
+     :79, `vm_reclaim_sampling_period_ns` under `CONFIG_WORKING_SET_ESTIMATION`); a timer, not a chance. The \
+     trap acts on the caller's own task only (osfmk/ipc/mach_kernelrpc.c :784, \
+     `port_name_to_current_task_noref`)",
+)];
+
+/// The accounting trap of [`MACH_TRAPS_IF_DEFINED`], whose definition the
+/// rules of [`MIG_ROUTINES_WITH_RECLAMATION`] also wait on.
+pub const RECLAMATION_TRAP: &str = "mach_vm_reclaim_update_kernel_accounting_trap";
+
+/// The MIG routines of the same ring, allowed where the kernel defines the
+/// accounting trap above (the releases whose libmalloc makes a ring) and
+/// the routine: xnu-11417.101.15 (macOS 15.4) on defines both routines, but
+/// no allocator of macOS 15 makes a ring, so there the rule is not emitted.
+pub const MIG_ROUTINES_WITH_RECLAMATION: &[(&str, &str)] = &[
+    (
+        "mach_vm_deferred_reclamation_buffer_resize",
+        "reachable by source, not measured: libmalloc's xzone resizes a full ring when it frees a span \
+         (libmalloc-812.100.31 xzone_segment.c :345 `_xzm_reclaim_sync_and_resize` when \
+         `mach_vm_reclaim_try_enter` finds the ring full, :300 `mach_vm_reclaim_ring_resize`); the ring's head moves \
+         only as the kernel reclaims it, so a server that frees more than its 1016 entries' worth of spans between the \
+         kernel's passes makes it (not reached by up to 12,000 frees of 64 KiB to 1 MiB in one run, each under a rule \
+         killing it by name); the routine acts on the caller's own task only (xnu-12377.1.9 osfmk/vm/vm_user.c \
+         `mach_vm_deferred_reclamation_buffer_resize`: `task != current_task()` is KERN_INVALID_TASK)",
+    ),
+    (
+        "mach_vm_deferred_reclamation_buffer_flush",
+        "reachable by source, not measured: libmalloc's xzone flushes the ring when its resize fails \
+         (xzone_segment.c :305, `_xzm_reclaim_force_sync`, :260) and when taking back a span loses a race with the \
+         kernel reclaiming it (xzone_malloc.c :447, :612, :689, :6904, each `xzm_reclaim_force_sync`, on the \
+         allocation path); not reached as the resize was not; the routine acts on the caller's own task only \
+         (osfmk/vm/vm_user.c `mach_vm_deferred_reclamation_buffer_flush`: `task != current_task()` is \
+         KERN_INVALID_TASK)",
+    ),
+];
+
 /// The file operations allowed in the share, each with the requests that
 /// make it; the rest of the share's file operations are below.
 pub const FILE_READ_OPS: &[(&str, &str)] = &[
@@ -298,6 +350,14 @@ pub fn profile(canonical: &Path, read_only: bool) -> Result<String, Refusal> {
     p.push_str(&list("syscall-mig", "kernel-mig-routine", MIG_ROUTINES.iter().map(|(n, _)| (*n).to_string())));
     for (name, _) in MIG_ROUTINES_IF_DEFINED {
         p.push_str(&format!("(when (defined? '{name}) (allow syscall-mig (kernel-mig-routine {name})))\n"));
+    }
+    for (name, _) in MACH_TRAPS_IF_DEFINED {
+        p.push_str(&format!("(when (defined? 'MSC_{name}) (allow syscall-mach (machtrap-number MSC_{name})))\n"));
+    }
+    for (name, _) in MIG_ROUTINES_WITH_RECLAMATION {
+        p.push_str(&format!(
+            "(when (defined? 'MSC_{RECLAMATION_TRAP}) (when (defined? '{name}) (allow syscall-mig (kernel-mig-routine {name}))))\n"
+        ));
     }
     // Not covered by the default rule (measured: the server's commands ran
     // under it before this rule), so denied here.
@@ -552,9 +612,20 @@ mod tests {
     /// security/mac_policy.h from xnu-12377.1.9 (macOS 26.0), not in
     /// xnu-11417.140.69 (macOS 15); the routine `mach_vm_reallocate` is in
     /// osfmk/mach/mach_vm.defs from xnu-12377.101.15, not in xnu-12377.81.4
-    /// or any earlier release.
-    const DEFINED_SINCE_XNU: &[(&str, (u32, u32))] =
-        &[("file-graft", (12377, 1)), ("file-ungraft", (12377, 1)), ("mach_vm_reallocate", (12377, 101))];
+    /// or any earlier release; the trap `mach_vm_reclaim_update_kernel_accounting_trap`
+    /// is osfmk/kern/syscall_sw.c's trap 63 from xnu-12377.1.9, `kern_invalid`
+    /// in xnu-11417.140.69; the routines `mach_vm_deferred_reclamation_buffer_flush`
+    /// and `_resize` are in mach_vm.defs from xnu-11417.101.15 (macOS 15.4),
+    /// not in xnu-11215.81.4 (whose routines of the ring are `_init`,
+    /// `_synchronize` and `_update_reclaimable_bytes`).
+    const DEFINED_SINCE_XNU: &[(&str, (u32, u32))] = &[
+        ("file-graft", (12377, 1)),
+        ("file-ungraft", (12377, 1)),
+        ("mach_vm_reallocate", (12377, 101)),
+        ("MSC_mach_vm_reclaim_update_kernel_accounting_trap", (12377, 1)),
+        ("mach_vm_deferred_reclamation_buffer_flush", (11417, 101)),
+        ("mach_vm_deferred_reclamation_buffer_resize", (11417, 101)),
+    ];
 
     /// This kernel's `xnu-A.B` (`uname -v`, `root:xnu-A.B.C~...`).
     fn xnu() -> (u32, u32) {
@@ -583,10 +654,9 @@ mod tests {
         let mut symbols = std::collections::BTreeSet::new();
         let mut optional = std::collections::BTreeSet::new();
         for text in [profile(Path::new("/private/tmp/share"), false).unwrap(), profile(Path::new("/private/tmp/share"), true).unwrap()] {
-            for line in text.lines() {
-                if let Some(rest) = line.strip_prefix("(when (defined? '") {
-                    optional.insert(rest.split(')').next().unwrap().to_string());
-                }
+            // Each name a rule waits on, nested ones too.
+            for piece in text.split("(defined? '").skip(1) {
+                optional.insert(piece.split(')').next().unwrap().to_string());
             }
             // Strings out (the share's path, the info type), then each token
             // that is not a number or a quoted symbol.
@@ -666,6 +736,9 @@ mod tests {
 (allow syscall-unix (syscall-number 29 53 73 75 92 95 116 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
 (allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_deallocate_trap MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
 (when (defined? 'mach_vm_reallocate) (allow syscall-mig (kernel-mig-routine mach_vm_reallocate)))
+(when (defined? 'MSC_mach_vm_reclaim_update_kernel_accounting_trap) (allow syscall-mach (machtrap-number MSC_mach_vm_reclaim_update_kernel_accounting_trap)))
+(when (defined? 'MSC_mach_vm_reclaim_update_kernel_accounting_trap) (when (defined? 'mach_vm_deferred_reclamation_buffer_resize) (allow syscall-mig (kernel-mig-routine mach_vm_deferred_reclamation_buffer_resize))))
+(when (defined? 'MSC_mach_vm_reclaim_update_kernel_accounting_trap) (when (defined? 'mach_vm_deferred_reclamation_buffer_flush) (allow syscall-mig (kernel-mig-routine mach_vm_deferred_reclamation_buffer_flush))))
 (deny system-fcntl (with send-signal SIGKILL))
 (allow system-fcntl (fcntl-command F_GETFD F_SETFD F_FULLFSYNC F_PREALLOCATE F_PUNCHHOLE))
 "#;
@@ -688,6 +761,9 @@ mod tests {
 (allow syscall-unix (syscall-number 29 53 73 75 92 95 116 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
 (allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_deallocate_trap MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
 (when (defined? 'mach_vm_reallocate) (allow syscall-mig (kernel-mig-routine mach_vm_reallocate)))
+(when (defined? 'MSC_mach_vm_reclaim_update_kernel_accounting_trap) (allow syscall-mach (machtrap-number MSC_mach_vm_reclaim_update_kernel_accounting_trap)))
+(when (defined? 'MSC_mach_vm_reclaim_update_kernel_accounting_trap) (when (defined? 'mach_vm_deferred_reclamation_buffer_resize) (allow syscall-mig (kernel-mig-routine mach_vm_deferred_reclamation_buffer_resize))))
+(when (defined? 'MSC_mach_vm_reclaim_update_kernel_accounting_trap) (when (defined? 'mach_vm_deferred_reclamation_buffer_flush) (allow syscall-mig (kernel-mig-routine mach_vm_deferred_reclamation_buffer_flush))))
 (deny system-fcntl (with send-signal SIGKILL))
 (allow system-fcntl (fcntl-command F_GETFD F_SETFD F_FULLFSYNC F_PREALLOCATE F_PUNCHHOLE))
 "#;

@@ -15,7 +15,8 @@ answered by a report instead; the server says each request it serves on
 stderr with the time, and makes one control call no list names (task_info)
 once confined. Then it runs the tests that serve requests from a confined
 server (requests: every request kind, the error paths, 64 READs of 1 MiB, a
-directory of 3000 entries; links; corpus; connection) N times, and reads
+directory of 3000 entries, READs again after an idle of 11 s, past the
+kernel's 10 s deferred-reclamation period; links; corpus; connection) N times, and reads
 Seatbelt's reports of each server (`/usr/bin/log show`).
 
 It prints the macOS build (sw_vers, the libraries' versions from the dyld

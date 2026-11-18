@@ -1172,7 +1172,7 @@ it means layer 1 let the request through.
     | --- | --- | --- | --- |
     | 15.8.2 (24H232), arm64, 7.5 GiB (CI's macos-15) | magazine (crash reports' `szone_*` frames); medium, as on every Apple silicon Mac whatever its memory | trap 12 (a new medium region); `madvise` not on record (allowed before the run) | CI run 44362564244: confine_probe's reports, crash reports of the probe and of confined servers |
     | 26.7.2 (CI's macos-latest) | not on record yet | not on record yet (its fs job passed at de8805f4, before the allocator shapes) | the next CI run's confine_probe |
-    | 27.2, arm64 (here) | xzone (crash reports' `_xzm_*` frames) | `madvise` (75, `MADV_ZERO` on a reused zeroed block); `mach_vm_reallocate` where defined | the C allocation program (c15/sbx/alloc.c), confine_probe, requests.rs |
+    | 27.2, arm64 (here) | xzone (crash reports' `_xzm_*` frames) | `madvise` (75, `MADV_ZERO` on a reused zeroed block); `mach_vm_reallocate` where defined; deferred reclamation's accounting trap (63) at the first free 10 s after the last sample (below) | the C allocation program (c15/sbx/alloc.c), confine_probe, requests.rs |
 
     The size class depends on the machine (architecture and memory, above), so a user's Mac and a runner can
     differ; the probe prints both with its reports. The same run's crash reports show a second kill on macOS 15,
@@ -1340,6 +1340,36 @@ it means layer 1 let the request through.
     only reads the time, and Firecracker's profile lists it too. confine_probe makes the call by its number under the
     profile (expected done), so the race does not decide the case;
     `test_a_confined_server_sets_times_to_now_again_and_again` (requests.rs) makes 20000 such SETATTRs confined.
+
+    Deferred reclamation (`MACH_TRAPS_IF_DEFINED`, `MIG_ROUTINES_WITH_RECLAMATION`): from macOS 26, libmalloc's xzone
+    allocator does not give a freed span back at once but puts it into a ring the kernel reclaims from when memory is
+    short (libmalloc-792.80.2 and 812.100.31: `CONFIG_XZM_DEFERRED_RECLAIM` 1 on macOS, `XZM_DEFERRED_RECLAIM_ENABLED_DEFAULT`
+    true; the ring, 1016 entries measured, is allocated at malloc's start, before the profile). Entering a span
+    (`mach_vm_reclaim_try_enter`) asks for an accounting update once the ring's sampling period has passed since its
+    last sample, and `mach_vm_reclaim_update_kernel_accounting` makes it as Mach trap 63 (xnu-12377.1.9
+    libsyscall/mach/vm_reclaim.c :265, :417). The period is 10 s on every macOS (osfmk/vm/vm_reclaim.c :79,
+    `vm_reclaim_sampling_period_ns` under `CONFIG_WORKING_SET_ESTIMATION`, off only on iOS), counted from the ring's
+    allocation: a timer, not a chance. So every confined server that lived 10 s and then freed a span was killed:
+    measured on macOS 27.2, the first READ of 1 MiB after an idle of 11 s (crash report: the trap ←
+    `mach_vm_reclaim_update_kernel_accounting` ← `_xzm_reclaim_mark_free` ← `xzm_segment_group_free_chunk` ← the
+    reply frame's buffer dropped in `Session::handle`). No test saw it, as every test's server ended within 10 s, and
+    neither did the discovery runs, for the same reason. The trap is listed where defined (xnu-12377 on; macOS 15's
+    trap 63 is `kern_invalid`, and its libmalloc-715 has no deferred reclamation on macOS), on that measurement. The
+    same ring's MIG routines are listed where the trap is defined, by source and not measured: libmalloc resizes a full
+    ring when it frees a span (`mach_vm_deferred_reclamation_buffer_resize`, xzone_segment.c :345, :300) and flushes it
+    when that fails or when taking back a span loses a race with the kernel's reclamation
+    (`mach_vm_deferred_reclamation_buffer_flush`, xzone_segment.c :305, :260; xzone_malloc.c :447, :612, :689, :6904);
+    frees of up to 12,000 blocks of 64 KiB to 1 MiB in one process did not reach either, each run under a rule that
+    killed it by name. The three act on the caller's own task only (osfmk/ipc/mach_kernelrpc.c :784,
+    `port_name_to_current_task_noref`; osfmk/vm/vm_user.c: `task != current_task()` is `KERN_INVALID_TASK`).
+    confine_probe makes each by the call itself on the process's own ring (found with
+    `mach_vm_reclaim_get_rings_for_task`) under the profile, expected done where the trap is defined, and says on
+    record which is missing elsewhere; `test_a_confined_server_answers_again_after_the_reclamation_period`
+    (requests.rs, macOS) reads 1 MiB, waits 11 s and reads again; without the entries the probe's three cases were
+    killed and the server was killed at the second round. Not done: `MallocLargeCache=0` in the server's environment,
+    which turns the reclamation off (xzone reads it in release builds, `_xzm_production_getenv`; measured: no ring,
+    and the 11 s case passes under a rule killing the trap), because it needs a re-exec or the launcher to set it
+    and puts the allocator in a mode measured nowhere else.
 
   - **How the lists were made, and the limit of that.** A discovery build (`--cfg wick_fsd_discovery`, never
     released) ends the profile with `(allow default (with report))` and allows unlisted calls with a report;
