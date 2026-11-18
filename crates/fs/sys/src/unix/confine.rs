@@ -990,6 +990,8 @@ pub mod nr {
     pub const LANDLOCK_CREATE_RULESET: c_long = libc::SYS_landlock_create_ruleset;
     /// `landlock_restrict_self`.
     pub const LANDLOCK_RESTRICT_SELF: c_long = libc::SYS_landlock_restrict_self;
+    /// `close_range`.
+    pub const CLOSE_RANGE: c_long = libc::SYS_close_range;
 }
 
 /// Has `cmd`'s child install `program` (after `no_new_privs`) before it

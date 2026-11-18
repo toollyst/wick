@@ -1354,6 +1354,152 @@ pub fn command_with_only_stdio(cmd: &mut std::process::Command) {
     }
 }
 
+/// The descriptors this process has open, ascending, as the kernel lists
+/// them, whatever their numbers: Linux, `/proc/self/fd` (the listing's own
+/// descriptor, closed when the listing ends, left out); macOS,
+/// `proc_pidinfo(PROC_PIDLISTFDS)`, the process's file table.
+pub fn open_descriptors() -> Result<Vec<c_int>> {
+    #[cfg(target_os = "linux")]
+    let listed: Vec<c_int> = {
+        let dir = std::fs::read_dir("/proc/self/fd").map_err(|e| HostErrno(e.raw_os_error().unwrap_or(libc::EIO)))?;
+        let mut v = Vec::new();
+        for e in dir {
+            let e = e.map_err(|e| HostErrno(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            v.push(e.file_name().to_str().and_then(|n| n.parse().ok()).ok_or(HostErrno(libc::EIO))?);
+        }
+        v
+    };
+    #[cfg(target_os = "macos")]
+    let listed: Vec<c_int> = {
+        let size = std::mem::size_of::<libc::proc_fdinfo>();
+        // SAFETY: a null buffer of size 0 asks for the size the list needs.
+        let need = unsafe { libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        if need <= 0 {
+            return Err(last());
+        }
+        // Room for more than asked: nothing else runs in this process
+        // while it lists, but the list is only as long as the buffer.
+        let room = usize::try_from(need).unwrap_or(0) / size + 32;
+        let mut buf = vec![libc::proc_fdinfo { proc_fd: 0, proc_fdtype: 0 }; room];
+        let bytes = c_int::try_from(room * size).map_err(|_| HostErrno(libc::EOVERFLOW))?;
+        // SAFETY: buf holds `bytes` bytes of proc_fdinfo records.
+        let got = unsafe {
+            libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDLISTFDS, 0, buf.as_mut_ptr().cast::<c_void>(), bytes)
+        };
+        if got <= 0 {
+            return Err(last());
+        }
+        let n = usize::try_from(got).unwrap_or(0) / size;
+        if n == room {
+            // As long as the buffer: there may be more than it held.
+            return Err(HostErrno(libc::EOVERFLOW));
+        }
+        buf[..n].iter().map(|i| i.proc_fd).collect()
+    };
+    let mut open: Vec<c_int> = listed
+        .into_iter()
+        // SAFETY: F_GETFD takes no pointer.
+        .filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
+        .collect();
+    open.sort_unstable();
+    Ok(open)
+}
+
+/// The descriptors open below `bound`, by asking each number (`F_GETFD`):
+/// for a process that can no longer list its table (Linux, once `/proc` is
+/// not in its root). The kernel gives a new descriptor the lowest free
+/// number below the soft `RLIMIT_NOFILE`, so with that limit as `bound`
+/// every descriptor the process opened itself is found.
+pub fn descriptors_below(bound: u64) -> Vec<c_int> {
+    let top = c_int::try_from(bound).unwrap_or(c_int::MAX);
+    // SAFETY: F_GETFD takes no pointer; a number not open is EBADF.
+    (0..top).filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0).collect()
+}
+
+/// Closes every descriptor above the standard streams but `keep`, whatever
+/// its number: Linux, `close_range` around `keep` (Linux 5.9; where the
+/// kernel has none, each descriptor [`open_descriptors`] lists); macOS, each
+/// one the process's file table lists. For a process's first step, before
+/// it opens anything: what its launcher left open is not its own.
+pub fn close_inherited(keep: Option<c_int>) -> Result<()> {
+    let keep = keep.filter(|&k| k > 2);
+    #[cfg(target_os = "linux")]
+    {
+        let ranges = match keep.and_then(|k| u32::try_from(k).ok()) {
+            Some(k) if k > 3 => vec![(3, k - 1), (k.saturating_add(1), u32::MAX)],
+            Some(k) => vec![(k.saturating_add(1), u32::MAX)],
+            None => vec![(3, u32::MAX)],
+        };
+        for (first, last) in ranges {
+            // SAFETY: close_range takes numbers only.
+            if unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) } < 0 {
+                let e = self::last();
+                if e.0 == libc::ENOSYS {
+                    return close_listed(keep);
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    close_listed(keep)
+}
+
+/// [`close_inherited`] by the kernel's list.
+fn close_listed(keep: Option<c_int>) -> Result<()> {
+    for fd in open_descriptors()? {
+        if fd > 2 && Some(fd) != keep {
+            // SAFETY: fd is open (listed) and nothing in this process owns
+            // it yet.
+            check(unsafe { libc::close(fd) })?;
+        }
+    }
+    Ok(())
+}
+
+/// Makes standard input `/dev/null`, read-only, for a process that reads
+/// none: what its launcher gave as input (a terminal, a file) is not kept.
+pub fn stdin_from_null() -> Result<()> {
+    // SAFETY: a NUL-terminated path; the flags take no pointer.
+    let null = owned(unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOCTTY) })?;
+    // SAFETY: both are descriptors of this process; dup2 replaces 0.
+    check(unsafe { libc::dup2(null.as_raw_fd(), 0) }).map(drop)
+}
+
+/// Whether `fd` is a channel for a byte and nothing else: a pipe or FIFO
+/// open for writing only, or a socket.
+#[allow(clippy::useless_conversion, reason = "mode_t is u16 on macOS, u32 on Linux")]
+pub fn is_write_channel(fd: BorrowedFd<'_>) -> Result<bool> {
+    let st = fstat(fd)?;
+    // SAFETY: F_GETFL takes no pointer.
+    let flags = check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) })?;
+    let kind = st.mode & u32::from(libc::S_IFMT);
+    Ok(kind == u32::from(libc::S_IFSOCK) || (kind == u32::from(libc::S_IFIFO) && flags & libc::O_ACCMODE == libc::O_WRONLY))
+}
+
+/// Has `cmd`'s child start with each of `fds` at its number (not
+/// close-on-exec), as a launcher that leaves descriptors open does: for the
+/// tests of a server that must not keep what it was started with.
+pub fn command_with_inherited(cmd: &mut std::process::Command, fds: Vec<(OwnedFd, c_int)>) {
+    use std::os::unix::process::CommandExt;
+    let closure = move || {
+        for (fd, at) in &fds {
+            // SAFETY: async-signal-safe; both are descriptors of the child,
+            // and dup2 leaves the new one not close-on-exec.
+            if unsafe { libc::dup2(fd.as_raw_fd(), *at) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    };
+    // SAFETY: the closure makes only async-signal-safe system calls and
+    // allocates nothing.
+    unsafe {
+        cmd.pre_exec(closure);
+    }
+}
+
 /// What descriptor `fd` of this process is, for a message: its file type
 /// and where the host can say it, its path (macOS `F_GETPATH`, Linux the
 /// `/proc/self/fd` link, which names a pipe or socket by its inode).
@@ -1414,6 +1560,56 @@ pub fn set_nofile(soft: u64) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
+
+    /// In a process of its own (the test binary again, with descriptors at
+    /// 140 and 141 left open as a launcher leaves them): every descriptor
+    /// above the standard streams but the one kept is closed, and standard
+    /// input is `/dev/null`.
+    #[test]
+    fn test_close_inherited_leaves_the_standard_streams_and_the_one_kept() {
+        const ALONE: &str = "WICK_FS_SYS_TEST_CLOSE_ALONE";
+        const NAME: &str = "unix::tests::test_close_inherited_leaves_the_standard_streams_and_the_one_kept";
+        if std::env::var_os(ALONE).is_none() {
+            let (r, w) = std::io::pipe().unwrap();
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([NAME, "--exact", "--test-threads=1", "--nocapture"]).env(ALONE, "1");
+            command_with_inherited(&mut cmd, vec![(r.into(), 140), (w.into(), 141)]);
+            let out = cmd.output().unwrap();
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(out.status.success() && text.contains("1 passed"), "in a process of its own:\n{text}");
+            return;
+        }
+        let before = open_descriptors().unwrap();
+        assert!(before.contains(&140) && before.contains(&141), "{before:?}");
+        close_inherited(Some(141)).unwrap();
+        stdin_from_null().unwrap();
+        let after = open_descriptors().unwrap();
+        assert_eq!(after, [0, 1, 2, 141], "{:?}", after.iter().map(|&fd| descriptor_described(fd)).collect::<Vec<_>>());
+        assert!(descriptor_described(0).ends_with(" /dev/null"), "{}", descriptor_described(0));
+        close_inherited(None).unwrap();
+        assert_eq!(open_descriptors().unwrap(), [0, 1, 2]);
+    }
+
+    #[test]
+    fn test_descriptors_are_listed_and_found_by_number() {
+        let f = std::fs::File::open("/dev/null").unwrap();
+        let fd = f.as_raw_fd();
+        assert!(open_descriptors().unwrap().contains(&fd));
+        let (soft, _) = nofile().unwrap();
+        assert!(descriptors_below(soft).contains(&fd));
+        assert!(!descriptors_below(u64::try_from(fd).unwrap()).contains(&fd));
+    }
+
+    #[test]
+    fn test_a_write_channel_is_a_pipe_s_write_end_or_a_socket() {
+        let (r, w) = std::io::pipe().unwrap();
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let f = std::fs::File::open("/dev/null").unwrap();
+        assert!(is_write_channel(w.as_fd()).unwrap());
+        assert!(is_write_channel(a.as_fd()).unwrap());
+        assert!(!is_write_channel(r.as_fd()).unwrap());
+        assert!(!is_write_channel(f.as_fd()).unwrap());
+    }
 
     #[test]
     fn test_a_command_with_only_stdio_inherits_nothing_else() {

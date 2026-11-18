@@ -341,6 +341,23 @@ wick-fsd (one per VM per share; started by the operator/adapter, outside the jai
 
 - **Stage 0** (operator's rights, reads no guest bytes):
   - parse arguments (`--shared-dir`, `--socket`, `--read-only`, limits);
+  - its first step, before anything is opened (`main.rs`, `start`): every descriptor it was started with but the
+    standard streams and `--ready-fd` closed, whatever its number (Linux `close_range` around `--ready-fd`, by the
+    kernel's `/proc/self/fd` list where the kernel has no `close_range`; macOS each descriptor of the file table
+    `proc_pidinfo(PROC_PIDLISTFDS)` lists, which has no bound to miss), then that list read back: a descriptor left
+    open (a close that failed, or said done and was not) is a refusal naming each, by what it is, before the socket
+    is bound; standard input made `/dev/null`, read-only
+    (wick-fsd reads none); `--ready-fd` required to be a pipe's write end or a socket, and closed once its one byte is
+    written. A launcher's descriptors survive `pivot_root` and a Seatbelt profile, and a read or write on one already
+    open is checked by nothing of the confinement: in CI run 44233741878's fs jobs (the unit-test step's record) a
+    step's shell held descriptors 142 and 145, two pipes' ends, on both Ubuntu runners, and 131 and 140, two
+    `com.apple.netsrc` control sockets, and 143 and 146, pipes, on macos-latest, which every process it starts
+    inherits (SECURITY.md, Fixed defects; `test_descriptors_it_was_started_with_are_closed`,
+    `test_refused_when_a_descriptor_it_was_started_with_survives`, `start.rs`). Standard output and error are kept as
+    given (Rust's start opens `/dev/null` for any of 0 to 2 that is closed): the operator's channel for `ready` and
+    the log, which the server only writes. A terminal there is not a way out: the server's filter allows `ioctl`
+    with `FS_IOC_GETFLAGS` only, so `TIOCSTI` kills it; a host file open for writing as stderr is the operator's log,
+    written by the server and nothing more;
   - open the share root;
   - check the volume: local, not the volume root or a system location, case sensitivity (§7), xattr/EA support;
   - bind and listen on the socket;
@@ -676,6 +693,7 @@ a refusal that names the problem, none with a switch (`test_stage0_refusals`,
    `fsetxattr` succeeded and made `._f`). Without, a share is served read-only, with no records;
 6. `RLIMIT_NOFILE` raised to the descriptors the limits let the server hold (`limits::descriptors`, §4.2) and read
    back, or refused if the hard limit is lower (macOS: or `kern.maxfilesperproc`, which xnu enforces when lower);
+   the server binary then sets the soft limit to exactly that, lowering it where it was higher (§6.1, step 10);
 7. beneath-resolution present, and names not folded by case unless the operator allowed it.
 
 ### 4.4 Cache modes
@@ -826,7 +844,12 @@ it means layer 1 let the request through.
     3. the child: `PR_SET_PDEATHSIG` SIGKILL (killing wick-fsd kills it), not dumpable (no ptrace or `/proc/<pid>`
        access for the host's processes of its uid), every mount private, the share bind-mounted onto itself without
        what is mounted beneath it, remounted `nosuid,nodev,noexec` (read-only for `--read-only`, and keeping the flags
-       the mount is locked with), `pivot_root` into it and the old root detached;
+       the mount is locked with); then its descriptors, the kernel's whole list from `/proc/self/fd` (the last point
+       it is in the root), required to be exactly the standard streams, the connection, its end of the parent's pipe
+       and stage 0's root (`held_exactly`): everything opened since the first step is one of these or closed again
+       (the listener and `--ready-fd` after the ready byte, the setgroups and map writes, `/proc/self/task`), so this
+       is an equality, not a subset, and anything else is named and refused; then `pivot_root` into it and the old
+       root detached;
     4. `/` opened and checked to be the object stage 0 checked (else refused), and the backend made on it;
     5. the bounding set emptied while `CAP_SETPCAP` is held (each drop asks for it, security/commoncap.c, v6.12,
        `cap_prctl_drop` :1235 to :1248, and a drop from root takes it with the permitted set, `cap_emulate_setxuid`
@@ -868,7 +891,13 @@ it means layer 1 let the request through.
        root): the four uids and gids (`--uid`/`--gid`, or the real ones, none apart), no supplementary groups as
        root, every capability set empty, `SECBIT_KEEP_CAPS` clear, `no_new_privs`, the parent-death signal SIGKILL,
        not dumpable, all read just before the filter, and the filter by its own effect just after. One refusal names
-       everything that did not hold (`test_each_thing_that_did_not_hold_is_named_in_one_refusal`). A server that is
+       everything that did not hold (`test_each_thing_that_did_not_hold_is_named_in_one_refusal`). Before them, its
+       descriptors by number (`fcntl(F_GETFD)` over every one below the soft `RLIMIT_NOFILE`, where the kernel gives
+       each new one the lowest free number, so every descriptor it opened itself is seen; above it nothing was open
+       at step 3's list), required to be exactly the standard streams, the connection and the backend's root
+       (`test_descriptors_held_exactly`). The soft limit is set after stage 0 to exactly what the share's limits may
+       hold open (`limits::descriptors`, 2112 by default): the server needs no more, and the walk costs 0.4 ms there
+       against 193 ms at Docker's default soft limit of 1048576 (measured in Docker's linuxkit 7.0.14, aarch64). A server that is
        not root keeps its user's supplementary groups: its user namespace denies `setgroups` (user_namespaces(7))
        [doc], and they grant nothing its user does not have.
 

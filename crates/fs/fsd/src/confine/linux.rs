@@ -15,8 +15,11 @@
 //! 3. the child dies with its parent, is not dumpable, makes every mount
 //!    private, bind-mounts the share onto itself (not what is mounted
 //!    beneath it), remounts the bind `nosuid,nodev,noexec` (and read-only
-//!    for a read-only share), and makes it the root with `pivot_root`, the
-//!    old root detached;
+//!    for a read-only share), lists its descriptors (`/proc/self/fd`, the
+//!    kernel's whole list, the last point it can be read) and requires them
+//!    to be exactly the standard streams, the caller's (the connection),
+//!    its end of the parent's pipe and stage 0's root, and makes the share
+//!    the root with `pivot_root`, the old root detached;
 //! 4. opens `/` and checks it is the object stage 0 checked.
 //!
 //! [`lock`], once the backend holds the new root:
@@ -35,12 +38,15 @@
 //!    kills the process on anything else;
 //! 10. reads back what must hold, in one place ([`check`]): the ids, the
 //!     groups, every capability set, `SECBIT_KEEP_CAPS`, `no_new_privs`, the
-//!     parent-death signal, dumpable, and the filter by its own effect.
+//!     parent-death signal, dumpable, and the filter by its own effect; and,
+//!     before the filter, that the descriptors open below the soft
+//!     `RLIMIT_NOFILE` (every one it opened itself is) are exactly the
+//!     standard streams and what the caller holds ([`held_exactly`]).
 //!
 //! Every step is required, and a failure is a [`Refusal`] naming it; no flag
 //! skips one.
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::path::Path;
 
 use wick_fs_sys as sys;
@@ -71,7 +77,14 @@ pub struct ParentWatch(std::os::fd::OwnedFd);
 /// Steps 1 to 4. Returns, in the confined child only, the new root, `keep`
 /// (the connection) and the [`ParentWatch`] for [`lock`]. `keep` is dropped
 /// in the parent before it waits.
-pub fn enter<T>(checked: Checked, plan: Plan, keep: T) -> Result<(std::os::fd::OwnedFd, T, ParentWatch), Refusal> {
+/// `kept`: the descriptors of `keep` (the connection), which the child
+/// goes on holding.
+pub fn enter<T>(
+    checked: Checked,
+    plan: Plan,
+    keep: T,
+    kept: &[RawFd],
+) -> Result<(std::os::fd::OwnedFd, T, ParentWatch), Refusal> {
     let root_user = sys::euid() == 0;
     match (root_user, plan.drop_to) {
         (true, None) => {
@@ -156,6 +169,13 @@ pub fn enter<T>(checked: Checked, plan: Plan, keep: T) -> Result<(std::os::fd::O
         flags |= c::ms::RDONLY;
     }
     c::remount_bind(share, flags).map_err(|e| refuse("the bind mount's remount (nosuid, nodev, noexec)", e))?;
+    // The kernel's whole list, read while `/proc` is still in the root:
+    // what the first step closed (main.rs) and every descriptor opened
+    // since, closed again or one of these.
+    let open = sys::open_descriptors().map_err(|e| refuse("listing the descriptors (/proc/self/fd)", e))?;
+    let mut expected = kept.to_vec();
+    expected.extend([watch.as_raw_fd(), checked.root.as_raw_fd()]);
+    held_exactly("before pivot_root", &open, &expected)?;
     c::pivot_to(share).map_err(|e| refuse("pivot_root to the share", e))?;
     let root = sys::open_root(Path::new("/")).map_err(|e| refuse("opening the new root", e))?;
     let st = sys::fstat(root.as_fd()).map_err(|e| refuse("fstat of the new root", e))?;
@@ -195,7 +215,9 @@ pub struct Locked {
 }
 
 /// Steps 5 to 10, in the confined child after the backend holds its root.
-pub fn lock(plan: Plan, watch: ParentWatch) -> Result<Locked, Refusal> {
+/// `held`: the descriptors the caller holds and serves with (the
+/// connection, the backend's root).
+pub fn lock(plan: Plan, watch: ParentWatch, held: &[RawFd]) -> Result<Locked, Refusal> {
     // Before the ids: the drop from root takes CAP_SETPCAP, which each
     // bounding drop needs.
     c::drop_bounding().map_err(|e| refuse("dropping the bounding set", e))?;
@@ -220,6 +242,12 @@ pub fn lock(plan: Plan, watch: ParentWatch) -> Result<Locked, Refusal> {
              no_new_privs"
         );
     }
+    // Its descriptors, every one it opened itself: below the soft limit
+    // (main.rs sets it to what the share's limits may hold open), where the
+    // kernel gives each new one the lowest free number. Above it nothing was
+    // open before pivot_root (listed there).
+    let (soft, _) = sys::nofile().map_err(|e| refuse("reading RLIMIT_NOFILE", e))?;
+    held_exactly("when it serves", &sys::descriptors_below(soft), held)?;
     // What holds, read back in one place (step 10): the calls above said
     // they were done; this is what the kernel holds. Nothing after the read
     // changes credentials (the filter's install does not: kernel/seccomp.c,
@@ -287,6 +315,26 @@ pub fn check(plan: Plan, state: &c::State, filtered: bool) -> Result<(), Refusal
     )))
 }
 
+/// The descriptors `open` are exactly the standard streams and `expected`:
+/// one refusal naming each other one (what it is, `descriptor_described`)
+/// and each expected one not open, `when`.
+pub fn held_exactly(when: &str, open: &[RawFd], expected: &[RawFd]) -> Result<(), Refusal> {
+    let expected: Vec<RawFd> = [0, 1, 2].iter().chain(expected).copied().collect();
+    let other: Vec<String> = open.iter().filter(|fd| !expected.contains(fd)).map(|&fd| sys::descriptor_described(fd)).collect();
+    let missing: Vec<RawFd> = expected.iter().filter(|fd| !open.contains(fd)).copied().collect();
+    let mut not = Vec::new();
+    if !other.is_empty() {
+        not.push(format!("descriptors open that wick-fsd did not open or keep: {}", other.join(", ")));
+    }
+    if !missing.is_empty() {
+        not.push(format!("descriptors it holds that are not open: {missing:?}"));
+    }
+    if not.is_empty() {
+        return Ok(());
+    }
+    Err(Refusal(format!("confinement: {when}, {}; wick-fsd does not serve unconfined", not.join("; "))))
+}
+
 /// Landlock's file rights for `abi`: (handled, allowed beneath the root).
 /// Never allowed: execute, and making devices, sockets, FIFOs and symlinks
 /// (the server emulates those as regular files; design-fs row 12).
@@ -346,6 +394,18 @@ mod tests {
         read_only: false,
         drop_to: None,
     };
+
+    #[test]
+    fn test_descriptors_held_exactly() {
+        held_exactly("t", &[0, 1, 2, 5, 9], &[9, 5]).unwrap();
+        let r = held_exactly("before pivot_root", &[0, 1, 2, 5, 9, 131], &[5, 9]).unwrap_err().0;
+        assert!(r.contains("before pivot_root, descriptors open that wick-fsd did not open or keep: 131: "), "{r}");
+        assert!(r.contains("does not serve unconfined") && !r.contains("not open: ["), "{r}");
+        let r = held_exactly("t", &[0, 1, 2, 7], &[5]).unwrap_err().0;
+        assert!(r.contains("7: ") && r.contains("descriptors it holds that are not open: [5]"), "{r}");
+        let r = held_exactly("t", &[0, 2, 5], &[5]).unwrap_err().0;
+        assert!(r.contains("not open: [1]"), "{r}");
+    }
 
     #[test]
     fn test_what_held_is_served() {

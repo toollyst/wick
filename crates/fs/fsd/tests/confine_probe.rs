@@ -28,7 +28,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::os::fd::{AsFd, BorrowedFd};
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
     use std::path::Path;
 
     use wick_fs_sys as sys;
@@ -62,6 +62,9 @@ mod linux {
                 ..Limits::default()
             },
         };
+        // As wick-fsd's main: the soft limit what the share may hold, the
+        // read-back's bound.
+        sys::set_nofile(wick_fsd::limits::descriptors(&shared.limits)).unwrap();
         let checked = match check(&shared, None) {
             Ok(c) => c,
             Err(r) => {
@@ -69,13 +72,14 @@ mod linux {
                 return 2;
             }
         };
-        let (root, (), watch) = match enter(checked, plan, ()) {
+        let (root, (), watch) = match enter(checked, plan, (), &[]) {
             Ok(x) => x,
             Err(r) => {
                 eprintln!("{}", r.0);
                 return 3;
             }
         };
+        let dir_root = root.as_raw_fd();
         let dir = match HostDir::new(root, Options { case_insensitive_ok: true, ..Options::default() }) {
             Ok(d) => d,
             Err(r) => {
@@ -86,7 +90,7 @@ mod linux {
         // A descriptor of the root for the cases (opened before the filter,
         // which has no openat).
         let Ok(root) = sys::open_root(Path::new("/")) else { return 6 };
-        if let Err(r) = lock(plan, watch) {
+        if let Err(r) = lock(plan, watch, &[dir_root, root.as_raw_fd()]) {
             eprintln!("{}", r.0);
             return 5;
         }
@@ -117,6 +121,9 @@ mod linux {
     }
 
     pub fn main() {
+        // As wick-fsd's first step: what this process was started with is
+        // not the confined process's (a CI runner leaves descriptors open).
+        sys::close_inherited(None).unwrap();
         if let Some(restricted) = userns_restricted() {
             println!("confine_probe: ran nothing confined: {restricted} (server.rs checks the refusal)");
             return;

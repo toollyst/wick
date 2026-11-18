@@ -20,12 +20,14 @@
 
 mod common;
 
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use common::drive::G;
 use common::remote::{Remote, Server, base_args, give_share, is_userns_refusal, userns_restricted};
 use common::*;
+use wick_fs_sys as sys;
 use wick_fs_sys::confine::{self as c, nr};
 
 struct Setup {
@@ -131,6 +133,125 @@ fn test_confined_status() {
     let (status, err) = g.s.finish();
     assert!(status.success(), "{status:?}: {err}");
     assert!(err.contains("layer refusals 0"), "{err}");
+}
+
+/// What a careless launcher leaves open, each at a number of its own: a
+/// file outside the share open for writing, the share's parent directory
+/// and a socket (one end of a pair, the other returned). On the macOS
+/// runner the step's shell holds two control sockets and two pipes so
+/// (CI run 44233741878).
+fn left_open(s: &Setup) -> (Vec<(OwnedFd, i32)>, UnixStream) {
+    let file = std::fs::File::create(s.base.join("left-open")).unwrap();
+    let dir = std::fs::File::open(&s.base).unwrap();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    (vec![(file.into(), 40), (dir.into(), 41), (theirs.into(), 42)], ours)
+}
+
+/// The descriptors of process `pid`, each with what it is (its
+/// `/proc/<pid>/fd` link); `None` where this process may not read them (a
+/// server that is not dumpable, read by a user).
+fn descriptors_of(pid: u32) -> Option<Vec<(i32, String)>> {
+    let dir = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return None,
+        Err(e) => panic!("/proc/{pid}/fd: {e}"),
+    };
+    let mut v: Vec<(i32, String)> = dir
+        .map(|e| {
+            let e = e.unwrap();
+            let fd = e.file_name().to_str().unwrap().parse().unwrap();
+            (fd, std::fs::read_link(e.path()).map_or_else(|e| e.to_string(), |p| p.display().to_string()))
+        })
+        .collect();
+    v.sort();
+    Some(v)
+}
+
+/// What wick-fsd was started with is closed before it serves, in its
+/// confined process and its waiting parent alike: a file, a directory and
+/// a socket left open by its launcher, by `close_range` and, where the
+/// kernel has none (ENOSYS, as before Linux 5.9), by the kernel's list.
+/// Read from outside as root; as a user the server's own read-back (it
+/// serves only with exactly what it opened) is what holds.
+#[test]
+fn test_descriptors_it_was_started_with_are_closed() {
+    for (tag, answer) in [("srv-left", None), ("srv-left-nosys", Some(c::Answer::Fail(38)))] {
+        let s = setup(tag);
+        let args = base_args(&s.share, &s.socket);
+        let (fds, _ours) = left_open(&s);
+        let mut supervisor = None;
+        let server = Server::start(&args, |cmd| {
+            sys::command_with_inherited(cmd, fds);
+            if let Some(answer) = answer {
+                let sock = c::command_with_supervisor(cmd, c::notify_program(&[(nr::CLOSE_RANGE, None)])).unwrap();
+                supervisor = Some(c::supervise(sock, move |_| answer));
+            }
+        });
+        let r = match Remote::connect(server) {
+            Ok(r) => r,
+            Err((mut server, why)) => {
+                let (status, err) = server.wait();
+                let Some(restricted) = userns_restricted() else { panic!("{tag}: {why} {status:?}: {err}") };
+                assert!(!status.success() && is_userns_refusal(&err), "{restricted}: not a user namespace's refusal: {err}");
+                eprintln!("ran nothing confined: {restricted}; refused at its user namespace, as it must: {err}");
+                return;
+            }
+        };
+        let child = u32::try_from(r.server.confined_pid().expect("the confined child")).unwrap();
+        let parent = r.server.child.id();
+        match (descriptors_of(child), descriptors_of(parent)) {
+            (Some(theirs), Some(waiting)) => {
+                for (who, fds, n) in [("the confined server", &theirs, 5), ("the waiting parent", &waiting, 4)] {
+                    let left: Vec<_> = fds.iter().filter(|(fd, _)| [40, 41, 42].contains(fd)).collect();
+                    assert!(left.is_empty(), "{tag}: {who} holds what it was started with: {fds:?}");
+                    assert!(!fds.iter().any(|(_, what)| what.contains("left-open")), "{tag}: {who}: {fds:?}");
+                    // The standard streams, then: the connection and the
+                    // share's root; the pipe the child watches.
+                    assert_eq!(fds.len(), n, "{tag}: {who}: {fds:?}");
+                    assert_eq!(fds[0].1, "/dev/null", "{tag}: {who}'s standard input: {fds:?}");
+                }
+            }
+            _ => eprintln!(
+                "ran nothing: /proc/<pid>/fd of a server that is not dumpable needs root (it served, so its own \
+                 read-back of its descriptors held)"
+            ),
+        }
+        let mut g = G::over(r);
+        g.getattr(ROOT, None).unwrap();
+        let (status, err) = g.s.finish();
+        assert!(status.success(), "{tag}: {status:?}: {err}");
+        if let Some(supervisor) = supervisor {
+            let (calls, _) = supervisor.join().unwrap();
+            assert!(!calls.is_empty(), "{tag}: close_range was not made");
+        }
+    }
+}
+
+/// A descriptor the server was started with that survives the close (its
+/// `close_range` said done and was not, as the supervisor answers) is found
+/// by the first step's read-back of the kernel's list, each named: the
+/// server refuses before it binds its socket, on any host.
+#[test]
+fn test_refused_when_a_descriptor_it_was_started_with_survives() {
+    let s = setup("srv-survives");
+    let args = base_args(&s.share, &s.socket);
+    let (fds, _ours) = left_open(&s);
+    let mut supervisor = None;
+    let mut server = Server::spawn(&args, |cmd| {
+        sys::command_with_inherited(cmd, fds);
+        let sock = c::command_with_supervisor(cmd, c::notify_program(&[(nr::CLOSE_RANGE, None)])).unwrap();
+        supervisor = Some(c::supervise(sock, |_| c::Answer::Pretend));
+    });
+    let (status, err) = server.wait();
+    assert!(!status.success(), "{status:?}: {err}");
+    let named = "closing the descriptors it was started with (said done), left open: [";
+    assert!(err.contains(named), "{err}");
+    for what in ["40: file ", "left-open", "41: directory ", "42: socket "] {
+        assert!(err.contains(what), "{what}: {err}");
+    }
+    assert!(err.contains("wick-fsd does not serve with them") && !s.socket.exists(), "{err}");
+    let (calls, _) = supervisor.unwrap().join().unwrap();
+    assert!(!calls.is_empty(), "close_range was not made");
 }
 
 /// A guest's MKDIR and SETATTR with every special bit pass the filter's

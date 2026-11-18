@@ -25,6 +25,12 @@ import sys
 # that are not a confined test left unconfined, each with why.
 KNOWN = [
     (
+        "ran nothing: /proc/<pid>/fd of a server that is not dumpable needs root",
+        "test_descriptors_it_was_started_with_are_closed reads the server's descriptors from outside, which a "
+        "server that is not dumpable shows to root only; the server served, so its own read-back of its "
+        "descriptors held, and the sudo step reads them",
+    ),
+    (
         "ran nothing: /proc/<pid>/root of a server that is not dumpable needs root",
         "test_outside_open_fails reads another process's /proc/<pid>/root, which a server that is not dumpable "
         "shows to root only; the server itself ran confined, and confine_probe opens the outside path from "
@@ -69,11 +75,14 @@ def verdict(name, text):
 
 
 # Lines of CI run 44233741878's step (ubuntu-latest), the server binary
-# under the grant, and what confine_probe prints there.
+# under the grant, with the line of a test added since, and what
+# confine_probe prints there.
 SERVER = """running 23 tests
 test test_a_guest_s_special_mode_bits_pass_the_filter ... ok
 test test_confined_status ... ok
 test test_outside_open_fails ... ran nothing: /proc/<pid>/root of a server that is not dumpable needs root (confine_probe checks it)
+ok
+test test_descriptors_it_was_started_with_are_closed ... ran nothing: /proc/<pid>/fd of a server that is not dumpable needs root (it served, so its own read-back of its descriptors held)
 ok
 test test_refused_without_id_drop ... ran nothing: a server that is not root drops no ids
 ok
@@ -92,7 +101,7 @@ confine_probe: 18 cases ok
 
 def selftest():
     cases = [
-        ("the run's server log", SERVER, 0, 4),
+        ("the run's server log", SERVER, 0, 5),
         ("confine_probe passing (no libtest lines)", PROBE, 0, 0),
         (
             "confine_probe refused after all",
@@ -109,10 +118,10 @@ def selftest():
                 "refused at its user namespace, as it must: x\nok",
             ),
             1,
-            4,
+            5,
         ),
-        ("an unknown ran nothing", SERVER + "test x ... ran nothing: something new\n", 1, 4),
-        ("a failed binary", SERVER.replace("test result: ok.", "test result: FAILED.") + "exit status 101\n", 3, 4),
+        ("an unknown ran nothing", SERVER + "test x ... ran nothing: something new\n", 1, 5),
+        ("a failed binary", SERVER.replace("test result: ok.", "test result: FAILED.") + "exit status 101\n", 3, 5),
         ("a panic", PROBE + "thread 'main' panicked at x\n", 1, 0),
         ("an empty log", "", 1, 0),
     ]

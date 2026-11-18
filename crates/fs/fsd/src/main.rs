@@ -16,7 +16,11 @@
 //! checks, the socket bound and listened on, ready said (a byte on
 //! `--ready-fd`, else a `ready` line on stdout), one connection accepted, the
 //! listener closed and unlinked, the peer's uid checked against `--peer-uid`
-//! (default: this process's). Then the confinement, and only then the hellos
+//! (default: this process's). Before all of it, its first step: every
+//! descriptor it was started with but the standard streams and
+//! `--ready-fd` closed, and standard input made `/dev/null` (wick-fsd reads
+//! none), so nothing its launcher left open reaches the confined server
+//! (docs/design-fs.md §4.2). Then the confinement, and only then the hellos
 //! and the requests, until the VMM closes the connection. Every step is
 //! required: there is no option that serves unconfined. On a host without
 //! confinement yet (macOS until its commit, Windows until its port) the
@@ -110,6 +114,65 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     })
 }
 
+/// What the first step leaves this process holding: `--ready-fd`, checked.
+#[derive(Debug, Default)]
+struct Start {
+    #[cfg(unix)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "a host without confinement says no ready"))]
+    ready: Option<std::os::fd::OwnedFd>,
+}
+
+/// The first step, before anything is opened: every descriptor but 0 to 2
+/// and `--ready-fd` closed, whatever its number, and the kernel's list read
+/// back (any left named, a refusal); standard input made
+/// `/dev/null`; `--ready-fd` checked to be a pipe's write end or a socket.
+/// Standard output and error are kept as given (std's start opens
+/// `/dev/null` for any of 0 to 2 that is closed): the operator's channel
+/// for `ready` and the log, which the server only writes.
+#[cfg(unix)]
+fn start(args: &Args) -> Result<Start, String> {
+    use std::os::fd::AsFd;
+
+    use wick_fs_sys as sys;
+
+    // Closed, then read back from the kernel's list: anything left (a close
+    // that failed, or said done and was not) is named, each by what it is.
+    let closed = sys::close_inherited(args.ready_fd);
+    let open = sys::open_descriptors().map_err(|e| format!("listing its descriptors: {e:?}"))?;
+    let left: Vec<String> = open
+        .iter()
+        .filter(|&&fd| fd > 2 && Some(fd) != args.ready_fd)
+        .map(|&fd| sys::descriptor_described(fd))
+        .collect();
+    if closed.is_err() || !left.is_empty() {
+        return Err(format!(
+            "closing the descriptors it was started with ({}), left open: [{}]; wick-fsd does not serve with them",
+            closed.map_or_else(|e| format!("{e:?}"), |()| "said done".into()),
+            left.join(", ")
+        ));
+    }
+    sys::stdin_from_null().map_err(|e| format!("standard input from /dev/null: {e:?}"))?;
+    let ready = match args.ready_fd {
+        None => None,
+        Some(fd) => {
+            let owned = sys::take_inherited(fd).map_err(|e| format!("--ready-fd {fd}: {e:?}"))?;
+            if !sys::is_write_channel(owned.as_fd()).map_err(|e| format!("--ready-fd {fd}: {e:?}"))? {
+                return Err(format!(
+                    "--ready-fd {fd} is not a pipe's write end or a socket ({})",
+                    sys::descriptor_described(fd)
+                ));
+            }
+            Some(owned)
+        }
+    };
+    Ok(Start { ready })
+}
+
+#[cfg(not(unix))]
+fn start(_: &Args) -> Result<Start, String> {
+    Ok(Start::default())
+}
+
 fn main() -> ExitCode {
     let args = match parse(std::env::args().skip(1)) {
         Ok(a) => a,
@@ -118,7 +181,14 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(&args) {
+    let start = match start(&args) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wick-fsd: {}: {e}", args.id);
+            return ExitCode::FAILURE;
+        }
+    };
+    match run(&args, start) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("wick-fsd: {}: {e}", args.id);
@@ -128,16 +198,16 @@ fn main() -> ExitCode {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run(_: &Args) -> Result<(), String> {
+fn run(_: &Args, _: Start) -> Result<(), String> {
     Err("this host has no confinement for wick-fsd yet (Linux has; macOS comes with its own commit, Windows with \
          its port), and wick-fsd does not serve unconfined"
         .into())
 }
 
 #[cfg(target_os = "linux")]
-fn run(args: &Args) -> Result<(), String> {
+fn run(args: &Args, start: Start) -> Result<(), String> {
     use std::io::Write;
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::net::UnixListener;
 
     use wick_fs_sys as sys;
@@ -155,15 +225,22 @@ fn run(args: &Args) -> Result<(), String> {
     };
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let checked = stage0::check(&share, home.as_deref()).map_err(|r| r.0)?;
+    // The soft RLIMIT_NOFILE set to exactly what the limits may hold open
+    // (stage 0 checked the hard one allows it): no more for the server,
+    // and the bound of the read-back's walk over its descriptors (lock).
+    let need = wick_fsd::limits::descriptors(&args.limits);
+    sys::set_nofile(need).map_err(|e| format!("RLIMIT_NOFILE to {need}: {e:?}"))?;
+    let (soft, _) = sys::nofile().map_err(|e| format!("RLIMIT_NOFILE: {e:?}"))?;
+    if soft != need {
+        return Err(format!("the soft RLIMIT_NOFILE is {soft} after setting it to {need}"));
+    }
     if args.socket.symlink_metadata().is_ok() {
         return Err(format!("{} exists; wick-fsd never removes what it did not make", args.socket.display()));
     }
     let listener = UnixListener::bind(&args.socket).map_err(|e| format!("{}: {e}", args.socket.display()))?;
-    match args.ready_fd {
-        Some(fd) => {
-            let fd = sys::take_inherited(fd).map_err(|e| format!("--ready-fd {fd}: {e:?}"))?;
-            std::fs::File::from(fd).write_all(b"R").map_err(|e| format!("--ready-fd: {e}"))?;
-        }
+    // The ready byte, then `--ready-fd` closed: it is not held after.
+    match start.ready {
+        Some(fd) => std::fs::File::from(fd).write_all(b"R").map_err(|e| format!("--ready-fd: {e}"))?,
         None => println!("ready"),
     }
     let accepted = listener.accept();
@@ -182,7 +259,9 @@ fn run(args: &Args) -> Result<(), String> {
     };
     // The waiting parent drops the connection; only the confined child
     // serves it.
-    let (root, mut conn, watch) = confine::enter(checked, plan, conn).map_err(|r| r.0)?;
+    let conn_fd = conn.as_raw_fd();
+    let (root, mut conn, watch) = confine::enter(checked, plan, conn, &[conn_fd]).map_err(|r| r.0)?;
+    let root_fd = root.as_raw_fd();
     let dir = HostDir::new(
         root,
         Options {
@@ -198,7 +277,10 @@ fn run(args: &Args) -> Result<(), String> {
         ..Config::default()
     };
     let mut session = Session::new(dir, config).map_err(|e| format!("the share's root: {e:?}"))?;
-    let locked = confine::lock(plan, watch).map_err(|r| r.0)?;
+    // What it holds when it serves: the connection and the share's root,
+    // which the backend keeps (it holds no other descriptor before a
+    // request).
+    let locked = confine::lock(plan, watch, &[conn_fd, root_fd]).map_err(|r| r.0)?;
     eprintln!(
         "wick-fsd: {}: confined (namespaces, pivot_root, no capabilities, no_new_privs, seccomp{})",
         args.id,

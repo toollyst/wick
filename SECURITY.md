@@ -268,6 +268,29 @@ has the per-control details and results.
     each one's whole time (`wick_uffd::MovingWindow`, which debug builds check).
 
   First run: CI.
+- **Linux: wick-fsd's confined server kept every descriptor its launcher left open** (from 62067d47, which added the
+  confined server, to the commit that adds this entry; never reachable from a guest: nothing in the VMM serves
+  wick-fsd yet, virtio-fs staging 8 and 9). It closed nothing it was started with, and a descriptor survives
+  `unshare`, `fork` and `pivot_root`; Landlock checks a file's rights when it is opened, not a read or write on one
+  already open, and the server's filter allows `read`, `write`, `sendto` and `recvfrom` on any descriptor. So a server
+  taken over through its parser could have read or written a host file, or spoken on a socket, that its launcher had
+  not marked close-on-exec, outside the share and past every layer. What an ordinary launcher hands down, measured by
+  the CI fs jobs' unit-test step's record (docs/design-fs.md §4.2 names the run): on ubuntu-latest and
+  ubuntu-24.04-arm the step's shell holds descriptors 142 and 145, a pipe's read end and another's write end, and on
+  macos-latest 131 and 140, two `com.apple.netsrc` control sockets, and 143 and 146, pipes; each process the tests
+  started inherited them, wick-fsd's unprivileged runs included (sudo closes them, so the root runs did not). Now
+  wick-fsd's first step, before it opens anything, closes every descriptor but the standard streams and `--ready-fd`
+  whatever its number (`close_range` around `--ready-fd`, or each one of the kernel's `/proc/self/fd` list where the
+  kernel has no `close_range`) and reads the kernel's list back, refusing with each descriptor left named, makes
+  standard input `/dev/null`, requires `--ready-fd` to be a pipe's write end or a socket and closes it after its byte;
+  the confined process then requires its descriptors to be exactly the ones it opened and keeps, from the kernel's
+  whole list before `pivot_root` and by number below the soft `RLIMIT_NOFILE` at the read-back, and refuses naming any
+  other (`test_descriptors_it_was_started_with_are_closed`: a file, a directory and a socket left open, gone from the
+  confined process and its waiting parent as root reads them, with and without `close_range`;
+  `test_refused_when_a_descriptor_it_was_started_with_survives`: a `close_range` that said it was done and was not;
+  `test_descriptors_held_exactly`; docs/design-fs.md §4.2 and §6.1, steps 3 and 10). On macOS wick-fsd refuses to
+  start on every version so far (its confinement is not built yet) and served nothing with what it was started with;
+  the first step closes them there too, by the file table's list (`proc_pidinfo`), before the refusal.
 - **Linux: wick-fsd started as root: its confined server did not die with wick-fsd, and was dumpable again where
   `fs.suid_dumpable` is 1** (from 62067d47, which added the confined server, to the commit that adds this entry;
   never reachable from a guest: nothing in the VMM serves wick-fsd yet, virtio-fs staging 8 and 9). The server set

@@ -139,6 +139,19 @@ impl Server {
     /// Starts `wick-fsd args` (with `cmd` changed by `prepare`, as the
     /// refusal tests do) and waits for its `ready` line.
     pub fn start(args: &[String], prepare: impl FnOnce(&mut Command)) -> Server {
+        let mut s = Server::spawn(args, prepare);
+        let mut line = String::new();
+        let _ = BufReader::new(s.child.stdout.take().unwrap()).read_line(&mut line);
+        if line.trim() != "ready" {
+            let (status, err) = s.wait();
+            panic!("wick-fsd did not start ({status:?}): {err}");
+        }
+        s
+    }
+
+    /// Starts `wick-fsd args` as [`Server::start`] does, without waiting
+    /// for `ready`: for a server refused before it.
+    pub fn spawn(args: &[String], prepare: impl FnOnce(&mut Command)) -> Server {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_wick-fsd"));
         cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         if simulated_restriction() {
@@ -157,14 +170,7 @@ impl Server {
             });
         }
         let socket = PathBuf::from(&args[args.iter().position(|a| a == "--socket").unwrap() + 1]);
-        let mut line = String::new();
-        let _ = BufReader::new(child.stdout.take().unwrap()).read_line(&mut line);
-        let mut s = Server { child, socket, stderr };
-        if line.trim() != "ready" {
-            let (status, err) = s.wait();
-            panic!("wick-fsd did not start ({status:?}): {err}");
-        }
-        s
+        Server { child, socket, stderr }
     }
 
     /// Waits (at most 30 s, then kills it) for the server to end: its status
