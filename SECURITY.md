@@ -223,20 +223,18 @@ has the per-control details and results.
   `CreateThread`'s, the pool's and the system's alike): the exception's context as this host sizes it
   (`InitializeContext2` for every XSAVE feature the system enables), the dispatcher's own 4 KiB, and 16 KiB for the
   handler (`windows_mm::HANDLER_STACK_BUDGET`). The guard region below the stack, which the system runs an overflow on
-  when the stack cannot grow, was there by the return of `SetThreadStackGuarantee`: on a `CreateThread` thread
-  and a pool thread, 28672 bytes of guard pages below StackLimit right after the call for a guarantee of 24576 (the
-  guarantee and a page, `windows_mm::guard_region_for`), and the same on those and a Rust thread at their own start
-  and after they grew 64 KiB (CI's STACKGUARANTEE, Windows Server 2025; Learn's page for the call names no
+  when the stack cannot grow, is made by `SetThreadStackGuarantee` itself: 12288 bytes of guard pages below
+  StackLimit before the call on a Rust and a pool thread, none on a `CreateThread` thread, and 28672 right after it
+  on all three for a guarantee of 24576 (the guarantee and a page, `windows_mm::guard_region_for`); the same at their
+  own start and after they grew 64 KiB, and 28672 on the process's main thread, given the guarantee at the
+  process's attach (CI's STACKGUARANTEE and GUARDSEEN lines, Windows Server 2025; Learn's page for the call names no
   mechanism). This entry said twice what was not measured: edea8e38 touched the guard page to make the region, and
-  12c8e7d8 committed it explicitly, saying the system makes it only at the stack's next growth; neither was needed
-  on the threads measured, and the explicit commit, which did nothing there, is gone. Not known yet: whether the
-  call makes the region or the thread had it before the call (12c8e7d8 read it only after); the region right after
-  the call on a Rust thread (12c8e7d8's reading, kept in thread-local storage, said 0 bytes before its commit and
-  after it, while the guarantee was set and the thread had 28672 at its own start); both now recorded before and
-  after the call, outside the thread's storage, by thread ID (GUARDSEEN); and the main thread's, given the guarantee at the process's attach (now listed, and under
-  what an overflow needs a failure). A thread the system cannot give the guarantee is said by its ID at its start,
-  which does not fail; a guarantee raised with no room left in the job is either refused by the call or given with
-  its region, never set without it (`test_a_stack_guarantee_raised_at_the_limit_is_given_or_refused`, first run: CI).
+  12c8e7d8 committed it explicitly, saying the system makes it only at the stack's next growth; neither was
+  needed, and the explicit commit is gone. A thread the system cannot give the guarantee is said by its ID at its
+  start, which does not fail; at the job's memory limit the call is refused (`ERROR_COMMITMENT_LIMIT`, 1455) and
+  leaves the guarantee and the guard pages as they were, never a guarantee without its region
+  (`test_a_stack_guarantee_raised_at_the_limit_is_given_or_refused`, GUARANTEELIMIT: a raise of 64 KiB with every
+  page of the job taken).
   The stack filter writes its line and the frames
   of a VMM that ends only with room for them, so it cannot fault before its exit with 137. The tests hold the room on every runner and kind of
   thread (STACKASK: at least the budget left under the handler; STACKUSE: at most the budget used), also with a
@@ -247,20 +245,26 @@ has the per-control details and results.
   dispatcher's and the handler's bytes; `test_a_stack_guarantee_that_cannot_be_set_is_said`).
   What it costs: each thread has the guarantee and one page more below its stack from its start, untouched, as guard
   pages: by the sizes, 28 KiB a thread on a host without AMX and 40 KiB with it (Rust's threads had Rust's own
-  guarantee of 20 KiB before, set by Rust's runtime at their start); that the region is charged to the job's commit,
-  and so to `memory.max`, when the guarantee is set, is to be measured
-  (`test_a_stack_guarantee_is_charged_when_it_is_set`: a thread's guarantee raised by 64 KiB grows the process's
-  commit by what its guard pages grew, within a page; first run: CI). A Firecracker has 5 threads and one a vCPU
+  guarantee of 20 KiB before, set by Rust's runtime after the loader's callback), charged to the job's commit, and so
+  to `memory.max`, when the guarantee is set (`test_a_stack_guarantee_is_charged_when_it_is_set`, GUARDCHARGE: a
+  thread's guarantee raised from 24576 to 90112 bytes grew its guard pages by 65536 and the process's commit by
+  65536). A Firecracker has 5 threads and one a vCPU
   (the event loop, the API thread, the PIT's timer, the TSC-deadline timer, the irqfd watcher), 2 in its API process,
   and one each, when they run, for the userfaultfd server and the reclaimer (a registration), the fifo relay, and an
   epoll's pipe or nested epoll: 224, 252 and 644 KiB with 1, 2 and 16 vCPUs without AMX, 320, 360 and 920 KiB with
   it, against the 128 MiB `memory.max` of jailer-test's limits stage (2 vCPUs) and a VMM's 3.3 to 6.2 MiB working
   set; the working set (docs/COMPATIBILITY.md's VMMMEM) gains at most the one page a thread, to be re-measured: first
-  run CI. Threads the callback does not reach: those made before the process's callback runs (ntdll's parallel
-  loader's workers, which map the DLLs the program imports and run nothing of wick's or Firecracker's) and those made
-  with `THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH` (none of wick's or Firecracker's); the test lists every thread with
-  the module it starts in, and fails on one without the guarantee that starts anywhere but ntdll; an overflow on one
-  of those it lists ends as before this fix. First run: CI.
+  run CI. Threads the callback does not reach: those made before the process's callback runs (two of the test
+  binary's, starting in ntdll with the guarantee 0 and 12288 bytes of guard pages) and those the loader never attaches
+  (made with `THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH`, or the loader's own workers, which may be started after the
+  callback too: one of the test binary's was such a thread or one listed before its attach ran, which CI's
+  listing could not tell apart). No TLS callback runs on a thread the loader does not attach, so none of wick's;
+  an overflow on one ends as before this fix. The test now reads each thread's TEB SameTebFlags (SkipThreadAttach,
+  LoaderWorker; ntdll's public symbols, not documented by Microsoft, its reading checked by the main thread's
+  InitialThread bit) and reads a thread without the guarantee again for up to 2 s; one the loader attaches that
+  still has none, or one it never attaches that starts outside ntdll, fails the test. Firecracker's own threads, as
+  the release build runs a booted guest with 1, 2 and 16 vCPUs, are checked the same way by CI's windows job
+  (`vmm-memory-record.py --check-stacks`, VMMSTACK GUARANTEE). First run of both: CI.
 - **Windows: a write into memory that a userfaultfd register was moving could be lost, and an access to it at the
   wrong moment could end the process** (since the register moves the memory into sections,
   `windows_mm::uffd_alias`; fixed in the commit that adds this entry). The register copies the mapping's resident

@@ -51,7 +51,10 @@ besides the VMMMEM lines:
 
   VMMSTACK ... thread=   one line per thread: its name, the stack reserved,
               committed and resident, how deep the lowest resident page is
-              and how deep the thread is now (its stack pointer)
+              and how deep the thread is now (its stack pointer), its stack
+              guarantee and the guard pages below its committed stack (the
+              region an overflow runs on), its TEB's SameTebFlags (whether
+              the loader never attaches it) and where it starts
   VMMSTACK ... frame     for the deepest thread of each kind and the median
               one: every value on the resident pages of its stack that is an
               address in an image right after a call instruction, that is
@@ -119,9 +122,14 @@ less than RUN_STACK_KIB of its stack committed from its base, naming each
 such thread and its size: the release build's own check that a vCPU
 thread's first run committed its stack (kvm-ioctls' `vcpu::RUN_STACK`,
 committed below the run call, whose own depth comes on top; this cannot
-see the call, so it asks for RUN_STACK_KIB from the base). Exit 2 when the
-output has no vCPU thread's line (no guest booted), 0 when every one has it.
-Needs no Windows.
+see the call, so it asks for RUN_STACK_KIB from the base). It also fails
+when a thread of the process lacks the stack guarantee (wick's TLS
+callback, crates/compat/libc windows_mm::at_thread_start) or the guard
+pages it sizes, unless its TEB says the loader never attaches it and it
+starts in ntdll (VMMSTACK GUARANTEE: Firecracker's own threads, every
+kind, as the release build runs them). Exit 2 when the output has no
+vCPU thread's line or no thread line with a guarantee (no guest booted),
+0 when every one has them. Needs no Windows.
 """
 
 import ctypes
@@ -145,6 +153,10 @@ RUN_STACK_KIB = 112
 # A VMMSTACK thread line of a vCPU thread, anywhere in a line (CI's log
 # puts a timestamp first).
 VCPU_STACK = re.compile(r"VMMSTACK vcpus=(\d+) thread='(fc_vcpu \d+)' tid=\d+ reserved \d+ KiB, committed (\d+) KiB")
+# A VMMSTACK thread line's stack guarantee, guard pages, TEB SameTebFlags
+# and start (module+offset).
+THREAD_GUARANTEE = re.compile(r"VMMSTACK vcpus=(\d+) thread='([^']*)' tid=(\d+) .*?, guarantee (\d+|not read) B?, "
+                              r"guard pages (\d+) B, teb flags (0x[0-9a-f]+|not read), start (\S+?)\+0x[0-9a-f]+")
 # Upstream's CI artifacts, as tools/windows/boot-test.ps1 has them.
 S3 = "https://s3.amazonaws.com/spec.ccfc.min"
 PREFIX = "firecracker-ci/20261105-6ea6634994fa-0/x86_64"
@@ -176,6 +188,17 @@ CONTEXT_CONTROL = 0x100001
 TEB_STACK_BASE, TEB_STACK_LIMIT, TEB_DEALLOCATION_STACK = 0x8, 0x10, 0x1478
 FRAME_LINES = 400
 MEM_COMMIT, MEM_FREE = 0x1000, 0x10000
+PAGE_GUARD = 0x100
+# TEB on x86-64: GuaranteedStackBytes (a ULONG), and SameTebFlags (a USHORT
+# of ntdll's public symbols' _TEB, not documented by Microsoft; the libc
+# test test_every_thread_has_the_stack_guarantee checks its reading) with
+# its SkipThreadAttach (made with THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH: no
+# DLL or TLS callback is attached to it, wick's included) and LoaderWorker
+# (a worker of the loader's own pool) bits.
+TEB_GUARANTEED_STACK_BYTES, TEB_SAME_TEB_FLAGS = 0x1748, 0x17EE
+TEB_SKIP_THREAD_ATTACH, TEB_LOADER_WORKER = 0x8, 0x2000
+# ThreadQuerySetWin32StartAddress (NtQueryInformationThread's class 9).
+THREAD_START_ADDRESS = 9
 MEM_PRIVATE, MEM_MAPPED, MEM_IMAGE = 0x20000, 0x40000, 0x1000000
 PROCESS_QUERY_INFORMATION, PROCESS_VM_READ = 0x400, 0x10
 THREAD_QUERY_INFORMATION = 0x40
@@ -695,11 +718,28 @@ def stack_pointer(k32, tid):
         k32.CloseHandle(t)
 
 
+def guard_below(k32, handle, limit, low):
+    """The guard pages right below `limit` (a thread's StackLimit), walked
+    down a page at a time, not below `low`: VirtualQueryEx's region runs up
+    from the page asked of, so one query at `limit` less a page would say
+    one page whatever lies below."""
+    n, mbi = 0, MBI()
+    while limit - n - PAGE >= low and n < 1 << 20:
+        if not k32.VirtualQueryEx(handle, ctypes.c_void_p(limit - n - PAGE), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            break
+        if mbi.State != MEM_COMMIT or not mbi.Protect & PAGE_GUARD:
+            break
+        n += PAGE
+    return n
+
+
 def thread_stacks(k32, psapi, ntdll, handle, pid):
     """Every thread's stack: a dict per thread with its id, name, the
     stack's allocation (`low`), base (`high`, where it starts) and limit
     (the lowest committed address), the addresses of its resident pages,
-    and its stack pointer."""
+    its stack pointer, its stack guarantee, the guard pages below its
+    limit, its TEB's SameTebFlags (None where not read) and its start
+    address."""
     out = []
     for tid in thread_ids(k32, pid):
         t = k32.OpenThread(THREAD_QUERY_INFORMATION, False, tid)
@@ -707,6 +747,9 @@ def thread_stacks(k32, psapi, ntdll, handle, pid):
             continue
         info = THREAD_BASIC_INFORMATION()
         status = ntdll.NtQueryInformationThread(t, 0, ctypes.byref(info), ctypes.sizeof(info), None)
+        start = ctypes.c_void_p()
+        if ntdll.NtQueryInformationThread(t, THREAD_START_ADDRESS, ctypes.byref(start), ctypes.sizeof(start), None) != 0:
+            start = ctypes.c_void_p()
         k32.CloseHandle(t)
         teb = info.TebBaseAddress
         if status != 0 or not teb:
@@ -726,8 +769,14 @@ def thread_stacks(k32, psapi, ntdll, handle, pid):
         resident = []
         if psapi.QueryWorkingSetEx(handle, entries, ctypes.sizeof(entries)):
             resident = [low + i * PAGE for i, e in enumerate(entries) if e.VirtualAttributes & WS_VALID]
+        guarantee = read(k32, handle, teb + TEB_GUARANTEED_STACK_BYTES, 4)
+        flags = read(k32, handle, teb + TEB_SAME_TEB_FLAGS, 2)
         out.append({"tid": tid, "name": thread_name(k32, tid), "low": low, "high": high, "limit": limit,
-                    "resident": resident, "context": stack_pointer(k32, tid)})
+                    "resident": resident, "context": stack_pointer(k32, tid),
+                    "guarantee": struct.unpack("<I", guarantee)[0] if guarantee else None,
+                    "guard": guard_below(k32, handle, limit, low),
+                    "flags": struct.unpack("<H", flags)[0] if flags else None,
+                    "start": start.value or 0})
     return out
 
 
@@ -893,6 +942,16 @@ def record_stacks(binds, pid, vcpus, rows, chains):
         raise OSError(ctypes.get_last_error(), "OpenProcess")
     try:
         threads = thread_stacks(k32, psapi, ntdll, handle, pid)
+        modules = sorted((base, base + size, os.path.basename(path), path)
+                         for _rss, what, base, size, path in rows if what == "image" and path)
+        modules += sorted((base, base + size, os.path.basename(path), path)
+                          for base, size, path in system_images(k32, psapi, handle))
+        modules.sort()
+
+        def start_of(t):
+            module = module_of(modules, t["start"])
+            return f"{module[2].lower()}+{t['start'] - module[0]:#x}" if module else f"?+{t['start']:#x}"
+
         by_kind = {}
         for t in threads:
             by_kind.setdefault(kind_of(t["name"]), []).append(t)
@@ -904,17 +963,15 @@ def record_stacks(binds, pid, vcpus, rows, chains):
             for t in group:
                 lowest = min(t["resident"]) if t["resident"] else t["high"]
                 now = "not read" if t["context"] is None else f"{(t['high'] - t['context'][0]) / 1024:.1f} KiB"
+                guarantee = "not read" if t["guarantee"] is None else t["guarantee"]
+                flags = "not read" if t["flags"] is None else f"{t['flags']:#06x}"
                 print(f"{tag} thread={t['name'] or '(unnamed)'!r} tid={t['tid']} reserved "
                       f"{(t['high'] - t['low']) // 1024} KiB, committed {(t['high'] - t['limit']) // 1024} KiB, "
                       f"resident {len(t['resident']) * PAGE // 1024} KiB, lowest resident page "
-                      f"{(t['high'] - lowest) // 1024} KiB deep, stack pointer {now} deep")
+                      f"{(t['high'] - lowest) // 1024} KiB deep, stack pointer {now} deep, guarantee {guarantee} B, "
+                      f"guard pages {t['guard']} B, teb flags {flags}, start {start_of(t)}")
         if not chains:
             return
-        modules = sorted((base, base + size, os.path.basename(path), path)
-                         for _rss, what, base, size, path in rows if what == "image" and path)
-        modules += sorted((base, base + size, os.path.basename(path), path)
-                          for base, size, path in system_images(k32, psapi, handle))
-        modules.sort()
         symbols = Symbols(k32, modules)
         print(f"{tag} symbols: {symbols.note}"
               + (f"; firecracker.exe from the linker's map, {len(MAP)} symbols" if symbols.mapped else ""))
@@ -1466,6 +1523,23 @@ def selftest():
     at_96 = before.replace("committed 52 KiB", "committed 112 KiB").replace("committed 48 KiB", "committed 110 KiB")
     assert short_run_stacks(at_96) == (2, ["vcpus=16 'fc_vcpu 0' 110 KiB"]), short_run_stacks(at_96)
     assert short_run_stacks("VMMMEM boot: a guest did not boot to its shell") == (0, [])
+    # The guarantee: lines without the fields (before) give none; a vCPU
+    # thread with it, a loader worker without it in ntdll (passes), one
+    # with no flag in ntdll and one of firecracker.exe without it (fail),
+    # and one whose guard pages are fewer than its guarantee (fails).
+    assert unguarded_threads(before) == (0, [], [])
+    line = ("2026-11-18T06:10:00.0Z VMMSTACK vcpus=2 thread='{n}' tid={t} reserved 2048 KiB, committed 52 KiB, "
+            "resident 52 KiB, lowest resident page 52 KiB deep, stack pointer 15.6 KiB deep, guarantee {g} B, "
+            "guard pages {p} B, teb flags {f}, start {s}+0x1d330\n")
+    rows = [("fc_vcpu 0", 1, 24576, 28672, "0x0000", "firecracker.exe"),
+            ("(unnamed)", 2, 0, 12288, "0x2008", "ntdll.dll"),
+            ("(unnamed)", 3, 0, 12288, "0x0000", "ntdll.dll"),
+            ("fc_api", 4, 0, 12288, "0x0000", "firecracker.exe"),
+            ("main", 5, 24576, 8192, "0x0400", "firecracker.exe")]
+    text = "".join(line.format(n=n, t=t, g=g, p=p, f=f, s=s) for n, t, g, p, f, s in rows)
+    found, bad, skipped = unguarded_threads(text)
+    assert (found, [b.split()[2] for b in bad], [k.split()[2] for k in skipped]) == (
+        5, ["tid=3", "tid=4", "tid=5"], ["tid=2"]), (found, bad, skipped)
     print("vmm-memory-record.py: selftest ok")
 
 
@@ -1476,19 +1550,52 @@ def short_run_stacks(text):
     return len(found), [f"vcpus={v} {name!r} {kib} KiB" for v, name, kib in found if int(kib) < RUN_STACK_KIB]
 
 
+def unguarded_threads(text):
+    """(the thread lines with a guarantee field found, those without the
+    stack guarantee and its guard pages, those the loader never attaches)
+    of a `--boot` run's output. A thread has the guarantee when it is above
+    0 and its guard pages at least as many bytes (the system makes the
+    region at SetThreadStackGuarantee: the guarantee and a page); one
+    without it passes only when its TEB says the loader never attaches it
+    (SkipThreadAttach or LoaderWorker: no TLS callback, wick's included,
+    runs on it) and it starts in ntdll."""
+    found, bad, skipped = 0, [], []
+    for vcpus, name, tid, guarantee, guard, flags, start in THREAD_GUARANTEE.findall(text):
+        found += 1
+        what = f"vcpus={vcpus} {name!r} tid={tid} guarantee {guarantee} B, guard pages {guard} B, teb flags {flags}, start {start}"
+        if guarantee != "not read" and int(guarantee) > 0 and int(guard) >= int(guarantee):
+            continue
+        never = flags != "not read" and int(flags, 16) & (TEB_SKIP_THREAD_ATTACH | TEB_LOADER_WORKER)
+        (skipped if never and start == "ntdll.dll" else bad).append(what)
+    return found, bad, skipped
+
+
 def check_stacks(path):
-    """`--check-stacks`: the exit status, after its line."""
+    """`--check-stacks`: the exit status, after its lines."""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
-        found, short = short_run_stacks(f.read())
+        text = f.read()
+    found, short = short_run_stacks(text)
+    threads, bad, skipped = unguarded_threads(text)
+    status = 0
+    if not threads:
+        print(f"VMMSTACK GUARANTEE: no thread line with its stack guarantee in {path}")
+        status = 2
+    elif bad:
+        print(f"VMMSTACK GUARANTEE: {len(bad)} of {threads} threads lack the stack guarantee or its guard pages and "
+              f"the loader attaches them: " + "; ".join(bad))
+        status = 1
+    else:
+        print(f"VMMSTACK GUARANTEE: every thread ({threads}) has the stack guarantee and its guard pages but "
+              f"{len(skipped)} the loader never attaches, in ntdll" + (": " + "; ".join(skipped) if skipped else ""))
     if not found:
         print(f"VMMSTACK RUNSTACK: no vCPU thread's stack line in {path}")
-        return 2
+        return status or 2
     if short:
         print(f"VMMSTACK RUNSTACK: {len(short)} of {found} vCPU threads have less than {RUN_STACK_KIB} KiB of "
               f"stack committed from the base (the first run commits RUN_STACK below its call): " + "; ".join(short))
         return 1
     print(f"VMMSTACK RUNSTACK: every vCPU thread ({found}) has {RUN_STACK_KIB} KiB or more committed from the base")
-    return 0
+    return status
 
 
 def main(args):

@@ -6498,22 +6498,29 @@ mod tests {
     /// exception's context, the dispatcher's and the handler's (the
     /// guarantee before its rounding) on each kind of thread: right after
     /// the callback's `SetThreadStackGuarantee` (its GUARDSEEN record, read
-    /// by the thread's ID, with what was there before the call: on the
-    /// threads measured the region was there right after it,
-    /// `windows_mm::set_the_stack_guarantee`), at the thread's own
+    /// by the thread's ID, with what was there before the call: the call
+    /// makes the region, CI run 44248573219: 12288 or 0 B before, 28672
+    /// after, `windows_mm::set_the_stack_guarantee`), at the thread's own
     /// start, and after its stack grew 64 KiB (the system's region, moved
     /// down by the growth). Said on every run (STACKGUARANTEE): per kind,
     /// the record (the guard pages and the guarantee before and after the
-    /// call), the walk at the start and after the growth; and every thread
-    /// of the process: its ID, its guarantee and its guard pages read
-    /// through its TEB, its record if the ring still holds it, whether it
-    /// was made before the loader's callback for the process ran, the
-    /// module it starts in. A thread made after that callback without the
-    /// guarantee fails the test by name, and so does one without it that
-    /// starts anywhere but ntdll (whose loader workers run before the
-    /// program's callbacks and run no code of wick's), and the process's
+    /// call), the walk at the start and after the growth; how many records
+    /// were written (the ring keeps the newest `GUARD_SEEN_LEN`); and every
+    /// thread of the process: its ID, its guarantee and its guard pages read
+    /// through its TEB, its TEB's SameTebFlags (whether the loader skips its
+    /// attach, [`TEB_SAME_TEB_FLAGS`]), its record if the ring still holds
+    /// it, whether it was made before the loader's callback for the process
+    /// ran, the module and offset it starts at. A thread without the
+    /// guarantee that the loader attaches and that must have it (made after
+    /// the callback, or starting outside ntdll) is read again for up to
+    /// 2 s, and fails the test by name unless it was given it by then (it
+    /// was listed before its attach ran: said). A thread the loader never
+    /// attaches (SkipThreadAttach or LoaderWorker) runs no TLS callback,
+    /// wick's included, and fails if it starts outside ntdll. The process's
     /// main thread (made before the callback, given the guarantee by its
-    /// `DLL_PROCESS_ATTACH`) with fewer guard pages than needed.
+    /// `DLL_PROCESS_ATTACH`) fails with fewer guard pages than needed, and
+    /// the flags' reading fails if the main thread has no InitialThread bit
+    /// or a recorded thread a skip bit.
     #[test]
     fn test_every_thread_has_the_stack_guarantee() {
         let want = crate::windows_mm::stack_guarantee();
@@ -6572,31 +6579,95 @@ mod tests {
             wrong.push(std::format!("this test's thread's guarantee {here} B, under {want} B"));
         }
         let attached = crate::windows_mm::PROCESS_ATTACHED_AT.load(Ordering::Relaxed);
-        for t in threads_of_this_process() {
+        crate::windows_mm::say_at_the_limit(format_args!(
+            "STACKGUARANTEE {} GUARDSEEN records written in this process, the ring keeps the newest {}",
+            crate::windows_mm::guard_seen_written(),
+            crate::windows_mm::GUARD_SEEN_LEN
+        ));
+        let threads = threads_of_this_process();
+        let short = |t: &ThreadSeen| t.guarantee.is_some_and(|g| (g as usize) < want);
+        let skipped = |t: &ThreadSeen| t.flags.is_some_and(|f| f & (TEB_SKIP_THREAD_ATTACH | TEB_LOADER_WORKER) != 0);
+        // A thread listed between its making and its loader's attach (its
+        // TLS callbacks run in the thread itself, before its start address)
+        // has no guarantee yet. Each one without it that the loader does
+        // attach (no skip bit) and that must have it is read again for up
+        // to 2 s: given it by then, it was early; gone, or still without,
+        // it fails by name.
+        let mut pending: std::vec::Vec<u32> = threads
+            .iter()
+            .filter(|t| short(t) && !skipped(t) && (t.created >= attached || t.start != "ntdll.dll"))
+            .map(|t| t.id)
+            .collect();
+        let mut outcome = std::collections::HashMap::new();
+        let since = std::time::Instant::now();
+        while !pending.is_empty() && since.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let now = threads_of_this_process();
+            pending.retain(|id| match now.iter().find(|t| t.id == *id) {
+                None => {
+                    outcome.insert(*id, std::format!("gone {} ms later, without the guarantee when last read", since.elapsed().as_millis()));
+                    false
+                }
+                Some(t) if !short(t) => {
+                    outcome.insert(*id, std::format!("given the guarantee ({:?} B) within {} ms: not yet attached when first listed", t.guarantee, since.elapsed().as_millis()));
+                    false
+                }
+                Some(_) => true,
+            });
+        }
+        for id in pending {
+            outcome.insert(id, "still without the guarantee 2 s later".into());
+        }
+        for t in &threads {
             let before = t.created < attached;
+            let seen = crate::windows_mm::guard_seen(t.id);
+            let late = outcome.get(&t.id);
             crate::windows_mm::say_at_the_limit(format_args!(
-                "STACKGUARANTEE thread {}: its guarantee {:?} B, {:?} B of guard pages below its StackLimit, {}, made {} the loader's \
-                 callback for the process, its start in {}",
+                "STACKGUARANTEE thread {}: its guarantee {:?} B, {:?} B of guard pages below its StackLimit, TEB SameTebFlags {}, {}, \
+                 made {} the loader's callback for the process, its start {}+{:#x}{}{}",
                 t.id,
                 t.guarantee,
                 t.guard,
-                Seen(crate::windows_mm::guard_seen(t.id)),
+                teb_flags(t.flags),
+                Seen(seen),
                 if before { "before" } else { "after" },
-                t.start
+                t.start,
+                t.start_at,
+                if late.is_some() { "; " } else { "" },
+                late.map_or("", std::string::String::as_str),
             ));
-            let short = t.guarantee.is_some_and(|g| (g as usize) < want);
-            if !before && short {
-                wrong.push(std::format!("thread {} made after the process's callback, its guarantee {:?} B", t.id, t.guarantee));
+            let given_late = late.is_some_and(|o| o.starts_with("given"));
+            if short(t) && !given_late {
+                if skipped(t) {
+                    // Never attached by the loader: no TLS callback, ours
+                    // included, runs on it; only ntdll's own work may.
+                    if t.start != "ntdll.dll" {
+                        wrong.push(std::format!("thread {} is never attached (TEB {}) and starts in {}, not ntdll", t.id, teb_flags(t.flags), t.start));
+                    }
+                } else if !before || t.start != "ntdll.dll" {
+                    wrong.push(std::format!(
+                        "thread {} (made {} the process's callback, its start {}+{:#x}) has the guarantee {:?} B and the loader attaches it: {}",
+                        t.id,
+                        if before { "before" } else { "after" },
+                        t.start,
+                        t.start_at,
+                        t.guarantee,
+                        late.map_or("not read again", std::string::String::as_str)
+                    ));
+                }
             }
-            // A thread without the guarantee that runs anything but the
-            // system loader's work (its start outside ntdll) is a thread
-            // wick or Firecracker code may run on: a gap, not a listing.
-            if short && t.start != "ntdll.dll" {
-                wrong.push(std::format!("thread {} without the guarantee starts in {}, not ntdll's loader", t.id, t.start));
+            // The main thread: made before the callback, outside ntdll; its
+            // guard pages, and SameTebFlags read where the TEB has them.
+            if before && t.start != "ntdll.dll" {
+                if t.guard.is_some_and(|g| g < need) {
+                    wrong.push(std::format!("the main thread {} has {:?} B of guard pages, under the {need} B an overflow needs", t.id, t.guard));
+                }
+                if t.flags.is_some_and(|f| f & TEB_INITIAL_THREAD == 0) {
+                    wrong.push(std::format!("the main thread {}'s TEB SameTebFlags {} has no InitialThread: the offset does not read the TEB's flags", t.id, teb_flags(t.flags)));
+                }
             }
-            // The main thread: made before the callback, outside ntdll.
-            if before && t.start != "ntdll.dll" && t.guard.is_some_and(|g| g < need) {
-                wrong.push(std::format!("the main thread {} has {:?} B of guard pages, under the {need} B an overflow needs", t.id, t.guard));
+            if seen.is_some() && skipped(t) {
+                wrong.push(std::format!("thread {} has a GUARDSEEN record and TEB SameTebFlags {}: the offset does not read the TEB's flags", t.id, teb_flags(t.flags)));
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
@@ -6746,6 +6817,36 @@ mod tests {
         guard: Option<usize>,
         /// When it was made (`FILETIME`).
         created: u64,
+        /// Its start address's offset in that module.
+        start_at: usize,
+        /// Its TEB's SameTebFlags ([`TEB_SAME_TEB_FLAGS`]), if it could be read.
+        flags: Option<u16>,
+    }
+
+    /// The x86-64 TEB's SameTebFlags (a `USHORT` at 0x17EE, ntdll's public
+    /// symbols' `_TEB`; not documented by Microsoft, so the test checks its
+    /// reading: the process's main thread has [`TEB_INITIAL_THREAD`] and a
+    /// thread the callback recorded has neither of the loader's skip bits).
+    const TEB_SAME_TEB_FLAGS: usize = 0x17ee;
+    /// SameTebFlags' SkipThreadAttach: made with
+    /// `THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH`, which the loader attaches to
+    /// no DLL and no TLS callback.
+    const TEB_SKIP_THREAD_ATTACH: u16 = 0x8;
+    /// SameTebFlags' InitialThread: the process's first thread.
+    const TEB_INITIAL_THREAD: u16 = 0x400;
+    /// SameTebFlags' LoaderWorker: a worker of the loader's own thread pool
+    /// (the parallel loader's, which maps and snaps the DLLs a load needs).
+    const TEB_LOADER_WORKER: u16 = 0x2000;
+
+    /// SameTebFlags as a line says them: the value and the bits named.
+    fn teb_flags(flags: Option<u16>) -> std::string::String {
+        let Some(f) = flags else { return "not read".into() };
+        let names: std::vec::Vec<&str> = [(TEB_SKIP_THREAD_ATTACH, "SkipThreadAttach"), (TEB_INITIAL_THREAD, "InitialThread"), (TEB_LOADER_WORKER, "LoaderWorker")]
+            .iter()
+            .filter(|(bit, _)| f & bit != 0)
+            .map(|&(_, name)| name)
+            .collect();
+        std::format!("{f:#06x} ({})", if names.is_empty() { "none".into() } else { names.join(", ") })
     }
 
     /// Every thread of this process (a ToolHelp snapshot), with its stack
@@ -6819,6 +6920,19 @@ mod tests {
                             )
                         } != 0;
                     let guarantee = read.then_some(g);
+                    let mut flags = 0u16;
+                    // SAFETY: this process; a buffer of the size passed.
+                    let flags = (read
+                        && unsafe {
+                            windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                                (info.teb + TEB_SAME_TEB_FLAGS) as *const c_void,
+                                (&raw mut flags).cast(),
+                                2,
+                                ptr::null_mut(),
+                            )
+                        } != 0)
+                        .then_some(flags);
                     // Its StackLimit and DeallocationStack, read the same
                     // way, and the guard pages below the one, walked to the
                     // other (a record: the thread may be growing its stack).
@@ -6847,12 +6961,15 @@ mod tests {
                     // SAFETY: as above; class 9, ThreadQuerySetWin32StartAddress, a pointer.
                     #[allow(clippy::cast_possible_truncation)]
                     unsafe { NtQueryInformationThread(h, 9, (&raw mut start_address).cast(), std::mem::size_of::<usize>() as u32, ptr::null_mut()) };
+                    let (start, start_at) = module_of_address(start_address);
                     out.push(ThreadSeen {
                         id: e.thread,
-                        start: module_name_of(start_address),
+                        start,
                         guarantee,
                         guard,
                         created: (u64::from(c.dwHighDateTime) << 32) | u64::from(c.dwLowDateTime),
+                        start_at,
+                        flags,
                     });
                     // SAFETY: our handle.
                     unsafe { CloseHandle(h) };
@@ -6866,8 +6983,9 @@ mod tests {
         out
     }
 
-    /// The file name of the module `address` lies in, or "?".
-    fn module_name_of(address: usize) -> std::string::String {
+    /// The file name of the module `address` lies in, or "?", and the
+    /// address's offset in it.
+    fn module_of_address(address: usize) -> (std::string::String, usize) {
         #[link(name = "kernel32")]
         unsafe extern "system" {
             fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
@@ -6878,13 +6996,13 @@ mod tests {
         let mut module = ptr::null_mut();
         // SAFETY: an address, looked up without a reference taken.
         if address == 0 || unsafe { GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, address as *const u16, &mut module) } == 0 {
-            return "?".into();
+            return ("?".into(), address);
         }
         let mut name = [0u16; 260];
         // SAFETY: the module and a buffer of the size given.
         let n = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), 260) } as usize;
         let full = std::string::String::from_utf16_lossy(&name[..n.min(260)]);
-        full.rsplit('\\').next().unwrap_or("?").to_ascii_lowercase()
+        (full.rsplit('\\').next().unwrap_or("?").to_ascii_lowercase(), address - module as usize)
     }
 
     /// A guarantee the system cannot give (here a simulated XSAVE area of

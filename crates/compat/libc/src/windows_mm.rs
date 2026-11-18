@@ -2049,13 +2049,13 @@ pub(crate) fn stack_guarantee() -> usize {
 /// What it costs: the guard region the guarantee sizes below a thread's
 /// committed stack ([`guard_region_for`]: the guarantee and a page),
 /// committed as guard pages, charged to the process and its job, and taken
-/// from the thread's reserve; on the threads measured the system had made
-/// it by the end of `SetThreadStackGuarantee` ([`set_the_stack_guarantee`]),
-/// so at the thread's start and not first at the memory limit
-/// (`test_every_thread_has_the_stack_guarantee`, per kind of thread, after
-/// the call, at the thread's own start and after it grew;
-/// `test_a_stack_guarantee_is_charged_when_it_is_set`: a guarantee raised
-/// by 64 KiB grows the process's commit by what the region grew). A
+/// from the thread's reserve; `SetThreadStackGuarantee` makes it
+/// ([`set_the_stack_guarantee`]), so at the thread's start and not first
+/// at the memory limit (`test_every_thread_has_the_stack_guarantee`, per
+/// kind of thread, after the call, at the thread's own start and after it
+/// grew; `test_a_stack_guarantee_is_charged_when_it_is_set`: a guarantee
+/// raised by 64 KiB grew the process's commit by 65536 B, what the region
+/// grew, CI run 44248573219's GUARDCHARGE). A
 /// guarantee that cannot be set (a reserve too small for it, or, at the
 /// memory limit, a refused commit:
 /// `test_a_stack_guarantee_raised_at_the_limit_is_given_or_refused`) is
@@ -2088,16 +2088,17 @@ unsafe extern "system" fn at_thread_start(_module: *mut c_void, reason: u32, _re
 
 /// Sets the calling thread's stack guarantee to [`stack_guarantee`] (a
 /// larger one already set stays: the system only raises it), and says so
-/// if it could not be set, or reads back smaller. What the guard region
-/// below the thread's committed stack is then is measured, not documented
-/// (Learn's page for the call gives no mechanism): on a `CreateThread`
-/// thread and a pool thread, 28672 B of guard pages below StackLimit right
-/// after the call for a guarantee of 24576 B, the guarantee and a page
-/// ([`guard_region_for`]), with nothing of wick's in between (CI run
-/// 44241167637's STACKGUARANTEE, Windows Server 2025 26100). What was
-/// there before the call, and the same on every kind of thread, is
-/// recorded (GUARDSEEN, `test_every_thread_has_the_stack_guarantee`,
-/// which asserts the region after the call; first run: CI).
+/// if it could not be set, or reads back smaller. The call makes the
+/// guard region below the thread's committed stack, measured, not
+/// documented (Learn's page for the call gives no mechanism): 12288 B of
+/// guard pages below StackLimit before it on a Rust and a pool thread, 0
+/// on a `CreateThread` thread, and 28672 B after it on all three for a
+/// guarantee of 24576 B, the guarantee and a page ([`guard_region_for`])
+/// (CI run 44248573219's GUARDSEEN records, Windows Server 2025 26100;
+/// `test_every_thread_has_the_stack_guarantee` asserts the region after
+/// the call). At the job's memory limit the call is refused
+/// (`ERROR_COMMITMENT_LIMIT`) and changes nothing (the same run's
+/// GUARANTEELIMIT), which the line below says.
 #[cfg(target_arch = "x86_64")]
 fn set_the_stack_guarantee(#[allow(unused_variables)] reason: u32) {
     let want = stack_guarantee();
@@ -2138,10 +2139,11 @@ fn set_the_stack_guarantee(#[allow(unused_variables)] reason: u32) {
 /// as the UCRT's `_resetstkoflw` makes it again after an overflow
 /// (misc/resetstk.cpp, Windows Kits 10.0.26100.0) and
 /// [`stack_page_after_the_reclaim`] after a refused commit. It is the size
-/// found right after `SetThreadStackGuarantee` and kept as the stack grew
-/// on the threads measured: 28672 B for 24576 B, after the call and after
-/// the stack grew 64 KiB, on a Rust, a `CreateThread` and a pool thread
-/// (CI run 44241167637, [`set_the_stack_guarantee`]); not documented. A
+/// `SetThreadStackGuarantee` makes it and the system keeps as the stack
+/// grows: 28672 B for 24576 B, after the call and after the stack grew
+/// 64 KiB, on a Rust, a `CreateThread` and a pool thread and on the
+/// process's main thread (CI runs 44241167637 and 44248573219,
+/// [`set_the_stack_guarantee`]); not documented. A
 /// guard-page hit moves the region down by the page hit (Learn,
 /// `_resetstkoflw`: the system "allocates a new guard page that is located
 /// one page below the last one"). Its pages are committed, so charged,
@@ -2187,14 +2189,22 @@ pub(crate) fn guard_below(limit: usize, most: usize) -> usize {
 }
 
 /// Tests: what [`set_the_stack_guarantee`] saw on each thread at its
-/// start (GUARDSEEN), in a ring of 256 kept apart from the thread's own
+/// start (GUARDSEEN), in a ring of [`GUARD_SEEN_LEN`] kept apart from the thread's own
 /// storage, so that a test reads it by the thread's ID: the ID (written
 /// last), the loader's reason, StackLimit and the reserve's low end, the
 /// guard bytes below StackLimit before and after `SetThreadStackGuarantee`
 /// ([`guard_below`]), the guarantee before and after, and the call's error.
 #[cfg(all(test, target_arch = "x86_64"))]
-static GUARD_SEEN: [[std::sync::atomic::AtomicUsize; 9]; 256] =
-    [const { [const { std::sync::atomic::AtomicUsize::new(0) }; 9] }; 256];
+static GUARD_SEEN: [[std::sync::atomic::AtomicUsize; 9]; GUARD_SEEN_LEN] =
+    [const { [const { std::sync::atomic::AtomicUsize::new(0) }; 9] }; GUARD_SEEN_LEN];
+
+/// Tests: the records [`GUARD_SEEN`] keeps, the newest. With 256, CI run
+/// 44248573219's listing found the test binary's main thread and three
+/// test threads with the guarantee and no record; whether the ring had
+/// gone round is now said beside the listing, with how many records were
+/// written ([`guard_seen_written`]).
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) const GUARD_SEEN_LEN: usize = 4096;
 #[cfg(all(test, target_arch = "x86_64"))]
 static GUARD_SEEN_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -2218,7 +2228,7 @@ pub(crate) struct GuardSeen {
 pub(crate) fn guard_seen(id: u32) -> Option<GuardSeen> {
     use std::sync::atomic::Ordering::Acquire;
     let next = GUARD_SEEN_NEXT.load(Acquire);
-    (0..next.min(256)).map(|k| (next - 1 - k) % 256).find_map(|i| {
+    (0..next.min(GUARD_SEEN_LEN)).map(|k| (next - 1 - k) % GUARD_SEEN_LEN).find_map(|i| {
         let r = &GUARD_SEEN[i];
         (r[0].load(Acquire) == id as usize).then(|| GuardSeen {
             reason: r[1].load(Acquire),
@@ -2233,11 +2243,18 @@ pub(crate) fn guard_seen(id: u32) -> Option<GuardSeen> {
     })
 }
 
+/// Tests: how many GUARDSEEN records were written, one a thread's start
+/// (the ring keeps the newest [`GUARD_SEEN_LEN`]).
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn guard_seen_written() -> usize {
+    GUARD_SEEN_NEXT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Tests: writes the calling thread's GUARDSEEN record; allocates nothing.
 #[cfg(all(test, target_arch = "x86_64"))]
 fn guard_seen_record(fields: [usize; 8]) {
     use std::sync::atomic::Ordering::{AcqRel, Release};
-    let r = &GUARD_SEEN[GUARD_SEEN_NEXT.fetch_add(1, AcqRel) % 256];
+    let r = &GUARD_SEEN[GUARD_SEEN_NEXT.fetch_add(1, AcqRel) % GUARD_SEEN_LEN];
     r[0].store(0, Release);
     for (slot, v) in r[1..].iter().zip(fields) {
         slot.store(v, Release);

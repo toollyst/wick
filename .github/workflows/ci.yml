@@ -2369,7 +2369,12 @@ jobs:
           # have at least kvm-ioctls' RUN_STACK of its stack committed from
           # the base (the first run commits it below the run call), which
           # --check-stacks reads from the VMMSTACK lines; an error if one
-          # has less, a warning if no guest booted to give the lines.
+          # has less, a warning if no guest booted to give the lines. The
+          # same lines carry each thread's stack guarantee, guard pages,
+          # TEB flags and start: every thread of the release Firecracker,
+          # of every kind, must have the guarantee and its guard pages,
+          # unless the loader never attaches it and it starts in ntdll
+          # (VMMSTACK GUARANTEE); an error otherwise.
           if ! python -I ../../tools/windows/vmm-memory-record.py --map "$RUNNER_TEMP/firecracker.map" \
               --boot "$RUNNER_TEMP/vmmmem-guest" \
               build/cargo_target/release/firecracker.exe 1 2 16 | tee "$RUNNER_TEMP/vmmmem-boot.log"; then
@@ -2378,10 +2383,10 @@ jobs:
           stacks=0
           python -I ../../tools/windows/vmm-memory-record.py --check-stacks "$RUNNER_TEMP/vmmmem-boot.log" || stacks=$?
           if [ "$stacks" = 1 ]; then
-            echo "::error::a vCPU thread of the release Firecracker has less than RUN_STACK committed (VMMSTACK RUNSTACK)"
+            echo "::error::a thread of the release Firecracker lacks the stack guarantee or its guard pages (VMMSTACK GUARANTEE), or a vCPU thread has less than RUN_STACK committed (VMMSTACK RUNSTACK)"
             failed=1
           elif [ "$stacks" != 0 ]; then
-            echo "::warning::vmm-memory-record.py --check-stacks: no vCPU thread's stack line to check"
+            echo "::warning::vmm-memory-record.py --check-stacks: no vCPU thread's stack line, or no thread line with its guarantee, to check"
           fi
           # What the host's reads of guest memory for a snapshot commit: a
           # 1 GiB guest that touched 64 MiB, after a full and a diff

@@ -139,10 +139,12 @@
   (downloaded into `<dir>` when not there; the ones `boot-test.ps1` boots),
   with a network interface: every vCPU runs. `--check-stacks <saved output>`
   then fails (exit 1) when a vCPU thread has less than kvm-ioctls'
-  `RUN_STACK` of its stack committed from its base (CI's windows job runs
-  it on the `--boot` output; it needs no Windows). Besides the VMMMEM lines it
-  prints each thread's stack (VMMSTACK lines: reserved, committed, resident,
-  how deep) and, for the deepest and the median thread of each kind, the
+  `RUN_STACK` of its stack committed from its base, or when a thread lacks
+  the stack guarantee or its guard pages and the loader attaches it (VMMSTACK
+  GUARANTEE; CI's windows job runs it on the `--boot` output; it needs no
+  Windows). Besides the VMMMEM lines it prints each thread's stack (VMMSTACK
+  lines: reserved, committed, resident, how deep, the guarantee, the guard
+  pages, the TEB's SameTebFlags, where it starts) and, for the deepest and the median thread of each kind, the
   return addresses on its stack's resident pages (module and offset, with
   the nearest symbol when `firecracker.pdb` is beside the binary, as in the
   kit), so that the calls that reached deep are named. VMMGUEST lines give
