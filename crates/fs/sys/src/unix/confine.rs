@@ -994,40 +994,77 @@ pub mod nr {
     pub const CLOSE_RANGE: c_long = libc::SYS_close_range;
 }
 
+/// In a `pre_exec` closure, a step that failed: written to the child's
+/// stderr as `pre_exec: <step><detail> failed (errno <n>)` and the child
+/// ends (`_exit(127)`), before its program. std's spawn carries back only
+/// the errno of a closure's error, the same as the exec's own, so a step
+/// says itself here instead: the spawn succeeds and the step is in what the
+/// child wrote (the tests read a server's stderr). Async-signal-safe: no
+/// allocation, `write` and `_exit` only.
+fn step_failed(step: &[u8], detail: &[u8]) -> ! {
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let mut digits = [0u8; 12];
+    let mut at = digits.len();
+    let mut n = errno.unsigned_abs();
+    loop {
+        at -= 1;
+        // A digit: n % 10 < 10.
+        digits[at] = b'0' + u8::try_from(n % 10).unwrap_or(0);
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for part in [&b"pre_exec: "[..], step, detail, b" failed (errno ", &digits[at..], b")\n"] {
+        // SAFETY: write of a slice it owns; whatever it returns, the child
+        // ends next.
+        unsafe { libc::write(2, part.as_ptr().cast(), part.len()) };
+    }
+    // SAFETY: ends the child at once, running nothing of the parent's.
+    unsafe { libc::_exit(127) }
+}
+
 /// Has `cmd`'s child, started by root, run in a mount namespace of its own
 /// in which each `(from, onto)` is bind-mounted, then as `uid`/`gid` with no
 /// supplementary group: the tests' way to give wick-fsd a stand-in for a
 /// host file it reads (a sysctl beneath `/proc/sys`) without changing the
-/// host's.
+/// host's. A step that fails is named on the child's stderr
+/// ([`step_failed`]); a spawn that fails is the fork or the exec itself.
 pub fn command_as_user_with_binds(cmd: &mut std::process::Command, uid: u32, gid: u32, binds: &[(&Path, &Path)]) {
     use std::os::unix::process::CommandExt;
-    let binds: Vec<(CString, CString)> = binds
+    // Each bind's source and target, and how its step is shown.
+    let binds: Vec<(CString, CString, Vec<u8>)> = binds
         .iter()
         .map(|(from, onto)| {
-            (
-                CString::new(from.as_os_str().as_bytes()).unwrap_or_default(),
-                CString::new(onto.as_os_str().as_bytes()).unwrap_or_default(),
-            )
+            let (from, onto) = (from.as_os_str().as_bytes(), onto.as_os_str().as_bytes());
+            let shown = [&b" of "[..], from, b" onto ", onto].concat();
+            (CString::new(from).unwrap_or_default(), CString::new(onto).unwrap_or_default(), shown)
         })
         .collect();
     let closure = move || {
-        let fail = || Err(std::io::Error::last_os_error());
         // SAFETY: async-signal-safe calls with NUL-terminated strings made
         // before the fork, or null where the call takes none.
         unsafe {
-            if libc::unshare(libc::CLONE_NEWNS) < 0
-                || libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null())
-                    < 0
-            {
-                return fail();
+            if libc::unshare(libc::CLONE_NEWNS) < 0 {
+                step_failed(b"unshare(CLONE_NEWNS)", b"");
             }
-            for (from, onto) in &binds {
+            if libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) < 0
+            {
+                step_failed(b"mount of / private and recursive", b"");
+            }
+            for (from, onto, shown) in &binds {
                 if libc::mount(from.as_ptr(), onto.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) < 0 {
-                    return fail();
+                    step_failed(b"bind mount", shown);
                 }
             }
-            if libc::setgroups(0, std::ptr::null()) < 0 || libc::setresgid(gid, gid, gid) < 0 || libc::setresuid(uid, uid, uid) < 0 {
-                return fail();
+            if libc::setgroups(0, std::ptr::null()) < 0 {
+                step_failed(b"setgroups(0)", b"");
+            }
+            if libc::setresgid(gid, gid, gid) < 0 {
+                step_failed(b"setresgid", b"");
+            }
+            if libc::setresuid(uid, uid, uid) < 0 {
+                step_failed(b"setresuid", b"");
             }
         }
         Ok(())
@@ -1040,7 +1077,8 @@ pub fn command_as_user_with_binds(cmd: &mut std::process::Command, uid: u32, gid
 }
 
 /// Has `cmd`'s child install `program` (after `no_new_privs`) before it
-/// runs its program: the tests' way to make one of wick-fsd's steps fail.
+/// runs its program: the tests' way to make one of wick-fsd's steps fail. A
+/// step that fails is named on the child's stderr ([`step_failed`]).
 pub fn command_with_filter(cmd: &mut std::process::Command, program: Vec<Insn>) {
     use std::os::unix::process::CommandExt;
     let filters: Vec<libc::sock_filter> = program
@@ -1060,15 +1098,15 @@ pub fn command_with_filter(cmd: &mut std::process::Command, program: Vec<Insn>) 
         };
         // SAFETY: prctl and seccomp are async-signal-safe system calls; prog
         // points at the filters, which the closure owns.
-        let r = unsafe {
-            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as c_ulong, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong)
-        };
-        if r < 0 {
-            return Err(std::io::Error::last_os_error());
+        unsafe {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as c_ulong, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong) < 0 {
+                step_failed(b"prctl(PR_SET_NO_NEW_PRIVS)", b"");
+            }
+            if libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0u32, &prog) < 0 {
+                step_failed(b"seccomp(SECCOMP_SET_MODE_FILTER)", b"");
+            }
         }
-        // SAFETY: as above.
-        let r = unsafe { libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0u32, &prog) };
-        if r < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+        Ok(())
     };
     // SAFETY: the closure makes only async-signal-safe system calls and
     // allocates nothing (the program was built before the fork).

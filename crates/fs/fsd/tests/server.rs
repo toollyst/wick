@@ -682,7 +682,12 @@ fn test_landlock_absent_is_logged() {
 /// which `/proc/sys/kernel` and `/proc/sys/user` are stand-ins holding that
 /// sysctl alone, starts it as 65534 (so it makes a user namespace) under the
 /// simulated restriction (its setgroups write refused, EACCES), and reads
-/// the refusal.
+/// the refusal. The server is started from a link or copy in the temporary
+/// directory: 65534 execs it, and execve needs search permission on every directory of
+/// the path (path_resolution(7)), which a runner's home may not give others
+/// (run 44244968658: the spawn refused, EACCES, on GitHub's Ubuntu runners,
+/// where the build is beneath /home/runner; the sudo step records that path
+/// with `namei -l`).
 #[test]
 fn test_the_refusal_names_the_restriction_it_reads() {
     if sys_euid() != 0 {
@@ -691,6 +696,15 @@ fn test_the_refusal_names_the_restriction_it_reads() {
     }
     const NAMES: [&str; 3] =
         ["kernel.apparmor_restrict_unprivileged_userns", "user.max_user_namespaces", "kernel.unprivileged_userns_clone"];
+    // The program 65534 execs, in a directory every user can search: a hard
+    // link to the built one where the two share a filesystem (no write, so
+    // no other test's child can hold it open for writing at the exec,
+    // ETXTBSY), a copy otherwise.
+    let bin = scratch("srv-names-bin");
+    let program = bin.join("wick-fsd");
+    if std::fs::hard_link(env!("CARGO_BIN_EXE_wick-fsd"), &program).is_err() {
+        std::fs::copy(env!("CARGO_BIN_EXE_wick-fsd"), &program).unwrap();
+    }
     for (tag, file, value) in [
         ("srv-names-apparmor", "kernel/apparmor_restrict_unprivileged_userns", "1"),
         ("srv-names-max", "user/max_user_namespaces", "0"),
@@ -712,7 +726,7 @@ fn test_the_refusal_names_the_restriction_it_reads() {
         args.drain(at..at + 4);
         args.extend(["--peer-uid", "0"].map(String::from));
         let (kernel, user) = (stand_in.join("kernel"), stand_in.join("user"));
-        let server = Server::start(&args, |cmd| {
+        let server = Server::start_from(&program, &args, |cmd| {
             c::command_as_user_with_binds(
                 cmd,
                 65534,
@@ -736,6 +750,33 @@ fn test_the_refusal_names_the_restriction_it_reads() {
             assert!(err.contains("start wick-fsd as root with --uid and --gid"), "{tag}: {err}");
         }
     }
+    remove(&bin);
+}
+
+/// The tests' helpers name a step of theirs that fails before the exec, on
+/// the child's stderr (std's spawn would carry back only an errno, the same
+/// as the exec's): an empty seccomp program (EINVAL) as any user, and as
+/// root a bind mount of a source that does not exist (ENOENT).
+#[test]
+fn test_a_helper_step_that_fails_names_itself() {
+    let run = |prepare: &dyn Fn(&mut std::process::Command)| {
+        let mut cmd = std::process::Command::new("/bin/true");
+        prepare(&mut cmd);
+        let out = cmd.output().expect("the spawn succeeds: the step ends the child");
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let (code, err) = run(&|cmd| c::command_with_filter(cmd, Vec::new()));
+    assert_eq!((code, err.as_str()), (Some(127), "pre_exec: seccomp(SECCOMP_SET_MODE_FILTER) failed (errno 22)\n"));
+    if sys_euid() != 0 {
+        eprintln!("ran nothing for the bind mount: it needs root (the sudo step runs it)");
+        return;
+    }
+    let missing = std::path::Path::new("/nonexistent-wick-stand-in");
+    let (code, err) = run(&|cmd| c::command_as_user_with_binds(cmd, 65534, 65534, &[(missing, std::path::Path::new("/proc/sys/user"))]));
+    assert_eq!(
+        (code, err.as_str()),
+        (Some(127), "pre_exec: bind mount of /nonexistent-wick-stand-in onto /proc/sys/user failed (errno 2)\n")
+    );
 }
 
 /// A host that restricts user namespaces refuses a server that is not root,
@@ -766,5 +807,6 @@ fn test_userns_restricted_refused() {
             assert!(err.contains("start wick-fsd as root with --uid and --gid"), "{err}");
         }
     }
-    eprintln!("refused as it must: {err}");
+    // One line, for the CI unit step's record.
+    eprintln!("refused as it must: {}", err.trim().replace('\n', " | "));
 }

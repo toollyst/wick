@@ -139,7 +139,13 @@ impl Server {
     /// Starts `wick-fsd args` (with `cmd` changed by `prepare`, as the
     /// refusal tests do) and waits for its `ready` line.
     pub fn start(args: &[String], prepare: impl FnOnce(&mut Command)) -> Server {
-        let mut s = Server::spawn(args, prepare);
+        Server::start_from(Path::new(env!("CARGO_BIN_EXE_wick-fsd")), args, prepare)
+    }
+
+    /// [`Server::start`] of the wick-fsd at `program` (a copy, where the
+    /// built one cannot be reached).
+    pub fn start_from(program: &Path, args: &[String], prepare: impl FnOnce(&mut Command)) -> Server {
+        let mut s = Server::spawn_from(program, args, prepare);
         let mut line = String::new();
         let _ = BufReader::new(s.child.stdout.take().unwrap()).read_line(&mut line);
         if line.trim() != "ready" {
@@ -152,13 +158,23 @@ impl Server {
     /// Starts `wick-fsd args` as [`Server::start`] does, without waiting
     /// for `ready`: for a server refused before it.
     pub fn spawn(args: &[String], prepare: impl FnOnce(&mut Command)) -> Server {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_wick-fsd"));
+        Server::spawn_from(Path::new(env!("CARGO_BIN_EXE_wick-fsd")), args, prepare)
+    }
+
+    /// [`Server::spawn`] of the wick-fsd at `program`.
+    pub fn spawn_from(program: &Path, args: &[String], prepare: impl FnOnce(&mut Command)) -> Server {
+        let mut cmd = Command::new(program);
         cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         if simulated_restriction() {
             sys::confine::command_with_filter(&mut cmd, sys::confine::simulated_userns_restriction());
         }
         prepare(&mut cmd);
-        let mut child = cmd.spawn().unwrap();
+        // A step of the tests' own before the exec says itself on the
+        // child's stderr and ends it (sys::confine's helpers): a spawn that
+        // fails is the fork or the exec.
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("{}: not started, the fork or the exec failed: {e}", program.display()));
         let stderr = Arc::new(Mutex::new(String::new()));
         {
             let mut pipe = child.stderr.take().unwrap();

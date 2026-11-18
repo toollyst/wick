@@ -46,6 +46,11 @@ KNOWN = [
         "the id drop is a step of a server started as root (--uid/--gid); the sudo step runs it",
     ),
     (
+        "ran nothing for the bind mount: it needs root",
+        "test_a_helper_step_that_fails_names_itself checks a test helper's report of its own failed step, not a "
+        "confinement; its seccomp case ran, its bind-mount case needs root, and the sudo step runs it",
+    ),
+    (
         "ran nothing: user namespaces are not restricted here (or this is root)",
         "test_userns_restricted_refused checks the refusal of a restricted host, which the grant lifts; the "
         "Unit tests step runs it restricted",

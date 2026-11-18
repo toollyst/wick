@@ -849,7 +849,11 @@ it means layer 1 let the request through.
     44233741878), then "start wick-fsd as root with --uid and --gid, or grant this binary user namespaces with an
     AppArmor profile" (`userns_restriction`, `test_the_restriction_is_named_as_read`; one sysctl at a time, the
     server started as 65534 with a stand-in for it bound over `/proc/sys` under the simulated restriction:
-    `test_the_refusal_names_the_restriction_it_reads`; the host's own in `test_userns_restricted_refused`). wick
+    `test_the_refusal_names_the_restriction_it_reads`, which execs a link or copy of wick-fsd in the temporary
+    directory: execve needs every directory of the path searchable, and a runner's home, where the build is, may
+    not be by others (run 44244968658: EACCES at the spawn; the sudo step records the path with `namei -l`); the host's own in `test_userns_restricted_refused`, whose
+    refusal the unit step prints on record). A helper step of the tests' that fails before the exec names itself on
+    the child's stderr (`pre_exec: <step> failed (errno N)`), so a failed spawn is the exec's own. wick
     never asks an operator to turn a host-wide restriction off: it guards every program on the host.
   - Landlock first appeared in Linux 5.13 [doc], and upstream supports 5.10 hosts (docs/kernel-policy.md) [src], so it
     is an added layer, never the only one.
