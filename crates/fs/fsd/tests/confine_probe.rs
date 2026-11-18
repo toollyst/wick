@@ -374,7 +374,7 @@ mod macos {
         }
         for name in names {
             let n = runs[name];
-            let said = union.get(name).map_or("nothing".to_string(), |calls| {
+            let said = union.get(name).map_or_else(|| "nothing".to_string(), |calls| {
                 calls.iter().map(|(c, k)| format!("{c} ({k} of {n})")).collect::<Vec<_>>().join("; ")
             });
             println!("reported, {name}, {n} runs: {said}");
