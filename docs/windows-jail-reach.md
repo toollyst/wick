@@ -359,8 +359,36 @@ names the operator listed.
   manager does not check the device object's security and the restricting SIDs are not asked; what the driver
   checks there is its own. Each answered the probe's unknown I/O-control code, its read and its zero-length write
   with an error: `0xc0000010` for most; `0xc0000002` from LanmanDatagramReceiver; `0xc000000d` for Ntfs's I/O
-  control; `0xc0000140` for Afd's read and write. Afd is the one Firecracker uses (Winsock). The allowlist is to be
-  written from this record.
+  control; `0xc0000140` for Afd's read and write.
+- **The allowlist.** `jailer-test.ps1 reach` asserts it from this record (first run: CI): every class of the
+  operator's list but Device reached none, and a class the list has that the allowlist does not name fails, named;
+  every device reached is one of these, and Afd is reached (the control); a device outside them fails, printed with
+  its device type, characteristics and the remedy to try. No device can be changed from user mode: the I/O manager
+  skips the device's security beneath its name unless the driver set `FILE_DEVICE_SECURE_OPEN`, and these are
+  control devices, not PnP stacks whose class key's `DeviceCharacteristics` could add it. What can be done is the
+  host's: unloading the driver.
+
+  | Device | Why a jail reaches it | Host hardening |
+  | --- | --- | --- |
+  | `\Device\Afd` (required) | Winsock's and the polling crate's driver: Firecracker uses it | none: needed |
+  | `\Ntfs` | NTFS's control device | none |
+  | `\Refs` (optional) | ReFS's control device, where ReFS is loaded (Server 2022 under fs-probe's imitation; not on CI's runner) | none |
+  | `\Device\RawDisk`, `RawCdRom`, `RawTape` | the RAW file system's control devices | none |
+  | `\Fat`, `\FatCdrom` (optional) | fastfat's control devices, while fastfat is loaded | stop or disable fastfat where no FAT volume is used: `reach -ReachHostHardening` stops it, lists the host's names again and starts it again (first run: CI) |
+  | `\Device\LanmanDatagramReceiver` (optional) | `bowser.sys`, the computer browser's datagram receiver | disable the browser: not tried |
+  | `\Device\MQAC` (optional) | Message Queuing's driver, where MSMQ is installed (CI's runner) | remove MSMQ: not tried |
+
+  Not in the list, so a host where a jail reaches them fails and prints them: devices with numbered names (a PnP
+  stack's, whose names change between boots; to try, not measured: `FILE_DEVICE_SECURE_OPEN` in the class key's
+  `DeviceCharacteristics`), the input class devices below, and any driver of the host's without
+  `FILE_DEVICE_SECURE_OPEN`, which is the operator's to decide.
+- **Keyboard and mouse class devices.** Measured under fs-probe's imitation of the jail's SID alone on Windows Server
+  2022 (fc-win): `\Device\KeyboardClass0` and `\Device\PointerClass0` were reached beneath their names, granted
+  `0x1f01ff`. On CI's runner (Server 2025, build 26100) both are in the operator's list and the jail reached neither
+  under the jailer (f4fb55c4); why the two hosts differ is not measured. What a jail can do there is not measured. Left for the PC: what an open
+  beneath the name of a keyboard class device gives (whether kbdclass completes a read for it: from its source and
+  the WDK's documentation first, then measured), and whether the class key's `DeviceCharacteristics` with
+  `FILE_DEVICE_SECURE_OPEN` closes it. No remedy is written as working until measured.
 - **The other checks.** A DLL loaded after the revert was refused (126), HKLM read (5), a pipe and a mailslot made
   (5); the pipes were listed (38 names); an `AF_UNIX` bind was allowed. TCP to loopback, to the link-local metadata
   address and to an external address stopped at Winsock's `socket` (5): see "IP without `--netns`" below.
@@ -375,9 +403,13 @@ names the operator listed.
 Under the jail's SID alone, Winsock's first `AF_INET` socket in a jailed process fails with os error 5 (the record
 above, and `jailer-test.ps1 netns`'s control at f4fb55c4, which failed for it). Winsock's first use of the TCP/IP
 transport in a process is done in the process, by `mswsock.dll`, and reads what the jail's SID may not;
-Firecracker's preload does it for `AF_UNIX` only (`jail_preload.rs`, its `winsock` step). `jailer-test.ps1 netns`
-records which of Winsock's keys the jail opens (`jail-probe wsreg:0`; first run: CI); until then the refusal is not
-located to the key.
+Firecracker's preload does it for `AF_UNIX` only (`jail_preload.rs`, its `winsock` step). Jailed, every Winsock key
+`jailer-test.ps1 netns` records was refused with 5 (`jail-probe wsreg:0`, each opened for `KEY_READ` under
+`HKLM\SYSTEM\CurrentControlSet\Services`: `Tcpip\Parameters\Winsock`, `Tcpip6\Parameters\Winsock`,
+`Tcpip\Parameters`, `WinSock\Parameters`, `WinSock2\Parameters`, `WinSock2\Parameters\Protocol_Catalog9`,
+`AFD\Parameters`, `afunix\Parameters\Winsock`), where the operator opened all eight (CI's Windows Server 2025 build
+26100). So the refusal is not one key's: the jail reads none of Winsock's configuration, the `AF_UNIX` helper's
+included, and its `AF_UNIX` sockets work because the preload takes that step before the revert (by source).
 
 It is not a refusal by the TCP/IP stack. Measured with a warmed helper: on fc-win (Windows Server 2022 build
 20348), under fs-probe's imitation (the jail's SID alone, medium integrity), a process that made an `AF_INET` socket
@@ -387,7 +419,7 @@ before its revert made new ones after it and connected them to loopback and to t
 token. `--netns`'s Windows Filtering Platform filters are what deny it: `jailer-test.ps1 netns` now makes every IP
 check from a probe that took Winsock's `AF_INET` step before its revert (`jail-probe inetwarm:0`, a step of the
 probe binary alone, which Firecracker's preload does not take), fails if the jail without a network does not then
-connect, and asserts the jails with a network refused (first run: CI).
+connect, and asserts the jails with a network refused (passed on CI's Windows Server 2025 build 26100).
 
 Firecracker makes no IP socket on Windows. Its API socket (`ext::api_process`, `UnixListener::bind`), its network
 endpoint (`platform::windows::net`, `UnixListener::bind`), vsock's (`vsock/unix/muxer.rs`), vhost-user's
@@ -810,9 +842,9 @@ to when the partition is made. What it brings, and what the next record (`jail-v
    the initial token keeps the session's four groups, the logon SID and the user's for the loader, the preload and
    the parked partition; after the revert Firecracker and its API process check that the process token's only
    restricting SID is a jail's (`jail_preload.rs`, `jail_sid_alone`) and end, named, if not; `isolation` asserts
-   it with the SID on the jail's root, and `C:\Windows\win.ini` denied. `reach` stays a record in it: the stage's
-   assertion, its allowlist, is written from the record CI prints under that token, after one record under each
-   token, not from fs-probe's imitation (the fourth record).
+   it with the SID on the jail's root, and `C:\Windows\win.ini` denied. `reach` stayed a record in it; its
+   assertion, the allowlist, was then written from the record CI printed under that token (f4fb55c4), not from
+   fs-probe's imitation (the allowlist, above).
 4. This page and SECURITY.md updated with the commit that fixes it and the numbers measured again.
 
 ## Not measured yet

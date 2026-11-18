@@ -54,12 +54,15 @@
   jailer refused the flag; needs an elevated PowerShell),
   `api` (the jail runs Firecracker and its API server's process, the latter
   under the whole mitigation profile; each one's end ends the other) and
-  `reach` (a record, nothing asserted yet, with the token's restricting SIDs: every named object, pipe and
+  `reach` (with the token's restricting SIDs: every named object, pipe and
   mailslot of the host, listed by the operator, is opened by `jail-probe.rs`
   in the jail as the jailer makes it, with the checks that are not names, a
   DLL loaded after the revert, HKLM, TCP and AF_UNIX; one `reach` line per
-  name reached and a `reach-summary` per type, the format the allowlist will
-  read; then `jail-probe smb`, this host's administrative shares, `IPC$` and
+  name reached and a `reach-summary` per type, asserted against the
+  allowlist written from the record under the jail's SID alone (every class
+  but Device none, an unknown class failing named; each device reached one
+  of nine, Afd required; the checks as measured; no SMB form opened by a
+  jailed run); then `jail-probe smb`, this host's administrative shares, `IPC$` and
   the `srvsvc` pipe through `\Device\Mup`, the LanMan redirector and a UNC
   name, and the RDP client drives, opened in the jail with `--netns` first,
   then in the jail, then from `jail-probe low` (the operator's token at low
@@ -74,7 +77,9 @@
   opened by the same forms in each run, its security and the canary's ACL
   recorded, and removed at the stage's end (the stage fails if it is not;
   `helpers -ReachSmbShare` runs its parts that need no jailer);
-  the records kept as `reach-record.txt` and `reach-objects.txt` in the work
+  with `-ReachHostHardening` (elevated; CI passes it) fastfat stopped, the
+  host's names listed again and fastfat started again as it was, failing if
+  it is not; the records kept as `reach-record.txt` and `reach-objects.txt` in the work
   directory for CI's upload; `jail-reach.rs`). With a
   guest: `netguest` (frames through the endpoint in the jail's own directory of the network),
   `isolation` (`jail-probe.rs`, run through the jailer as the jailed binary,

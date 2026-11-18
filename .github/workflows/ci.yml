@@ -3111,10 +3111,12 @@ jobs:
       # sections and hugepages have steps of their own. -ReachSmbShare: reach
       # makes a share of its own for the run, read granted to Everyone, and
       # removes it at the stage's end (a run on a PC makes none unless asked).
+      # -ReachHostHardening: reach stops fastfat, lists the host's names
+      # again and starts it again (a run on a PC does not unless asked).
       - name: jailer-test.ps1
         if: (success() || failure()) && steps.kit.outcome == 'success'
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir $env:WJT -Assets $env:WBT -ReachSmbShare `
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 -WorkDir $env:WJT -Assets $env:WBT -ReachSmbShare -ReachHostHardening `
             -Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,daemonize,handles,handoff,netns,netguest,api,isolation,reach,boot,restart,shared,limits,memory,cpu,uffd,vhost-user
           exit $LASTEXITCODE
       # memory.max and sections (docs/COMPATIBILITY.md, the memory.max row's

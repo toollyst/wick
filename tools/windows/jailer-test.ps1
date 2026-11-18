@@ -6,7 +6,7 @@
 # jailed binary), a jailed microVM booting, and the Job Object limits.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\windows\jailer-test.ps1 `
-#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,reach,boot,restart,shared,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user|x2storm] [-Bin <dir>] [-X2ApicFirecracker <exe>] [-ReachSmbShare]
+#       -WorkDir C:\wjt [-Stage refuse,freeze,cpuset,parent,weight,low,links,nofile,sections,daemonize,handles,pidns,handoff,netns,netguest,api,isolation,reach,boot,restart,shared,bindlink,limits,memory,cpu,hugepages,uffd,vhost-user|x2storm] [-Bin <dir>] [-X2ApicFirecracker <exe>] [-ReachSmbShare] [-ReachHostHardening]
 #
 # `refuse`, `freeze`, `cpuset`, `parent`, `weight`, `low`, `links`, `nofile`, `sections`, `daemonize`, `handles`, `pidns`, `handoff`, `netns`,
 # `api` and `reach` need no WHP; the others boot a guest. `helpers` (not in
@@ -25,6 +25,9 @@
 # `reach` make a share of its own for the run, read granted to Everyone,
 # removed at the stage's end (elevated only; without it no share is made),
 # and `helpers` run that share probe's parts that need no jailer.
+# -ReachHostHardening lets `reach` stop fastfat, list the host's names again
+# and start it again as it was (elevated only; without it nothing is
+# stopped).
 #
 # -Bin holds jailer.exe and firecracker.exe (default: the release build),
 # `examples\uffd_on_demand_handler.exe` for `uffd` and, for `vhost-user`,
@@ -42,7 +45,8 @@ param(
     [string]$Assets = 'C:\wbt',
     [string]$Probe = '',
     [string]$X2ApicFirecracker = '',
-    [switch]$ReachSmbShare
+    [switch]$ReachSmbShare,
+    [switch]$ReachHostHardening
 )
 $ErrorActionPreference = 'Stop'
 # Firecracker, the jailer and the probes write UTF-8 (Rust's strings,
@@ -999,13 +1003,25 @@ function New-ReachShare([string]$name, [string]$dir) {
     "smb-share-canary-acl: $((Get-Acl $canary).Sddl)"
 }
 
-# Removes New-ReachShare's share and directory, and fails if the share is
-# still there: a share left behind would serve its directory to the network.
+# Removes New-ReachShare's share and directory, and returns the failure if
+# the share is still there (a share left behind would serve its directory to
+# the network), nothing otherwise. It runs in a finally block, so it does not
+# throw: the caller reports it with any failure before it (Complete-Stage).
 function Remove-ReachShare([string]$name, [string]$dir) {
     Remove-SmbShare -Name $name -Force -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force -LiteralPath $dir -ErrorAction SilentlyContinue
     $left = Get-SmbShare -Name $name -ErrorAction SilentlyContinue
-    Check ($null -eq $left) "the share $name is still there after the stage (Remove-SmbShare did not remove it): remove it by hand"
+    if ($null -ne $left) { "the share $name is still there after the stage (Remove-SmbShare did not remove it): remove it by hand" }
+}
+
+# Ends a stage whose cleanup can fail after the stage itself failed: an
+# exception thrown in a finally block replaces the one in flight, so the
+# stage catches its own (`err`), cleans up, and this reports both when both
+# failed, the cleanup's alone, or the stage's.
+function Complete-Stage($err, [string]$cleanup) {
+    if ($cleanup -and $err) { throw [Failure]::new("$cleanup; and before it: $($err.Exception.Message)") }
+    if ($cleanup) { throw [Failure]::new($cleanup) }
+    if ($err) { throw $err }
 }
 
 # The SMB checks of a run: C$ and the rest, the share when there is one,
@@ -1035,11 +1051,137 @@ function Get-SmbAll([string[]]$ls, [string]$prefix, [string]$who, [string]$share
     $parts -join '; '
 }
 
-# What a jailed process reaches of the host's named objects, a record under
-# the jail's token as the jailer makes it (docs/windows-jail-reach.md; option
-# P: step A recorded it under the token with the session's groups, step C
-# under the jail's SID alone, the record the allowlist is to be written
-# from): jail-probe `reachlist`, run by the operator, lists
+# The devices a jail reaches under the jail's SID alone, each with its
+# reason; all reached beneath their names, which the I/O manager does not
+# check against the device's security when the device lacks
+# FILE_DEVICE_SECURE_OPEN, so the restricting SIDs are not asked. Optional
+# ones are there on some hosts only. The assertion is "a subset of these",
+# with the required one reached.
+$ReachDevices = [ordered]@{
+    '\Device\Afd'                    = @{ Required = $true; Why = "Winsock's and the polling crate's driver: Firecracker uses it" }
+    '\Ntfs'                           = @{ Required = $false; Why = "NTFS's control device; nothing to change from user mode" }
+    '\Refs'                           = @{ Required = $false; Why = "ReFS's control device, where ReFS is loaded (Server 2022 under fs-probe's imitation); nothing to change from user mode" }
+    '\Device\RawDisk'                = @{ Required = $false; Why = "the RAW file system's control device; nothing to change from user mode" }
+    '\Device\RawCdRom'               = @{ Required = $false; Why = "the RAW file system's control device; nothing to change from user mode" }
+    '\Device\RawTape'                = @{ Required = $false; Why = "the RAW file system's control device; nothing to change from user mode" }
+    '\Fat'                            = @{ Required = $false; Why = "fastfat's control device, while fastfat is loaded (host hardening: stop or disable fastfat where no FAT volume is used)" }
+    '\FatCdrom'                       = @{ Required = $false; Why = "fastfat's control device, while fastfat is loaded (as \Fat)" }
+    '\Device\LanmanDatagramReceiver' = @{ Required = $false; Why = "bowser.sys, the computer browser's datagram receiver (host hardening, untested: disable the browser)" }
+    '\Device\MQAC'                   = @{ Required = $false; Why = "Message Queuing's driver, where MSMQ is installed (CI's runner) (host hardening, untested: remove MSMQ)" }
+}
+# The object classes of the operator's list and what a jail reaches of
+# each: Device is $ReachDevices's; every other, none. A class the list has
+# that is not here fails, named, so that a Windows that adds one is a
+# difference on the record, not a pass by omission.
+$ReachClasses = [ordered]@{}
+foreach ($c in 'ALPC Port', 'Callback', 'CpuPartition', 'Directory', 'Directory-unlisted', 'Driver', 'Event', 'FilterConnectionPort', 'Job', 'Key', 'KeyedEvent', 'Mailslot', 'Mutant', 'Partition', 'Pipe', 'Section', 'Semaphore', 'Session', 'SymbolicLink', 'Type', 'WindowStation') { $ReachClasses[$c] = 0 }
+$ReachClasses['Device'] = 'the allowlist'
+# The checks that are not names, as the jail's SID alone gives them: true
+# allowed, false denied. The pipe list and IP are recorded, not asserted
+# (IP: docs/windows-jail-reach.md, "IP without --netns").
+$ReachChecks = [ordered]@{
+    'load-library-after-revert version.dll' = $false
+    'load-library-after-revert dbghelp.dll' = $false
+    'hklm-read'                             = $false
+    'hklm-system-read'                      = $false
+    'named-pipe-create'                     = $false
+    'mailslot-create'                       = $false
+    'unix-socket-bind'                      = $true
+}
+
+# What the jail reached against $ReachClasses, $ReachDevices and
+# $ReachChecks: the failures, each named (empty when it holds), and the
+# devices reached. `listed` is the classes of the operator's list: each must
+# have its summary line, and a record with none fails.
+function Test-ReachAllowlist([string[]]$lines, [string[]]$listed) {
+    $bad = @()
+    $summary = @($lines | Where-Object { $_.StartsWith('reach-summary ') })
+    $counts = @($summary | ForEach-Object { $_.Substring('reach-summary '.Length) }) -join '; '
+    if ($summary.Count -eq 0) { $bad += 'the jailed record has no reach-summary line, so no class was checked' }
+    if (@($listed).Count -eq 0) { $bad += "the operator's list has no class, so no class was checked" }
+    foreach ($c in @($listed | Sort-Object -Unique)) {
+        if (-not ($summary | Where-Object { $_.StartsWith("reach-summary $c tried ") })) { $bad += "the operator's list has class $c, and the jailed record has no summary for it" }
+    }
+    foreach ($l in $summary) {
+        if ($l -notmatch '^reach-summary (.+) tried (\d+) reached (\d+)$') { $bad += "a summary line not read: $l"; continue }
+        $class = $Matches[1]; $n = [int]$Matches[3]
+        if (-not $ReachClasses.Contains($class)) { $bad += "a class not in the allowlist's classes: $class ($l)"; continue }
+        if ($class -ne 'Device' -and $n -ne $ReachClasses[$class]) { $bad += "$class reached $n, where the allowlist has $($ReachClasses[$class])" }
+    }
+    $devices = @($lines | Where-Object { $_.StartsWith("reach Device`t") })
+    $names = @()
+    foreach ($l in $devices) {
+        $f = $l -split "`t"
+        $name = $f[1]; $how = $f[2]
+        $names += $name
+        if ($ReachDevices.Contains($name)) { continue }
+        $kind = if ($how -match '(type 0x[0-9a-f]+ chars 0x[0-9a-f]+ secure-open \S+)') { $Matches[1] } else { $how }
+        $remedy = if ($name -match '^\\Device\\[0-9a-fA-F]{8}$') {
+            "an unnamed device (a PnP stack's; its name changes between boots): to try, not measured, FILE_DEVICE_SECURE_OPEN in its class key's DeviceCharacteristics"
+        } elseif ($name -match '^\\Device\\(KeyboardClass|PointerClass)\d+$') {
+            "an input class device: what a jail can do there is not measured; to try, not measured, FILE_DEVICE_SECURE_OPEN in the class key's DeviceCharacteristics (docs/windows-jail-reach.md)"
+        } else {
+            "a driver of this host without FILE_DEVICE_SECURE_OPEN: the operator's to decide (docs/windows-jail-reach.md)"
+        }
+        $bad += "$name reached, not in the allowlist ($kind): $remedy"
+    }
+    foreach ($k in $ReachDevices.Keys) {
+        if ($ReachDevices[$k].Required -and $names -notcontains $k) { $bad += "$k not reached: it is the allowlist's control (Firecracker uses it), so the probe's opening or the jail changed" }
+    }
+    foreach ($k in $ReachChecks.Keys) {
+        $l = $lines | Where-Object { $_.StartsWith("reach-check $k ") } | Select-Object -First 1
+        if (-not $l) { $bad += "reach-check $k did not answer"; continue }
+        if ($l.Substring("reach-check $k ".Length).StartsWith('allowed') -ne $ReachChecks[$k]) { $bad += $l }
+    }
+    if ($bad.Count) { $bad += "the classes as reached: $counts" }
+    @{ Bad = $bad; Devices = $names; Counts = $counts }
+}
+
+# Host hardening for two of the allowlist's devices: fastfat stopped
+# (sc.exe stop, its start type left as it is), and, once it is Stopped, the
+# host's names listed again (jail-probe reachlist) and whether \Fat and
+# \FatCdrom went; then started again, failing if it is not as it was. A stop
+# refused, or one that does not reach Stopped within 10 s, is recorded as
+# such and the list is not read as the hardened one; nothing is tried twice.
+# A failure to start it again is reported with any failure before it, which
+# it would otherwise replace (an exception thrown in a finally block replaces
+# the one in flight). Returns the record line.
+function Test-FastfatHardening([string]$probe, [string]$base) {
+    $was = Get-CimInstance Win32_SystemDriver -Filter "Name='fastfat'" -ErrorAction SilentlyContinue
+    if (-not $was) { return 'fastfat: no such driver on this host' }
+    $head = "fastfat $($was.State), start $($was.StartMode)"
+    if ($was.State -ne 'Running') { return "${head}: not running, so not tried" }
+    $list = Join-Path $base 'fat-objects.txt'
+    $stop = (& sc.exe stop fastfat 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) -join ' '
+    $stopCode = $LASTEXITCODE
+    if ($stopCode -ne 0) { return "${head}: sc stop refused (exit $stopCode): $stop" }
+    $line = $null
+    $err = $null
+    try {
+        $t = [DateTime]::Now.AddSeconds(10)
+        do { Start-Sleep -Milliseconds 200; $now = Get-CimInstance Win32_SystemDriver -Filter "Name='fastfat'" } while ($now.State -ne 'Stopped' -and [DateTime]::Now -lt $t)
+        if ($now.State -ne 'Stopped') {
+            $line = "${head}: sc stop accepted, but fastfat did not stop within 10 s (state $($now.State)), so the host's names were not listed as hardened"
+        } else {
+            $made = & $probe "reachlist:$list"
+            $names = @(Get-Content $list -ErrorAction SilentlyContinue | Where-Object { $_ -match "^Device`t\\(Fat|FatCdrom)$" })
+            $line = "${head}: stopped; the host's list then $(if ($names.Count) { "still has $($names -join ', ')" } else { 'has neither \Fat nor \FatCdrom' }) ($($made -replace '^reachlist:\S+ allowed ', ''))"
+        }
+    } catch {
+        $err = $_
+    }
+    $start = (& sc.exe start fastfat 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) -join ' '
+    $t = [DateTime]::Now.AddSeconds(10)
+    do { Start-Sleep -Milliseconds 200; $back = Get-CimInstance Win32_SystemDriver -Filter "Name='fastfat'" -ErrorAction SilentlyContinue } while ($back.State -ne 'Running' -and [DateTime]::Now -lt $t)
+    $restart = if ($back.State -ne 'Running' -or $back.StartMode -ne $was.StartMode) { "fastfat is not as it was after the stage (state $($back.State), start $($back.StartMode); sc start: $start): start it by hand" }
+    Complete-Stage $err $restart
+    $line
+}
+
+# What a jailed process reaches of the host's named objects, under the
+# jail's token as the jailer makes it (docs/windows-jail-reach.md; option P:
+# step A recorded it under the token with the session's groups, step C under
+# the jail's SID alone, the record the allowlist above is written from): jail-probe `reachlist`, run by the operator, lists
 # every named object of the object manager's namespace, every named pipe and
 # every mailslot into the jail's root; jail-probe `reach`, the jailer's own
 # spawn, after Firecracker's preload and RevertToSelf as every jailed check
@@ -1085,9 +1227,19 @@ function Get-SmbAll([string[]]$ls, [string]$prefix, [string]$who, [string]$share
 # there for that run. The share and its directory are removed when the
 # stage ends, and the stage fails if the share is still there.
 # The records are kept as reach-record.txt and reach-objects.txt in the
-# work directory, which CI's upload takes. It asserts nothing of what is
-# reached, only that the record is whole: the list made, the jailed probe's
-# end line, a summary, each SMB run's end line. Needs no guest.
+# work directory, which CI's upload takes. The record must be whole (the
+# list made, the jailed probe's end line, a summary, each SMB run's end
+# line), and what the jail reached is asserted against $ReachClasses,
+# $ReachDevices and $ReachChecks, written from the record under the jail's
+# SID alone (f4fb55c4): every class but Device reached 0, and a class the
+# operator's list has that is not in $ReachClasses fails, named; every
+# device reached is in $ReachDevices (a name outside it fails, printed with
+# its device type, characteristics and the remedy to try), and \Device\Afd,
+# which Firecracker uses, is reached (the control); each check as measured;
+# no SMB form opened by any jailed run. With -ReachHostHardening (elevated;
+# CI passes it) it then stops fastfat, lists the host's names again, records
+# whether \Fat and \FatCdrom went, and starts it again, failing if it is not
+# running as before. Needs no guest.
 function Stage-Reach([string]$External = '8.8.8.8:53') {
     $probe = Get-Probe
     $base = New-Base 'reach'
@@ -1101,6 +1253,8 @@ function Stage-Reach([string]$External = '8.8.8.8:53') {
     $listener.Start()
     $shareName = $null
     $shareDir = Join-Path $base 'share'
+    $stageErr = $null
+    $cleanup = $null
     try {
         $port = $listener.LocalEndpoint.Port
         $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -1196,13 +1350,43 @@ function Stage-Reach([string]$External = '8.8.8.8:53') {
         Check ($summary.Count -gt 0) 'the jailed record has no reach-summary line'
         $checks = @($lines | Where-Object { $_.StartsWith('reach-check ') })
         $sids = $lines | Where-Object { $_.StartsWith('restricted:0 ') } | Select-Object -First 1
-        "a record, nothing asserted, under a token whose restricting SIDs are $($sids -replace '^restricted:0 allowed ', ''): the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks; SMB ($serverState; $shares; $($shareLines -join '; ')), in this order: jailed with --netns $smbNet; jailed $smbJailed; low integrity $smbLow; the operator $smbControl; jailed on the user's sessions ($($toShare.Count) to the share of $($before.Count) connections) $smbReuse; $($connLines -join '; ')"
+        # The allowlist, and no SMB form opened by a jailed run (with
+        # --netns, without, and on the user's sessions).
+        $listed = @(Get-Content (Join-Path $root 'objects.txt') -ErrorAction SilentlyContinue | ForEach-Object { ($_ -split "`t")[0] } | Where-Object { $_ } | Sort-Object -Unique)
+        $allow = Test-ReachAllowlist $lines $listed
+        # Each jailed run the stage made must have at least one SMB end line
+        # with forms tried, every one with none opened: a run whose record
+        # has none (it died, the format changed) fails, named.
+        $opened = @()
+        $sets = @(@{ N = 'the jailed run'; P = ''; L = $lines }, @{ N = "the jailed run on the user's sessions"; P = 'reuse: '; L = $reuseLines })
+        if ($elevated) { $sets += @{ N = 'the jailed run with --netns'; P = 'netns: '; L = $netLines } }
+        foreach ($set in $sets) {
+            $ends = @($set.L | Where-Object { $_ -match "^$([regex]::Escape($set.P))smb:\S+ done \d+ of \d+ opened$" })
+            if ($ends.Count -eq 0) { $opened += "$($set.N): no SMB end line"; continue }
+            foreach ($l in $ends) {
+                $null = $l -match ' done (\d+) of (\d+) opened$'
+                if ([int]$Matches[2] -eq 0) { $opened += "$($set.N): tried no form: $l" }
+                elseif ([int]$Matches[1] -ne 0) { $opened += "$($set.N): $l" }
+            }
+        }
+        Check ($allow.Bad.Count -eq 0 -and $opened.Count -eq 0) "what the jail reached is not the allowlist's: $(@($allow.Bad + $opened) -join ' | ')"
+        # Host hardening, when asked: fastfat stopped, the host's names
+        # listed again, fastfat started again as it was.
+        $fat = 'fastfat not tried: not asked (-ReachHostHardening)'
+        if ($ReachHostHardening) {
+            Check $elevated 'reach -ReachHostHardening needs an elevated PowerShell (it stops and starts a driver)'
+            $fat = Test-FastfatHardening $probe $base
+        }
+        "the allowlist held under a token whose restricting SIDs are $($sids -replace '^restricted:0 allowed ', ''): devices $($allow.Devices -join ', '), every other class 0, the checks as measured, no SMB form opened by a jailed run; $fat; the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks; SMB ($serverState; $shares; $($shareLines -join '; ')), in this order: jailed with --netns $smbNet; jailed $smbJailed; low integrity $smbLow; the operator $smbControl; jailed on the user's sessions ($($toShare.Count) to the share of $($before.Count) connections) $smbReuse; $($connLines -join '; ')"
+    } catch {
+        $stageErr = $_
     } finally {
         $listener.Stop()
         Stop-Jailed
         # The share goes with the stage, whatever happened.
-        if ($shareName) { Remove-ReachShare $shareName $shareDir }
+        if ($shareName) { $cleanup = Remove-ReachShare $shareName $shareDir }
     }
+    Complete-Stage $stageErr $cleanup
 }
 
 # Row 16 of docs/PORTING.md: only the jail's identity reaches a jail. A plain
@@ -3157,6 +3341,8 @@ function Stage-Helpers {
     $probe = Get-Probe
     $dir = Join-Path $base 'share'
     $name = New-ReachShareName
+    $stageErr = $null
+    $cleanup = $null
     try {
         $record = @(New-ReachShare $name $dir)
         # The share grants read (to Everyone, named in the system's
@@ -3194,9 +3380,12 @@ function Stage-Helpers {
         Check ($token -match 'token:0 allowed integrity 8192 administrators no privileges 1') "jail-probe medium is not the UAC-filtered token at medium integrity: $token (exit $($m[0]))"
         $sumMedium = Get-SmbAll $medium 'medium: ' 'the medium-integrity run' $name
         $sumOp = Get-SmbAll $op 'operator: ' 'the operator' $name
+    } catch {
+        $stageErr = $_
     } finally {
-        Remove-ReachShare $name $dir
+        $cleanup = Remove-ReachShare $name $dir
     }
+    Complete-Stage $stageErr $cleanup
     "$msg; reach's share probe without a jailer, nothing asserted of what opens: $name made and removed, its access and the canary's ACL as reach makes them, the operator read the canary through \\127.0.0.1; jail-probe low $sumLow; jail-probe medium (the UAC-filtered token, on the low run's sessions) $sumMedium; the operator $sumOp"
 }
 
