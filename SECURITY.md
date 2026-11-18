@@ -1388,6 +1388,16 @@ upstream Firecracker and its jailer.
     record did not settle it: its vCPU's run did not return under the emulated local APIC. Which one, and what each
     leaves reachable, is measured next (`fs-probe whp-token`,
     `fs-probe jail-variants`; docs/windows-jail-reach.md).
+  - **Option P's partition, kept for a start tried again.** kvm-ioctls can park the partition made before the
+    revert and give it back when a VM is dropped, for the process's next VM (upstream lets a failed
+    `InstanceStart` be tried again in one process). Before it is used again, everything WHP lets be read is read
+    back and compared with the partition as parked; a difference deletes it and the next VM is a named error
+    (`test_a_recycled_partition_is_as_a_fresh_one`, after a VM that ran a guest with an interrupt, dirty-page
+    tracking and its memory unmapped and mapped again; first run: CI). What WHP does not expose, such as the
+    hypervisor's own translation caches, cannot be compared. A parked partition is only ever used again inside the
+    same Firecracker process: the same jail, the same operator-given guest images and devices, the same principal.
+    It is never handed between processes or jails, so whatever the hypervisor keeps inside it stays within one
+    trust domain; that is an unknown of correctness, not of isolation. Firecracker does not park yet.
   - **The plan this replaces cannot be done.** ALL APPLICATION PACKAGES in place of the four groups:
     `CreateRestrictedToken` refuses it, ALL RESTRICTED APPLICATION PACKAGES and the `hypervisorPlatform`
     capability SID as restricting SIDs with error 87 (`fs-probe jail-variants`, `fs-probe whp-token`). WHP refuses

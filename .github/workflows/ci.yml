@@ -2029,6 +2029,14 @@ jobs:
           # allows that WHP refuses fails the test by name; then each gated
           # flag in the table and in the guest's own CPUID.
           alone whp::vcpu::fpu_tests::test_cr4_bits_kvm_takes_are_taken_by_whp
+          # The partition parked at a Firecracker process's start (whp/park.rs),
+          # given back after a VM that ran a guest (an interrupt taken, dirty
+          # pages tracked, its memory unmapped and mapped again): every
+          # property, the mapped pages, vCPUs 0 and 1 as made and a read of
+          # the old memory as a fresh partition's (PARKCMP lines; PARKREC the
+          # park's time and the guest's steps); a second VM at once refused.
+          # Alone: it parks this process's partition.
+          alone whp::vcpu::park_tests::test_a_recycled_partition_is_as_a_fresh_one
           # Before an x2APIC partition (X2APICREC, LAPICFMT lines): whether
           # WHP makes one; APIC_BASE and the guest's switch to x2APIC; each
           # x2APIC register MSR, done or #GP and by whom; a self-IPI, an IPI

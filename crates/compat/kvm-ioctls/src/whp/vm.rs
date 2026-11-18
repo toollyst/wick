@@ -203,6 +203,9 @@ pub(crate) struct VmInner {
     /// `tsc_write_lock` (`VcpuShared::synchronize_tsc`).
     pub(crate) tsc_sync: Mutex<super::tscsync::TscSync>,
     pub(crate) vcpus: Mutex<Vec<Weak<VcpuShared>>>,
+    /// The index of every vCPU made in the partition, which a parked
+    /// partition deletes before it is parked again ([`super::park`]).
+    pub(crate) made_vcpus: Mutex<Vec<u32>>,
     /// The irqfd watcher thread wakes on this to stop (with `stop` set) or
     /// to watch the irqfds registered since it last looked.
     stop_evt: EventFd,
@@ -322,6 +325,16 @@ impl Drop for VmInner {
             if h.thread().id() != std::thread::current().id() {
                 let _ = h.join();
             }
+        }
+        if super::park::is_parked(self.part) {
+            // The process's parked partition: given back, as it was parked,
+            // for a start tried again ([`super::park`]).
+            let vcpus = std::mem::take(&mut *self.made_vcpus.lock().unwrap());
+            let ranges: Vec<(u64, u64)> =
+                self.memory.lock().unwrap().values().filter(|s| s.size > 0).map(|s| (s.guest_phys, s.size)).collect();
+            let suspended = self.time_phase.load(Ordering::Acquire) != TIME_RUNNING;
+            super::park::recycle(self.part, &vcpus, &ranges, suspended);
+            return;
         }
         // SAFETY: deletes the partition this VM owns, after its vCPUs are gone.
         unsafe { whv::WHvDeletePartition(self.part) };
@@ -792,11 +805,22 @@ impl VmFd {
         // before the VM's own partition is made: the probe of the registers
         // a partition keeps, whose refused calls cost the calling thread
         // 32 KiB of stack for good (`regs::probe_partition`).
-        super::regs::probe_partition()?;
-        let (part, apic) = make_partition()?;
+        // A Firecracker process parked its partition at its start
+        // ([`super::park`]), where the probe ran too; any other makes one now.
+        let (part, apic) = match super::park::take()? {
+            Some(parked) => parked,
+            None => {
+                super::regs::probe_partition()?;
+                make_partition()?
+            }
+        };
         let inner = tsc_write_exit(part).and_then(|()| VmInner::setup(part, apic)).inspect_err(|_| {
-            // SAFETY: cleans up the partition we just created on failure.
-            unsafe { whv::WHvDeletePartition(part) };
+            if super::park::is_parked(part) {
+                super::park::untake(part);
+            } else {
+                // SAFETY: cleans up the partition we just created on failure.
+                unsafe { whv::WHvDeletePartition(part) };
+            }
         })?;
         let fd = Handle::new()?;
         Ok(VmFd {
@@ -861,7 +885,7 @@ pub(crate) fn probe_registers(names: &[WHV_REGISTER_NAME]) -> Result<Vec<bool>> 
 
 /// A new partition, configured as every VM's and set up ([`configure`]);
 /// deleted again if that fails.
-fn make_partition() -> Result<(WHV_PARTITION_HANDLE, super::apicmode::LocalApic)> {
+pub(crate) fn make_partition() -> Result<(WHV_PARTITION_HANDLE, super::apicmode::LocalApic)> {
     let part = ffi::create_partition()?;
     let apic = configure(part).inspect_err(|_| {
         // SAFETY: the partition made above, which nothing else has.
@@ -1197,6 +1221,7 @@ impl VmInner {
             deadlines: super::tscdeadline::Timers::new().map_err(io_err)?,
             tsc_sync: Mutex::new(super::tscsync::TscSync::new()),
             vcpus: Mutex::new(Vec::new()),
+            made_vcpus: Mutex::new(Vec::new()),
             stop_evt,
             stop: AtomicBool::new(false),
             watcher: Mutex::new(None),

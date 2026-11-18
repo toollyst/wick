@@ -227,6 +227,49 @@ pub(crate) unsafe fn WHvDeletePartition(partition: WHV_PARTITION_HANDLE) -> HRES
     }
 }
 
+/// `WHvDeleteVirtualProcessor` from `winhvplatform.dll`, loaded at first
+/// use: a parked partition's vCPUs go before it is parked again
+/// (`super::park`).
+///
+/// # Safety
+/// As the Windows function.
+pub(crate) unsafe fn WHvDeleteVirtualProcessor(partition: WHV_PARTITION_HANDLE, vpindex: u32) -> HRESULT {
+    type F = unsafe extern "system" fn(WHV_PARTITION_HANDLE, u32) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvDeleteVirtualProcessor")) {
+        // SAFETY: the address of `WHvDeleteVirtualProcessor`, whose signature `F` is.
+        Some(p) => unsafe { std::mem::transmute::<usize, F>(p)(partition, vpindex) },
+        None => unavailable(Dll::Platform),
+    }
+}
+
+/// `WHvGetPartitionCounters` from `winhvplatform.dll`, loaded at first use:
+/// the memory counters say how many pages a partition maps (`super::park`).
+///
+/// # Safety
+/// As the Windows function.
+pub(crate) unsafe fn WHvGetPartitionCounters(
+    partition: WHV_PARTITION_HANDLE,
+    counterset: WHV_PARTITION_COUNTER_SET,
+    buffer: *mut core::ffi::c_void,
+    buffersizeinbytes: u32,
+    byteswritten: *mut u32,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(
+        WHV_PARTITION_HANDLE,
+        WHV_PARTITION_COUNTER_SET,
+        *mut core::ffi::c_void,
+        u32,
+        *mut u32,
+    ) -> HRESULT;
+    static P: OnceLock<Option<usize>> = OnceLock::new();
+    match *P.get_or_init(|| proc_address(Dll::Platform, c"WHvGetPartitionCounters")) {
+        // SAFETY: the address of `WHvGetPartitionCounters`, whose signature `F` is.
+        Some(p) => unsafe { std::mem::transmute::<usize, F>(p)(partition, counterset, buffer, buffersizeinbytes, byteswritten) },
+        None => unavailable(Dll::Platform),
+    }
+}
+
 /// `WHvDeleteTrigger` from `winhvplatform.dll`, loaded at first use; as
 /// [`WHvCreateTrigger`], for the record only.
 ///

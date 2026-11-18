@@ -491,6 +491,21 @@ to when the partition is made. What it brings, and what the next record (`jail-v
    load and registry read that fails is recorded, which gives the list to preload.
 2. With WHP (CI's Windows runner, else a PC): the same through a boot, snapshot, network, vsock and block devices,
    and WHP's devices and their security.
+   Option P's partition, made before the revert: kvm-ioctls parks it (crates/compat/kvm-ioctls/src/whp/park.rs,
+   `park_partition`), with the register probe; the VM takes it. A VM dropped gives it back for a start tried again,
+   as upstream lets a failed `InstanceStart` be tried again in the same process: its vCPUs deleted, its memory
+   unmapped, partition time running, the four properties settable after set-up written back. Then every property
+   and the mapped-page counters are read back and compared with the partition as parked; a difference or a failed
+   step deletes it, and the process's next VM is an error that says to start it again. A second VM while the first
+   has the partition is that error too. Firecracker does not park yet. Test:
+   `test_a_recycled_partition_is_as_a_fresh_one` in CI's WHP step, alone in its process: a partition given back
+   after a VM that ran a guest (an interrupt taken, dirty pages tracked, its memory unmapped and mapped again),
+   compared with a fresh one by every property, the mapped pages, vCPUs 0 and 1 as made (every KVM getter, the MSRs
+   but three running counters, InterruptControllerState2, the pending interruption, event and activity state) and
+   a read of the old memory (first run: CI). What WHP does not expose (the hypervisor's translation caches and
+   objects of its own) cannot be compared: a parked partition is only ever used again by the same process, for the
+   same jail, guest images, devices and principal, and never handed to another process or jail, so that is an
+   unknown of correctness, not of isolation.
 3. The jailer change, and a stage of `tools/windows/jailer-test.ps1` that fails when the jailed token opens a device
    outside an explicit list, any ALPC port or service pipe, or can make a pipe or a mailslot. Every jailer-test
    configuration is run again.

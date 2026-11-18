@@ -296,6 +296,18 @@ sleeps while no vCPU is in the guest and ends with the microVM. It is an ordinar
 waits for a CPU like the vCPUs, and the steal reaches the guest later by that wait (not closed). Cost and lateness:
 docs/COMPATIBILITY.md, PV time.
 
+A parked WHP partition (`crates/compat/kvm-ioctls/src/whp/park.rs`): a token whose only restricting SID is the
+jail's own cannot open `\Device\VidExo`, so under it no partition can be made, while one made and set up before the
+revert runs (docs/windows-jail-reach.md, option P). `park_partition` makes the process's partition early, with the
+register probe that needs one of its own; `create_vm` takes it. Its properties that are fixed at set-up are the
+host's, never a VM's (processor count `MAX_VCPUS`, features, XSAVE, the local APIC mode, the exit kinds); the four
+WHP lets change after set-up are set by the VM as before. A dropped VM gives the partition back for the process's
+next VM, as upstream lets a failed `InstanceStart` be tried again: its vCPUs deleted, its memory unmapped, time
+running, the four properties written back, then every property and the mapped-page counters read back and compared
+with the partition as parked. A difference, or a step that fails, deletes it, and the next VM is a named error
+saying to start the process again, as is a second VM while the first holds it. The partition is never handed to
+another process or jail. Firecracker does not park yet.
+
 ## The POSIX layer on Windows
 
 Upstream and the external crates (`vmm-sys-util`, `event-manager`,

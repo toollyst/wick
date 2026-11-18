@@ -647,6 +647,7 @@ pub(crate) fn create(inner: Arc<VmInner>, id: u64) -> Result<VcpuFd> {
     let index = u32::try_from(id).map_err(|_| Error::new(libc::EINVAL))?;
     // SAFETY: creates a virtual processor in this VM's partition.
     super::ffi::hr(unsafe { whv::WHvCreateVirtualProcessor(inner.part, index, 0) })?;
+    inner.made_vcpus.lock().unwrap().push(index);
     // An application processor waits for the guest's INIT/SIPI, which WHP's
     // local APIC handles, as KVM's APs do; only the BSP (vCPU 0) runs from
     // the registers Firecracker sets.
@@ -16054,5 +16055,313 @@ mod lapic_format_tests {
             assert_eq!(unkept_line(&mut seen, index, true), Unkept::Said, "past the bound: {index:#x}");
         }
         assert_eq!(seen.len(), UNKEPT_NAMED + 1, "what is kept stays bounded");
+    }
+}
+
+// A parked partition given back after a VM is as a new one (`super::park`):
+// the state a VM leaves in it, a guest that ran with an interrupt taken,
+// dirty pages tracked and its memory unmapped and mapped again, is gone,
+// by everything WHP reads back. Alone in its process: it parks the
+// process's partition (CI's WHP step).
+#[cfg(test)]
+mod park_tests {
+    use super::super::{ffi, Kvm, VmFd};
+    use super::*;
+    use kvm_bindings::{kvm_msi, kvm_msr_entry, kvm_segment, Msrs, KVM_MEM_LOG_DIRTY_PAGES};
+
+    const MEM: usize = 2 << 20;
+    /// What a fresh VM maps: the page tables, the GDT, the IDT and the code.
+    const SMALL: u64 = 0x10000;
+    const GDT: u64 = 0x4000;
+    const IDT: u64 = 0x5000;
+    /// The probe of [`observe`]: a read of [`OLD_GPA`], `out 0x82, al`, `jmp $`.
+    const PROBE: u64 = 0x6000;
+    /// The guest of [`run_a_guest`]: `sti`, a write, `out 0x80, al`, a wait for
+    /// the interrupt's handler, `out 0x81, al`, `jmp $`.
+    const CODE: u64 = 0x6100;
+    /// The handler of vector [`VECTOR`]: a write, `iretq`.
+    const HANDLER: u64 = 0x7000;
+    const WRITTEN: u64 = 0x8000;
+    const VECTOR: u8 = 0x30;
+    /// Mapped only by the VM that ran a guest (its 2 MiB slot).
+    const OLD_GPA: u64 = 0x10_0000;
+
+    fn put(m: *mut u8, at: u64, bytes: &[u8]) {
+        // SAFETY: within the test's mapping.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), m.add(at as usize), bytes.len()) };
+    }
+
+    /// Guest memory: long mode's tables (the first 2 MiB identity mapped),
+    /// a GDT (64-bit code at 8, data at 0x10), an IDT with [`HANDLER`] at
+    /// [`VECTOR`], the probe and the guest.
+    fn guest() -> *mut u8 {
+        // SAFETY: anonymous memory for the test, unmapped by the caller.
+        let p = unsafe {
+            libc::mmap(std::ptr::null_mut(), MEM, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        let m = p.cast::<u8>();
+        let q = |at: u64, v: u64| put(m, at, &v.to_le_bytes());
+        q(0x1000, 0x2000 | 3);
+        q(0x2000, 0x3000 | 3);
+        q(0x3000, 0x83);
+        q(GDT + 8, 0x00AF_9A00_0000_FFFF);
+        q(GDT + 16, 0x00CF_9200_0000_FFFF);
+        let low = (HANDLER & 0xFFFF) | (8 << 16) | (0x8E << 40) | (((HANDLER >> 16) & 0xFFFF) << 48);
+        q(IDT + u64::from(VECTOR) * 16, low);
+        q(IDT + u64::from(VECTOR) * 16 + 8, HANDLER >> 32);
+        // mov al, [OLD_GPA]; out 0x82, al; jmp $
+        let old = u32::try_from(OLD_GPA).unwrap().to_le_bytes();
+        put(m, PROBE, &[&[0x8A, 0x04, 0x25][..], &old, &[0xE6, 0x82, 0xEB, 0xFE]].concat());
+        put(
+            m,
+            CODE,
+            &[
+                0xFB, // sti
+                0xC6, 0x04, 0x25, 0x00, 0x80, 0x00, 0x00, 0x01, // mov byte [WRITTEN], 1
+                0xE6, 0x80, // out 0x80, al
+                0x80, 0x3C, 0x25, 0x01, 0x80, 0x00, 0x00, 0x00, // cmp byte [WRITTEN + 1], 0
+                0x74, 0xF6, // je back to the cmp
+                0xE6, 0x81, // out 0x81, al
+                0xEB, 0xFE, // jmp $
+            ],
+        );
+        put(m, HANDLER, &[0xC6, 0x04, 0x25, 0x01, 0x80, 0x00, 0x00, 0x02, 0x48, 0xCF]);
+        m
+    }
+
+    fn segment(selector: u16, type_: u8, l: u8, db: u8) -> kvm_segment {
+        kvm_segment { base: 0, limit: 0xFFFF_FFFF, selector, type_, present: 1, dpl: 0, db, s: 1, l, g: 1, ..Default::default() }
+    }
+
+    /// vCPU 0 in long mode at `rip`, its local APIC on.
+    fn start(vcpu: &VcpuFd, rip: u64) {
+        let mut s = vcpu.get_sregs().unwrap();
+        s.cr0 = 0x8000_0031;
+        s.cr3 = 0x1000;
+        s.cr4 = 0x220;
+        s.efer = 0x500;
+        s.cs = segment(8, 11, 1, 0);
+        let data = segment(0x10, 3, 0, 1);
+        (s.ds, s.es, s.fs, s.gs, s.ss) = (data, data, data, data, data);
+        s.tr.type_ = 11;
+        s.tr.present = 1;
+        s.tr.s = 0;
+        (s.gdt.base, s.gdt.limit) = (GDT, 23);
+        (s.idt.base, s.idt.limit) = (IDT, 0xFFF);
+        vcpu.set_sregs(&s).unwrap();
+        let mut lapic = vcpu.get_lapic().unwrap();
+        // The spurious vector register (0xF0): the APIC on, vector 0xFF.
+        for (i, b) in 0x1FFu32.to_le_bytes().iter().enumerate() {
+            lapic.regs[0xF0 + i] = b.cast_signed();
+        }
+        vcpu.set_lapic(&lapic).unwrap();
+        vcpu.set_regs(&kvm_regs { rip, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+    }
+
+    /// The exits of runs until an `out` to a port in 0x80..=0x82 (at most 8,
+    /// and a kick 5 s after the first run began).
+    fn run_to_out(vcpu: &mut VcpuFd) -> String {
+        let watchdog = super::Watchdog::arm(vcpu);
+        let mut exits = Vec::new();
+        while exits.len() < 8 {
+            let (line, more) = match vcpu.run() {
+                Ok(VcpuExit::IoOut(port, _)) if (0x80..=0x82).contains(&port) => (format!("IoOut {port:#x}"), false),
+                Ok(VcpuExit::IoOut(port, _)) => (format!("IoOut {port:#x}"), true),
+                Ok(VcpuExit::MmioRead(address, data)) => {
+                    data.fill(0);
+                    (format!("MmioRead {address:#x}"), true)
+                }
+                Ok(VcpuExit::MmioWrite(address, _)) => (format!("MmioWrite {address:#x}"), true),
+                Ok(VcpuExit::Hlt) => ("Hlt".to_string(), false),
+                Ok(_) => ("(another)".to_string(), false),
+                Err(e) if e.errno() == libc::EINTR => ("none within 5 s (kicked)".to_string(), false),
+                Err(e) => (format!("run failed, errno {}", e.errno()), false),
+            };
+            exits.push(line);
+            if !more {
+                break;
+            }
+        }
+        drop(watchdog);
+        vcpu.set_kvm_immediate_exit(0);
+        exits.join(", ")
+    }
+
+    fn slot(vm: &VmFd, slot: u32, flags: u32, size: u64, m: *mut u8) {
+        // SAFETY: the test's memory, mapped while the VM has it.
+        unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot,
+                flags,
+                guest_phys_addr: 0,
+                memory_size: size,
+                userspace_addr: m as u64,
+            })
+        }
+        .unwrap();
+    }
+
+    /// Everything WHP and the backend read back of a new vCPU, by name; the
+    /// counters that run from its creation left out: the TSC (MSR 0x10),
+    /// MPERF and APERF (0xE7, 0xE8).
+    fn vcpu_state(kvm: &Kvm, vcpu: &VcpuFd) -> Vec<(String, String)> {
+        let mut out = vec![
+            ("regs".to_string(), format!("{:?}", vcpu.get_regs().unwrap())),
+            ("sregs".to_string(), format!("{:?}", vcpu.get_sregs().unwrap())),
+            ("fpu".to_string(), format!("{:?}", vcpu.get_fpu().unwrap())),
+            ("lapic".to_string(), format!("{:?}", vcpu.get_lapic().unwrap().regs)),
+            ("xcrs".to_string(), format!("{:?}", vcpu.get_xcrs().unwrap())),
+            ("debugregs".to_string(), format!("{:?}", vcpu.get_debug_regs().unwrap())),
+            ("mp_state".to_string(), format!("{:?}", vcpu.get_mp_state().unwrap())),
+            ("vcpu_events".to_string(), format!("{:?}", vcpu.get_vcpu_events().unwrap())),
+            // SAFETY: a vCPU of a live VM.
+            ("xsave".to_string(), format!("{:?}", unsafe { vcpu.get_xsave() }.unwrap().region)),
+        ];
+        let indices: Vec<kvm_msr_entry> = kvm
+            .get_msr_index_list()
+            .unwrap()
+            .as_slice()
+            .iter()
+            .filter(|&&i| ![0x10, 0xE7, 0xE8].contains(&i))
+            .map(|&index| kvm_msr_entry { index, ..Default::default() })
+            .collect();
+        let mut msrs = Msrs::from_entries(&indices).unwrap();
+        let n = vcpu.get_msrs(&mut msrs).unwrap();
+        out.push(("msrs".to_string(), format!("{n} read: {:?}", msrs.as_slice())));
+        let (part, vp) = (vcpu.part(), vcpu.vp());
+        out.push(("InterruptControllerState2".to_string(), format!("{:?}", state2(part, vp))));
+        for (name, reg) in [
+            ("PendingInterruption", whv::WHvRegisterPendingInterruption),
+            ("InternalActivityState", whv::WHvRegisterInternalActivityState),
+            ("PendingEvent", whv::WHvRegisterPendingEvent),
+        ] {
+            // SAFETY: a register value is plain data; its 128 bits are read.
+            let v = ffi::get_register(part, vp, reg).map(|v| unsafe { v.Reg128.Anonymous.Low64 });
+            out.push((name.to_string(), format!("{v:?}")));
+        }
+        out
+    }
+
+    fn state2(part: whv::WHV_PARTITION_HANDLE, vp: u32) -> std::result::Result<Vec<u8>, i32> {
+        let mut buf = vec![0u8; 4096];
+        let mut written = 0u32;
+        // SAFETY: an output buffer of the size passed.
+        let hres = unsafe {
+            whv::WHvGetVirtualProcessorState(
+                part,
+                vp,
+                whv::WHvVirtualProcessorStateTypeInterruptControllerState2,
+                buf.as_mut_ptr().cast(),
+                4096,
+                &mut written,
+            )
+        };
+        if hres == 0 {
+            buf.truncate(written as usize);
+            Ok(buf)
+        } else {
+            Err(hres)
+        }
+    }
+
+    /// What a new VM shows: its partition's properties and mapped pages
+    /// (before any memory), vCPUs 0 and 1 as made, then the probe's read of
+    /// [`OLD_GPA`] (unmapped here), and a dirty-page query of the 2 MiB a
+    /// VM before may have mapped.
+    fn observe(kvm: &Kvm) -> Vec<(String, String)> {
+        let vm = kvm.create_vm().unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        let ap = vm.create_vcpu(1).unwrap();
+        let part = vcpu.part();
+        let mut out = Vec::new();
+        let props = super::super::park::Properties::of(part);
+        for ((_, name), v) in super::super::park::PROPERTIES.iter().zip(&props.0) {
+            if *name != "ReferenceTime" {
+                out.push((format!("property {name}"), format!("{v:?}")));
+            }
+        }
+        out.push(("mapped pages".to_string(), format!("{:?}", super::super::park::mapped_pages(part))));
+        for (who, v) in [("vCPU 0", &vcpu), ("vCPU 1", &ap)] {
+            for (name, state) in vcpu_state(kvm, v) {
+                out.push((format!("{who} {name}"), state));
+            }
+        }
+        let m = guest();
+        slot(&vm, 0, 0, SMALL, m);
+        start(&vcpu, PROBE);
+        out.push(("the probe's read of the old GPA".to_string(), run_to_out(&mut vcpu)));
+        let mut bitmap = vec![0u64; MEM / 4096 / 64];
+        // SAFETY: a bitmap of one bit per page of the range.
+        let hres = unsafe {
+            whv::WHvQueryGpaRangeDirtyBitmap(part, 0, MEM as u64, bitmap.as_mut_ptr(), u32::try_from(bitmap.len() * 8).unwrap())
+        };
+        out.push(("a dirty-page query of the old range".to_string(), format!("{:#010x}", hres.cast_unsigned())));
+        drop((vcpu, ap, vm));
+        // SAFETY: the test's memory; no VM has it now.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        out
+    }
+
+    /// A VM that runs a guest: vCPU 0 writes guest memory with dirty pages
+    /// tracked, takes an interrupt, and the 2 MiB slot is unmapped and
+    /// mapped again (smaller, as a balloon's memory goes and comes back);
+    /// vCPU 1 is made and never runs. The steps, as lines.
+    fn run_a_guest(kvm: &Kvm) -> Vec<String> {
+        let vm = kvm.create_vm().unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        let _ap = vm.create_vcpu(1).unwrap();
+        let m = guest();
+        slot(&vm, 0, KVM_MEM_LOG_DIRTY_PAGES, MEM as u64, m);
+        start(&vcpu, CODE);
+        let mut lines = vec![format!("to its write: {}", run_to_out(&mut vcpu))];
+        let msi = kvm_msi { address_lo: 0xFEE0_0000, data: u32::from(VECTOR), ..Default::default() };
+        lines.push(format!("the MSI: {:?}", vm.signal_msi(msi)));
+        lines.push(format!("to the handler's write: {}", run_to_out(&mut vcpu)));
+        // SAFETY: within the test's mapping.
+        let written = unsafe { [*m.add(WRITTEN as usize), *m.add(WRITTEN as usize + 1)] };
+        lines.push(format!("the guest's writes: {written:?}"));
+        let dirty = vm.get_dirty_log(0, MEM).unwrap();
+        lines.push(format!("dirty pages: {}", dirty.iter().map(|w| w.count_ones()).sum::<u32>()));
+        slot(&vm, 0, 0, 0, m);
+        slot(&vm, 0, 0, SMALL, m);
+        lines.push("the slot unmapped and mapped again".to_string());
+        assert_eq!(written, [1, 2], "the guest did not run its write and its interrupt's: {lines:?}");
+        drop((vcpu, _ap, vm));
+        // SAFETY: the test's memory; no VM has it now.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
+        lines
+    }
+
+    #[test]
+    #[ignore = "needs WHP, alone in its process (it parks the process's partition): CI's WHP step"]
+    fn test_a_recycled_partition_is_as_a_fresh_one() {
+        assert!(!super::super::park::partition_parked());
+        let kvm = Kvm::new().unwrap();
+        let fresh = observe(&kvm);
+        let before = std::time::Instant::now();
+        super::super::park::park_partition().unwrap();
+        eprintln!("PARKREC parked in {} us (the register probe and the partition)", before.elapsed().as_micros());
+        for line in run_a_guest(&kvm) {
+            eprintln!("PARKREC a guest that ran: {line}");
+        }
+        assert!(super::super::park::partition_parked(), "the partition was not given back (its line above)");
+        let recycled = observe(&kvm);
+        assert!(super::super::park::partition_parked(), "the partition was not given back a second time");
+        assert_eq!(fresh.len(), recycled.len());
+        let mut differ = Vec::new();
+        for ((name, a), (_, b)) in fresh.iter().zip(&recycled) {
+            eprintln!("PARKCMP {name}: {}", if a == b { "the same" } else { "DIFFERS" });
+            if a != b {
+                differ.push(format!("{name}: fresh {a}, given back {b}"));
+            }
+        }
+        assert!(differ.is_empty(), "a partition given back differs from a fresh one: {differ:#?}");
+        // A second VM while the first has the partition: refused, named.
+        let vm = kvm.create_vm().unwrap();
+        let second = kvm.create_vm();
+        assert_eq!(second.err().map(|e| e.errno()), Some(libc::EBUSY));
+        drop(vm);
+        assert!(super::super::park::partition_parked());
     }
 }

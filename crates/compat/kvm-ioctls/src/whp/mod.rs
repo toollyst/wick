@@ -41,6 +41,7 @@ mod guest_mem;
 mod irqchip;
 mod kvmmsr;
 mod mce;
+mod park;
 mod pvclock;
 mod regs;
 mod tscdeadline;
@@ -57,6 +58,7 @@ use wick_os::fd::{AsRawFd, RawFd};
 use windows_sys::Win32::System::Threading::CreateEventW;
 
 pub use cap::Cap;
+pub use park::{park_partition, partition_parked};
 pub use vcpu::VcpuFd;
 pub use vm::VmFd;
 pub use vmm_sys_util::errno::Error;
