@@ -53,9 +53,12 @@ pub fn give_share(share: &Path) {
 
 /// Why this host refuses a server that is not root its user namespace, if
 /// it does (the sysctls of Ubuntu's AppArmor restriction and of the
-/// namespace limit).
+/// namespace limit). `WICK_FS_TEST_USERNS_GRANTED=1` says an AppArmor
+/// profile grants the built wick-fsd and confine_probe user namespaces
+/// whatever the sysctl (the CI fs job's step): then nothing is restricted,
+/// and a refusal fails the test.
 pub fn userns_restricted() -> Option<String> {
-    if sys::euid() == 0 {
+    if sys::euid() == 0 || std::env::var_os("WICK_FS_TEST_USERNS_GRANTED").is_some_and(|v| v == "1") {
         return None;
     }
     let read = |p: &str| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string());

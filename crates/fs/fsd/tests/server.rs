@@ -85,7 +85,7 @@ fn test_confined_status() {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
     assert_eq!(status_field(&status, "Seccomp:"), "2", "seccomp filter mode");
     assert_eq!(status_field(&status, "NoNewPrivs:"), "1");
-    for cap in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
+    for cap in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:", "CapBnd:"] {
         assert_eq!(status_field(&status, cap), "0000000000000000", "{cap}");
     }
     if sys_euid() == 0 {
@@ -115,11 +115,73 @@ fn test_confined_status() {
             assert_ne!(theirs, ours, "{ns} namespace");
         }
     }
+    // The waiting parent, outside the pid namespace: the same ids, no
+    // capabilities, no_new_privs and a filter of its own.
+    let parent = r.server.child.id();
+    let status = std::fs::read_to_string(format!("/proc/{parent}/status")).unwrap();
+    assert_eq!(status_field(&status, "Seccomp:"), "2", "the parent's seccomp filter mode");
+    assert_eq!(status_field(&status, "NoNewPrivs:"), "1", "the parent");
+    for cap in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:", "CapBnd:"] {
+        assert_eq!(status_field(&status, cap), "0000000000000000", "the parent's {cap}");
+    }
+    let uid = if sys_euid() == 0 { "65534".to_string() } else { sys_euid().to_string() };
+    assert!(status_field(&status, "Uid:").split_whitespace().all(|u| u == uid), "the parent: {status}");
     let mut g = G::over(r);
     g.getattr(ROOT, None).unwrap();
     let (status, err) = g.s.finish();
     assert!(status.success(), "{status:?}: {err}");
     assert!(err.contains("layer refusals 0"), "{err}");
+}
+
+/// A guest's MKDIR and SETATTR with every special bit pass the filter's
+/// mkdirat and fchmod rules (`SERVER_SYSCALLS`): the host gets 0o700 and
+/// the permission bits, the record the guest's mode.
+#[test]
+fn test_a_guest_s_special_mode_bits_pass_the_filter() {
+    let s = setup("srv-special");
+    let Some(r) = confined(&s, &[]) else { return };
+    let mut g = G::over(r);
+    let (e, out) = g.call(wick_fsd::fuse::Opcode::Mkdir, ROOT, &[&le32(0o7777), &le32(0), &name(b"d")]);
+    assert_eq!(e, 0, "MKDIR 0o7777");
+    let d = u64_at(&out, 0);
+    assert_eq!(g.getattr(d, None).unwrap().mode & 0o7777, 0o7777);
+    let (f, fh) = g.create(ROOT, b"f");
+    g.release(f, fh);
+    let a = g.setattr(f, common::drive::FATTR_MODE, 0, 0o6777, None).unwrap();
+    assert_eq!(a.mode & 0o7777, 0o6777);
+    let a = g.setattr(d, common::drive::FATTR_MODE, 0, 0o1755, None).unwrap();
+    assert_eq!(a.mode & 0o7777, 0o1755);
+    let (status, err) = g.s.finish();
+    assert!(status.success(), "{status:?}: {err}");
+    assert!(err.contains("layer refusals 0,"), "{err}");
+}
+
+/// Killing wick-fsd (the waiting parent) ends the confined server: its
+/// parent-death signal holds after its drop to --uid/--gid, which clears it
+/// (`commit_creds`, kernel/cred.c), so a root-started server armed it again.
+#[test]
+fn test_the_confined_server_dies_with_its_parent() {
+    let s = setup("srv-death");
+    let Some(mut r) = confined(&s, &[]) else { return };
+    let pid = r.server.confined_pid().expect("the confined child");
+    r.server.child.kill().unwrap();
+    r.server.child.wait().unwrap();
+    let start = std::time::Instant::now();
+    let gone = loop {
+        // Gone, or a zombie waiting for init to reap it.
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|st| st.rfind(')').map(|i| st[i + 2..].chars().next()))
+            .flatten();
+        if matches!(state, None | Some('Z' | 'X')) {
+            break true;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(gone, "the confined server (pid {pid}) outlived its parent");
 }
 
 fn sys_euid() -> u32 {
@@ -242,23 +304,193 @@ fn test_refused_without_id_drop() {
         eprintln!("ran nothing: a server that is not root drops no ids");
         return;
     }
-    refused_when("srv-drop", &[(nr::SETRESUID, None)], EPERM, "dropping to --uid/--gid");
+    refused_when("srv-drop", &[(nr::SETRESUID, None)], EPERM, "the waiting parent: dropping to --uid/--gid");
 }
 
 #[test]
 fn test_refused_without_capability_drop() {
-    refused_when("srv-capset", &[(nr::CAPSET, None)], EPERM, "dropping the capabilities");
+    refused_when("srv-capset", &[(nr::CAPSET, None)], EPERM, "the waiting parent: dropping the capabilities");
 }
 
 #[test]
 fn test_refused_without_no_new_privs() {
     // prctl(PR_SET_NO_NEW_PRIVS, ...) only (38): the other prctl calls work.
-    refused_when("srv-nnp", &[(nr::PRCTL, Some((0, 38)))], EPERM, "PR_SET_NO_NEW_PRIVS");
+    refused_when("srv-nnp", &[(nr::PRCTL, Some((0, 38)))], EPERM, "the waiting parent: PR_SET_NO_NEW_PRIVS");
 }
 
 #[test]
 fn test_refused_without_seccomp() {
-    refused_when("srv-seccomp", &[(nr::SECCOMP, None)], EPERM, "the seccomp filter");
+    refused_when("srv-seccomp", &[(nr::SECCOMP, None)], EPERM, "the waiting parent: the seccomp filter");
+}
+
+/// What a supervised run saw ([`in_the_child`]).
+struct Seen {
+    served: bool,
+    err: String,
+    /// The calls the confined child made of the one supervised.
+    child_calls: usize,
+    /// The test's own filter needed `no_new_privs` (no `CAP_SYS_ADMIN`), so
+    /// the server had it before its own step.
+    nnp_before: bool,
+}
+
+/// Runs a server whose confined child (and only it: its waiting parent's
+/// same call is made as asked) gets `answer` for its `nth` call of `call`
+/// (every one for `None`); `None` where this host refuses the user
+/// namespace first. The refusal tests above fail the first process to make
+/// a call, which for a step both make is the waiting parent; these reach
+/// the child's own step (docs/design-fs.md §6.1, the refusal tests).
+fn in_the_child(tag: &str, call: (std::ffi::c_long, Option<(u32, u32)>), nth: Option<usize>, answer: c::Answer) -> Option<Seen> {
+    let s = setup(tag);
+    let args = base_args(&s.share, &s.socket);
+    let mut supervisor = None;
+    let server = Server::start(&args, |cmd| {
+        let sock = c::command_with_supervisor(cmd, c::notify_program(&[call])).unwrap();
+        let mut seen = 0;
+        supervisor = Some(c::supervise(sock, move |made| {
+            if !made.nested {
+                return c::Answer::Continue;
+            }
+            seen += 1;
+            if nth.is_none_or(|n| n == seen) { answer } else { c::Answer::Continue }
+        }));
+    });
+    let (served, err) = match Remote::connect(server) {
+        Ok(r) => {
+            let mut g = G::over(r);
+            g.getattr(ROOT, None).unwrap();
+            let (_, err) = g.s.finish();
+            (true, err)
+        }
+        Err((mut server, _)) => {
+            let (status, err) = server.wait();
+            assert!(!status.success(), "{status:?}: {err}");
+            (false, err)
+        }
+    };
+    let (calls, nnp_before) = supervisor.unwrap().join().unwrap();
+    if !served && let Some(restricted) = userns_restricted() && err.contains("unshare of the namespaces") {
+        eprintln!("ran nothing confined: {restricted}: {err}");
+        return None;
+    }
+    let child_calls = calls.iter().filter(|c| c.nested).count();
+    Some(Seen {
+        served,
+        err,
+        child_calls,
+        nnp_before,
+    })
+}
+
+/// The child's own step failed: refused, naming it, not the parent's.
+fn child_refused(seen: &Seen, nth: usize, step: &str) {
+    assert!(seen.child_calls >= nth, "the child made the call {} times, not {nth}: {}", seen.child_calls, seen.err);
+    assert!(!seen.served, "served with the child's {step} failing: {}", seen.err);
+    assert!(seen.err.contains(&format!("confinement: {step} failed")), "{step}: {}", seen.err);
+    assert!(!seen.err.contains("the waiting parent"), "{}", seen.err);
+}
+
+/// The child's step said it was done and was not: the read-back refuses.
+fn read_back_refused(seen: &Seen, what: &str) {
+    assert!(seen.child_calls >= 1, "the child never made the call: {}", seen.err);
+    assert!(!seen.served, "served although {what}: {}", seen.err);
+    assert!(seen.err.contains("read back after the steps, what did not hold") && seen.err.contains(what), "{what}: {}", seen.err);
+}
+
+const PR_SET_PDEATHSIG: u32 = 1;
+const PR_SET_DUMPABLE: u32 = 4;
+const PR_CAPBSET_DROP: u32 = 24;
+const PR_SET_NO_NEW_PRIVS: u32 = 38;
+
+#[test]
+fn test_the_child_s_parent_death_signal_steps() {
+    let call = (nr::PRCTL, Some((0, PR_SET_PDEATHSIG)));
+    let Some(seen) = in_the_child("srv-c-pdeath1", call, Some(1), c::Answer::Fail(EPERM)) else { return };
+    child_refused(&seen, 1, "PR_SET_PDEATHSIG");
+    let seen = in_the_child("srv-c-pdeath2", call, Some(2), c::Answer::Fail(EPERM)).unwrap();
+    child_refused(&seen, 2, "PR_SET_PDEATHSIG after the id drop");
+    let seen = in_the_child("srv-c-pdeath0", call, None, c::Answer::Pretend).unwrap();
+    read_back_refused(&seen, "the parent-death signal is 0, not SIGKILL");
+}
+
+#[test]
+fn test_the_child_s_dumpable_steps() {
+    let call = (nr::PRCTL, Some((0, PR_SET_DUMPABLE)));
+    let Some(seen) = in_the_child("srv-c-dump1", call, Some(1), c::Answer::Fail(EPERM)) else { return };
+    child_refused(&seen, 1, "PR_SET_DUMPABLE");
+    let seen = in_the_child("srv-c-dump2", call, Some(2), c::Answer::Fail(EPERM)).unwrap();
+    child_refused(&seen, 2, "PR_SET_DUMPABLE after the id drop");
+    let seen = in_the_child("srv-c-dump0", call, None, c::Answer::Pretend).unwrap();
+    // As root the id drop sets dumpable to fs.suid_dumpable (commit_creds):
+    // where that is 0 the child is not dumpable without its own call, and
+    // the read-back finds it so.
+    let suid_dumpable = std::fs::read_to_string("/proc/sys/fs/suid_dumpable").unwrap();
+    if sys_euid() == 0 && suid_dumpable.trim() == "0" {
+        assert!(seen.served && seen.child_calls >= 2, "{}", seen.err);
+    } else {
+        read_back_refused(&seen, "the process is dumpable");
+    }
+}
+
+#[test]
+fn test_the_child_s_id_drop() {
+    if sys_euid() != 0 {
+        eprintln!("ran nothing: a server that is not root drops no ids");
+        return;
+    }
+    let call = (nr::SETRESUID, None);
+    let seen = in_the_child("srv-c-drop1", call, Some(1), c::Answer::Fail(EPERM)).unwrap();
+    child_refused(&seen, 1, "dropping to --uid/--gid");
+    // Said done and not: drop_ids reads its ids back itself.
+    let seen = in_the_child("srv-c-drop0", call, None, c::Answer::Pretend).unwrap();
+    child_refused(&seen, 1, "dropping to --uid/--gid");
+}
+
+#[test]
+fn test_the_child_s_capability_drop() {
+    let call = (nr::CAPSET, None);
+    let Some(seen) = in_the_child("srv-c-capset1", call, Some(1), c::Answer::Fail(EPERM)) else { return };
+    child_refused(&seen, 1, "dropping the capabilities");
+    let seen = in_the_child("srv-c-capset0", call, None, c::Answer::Pretend).unwrap();
+    if sys_euid() == 0 {
+        // The drop from root to 65534 cleared them already
+        // (security/commoncap.c, cap_emulate_setxuid): what holds is none.
+        assert!(seen.served, "{}", seen.err);
+    } else {
+        read_back_refused(&seen, "capabilities (effective, permitted, inheritable) are left");
+    }
+    let bounding = (nr::PRCTL, Some((0, PR_CAPBSET_DROP)));
+    let seen = in_the_child("srv-c-bset1", bounding, Some(1), c::Answer::Fail(EPERM)).unwrap();
+    child_refused(&seen, 1, "dropping the bounding set");
+    let seen = in_the_child("srv-c-bset0", bounding, None, c::Answer::Pretend).unwrap();
+    read_back_refused(&seen, "the bounding set holds");
+}
+
+#[test]
+fn test_the_child_s_no_new_privs() {
+    let call = (nr::PRCTL, Some((0, PR_SET_NO_NEW_PRIVS)));
+    let Some(seen) = in_the_child("srv-c-nnp1", call, Some(1), c::Answer::Fail(EPERM)) else { return };
+    child_refused(&seen, 1, "PR_SET_NO_NEW_PRIVS");
+    let seen = in_the_child("srv-c-nnp0", call, None, c::Answer::Pretend).unwrap();
+    if seen.nnp_before {
+        // The test's own filter needed it: it held before the step.
+        assert!(seen.served, "{}", seen.err);
+    } else {
+        // Without it and without CAP_SYS_ADMIN the kernel refuses Landlock's
+        // domain (security/landlock/syscalls.c, v6.12, :488) and the filter
+        // (kernel/seccomp.c, :683 to :684), whichever comes first.
+        let step = if seen.err.contains("Landlock failed") { "Landlock" } else { "the seccomp filter" };
+        child_refused(&seen, 1, step);
+    }
+}
+
+#[test]
+fn test_the_child_s_seccomp_filter() {
+    let call = (nr::SECCOMP, None);
+    let Some(seen) = in_the_child("srv-c-seccomp1", call, Some(1), c::Answer::Fail(EPERM)) else { return };
+    child_refused(&seen, 1, "the seccomp filter");
+    let seen = in_the_child("srv-c-seccomp0", call, None, c::Answer::Pretend).unwrap();
+    read_back_refused(&seen, "the seccomp filter is not in place");
 }
 
 #[test]

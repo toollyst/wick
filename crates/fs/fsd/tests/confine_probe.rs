@@ -32,6 +32,7 @@ mod linux {
     use std::path::Path;
 
     use wick_fs_sys as sys;
+    use wick_fs_sys::confine::probe::Form;
     use wick_fs_sys::confine::{self as c, probe};
     use wick_fsd::confine::linux::{Plan, enter, lock};
     use wick_fsd::host::unix::{HostDir, Options};
@@ -68,7 +69,7 @@ mod linux {
                 return 2;
             }
         };
-        let (root, ()) = match enter(checked, plan, ()) {
+        let (root, (), watch) = match enter(checked, plan, ()) {
             Ok(x) => x,
             Err(r) => {
                 eprintln!("{}", r.0);
@@ -85,7 +86,7 @@ mod linux {
         // A descriptor of the root for the cases (opened before the filter,
         // which has no openat).
         let Ok(root) = sys::open_root(Path::new("/")) else { return 6 };
-        if let Err(r) = lock(plan) {
+        if let Err(r) = lock(plan, watch) {
             eprintln!("{}", r.0);
             return 5;
         }
@@ -144,6 +145,17 @@ mod linux {
             ("/etc/passwd by stat", |_, _| i32::from(std::fs::symlink_metadata("/etc/passwd").is_ok()), 0),
             // `..` of the root is refused beneath it.
             ("openat2 of .. beneath the root", |_, root| i32::from(sys::open_dir(root, b"..").is_ok()), 0),
+            // The argument rules: each form the server never makes of a call
+            // it does make (docs/design-fs.md §6.1, step 9).
+            ("utimensat with a path", |_, root| i32::from(probe::form(root, Form::UtimensatPath).is_ok()), KILLED),
+            ("linkat AT_SYMLINK_FOLLOW", |_, root| i32::from(probe::form(root, Form::LinkatFollow).is_ok()), KILLED),
+            ("linkat AT_EMPTY_PATH", |_, root| i32::from(probe::form(root, Form::LinkatEmptyPath).is_ok()), KILLED),
+            ("newfstatat following a link", |_, root| i32::from(probe::form(root, Form::FstatatFollow).is_ok()), KILLED),
+            ("statx following a link", |_, root| i32::from(probe::form(root, Form::StatxFollow).is_ok()), KILLED),
+            ("unlinkat with another flag", |_, root| i32::from(probe::form(root, Form::UnlinkatFlag).is_ok()), KILLED),
+            ("mkdirat with another mode", |_, root| i32::from(probe::form(root, Form::MkdiratMode).is_ok()), KILLED),
+            ("renameat2 RENAME_WHITEOUT", |_, root| i32::from(probe::form(root, Form::RenameWhiteout).is_ok()), KILLED),
+            ("fchmod setuid", |_, root| i32::from(probe::form(root, Form::FchmodSetuid).is_ok()), KILLED),
         ];
         let mut failed = Vec::new();
         for &(name, act, want) in cases {

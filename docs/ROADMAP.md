@@ -245,8 +245,9 @@ corpus and swap race against a real directory, `test_traversal_corpus`, `test_sw
 and unlinks of held and open files over the model and the host, `crates/fs/fsd/tests/links.rs`; nodes that cost
 memory only and a cache of held descriptors, `held.rs`, `stale.rs`, `memory.rs`), the `wick-fsd`
 binary confined on Linux (namespaces, `pivot_root` into the share, the id and capability drop, `no_new_privs`, Landlock
-where present and a seccomp allow-list; `test_confined_status`, `confine_probe`, one refusal test per step, and the
-corpus against the confined server), and guest kernels with
+where present and a seccomp allow-list, its waiting parent confined too, and everything read back before serving;
+`test_confined_status`, `confine_probe`, one refusal test per step in each process that takes it, and the corpus
+against the confined server), and guest kernels with
 `CONFIG_VIRTIO_FS` built by CI's `guest-kernels` job (`tools/linux/guest-kernel.sh`); nothing a guest can use yet. The plan:
 
 - The device in Firecracker only copies bounded, unparsed requests between the virtqueues and one socket.

@@ -177,3 +177,73 @@ fn test_an_unlinked_file_open_while_the_cache_lets_go_is_served() {
     g.forget(f, 1);
     remove(&base);
 }
+
+/// A chain deeper than the cache, every ancestor let go, walked again from
+/// the root, in a process of its own (the descriptors and their limit are
+/// the process's, and this file's other tests run as threads of one): the
+/// soft `RLIMIT_NOFILE` is set to the descriptors open, the cache full, and
+/// one more, so a walk that kept a second descriptor beyond the cache would
+/// meet EMFILE; then one more for CREATE's handle. The bound is
+/// docs/design-fs.md §4.3's, inside `SPARE_FDS` and so inside
+/// `limits::descriptors`.
+#[test]
+fn test_a_chain_deeper_than_the_cache_is_walked_within_one_spare_descriptor() {
+    const ALONE: &str = "WICK_FS_TEST_STALE_ALONE";
+    const NAME: &str = "test_a_chain_deeper_than_the_cache_is_walked_within_one_spare_descriptor";
+    if std::env::var_os(ALONE).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
+            .env(ALONE, "1")
+            .output()
+            .unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && text.contains("1 passed"), "the walk in a process of its own:\n{text}");
+        return;
+    }
+    const DEPTH: usize = 8;
+    let base = scratch("stale-deep");
+    let mut path = base.clone();
+    for i in 0..DEPTH {
+        path.push(format!("c{i}"));
+        std::fs::create_dir(&path).unwrap();
+    }
+    std::fs::create_dir(base.join("other")).unwrap();
+    let mut g = small(&base);
+    let mut d = ROOT;
+    for i in 0..DEPTH {
+        d = g.lookup(d, format!("c{i}").as_bytes()).unwrap();
+    }
+    // The cache (the root and one more) holds `other` now: the chain, all of
+    // it, let go.
+    g.lookup(ROOT, b"other").unwrap();
+
+    // The lowest free descriptor is the next one opened; none is open above
+    // it (the listing's own is it), so the limit counts descriptors.
+    let next = std::fs::File::open("/dev/null").map(|f| std::os::fd::AsRawFd::as_raw_fd(&f)).unwrap();
+    let open: Vec<i32> = std::fs::read_dir("/dev/fd").unwrap().map(|e| e.unwrap().file_name().to_str().unwrap().parse().unwrap()).collect();
+    assert!(open.iter().all(|&fd| fd <= next), "descriptors open above the lowest free one {next}: {open:?}");
+    let next = u64::try_from(next).unwrap();
+    let (soft, _) = sys::nofile().unwrap();
+    let limits = wick_fsd::limits::Limits {
+        max_held: 2,
+        ..wick_fsd::limits::Limits::default()
+    };
+    assert!(2 <= wick_fsd::limits::SPARE_FDS && 2 <= wick_fsd::limits::descriptors(&limits));
+
+    // The walk: one descriptor beyond the cache at most.
+    sys::set_nofile(next + 1).unwrap();
+    let walked = g.getattr(d, None).map(drop);
+    let missing = g.lookup(d, b"missing");
+    // CREATE: its handle's descriptor too.
+    sys::set_nofile(next + 2).unwrap();
+    let created = g.call(wick_fsd::fuse::Opcode::Create, d, &[&[&le32(2)[..], &le32(0o644), &le32(0), &le32(0)].concat(), &name(b"deep")]);
+    sys::set_nofile(soft).unwrap();
+    assert_eq!(walked, Ok(()), "the chain walked again within the cache and one");
+    assert_eq!(missing, Err(Errno::ENOENT));
+    assert_eq!(created.0, 0, "CREATE within the cache, one and its handle");
+    assert!(path.join("deep").is_file(), "made where the chain is");
+    // After: the cache and the handle, nothing of the walk left.
+    let after = std::fs::read_dir("/dev/fd").unwrap().count();
+    assert!(after <= open.len() + 1, "{after} descriptors after, {} before the walk", open.len());
+    remove(&base);
+}

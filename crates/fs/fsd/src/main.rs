@@ -182,7 +182,7 @@ fn run(args: &Args) -> Result<(), String> {
     };
     // The waiting parent drops the connection; only the confined child
     // serves it.
-    let (root, mut conn) = confine::enter(checked, plan, conn).map_err(|r| r.0)?;
+    let (root, mut conn, watch) = confine::enter(checked, plan, conn).map_err(|r| r.0)?;
     let dir = HostDir::new(
         root,
         Options {
@@ -198,7 +198,7 @@ fn run(args: &Args) -> Result<(), String> {
         ..Config::default()
     };
     let mut session = Session::new(dir, config).map_err(|e| format!("the share's root: {e:?}"))?;
-    let locked = confine::lock(plan).map_err(|r| r.0)?;
+    let locked = confine::lock(plan, watch).map_err(|r| r.0)?;
     eprintln!(
         "wick-fsd: {}: confined (namespaces, pivot_root, no capabilities, no_new_privs, seccomp{})",
         args.id,

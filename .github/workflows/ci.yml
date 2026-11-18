@@ -1305,6 +1305,51 @@ jobs:
             sudo "$bin"
           done
           sudo umount "$t/cf" "$t/fat"
+      # wick-fsd's user-namespace path (docs/design-fs.md §6.1, row 20), run
+      # where Ubuntu restricts unprivileged user namespaces
+      # (kernel.apparmor_restrict_unprivileged_userns = 1, left as it is): an
+      # AppArmor profile grants user namespaces to the built wick-fsd and
+      # confine_probe by path and nothing else (Ubuntu's way, flags=unconfined
+      # otherwise), and the tests run as the runner's user, none of them
+      # running nothing confined. The next step removes the profile, whatever
+      # happened here.
+      - name: User-namespace path under an AppArmor profile (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sysctl kernel.apparmor_restrict_unprivileged_userns user.max_user_namespaces || true
+          cargo build --locked -p wick-fsd
+          fsd="$PWD/target/debug/wick-fsd"
+          probe="$PWD/$(cargo test --locked --test confine_probe --no-run 2>&1 | grep -o 'target/debug/deps/confine_probe-[0-9a-f]*' | head -1)"
+          p="$RUNNER_TEMP/wick-fsd-userns.apparmor"
+          cat > "$p" <<EOF
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile wick-fsd $fsd flags=(unconfined) {
+            userns,
+          }
+
+          profile wick-fsd-confine-probe $probe flags=(unconfined) {
+            userns,
+          }
+          EOF
+          echo "The profile loaded:"
+          cat "$p"
+          sudo apparmor_parser -r "$p"
+          for test in server confine_probe corpus links; do
+            bin="$(cargo test --locked --test "$test" --no-run 2>&1 | grep -o "target/debug/deps/$test-[0-9a-f]*" | head -1)"
+            WICK_FS_TEST_USERNS_GRANTED=1 "$bin" --nocapture 2>&1 | tee "$RUNNER_TEMP/userns-$test.log" | grep -E "^test |test result|panicked|ran nothing"
+          done
+          if grep -h "ran nothing confined" "$RUNNER_TEMP"/userns-*.log; then
+            echo "a test ran nothing confined under the profile"
+            exit 1
+          fi
+      - name: Remove the AppArmor profile (Linux)
+        if: always() && runner.os == 'Linux'
+        run: |
+          p="$RUNNER_TEMP/wick-fsd-userns.apparmor"
+          if [ -f "$p" ]; then sudo apparmor_parser -R "$p"; else echo "no profile was written"; fi
       # On record (libtest keeps a passing test's output): what this macOS's
       # msdos does with renameatx_np(RENAME_SWAP), and the backend's
       # exchange there, for design-fs §4.3.

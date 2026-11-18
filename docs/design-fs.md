@@ -70,7 +70,7 @@ documented or measured; **measure** = the fix is designed, a measurement on the 
 | 17 | Snapshot with a live FUSE session | v1: snapshot refused with an API error naming virtio-fs (`snapshot_blocker` hook exists). Later: server state saved as paths and re-resolved beneath the root on restore | Snapshot create with fs → API error | now |
 | 18 | Feature off still adds attack surface | Cargo feature `fs`, default off; `wick-fsd` separate binary; no device/process/socket without config | Default build has no fs symbols; a planned boot-test stage `fs-off` shows no virtio device 26 | now |
 | 19 | Older macOS releases lack `O_RESOLVE_BENEATH` | Require the first macOS release that has the flag and refuse loudly on older ones (the same layers on every host, no reduced mode). **Which release that is is unconfirmed:** the flag is in the macOS 27.2 SDK's `sys/fcntl.h` (read 2026-11-13); this research read it in XNU's `bsd/sys/fcntl.h` from xnu-11417 on, which it took to be macOS 15.4; a third-party rsync patch says macOS 15 ([patch](https://sources.suse.com/SUSE:SLFO:1.1:Build/rsync/c0c245c4f613433f762b3dee895547b4/rsync-hardening-0021-syscall-also-use-O_RESOLVE_BENEATH-on-FreeBSD-and-Ma.patch)). 15.4 is used below as that working assumption, not as a settled floor | macOS 15 CI job: fs starts where the flag works and refuses below | measure on macOS 15 |
-| 20 | Linux host with unprivileged user namespaces disabled (Ubuntu AppArmor) | Start wick-fsd from root, which confines and drops to an unprivileged uid with no capabilities, as the jailer does; otherwise refuse loudly | Run with userns disabled: refuses without root, confined with root. `test_userns_restricted_refused` (as a user where the host restricts user namespaces, as CI's Ubuntu may); the root path is every confined test run as root (CI's fs job's sudo step) | now |
+| 20 | Linux host with unprivileged user namespaces disabled (Ubuntu AppArmor) | Start wick-fsd from root, which confines and drops to an unprivileged uid with no capabilities, as the jailer does; otherwise refuse loudly | Run with userns disabled: refuses without root, confined with root. `test_userns_restricted_refused` (as a user where the host restricts user namespaces, as CI's Ubuntu does, run 44207018536); the root path is every confined test run as root (CI's fs job's sudo step); user-namespace path: Docker on the Mac only (§6.1), and the fs job's AppArmor-profile step, which no run has passed yet | now |
 | 21 | Guest kernel lacks the driver | Upstream CI configs have `CONFIG_FUSE_FS=y`, `# CONFIG_VIRTIO_FS is not set`; wick's guest kernels add `CONFIG_VIRTIO_FS=y` (built: `tools/linux/guest-kernel.sh` with the fragment `tools/linux/guest-kernel-virtio-fs.config`, CI's `guest-kernels` job) | Guest boot with fs mounts the share | now |
 
 | 22 | Performance cost of the separate server | Measured 2026-11-13 on a MacBookPro18,3, macOS 27.2, **load average 53–79** (so upper bounds; re-measure idle with a concurrent control): AF_UNIX round trip 128 B ≈ 7.6–7.9 µs median; 1 MiB through the socket 267–409 µs (≈ 2.6–3.9 GB/s); host `fstatat` 0.8 µs, `openat`+`close` 7.2 µs, create+4 KiB write+close 64 µs; memcpy 41.7 GB/s (benchmark: a C program, not in the repository; AF_UNIX stream socketpair between two processes, medians of 20,000 round trips for 128 B and 4 KiB and of 2,000 for 128 KiB and 1 MiB, two runs; the busy machine also gave p99s from 0.4 to 5.4 ms). Small ops: the hop is about one host open; vhost-user on macOS/Windows also wakes the VMM (no in-kernel ioeventfd: wick's eventfds are pipes, docs/PORTING.md) [inf], so its round-trip cost is similar and the split's real extra is the data copy. Large I/O: replace the socket payload with a fixed-size shared ring between VMM and server (never guest memory; bounded and counted, since shared sections escape the Windows Job limit): one memcpy at ~40 GB/s ≈ 25 µs/MiB, socket only for notifications. Guest page cache and attr/entry timeouts keep repeated lookups in the guest | Benchmarks per host: fio seq 1 MiB read/write, untar of a kernel tree, `git status` on a large repo, `npm install`; split vs virtiofsd (Linux) and vs an in-VMM prototype; acceptance target set from the Linux virtiofsd number | measure |
@@ -515,7 +515,13 @@ server's only unsafe code, `wick-fsd` itself forbids it):
     another generation, is ESTALE) [src] and virtiofsd for an inode whose file handle no longer opens
     (`--inode-file-handles`, which keeps a file handle in place of an `O_PATH` descriptor per inode [doc];
     `open_by_handle_at` is ESTALE from `exportfs_decode_fh`, fs/exportfs/expfs.c, v6.12, :166 and :190 [src])
-    (`crates/fs/fsd/tests/stale.rs`). An identity is `(st_dev, st_ino)`, as a leaf's (below, Inode numbers reused). A
+    (`crates/fs/fsd/tests/stale.rs`). However deep the walk, it holds at most one descriptor beyond the cache at a
+    time: the directory it opens the next one beneath, which the cache may already have let go, kept until the next
+    is open and then closed; so a request holds the cache, one more, and what it opens itself (a handle's
+    descriptor), all inside `SPARE_FDS` and so inside `limits::descriptors`
+    (`test_a_chain_deeper_than_the_cache_is_walked_within_one_spare_descriptor`: a cache of 2, a chain of 8 all let
+    go, walked under a soft `RLIMIT_NOFILE` of the descriptors open and one more, then one more for CREATE's
+    handle, in a process of its own). An identity is `(st_dev, st_ino)`, as a leaf's (below, Inode numbers reused). A
     directory the cache still holds is served wherever the host moved it, as before
     (`test_a_held_directory_the_host_moved_is_served`).
   - Any other object is one *leaf* per identity, which keeps the names it is known by, as (directory node, name),
@@ -764,6 +770,32 @@ it means layer 1 let the request through.
   - If none of these is possible (unprivileged user namespaces disabled, as with Ubuntu's AppArmor userns
     restriction), **fail loudly**. Landlock alone is not enough: it "currently [cannot] restrict ... chmod(2),
     chown(2), setxattr(2), utime(2) ..." ([Landlock docs](https://docs.kernel.org/userspace-api/landlock.html)) [doc].
+  - **Stock hosts restrict unprivileged user namespaces**, so the root start is the common one:
+    - Ubuntu: 23.10 added `kernel.apparmor_restrict_unprivileged_userns`, under which an unconfined process's new
+      user namespace gets AppArmor's `unprivileged_userns` profile and no capabilities in it
+      ([Canonical, 2023-10-09](https://canonical.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces);
+      [spec](https://discourse.ubuntu.com/t/spec-unprivileged-user-namespace-restrictions-via-apparmor-in-ubuntu-23-10/37626))
+      [doc], and 24.04 turns it on by default ([LP #2046477](https://bugs.launchpad.net/bugs/2046477)) [doc].
+      GitHub's ubuntu-latest has it on: as the runner's user, wick-fsd refuses and `confine_probe` says "ran nothing
+      confined: kernel.apparmor_restrict_unprivileged_userns = 1" (CI run 44207018536's fs job), so CI runs the
+      user-namespace path's refusal only (`test_userns_restricted_refused`) and the root path for everything else.
+    - Debian: its own kernel patch's `kernel.unprivileged_userns_clone`, 0 (off) before bullseye (11) and 1 since
+      ([bubblewrap's README.Debian](https://sources.debian.org/src/bubblewrap/0.11.0-2/debian/README.Debian)) [doc].
+    - RHEL and others: upstream's `user.max_user_namespaces`, 0 disables them
+      ([kernel docs](https://docs.kernel.org/admin-guide/sysctl/user.html)) [doc]; RHEL 7 needed
+      `namespace.unpriv_enable=1` as well ([Red Hat bug 1499046](https://bugzilla.redhat.com/show_bug.cgi?id=1499046))
+      [doc], and the RHEL 9 STIG sets it to 0 where no containers run
+      ([V-257816](https://stigviewer.com/stig/red_hat_enterprise_linux_9/2023-12-01/finding/V-257816)) [doc].
+
+    What an operator does: start wick-fsd as root with `--uid`/`--gid`, as the jailer will (decision 6): the
+    supported path, which every confined test runs as root on CI. An AppArmor profile that grants `userns` to the
+    wick-fsd binary alone (`flags=(unconfined)`, Ubuntu's way for a program that needs user namespaces) lets it start
+    unprivileged on Ubuntu: the CI fs job now loads one for the built wick-fsd and `confine_probe` by path, runs the
+    confined tests as the runner's user with `WICK_FS_TEST_USERNS_GRANTED=1` and fails if any ran nothing confined, and
+    removes the profile whatever happened. Until a run has passed it the path is not supported; then its profile text
+    goes here as the tested alternative. wick never asks an operator to turn a host-wide restriction off: it guards
+    every program on the host. The user-namespace path itself has run only in Docker on this Mac (linuxkit 7.0.14,
+    aarch64, the tests as uid 65534) so far.
   - Landlock first appeared in Linux 5.13 [doc], and upstream supports 5.10 hosts (docs/kernel-policy.md) [src], so it
     is an added layer, never the only one.
   - **As built** (`crates/fs/fsd/src/confine/linux.rs`, the calls in `crates/fs/sys/src/unix/confine.rs`), after
@@ -771,15 +803,30 @@ it means layer 1 let the request through.
     1. `unshare(CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWNET|CLONE_NEWIPC)`, with `CLONE_NEWUSER` when not root (its own uid
        and gid mapped 1:1, `setgroups` denied);
     2. `fork`: the child is pid 1 of the new pid namespace. The parent drops the connection and everything else it
-       holds, waits, and exits as the child did (a child killed by the filter shows as signal 31, SIGSYS, logged);
+       holds but its end of the pipe the child watches and the standard streams, then confines itself: the child's
+       `--uid`/`--gid` when root-started, every capability dropped, not dumpable, `no_new_privs`, and a seccomp filter
+       of its own, `PARENT_SYSCALLS` (`wait4`, `write`/`writev` for its one line, `rt_sigreturn`, `restart_syscall`,
+       `exit_group`, `exit`; anything else kills it). It takes no input and needs to signal nothing (the child dies
+       with it), but it lives as long as the share, so it keeps nothing it does not need
+       (`test_confined_status` reads its `/proc/<pid>/status` as the child's). A step that fails ends it, and the
+       child with it. It waits and exits as the child did, by `_exit` (a child killed by the filter shows as signal
+       31, SIGSYS, logged);
     3. the child: `PR_SET_PDEATHSIG` SIGKILL (killing wick-fsd kills it), not dumpable (no ptrace or `/proc/<pid>`
        access for the host's processes of its uid), every mount private, the share bind-mounted onto itself without
        what is mounted beneath it, remounted `nosuid,nodev,noexec` (read-only for `--read-only`, and keeping the flags
        the mount is locked with), `pivot_root` into it and the old root detached;
     4. `/` opened and checked to be the object stage 0 checked (else refused), and the backend made on it;
-    5. as root, `--uid`/`--gid` (required, never 0) with no supplementary groups, every id checked; not root, no
-       `--uid`;
-    6. every capability dropped (bounding, ambient, effective, permitted, inheritable);
+    5. the bounding set emptied while `CAP_SETPCAP` is held (each drop asks for it, security/commoncap.c, v6.12,
+       `cap_prctl_drop` :1235 to :1248, and a drop from root takes it with the permitted set, `cap_emulate_setxuid`
+       :1085 to :1098) [src], a capability that cannot be dropped a refusal; then, as root, `--uid`/`--gid`
+       (required, never 0) with no supplementary groups, every id checked; not root, no `--uid`;
+    6. every other capability dropped (ambient, effective, permitted, inheritable), the bounding set checked empty
+       (SECURITY.md, Fixed defects: it used to be dropped after the ids, and the refusal taken as nothing left);
+       then the parent-death
+       signal and not-dumpable of step 3 set again, the parent checked alive through the pipe: a change of the
+       effective or file-system ids clears the signal and sets dumpable to `fs.suid_dumpable` (`commit_creds`,
+       kernel/cred.c, v6.12, :406 to :413) [src] (`test_the_confined_server_dies_with_its_parent`; SECURITY.md,
+       Fixed defects);
     7. `no_new_privs`;
     8. Landlock where the kernel has it: file rights beneath the new root only, never execute or making devices,
        sockets, FIFOs or symlinks (the server makes regular files only); TCP bind and connect handled with no rule
@@ -789,10 +836,63 @@ it means layer 1 let the request through.
        `FS_IOC_GETFLAGS`, `fcntl` only `F_GETFL`/`F_GETFD`, `mmap`/`mprotect` never `PROT_EXEC`, `sendto`/`recvfrom`
        without an address, `tgkill` only SIGABRT); this architecture only and no x32; anything else
        `SECCOMP_RET_KILL_PROCESS`. No `openat` (opens are `openat2` beneath a held directory), no `socket`, `clone` or
-       `execve`, no `mknodat`, `setresuid`, `setresgid` or `capset`.
+       `execve`, no `mknodat`, `setresuid`, `setresgid` or `capset`. The path-taking calls the server makes have
+       the rules their arguments allow, so that no form that follows a link or makes what the server never makes is
+       there even inside the pivoted root: `utimensat` only with no path (`futimens`), `linkat` with no flags (never
+       `AT_SYMLINK_FOLLOW` or `AT_EMPTY_PATH`), `newfstatat` and `statx` only with `AT_SYMLINK_NOFOLLOW` or
+       `AT_EMPTY_PATH`, `unlinkat` with no flag or `AT_REMOVEDIR`, `mkdirat` with mode 0o700 only, `renameat2`
+       with no flag, `RENAME_NOREPLACE` or `RENAME_EXCHANGE` (never `RENAME_WHITEOUT`), `fchmod` never setuid,
+       setgid or sticky. The last two are what the server sends for any guest request: `HostDir::mkdir` makes every
+       directory 0o700 and `HostDir::set_perm` passes the guest's permission bits with its own access
+       (`(mode & 0o777) | 0o700` or `0o600`), the guest's mode, special bits included, kept in the record
+       (`test_a_guest_s_special_mode_bits_pass_the_filter`). `confine_probe` makes each refused form and must be
+       killed. No rule is possible for
+       `readlinkat` (no flags; it never follows its last component, and the server gives it one) or for `openat2`'s
+       `RESOLVE_*` (in a structure behind a pointer, which a seccomp filter cannot read: classic BPF sees only the
+       system call's number and argument values, Documentation/userspace-api/seccomp_filter.rst) [doc]: those rest on
+       the server's single-component names, `pivot_root` and Landlock. One more entry is never made for what it
+       does: `getppid`, which cannot fail, fails with `ENOTRECOVERABLE` under this filter and no other, for step 10;
+    10. read back, in one place (`confine::linux::check`), from the calls that read each (`/proc` is not in the new
+       root): the four uids and gids (`--uid`/`--gid`, or the real ones, none apart), no supplementary groups as
+       root, every capability set empty, `SECBIT_KEEP_CAPS` clear, `no_new_privs`, the parent-death signal SIGKILL,
+       not dumpable, all read just before the filter, and the filter by its own effect just after. One refusal names
+       everything that did not hold (`test_each_thing_that_did_not_hold_is_named_in_one_refusal`). A server that is
+       not root keeps its user's supplementary groups: its user namespace denies `setgroups` (user_namespaces(7))
+       [doc], and they grant nothing its user does not have.
 
-    Only then are the hellos exchanged and a frame read. Each step is required and a failure is a refusal naming it
-    (`test_refused_without_*`); there is no flag that skips one.
+    Only then are the hellos exchanged and a frame read. Each step is required and a failure is a refusal naming it;
+    there is no flag that skips one.
+
+    **What a later step could reset**, from the kernel's source (v6.12) [src], for each state set before a change
+    of credentials or namespaces:
+
+    | State | Set at | What could reset it later | Read back (step 10) |
+    |---|---|---|---|
+    | parent-death signal | step 3, again in step 6 | `fork` gives a child none (kernel/fork.c :2453): set in the child. `commit_creds` clears it when the euid, egid, fsuid or fsgid changes or the new permitted set is not a subset of the old (kernel/cred.c :406 to :413, `cred_cap_issubset` :353 to :376): the drop to `--uid`/`--gid` does, so step 6 sets it again after. `unshare(CLONE_NEWUSER)` commits new credentials (kernel/fork.c :3360) but counts as a subset (the new namespace's owner is the euid, cred.c :369 to :373), and it comes before step 3; the capability drops only shrink the permitted set; Landlock's `commit_creds` (security/landlock/syscalls.c :524) changes no id | `PR_GET_PDEATHSIG` |
+    | not dumpable | step 3, again in step 6 | the same `commit_creds` rule sets `fs.suid_dumpable` | `PR_GET_DUMPABLE` |
+    | `uid_map`, `gid_map`, `setgroups` deny | step 1 (not root) | the writes set the namespace's maps and flag, not the process's credentials (kernel/user_namespace.c `map_write` :922, `proc_setgroups_write` :1215: no `commit_creds`), and nothing writes them again | the ids |
+    | securebits | (none set) | `unshare(CLONE_NEWUSER)` sets them to the default and every capability set to full in the new namespace (kernel/user_namespace.c `set_cred_user_ns` :43 to :53); `execve` clears `SECBIT_KEEP_CAPS` (security/commoncap.c :961), with which a drop from root would keep the permitted set (:1085 to :1098); step 6 empties every set whatever they are | `PR_GET_SECUREBITS` (`SECBIT_KEEP_CAPS` clear), `capget`, `PR_CAPBSET_READ`, `PR_CAP_AMBIENT_IS_SET` |
+    | `no_new_privs` | step 7 | nothing: `PR_SET_NO_NEW_PRIVS` only sets it (kernel/sys.c :2619 to :2624) | `PR_GET_NO_NEW_PRIVS` |
+    | Landlock domain | step 8 | nothing: a domain is only ever stacked onto (syscalls.c :513, `landlock_merge_ruleset`) | not possible: the kernel has no call that reads a domain (syscalls.c: `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` only); `landlock_restrict_self` returns 0 only from the `commit_creds` of the new domain (:524) |
+    | seccomp filter | step 9 | nothing: filters are only ever added (kernel/seccomp.c `seccomp_set_mode_filter` :1990 to :1996), and its install changes no credentials | the `getppid` probe |
+
+    **Refusal tests.** `test_refused_without_*` make a system call fail for the first process that makes it; for the
+    steps both processes take (`setresuid`, `capset`, not dumpable, `no_new_privs`, the filter) that is the waiting
+    parent, and they now check its refusal ("the waiting parent: ..."). The child's own steps are reached by a test
+    filter that tells a supervisor in the test of each such call (`SECCOMP_RET_USER_NOTIF`): it lets the parent's call
+    through as made and answers the child's (by its pid namespace) with a failure, or with a 0 for a call it did not
+    make, which only the read-back finds (`in_the_child`; `test_the_child_s_parent_death_signal_steps`,
+    `test_the_child_s_dumpable_steps`, `test_the_child_s_id_drop`, `test_the_child_s_capability_drop`,
+    `test_the_child_s_no_new_privs`, `test_the_child_s_seccomp_filter`). Where the host makes a step's state hold
+    without it, the test checks that it holds: as root, the drop to 65534 empties the capabilities and sets dumpable to
+    `fs.suid_dumpable`; a test filter installed without `CAP_SYS_ADMIN` needs `no_new_privs` itself, and without
+    `no_new_privs` the kernel refuses the server's Landlock domain and filter (security/landlock/syscalls.c :488,
+    kernel/seccomp.c :683 to :684). The steps only the child takes (`PR_SET_PDEATHSIG`, the mounts, `pivot_root`,
+    Landlock) are failed by the first-caller tests too. No test makes these fail in the child: the check that the new
+    root is the object stage 0 checked (it needs the share replaced between the two, a race no test wins on purpose);
+    the parent-alive check of steps 3 and 6 (`EIDRM` when its pipe is closed); and a Landlock domain that was said to be
+    made and was not, which nothing can read back.
+
 - **Resolution:** `openat2(2)` (Linux 5.6+) with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV`
   and a single component; no fallback (§4.3). Nodes as on macOS (§4.3): directories held open, anything else a
   leaf found by its known names and checked at each use. Not `O_PATH` fds reopened through `/proc/self/fd` as

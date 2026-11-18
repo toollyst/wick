@@ -228,6 +228,31 @@ has the per-control details and results.
     each one's whole time (`wick_uffd::MovingWindow`, which debug builds check).
 
   First run: CI.
+- **Linux: wick-fsd started as root: its confined server did not die with wick-fsd, and was dumpable again where
+  `fs.suid_dumpable` is 1** (from 62067d47, which added the confined server, to the commit that adds this entry;
+  never reachable from a guest: nothing in the VMM serves wick-fsd yet, virtio-fs staging 8 and 9). The server set
+  its parent-death signal and not-dumpable before its drop to `--uid`/`--gid`, and a change of the effective ids
+  clears the signal and sets dumpable to `fs.suid_dumpable` (`commit_creds`, kernel/cred.c, v6.12, :406 to :413).
+  So killing wick-fsd left the confined server running until its connection ended, and on a host whose
+  `fs.suid_dumpable` is 1 another process of that uid could have traced it (with 0, the kernel's default, or 2,
+  `__ptrace_may_access` refuses a process that is not `SUID_DUMP_USER`, kernel/ptrace.c, v6.12, :342). Now both are
+  set again after the drop, with the parent checked alive, and read back with the rest of the confinement once every
+  step is done; the server refuses to start otherwise. On the parent tree as root (Docker's linuxkit 7.0.14, aarch64,
+  `fs.suid_dumpable` 0) the server outlived its killed parent and `test_the_confined_server_dies_with_its_parent`
+  failed; it passed there as uid 65534 (`test_the_confined_server_dies_with_its_parent`,
+  `test_the_child_s_parent_death_signal_steps`, `test_the_child_s_dumpable_steps`, docs/design-fs.md §6.1, steps 6
+  and 10). A server started without root changes no ids and was not affected.
+- **Linux: wick-fsd started as root served with its whole bounding set** (from 62067d47 to the commit that adds
+  this entry; never reachable from a guest, as above). It dropped to `--uid`/`--gid` before it emptied the bounding
+  set, and the drop from root takes `CAP_SETPCAP` with the rest of the permitted set (security/commoncap.c, v6.12,
+  `cap_emulate_setxuid` :1085 to :1098), which each `PR_CAPBSET_DROP` asks for (`cap_prctl_drop` :1235 to :1248); it
+  took the `EPERM` that followed as nothing left to drop. Measured on the parent tree as root (Docker's linuxkit
+  7.0.14, aarch64): the confined server's `CapBnd` held every one of the kernel's 41 capabilities, its effective and
+  permitted sets empty; `test_the_confined_server_dies_with_its_parent` failed there as root and passed as uid 65534.
+  Its filter and `no_new_privs` refuse `execve`, the one thing the bounding set limits, so nothing was gained by it.
+  Now the set is emptied before the drop, a capability that cannot be dropped is a refusal, and the read-back
+  requires it empty (`test_confined_status` reads `CapBnd` 0 for both processes; `test_the_child_s_capability_drop`;
+  docs/design-fs.md §6.1, steps 5 and 10).
 - **macOS: wick-fsd's exchange (`RENAME_EXCHANGE`) on a volume without one could replace the target with the source and
   report success** (from 4f7f4673, which added the host directory, to ff3174a1, which fixed it; never reachable from a
   guest). The backend learned whether a volume exchanges from the error `renameatx_np(RENAME_SWAP)` gave, and macOS

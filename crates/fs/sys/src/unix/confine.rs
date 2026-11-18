@@ -8,7 +8,7 @@
 //! failure is the caller's refusal to serve.
 
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -116,7 +116,12 @@ pub fn parent_watch() -> Result<(OwnedFd, OwnedFd)> {
 /// wick-fsd kills its confined child; EIDRM if the parent ended already
 /// (its end of the [`parent_watch`] pipe is closed). The parent is outside
 /// the child's pid namespace, where `getppid` says 0, hence the pipe.
-pub fn die_with_parent(watch: OwnedFd) -> Result<()> {
+///
+/// A change of the effective or file-system ids clears the signal and sets
+/// dumpable to `fs.suid_dumpable` (`commit_creds`, kernel/cred.c, v6.12,
+/// :406 to :413): after [`drop_ids`] it is armed again, and
+/// [`death_signal`] and [`dumpable`] read what holds.
+pub fn die_with_parent(watch: BorrowedFd<'_>) -> Result<()> {
     prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as c_ulong)?;
     let mut p = libc::pollfd {
         fd: watch.as_raw_fd(),
@@ -129,6 +134,32 @@ pub fn die_with_parent(watch: OwnedFd) -> Result<()> {
         return Err(HostErrno(libc::EIDRM));
     }
     Ok(())
+}
+
+/// The parent-death signal [`die_with_parent`] sets.
+pub const SIGKILL: i32 = libc::SIGKILL;
+
+/// This process's parent-death signal (`PR_GET_PDEATHSIG`), 0 for none.
+pub fn death_signal() -> Result<i32> {
+    let mut sig: c_int = 0;
+    let at = std::ptr::from_mut(&mut sig) as c_ulong;
+    // SAFETY: PR_GET_PDEATHSIG writes one int at the address given.
+    check(unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, at, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong) })?;
+    Ok(sig)
+}
+
+/// Whether this process is dumpable (`PR_GET_DUMPABLE`).
+pub fn dumpable() -> Result<bool> {
+    // SAFETY: PR_GET_DUMPABLE takes no pointer.
+    let r = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong) };
+    check(r).map(|r| r != 0)
+}
+
+/// Ends this process now with `code` (`_exit`: no atexit handlers, no
+/// flushing, one `exit_group`), as the waiting parent does under its filter.
+pub fn exit_now(code: i32) -> ! {
+    // SAFETY: _exit never returns and touches no memory of this process.
+    unsafe { libc::_exit(code) }
 }
 
 /// The pid of this process.
@@ -257,20 +288,30 @@ struct CapData {
 
 const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
-/// Drops every capability: the bounding set (while `CAP_SETPCAP` is still
-/// held; EPERM without it is ignored, as a process without capabilities
-/// has nothing to drop), the ambient set, then effective, permitted and
-/// inheritable to nothing.
-pub fn drop_capabilities() -> Result<()> {
+/// Empties the bounding set, while `CAP_SETPCAP` is held: the kernel asks
+/// for it at each drop, even of one already gone (security/commoncap.c,
+/// v6.12, `cap_prctl_drop` :1235 to :1248), and a drop from root to another
+/// uid takes it with the rest of the permitted set (`cap_emulate_setxuid`
+/// :1085 to :1098), so this comes before [`drop_ids`]. A capability that
+/// cannot be dropped is the error, never passed over.
+pub fn drop_bounding() -> Result<()> {
     for cap in 0..64 {
-        match prctl(libc::PR_CAPBSET_DROP, cap) {
-            Ok(()) => {}
+        match bounding_has(cap) {
+            Ok(false) => {}
+            Ok(true) => prctl(libc::PR_CAPBSET_DROP, cap)?,
             // Past the last capability this kernel has.
             Err(e) if e.0 == libc::EINVAL => break,
-            Err(e) if e.0 == libc::EPERM => break,
             Err(e) => return Err(e),
         }
     }
+    Ok(())
+}
+
+/// Drops every capability: the bounding set ([`drop_bounding`], which finds
+/// it empty when called before), the ambient set, then effective, permitted
+/// and inheritable to nothing.
+pub fn drop_capabilities() -> Result<()> {
+    drop_bounding()?;
     // SAFETY: PR_CAP_AMBIENT_CLEAR_ALL takes integer arguments only.
     check(unsafe {
         libc::prctl(
@@ -294,6 +335,135 @@ pub fn drop_capabilities() -> Result<()> {
     // live across the call.
     check_long(unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) })?;
     Ok(())
+}
+
+/// Whether capability `cap` is in this process's bounding set
+/// (`PR_CAPBSET_READ`); EINVAL past the last this kernel has.
+fn bounding_has(cap: c_ulong) -> Result<bool> {
+    // SAFETY: PR_CAPBSET_READ takes integer arguments only.
+    let r = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong) };
+    check(r).map(|r| r == 1)
+}
+
+/// Whether capability `cap` is in this process's ambient set.
+fn ambient_has(cap: c_ulong) -> Result<bool> {
+    // SAFETY: PR_CAP_AMBIENT_IS_SET takes integer arguments only.
+    let r = unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_IS_SET as c_ulong,
+            cap,
+            0 as c_ulong,
+            0 as c_ulong,
+        )
+    };
+    check(r).map(|r| r == 1)
+}
+
+/// `SECBIT_KEEP_CAPS` (include/uapi/linux/securebits.h).
+pub const SECBIT_KEEP_CAPS: u32 = 1 << 4;
+
+/// What the kernel holds for this process, read back after the steps
+/// (docs/design-fs.md §6.1, the read-back): each from the call that reads
+/// it, none from `/proc`, which the confined root does not have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct State {
+    /// Real, effective, saved and file-system uid.
+    pub uids: [u32; 4],
+    /// Real, effective, saved and file-system gid.
+    pub gids: [u32; 4],
+    /// The number of supplementary groups.
+    pub groups: usize,
+    /// Effective, permitted and inheritable, both words each (capget).
+    pub caps: [u32; 6],
+    /// The capabilities still in the bounding set.
+    pub bounding: Vec<u32>,
+    /// The capabilities in the ambient set.
+    pub ambient: Vec<u32>,
+    /// `PR_GET_SECUREBITS`.
+    pub securebits: u32,
+    /// `PR_GET_NO_NEW_PRIVS`.
+    pub no_new_privs: bool,
+    /// `PR_GET_PDEATHSIG`.
+    pub death_signal: i32,
+    /// `PR_GET_DUMPABLE`.
+    pub dumpable: bool,
+}
+
+/// Reads [`State`] back.
+pub fn state() -> Result<State> {
+    let (mut r, mut e, mut s) = (0, 0, 0);
+    // SAFETY: three valid uid_t for getresuid to fill.
+    check(unsafe { libc::getresuid(&mut r, &mut e, &mut s) })?;
+    // SAFETY: an invalid id (-1) changes nothing and returns the current
+    // one (kernel/sys.c, v6.12, `__sys_setfsuid` :883 to :884).
+    let fsuid = unsafe { libc::setfsuid(u32::MAX) }.cast_unsigned();
+    let (mut gr, mut ge, mut gs) = (0, 0, 0);
+    // SAFETY: three valid gid_t for getresgid to fill.
+    check(unsafe { libc::getresgid(&mut gr, &mut ge, &mut gs) })?;
+    // SAFETY: as setfsuid.
+    let fsgid = unsafe { libc::setfsgid(u32::MAX) }.cast_unsigned();
+    // SAFETY: size 0 asks for the count only.
+    let groups = check(unsafe { libc::getgroups(0, std::ptr::null_mut()) })?;
+    let header = CapHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: capget reads a version-3 header and fills two data structs.
+    check_long(unsafe { libc::syscall(libc::SYS_capget, &header, data.as_mut_ptr()) })?;
+    let mut bounding = Vec::new();
+    let mut ambient = Vec::new();
+    for cap in 0..64u32 {
+        match bounding_has(c_ulong::from(cap)) {
+            Ok(has) => {
+                if has {
+                    bounding.push(cap);
+                }
+            }
+            Err(e) if e.0 == libc::EINVAL => break,
+            Err(e) => return Err(e),
+        }
+        if ambient_has(c_ulong::from(cap))? {
+            ambient.push(cap);
+        }
+    }
+    // SAFETY: PR_GET_SECUREBITS and PR_GET_NO_NEW_PRIVS take no pointer.
+    let securebits = check(unsafe { libc::prctl(libc::PR_GET_SECUREBITS, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong) })?;
+    // SAFETY: as above.
+    let nnp = check(unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong) })?;
+    Ok(State {
+        uids: [r, e, s, fsuid],
+        gids: [gr, ge, gs, fsgid],
+        groups: usize::try_from(groups).unwrap_or(usize::MAX),
+        caps: [
+            data[0].effective,
+            data[1].effective,
+            data[0].permitted,
+            data[1].permitted,
+            data[0].inheritable,
+            data[1].inheritable,
+        ],
+        bounding,
+        ambient,
+        securebits: u32::try_from(securebits).unwrap_or(u32::MAX),
+        no_new_privs: nnp == 1,
+        death_signal: death_signal()?,
+        dumpable: dumpable()?,
+    })
+}
+
+/// Whether the server's filter is in place, by its own effect: its
+/// [`FILTER_PROBE`] call fails with [`FILTER_PROBE_ERRNO`] (any filter
+/// installed before, the launcher's or a test's, answers otherwise).
+pub fn filter_in_place() -> bool {
+    // SAFETY: getppid takes no arguments.
+    let r = unsafe { libc::syscall(FILTER_PROBE) };
+    r < 0 && last().0 == FILTER_PROBE_ERRNO
 }
 
 /// Landlock's access rights (`include/uapi/linux/landlock.h`).
@@ -478,6 +648,8 @@ pub mod bpf {
     pub const ERRNO: u32 = 0x0005_0000;
     /// `SECCOMP_RET_ALLOW`.
     pub const ALLOW: u32 = 0x7fff_0000;
+    /// `SECCOMP_RET_USER_NOTIF`.
+    pub const USER_NOTIF: u32 = 0x7fc0_0000;
     /// `seccomp_data.nr`.
     pub const NR: u32 = 0;
     /// `seccomp_data.arch`.
@@ -509,13 +681,30 @@ pub enum Args {
     OneOf(u32, &'static [u32]),
     /// Argument `i` (low 32 bits) has none of these bits.
     NoneOf(u32, u32),
+    /// Argument `i` (low 32 bits) has at least one of these bits.
+    AnyOf(u32, u32),
     /// Argument `i` is 0 (all 64 bits).
     Zero(u32),
+    /// Never made for what it does: the call fails with this errno, which
+    /// only this filter gives it ([`FILTER_PROBE`]).
+    Fails(i32),
 }
 
 fn nr(n: c_long) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
+
+/// A stat that does not follow a final link: `AT_SYMLINK_NOFOLLOW`, or
+/// `AT_EMPTY_PATH` (the descriptor itself, libc's and std's `fstat`).
+pub const STAT_NOFOLLOW: u32 = (libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) as u32;
+
+/// The errno [`FILTER_PROBE`]'s call answers under the server's filter.
+pub const FILTER_PROBE_ERRNO: i32 = libc::ENOTRECOVERABLE;
+
+/// The call [`filter_in_place`] makes: `getppid`, which cannot fail
+/// (kernel/sys.c), fails with [`FILTER_PROBE_ERRNO`] under the server's
+/// filter and under no other.
+pub const FILTER_PROBE: c_long = libc::SYS_getppid;
 
 /// `FS_IOC_GETFLAGS`: a directory's casefold flag, read when the server
 /// holds a directory.
@@ -540,21 +729,60 @@ pub const SERVER_SYSCALLS: &[(c_long, &str, Args)] = &[
     (libc::SYS_lseek, "a listing's position", Args::Any),
     (libc::SYS_close, "descriptors the server is done with", Args::Any),
     (libc::SYS_openat2, "every open: beneath a held directory, no link", Args::Any),
-    (libc::SYS_newfstatat, "fstatat(AT_SYMLINK_NOFOLLOW) of one name; libc's fstat", Args::Any),
+    (
+        libc::SYS_newfstatat,
+        "fstatat(AT_SYMLINK_NOFOLLOW) of one name; libc's fstat (AT_EMPTY_PATH): never one that follows a link",
+        Args::AnyOf(3, STAT_NOFOLLOW),
+    ),
     (libc::SYS_fstat, "fstat of an opened object", Args::Any),
-    (libc::SYS_statx, "libc's fstat on some versions", Args::Any),
+    (
+        libc::SYS_statx,
+        "std's and libc's fstat on some versions (AT_EMPTY_PATH): never one that follows a link",
+        Args::AnyOf(2, STAT_NOFOLLOW),
+    ),
     (libc::SYS_getdents64, "READDIR", Args::Any),
     (libc::SYS_fgetxattr, "the record and guest attributes", Args::Any),
     (libc::SYS_fsetxattr, "the record and guest attributes", Args::Any),
     (libc::SYS_flistxattr, "LISTXATTR", Args::Any),
     (libc::SYS_fremovexattr, "REMOVEXATTR", Args::Any),
-    (libc::SYS_mkdirat, "MKDIR", Args::Any),
-    (libc::SYS_unlinkat, "UNLINK, RMDIR", Args::Any),
-    (libc::SYS_renameat2, "RENAME, NOREPLACE, EXCHANGE", Args::Any),
-    (libc::SYS_linkat, "LINK", Args::Any),
-    (libc::SYS_readlinkat, "READLINK of a host symlink", Args::Any),
-    (libc::SYS_fchmod, "SETATTR mode", Args::Any),
-    (libc::SYS_utimensat, "SETATTR times (futimens)", Args::Any),
+    (
+        libc::SYS_mkdirat,
+        "MKDIR: wick-fsd's HostDir::mkdir makes every directory 0o700, whatever mode the guest asks (its mode goes \
+         to the record, and its permission bits to fchmod after)",
+        Args::OneOf(2, &[0o700]),
+    ),
+    (
+        libc::SYS_unlinkat,
+        "UNLINK, RMDIR",
+        Args::OneOf(2, &[0, libc::AT_REMOVEDIR as u32]),
+    ),
+    (
+        libc::SYS_renameat2,
+        "RENAME, NOREPLACE, EXCHANGE (never WHITEOUT)",
+        Args::OneOf(4, &[0, libc::RENAME_NOREPLACE, libc::RENAME_EXCHANGE]),
+    ),
+    (
+        libc::SYS_linkat,
+        "LINK, no flags: never AT_SYMLINK_FOLLOW or AT_EMPTY_PATH",
+        Args::Zero(4),
+    ),
+    (
+        libc::SYS_readlinkat,
+        "READLINK of a host symlink (no flags to check; the name is one component)",
+        Args::Any,
+    ),
+    (
+        libc::SYS_fchmod,
+        "SETATTR mode and a new node's mode: HostDir::set_perm passes the guest's permission bits (mode & 0o777) \
+         with the server's own access (0o700 a directory, 0o600 a file), so never setuid, setgid or sticky; the \
+         guest's special bits are kept in the record",
+        Args::NoneOf(1, libc::S_ISUID | libc::S_ISGID | libc::S_ISVTX),
+    ),
+    (
+        libc::SYS_utimensat,
+        "SETATTR times: futimens only (no path, so no link followed)",
+        Args::Zero(1),
+    ),
     (libc::SYS_ftruncate, "SETATTR size", Args::Any),
     (libc::SYS_fallocate, "FALLOCATE", Args::Any),
     (libc::SYS_fsync, "FSYNC", Args::Any),
@@ -585,7 +813,31 @@ pub const SERVER_SYSCALLS: &[(c_long, &str, Args)] = &[
     (libc::SYS_restart_syscall, "a call restarted after a signal", Args::Any),
     (libc::SYS_exit, "the end", Args::Any),
     (libc::SYS_exit_group, "the end", Args::Any),
+    (
+        FILTER_PROBE,
+        "never made for its answer: confine::linux::lock's read-back, the filter's own effect",
+        Args::Fails(FILTER_PROBE_ERRNO),
+    ),
 ];
+
+/// Every system call the waiting parent makes once it has forked the
+/// confined child (docs/design-fs.md §6.1, step 2): it waits for the child,
+/// may write one line to stderr, and exits as the child did.
+pub const PARENT_SYSCALLS: &[(c_long, &str, Args)] = &[
+    (libc::SYS_wait4, "waitpid for the confined child", Args::Any),
+    (libc::SYS_write, "the line saying how the child ended (stderr)", Args::Any),
+    (libc::SYS_writev, "the same, vectored", Args::Any),
+    (libc::SYS_rt_sigreturn, "return from a signal", Args::Any),
+    (libc::SYS_restart_syscall, "a wait restarted after a signal", Args::Any),
+    (libc::SYS_exit_group, "the end (_exit)", Args::Any),
+    (libc::SYS_exit, "the end", Args::Any),
+];
+
+/// The waiting parent's seccomp program: [`PARENT_SYSCALLS`], anything else
+/// `SECCOMP_RET_KILL_PROCESS`.
+pub fn parent_program() -> Vec<Insn> {
+    allow_list(PARENT_SYSCALLS, bpf::KILL_PROCESS)
+}
 
 /// The server's seccomp program: this architecture only (x32 refused),
 /// [`SERVER_SYSCALLS`] with their argument rules, anything else
@@ -632,6 +884,13 @@ pub fn allow_list(list: &[(c_long, &str, Args)], otherwise: u32) -> Vec<Insn> {
                 insn(RET, otherwise, 0, 0),
                 insn(RET, ALLOW, 0, 0),
             ],
+            Args::AnyOf(i, bits) => vec![
+                insn(LD_W_ABS, arg_lo(i), 0, 0),
+                insn(JSET, bits, 1, 0),
+                insn(RET, otherwise, 0, 0),
+                insn(RET, ALLOW, 0, 0),
+            ],
+            Args::Fails(e) => vec![insn(RET, ERRNO | (u32::try_from(e).unwrap_or(1) & 0xffff), 0, 0)],
             Args::Zero(i) => vec![
                 insn(LD_W_ABS, arg_lo(i), 0, 0),
                 insn(JEQ, 0, 1, 0),
@@ -657,10 +916,23 @@ pub fn allow_list(list: &[(c_long, &str, Args)], otherwise: u32) -> Vec<Insn> {
 /// else: the refusal tests run wick-fsd under one, so a confinement step
 /// fails for real (docs/design-fs.md §6.1).
 pub fn deny_program(deny: &[(c_long, Option<(u32, u32)>)], errno: i32) -> Vec<Insn> {
+    matching_program(deny, bpf::ERRNO | (u32::try_from(errno).unwrap_or(1) & 0xffff))
+}
+
+/// A filter that tells a supervisor of each system call of `calls` (as in
+/// [`deny_program`]) and allows everything else: the supervisor
+/// ([`supervise`]) answers each, by the process that made it, so a test
+/// makes the confined child's own step fail where its waiting parent makes
+/// the same call.
+pub fn notify_program(calls: &[(c_long, Option<(u32, u32)>)]) -> Vec<Insn> {
+    matching_program(calls, bpf::USER_NOTIF)
+}
+
+fn matching_program(calls: &[(c_long, Option<(u32, u32)>)], matched: u32) -> Vec<Insn> {
     use bpf::*;
-    let ret = insn(RET, ERRNO | (u32::try_from(errno).unwrap_or(1) & 0xffff), 0, 0);
+    let ret = insn(RET, matched, 0, 0);
     let mut p = vec![insn(LD_W_ABS, NR, 0, 0)];
-    for &(n, arg) in deny {
+    for &(n, arg) in calls {
         match arg {
             None => {
                 p.push(insn(JEQ, nr(n), 0, 1));
@@ -744,6 +1016,230 @@ pub fn command_with_filter(cmd: &mut std::process::Command, program: Vec<Insn>) 
     }
 }
 
+/// One system call a supervised process made ([`supervise`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Call {
+    /// The process, in the supervisor's pid namespace.
+    pub pid: i32,
+    /// Made in a pid namespace below the supervisor's (its `NSpid` has more
+    /// than one entry): wick-fsd's confined child, not its waiting parent.
+    pub nested: bool,
+    /// The system call.
+    pub nr: i32,
+    /// Its arguments.
+    pub args: [u64; 6],
+}
+
+/// What [`supervise`] answers a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// The kernel makes the call as asked (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`).
+    Continue,
+    /// The call fails with this errno, not made.
+    Fail(i32),
+    /// The call returns 0, not made: a step that says it was done and was
+    /// not, which only a read-back finds.
+    Pretend,
+}
+
+/// Has `cmd`'s child install `program` with a listener
+/// (`SECCOMP_FILTER_FLAG_NEW_LISTENER`) and send the listener over the
+/// returned socket before it runs its program, for [`supervise`]. It sets
+/// `no_new_privs` only where the kernel asks for it (without
+/// `CAP_SYS_ADMIN`), so a test of the server's own `no_new_privs` can see
+/// it; the byte sent with the listener is 1 where it did.
+pub fn command_with_supervisor(cmd: &mut std::process::Command, program: Vec<Insn>) -> Result<OwnedFd> {
+    use std::os::unix::process::CommandExt;
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: fds has room for the two descriptors socketpair returns.
+    check(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) })?;
+    let (ours, theirs) = (owned(fds[0])?, owned(fds[1])?);
+    let filters: Vec<libc::sock_filter> = program
+        .iter()
+        .map(|i| libc::sock_filter {
+            code: i.code,
+            jt: i.jt,
+            jf: i.jf,
+            k: i.k,
+        })
+        .collect();
+    let len = u16::try_from(filters.len()).unwrap_or(0);
+    let closure = move || {
+        let prog = libc::sock_fprog {
+            len,
+            filter: filters.as_ptr().cast_mut(),
+        };
+        let install = || {
+            // SAFETY: prog points at the filters, which the closure owns.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_seccomp,
+                    libc::SECCOMP_SET_MODE_FILTER,
+                    libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                    &prog,
+                )
+            }
+        };
+        let mut nnp = 0u8;
+        let mut listener = install();
+        if listener < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES) {
+            // SAFETY: integer arguments only.
+            let r = unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as c_ulong, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong)
+            };
+            if r < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            nnp = 1;
+            listener = install();
+        }
+        if listener < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = c_int::try_from(listener).unwrap_or(-1);
+        send_fd(theirs.as_raw_fd(), fd, nnp)?;
+        // SAFETY: the listener this closure was given; theirs closes at exec.
+        unsafe { libc::close(fd) };
+        Ok(())
+    };
+    // SAFETY: the closure makes only async-signal-safe system calls and
+    // allocates nothing (the program was built before the fork).
+    unsafe {
+        cmd.pre_exec(closure);
+    }
+    Ok(ours)
+}
+
+/// One descriptor's bytes in a control message.
+const FD_LEN: u32 = 4;
+
+/// Sends `fd` and one byte over `sock` (`SCM_RIGHTS`); async-signal-safe.
+fn send_fd(sock: c_int, fd: c_int, byte: u8) -> std::io::Result<()> {
+    let mut data = [byte];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr().cast::<c_void>(),
+        iov_len: 1,
+    };
+    // Room for one cmsghdr and one descriptor, aligned.
+    let mut space = [0u64; 4];
+    // SAFETY: a zeroed msghdr is valid; the pointers set below point at
+    // locals that live across sendmsg, and CMSG_* stay inside `space`.
+    unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = space.as_mut_ptr().cast::<c_void>();
+        msg.msg_controllen = libc::CMSG_SPACE(FD_LEN) as _;
+        let cm = libc::CMSG_FIRSTHDR(&msg);
+        (*cm).cmsg_level = libc::SOL_SOCKET;
+        (*cm).cmsg_type = libc::SCM_RIGHTS;
+        (*cm).cmsg_len = libc::CMSG_LEN(FD_LEN) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cm).cast::<c_int>(), fd);
+        if libc::sendmsg(sock, &msg, 0) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Receives what [`send_fd`] sent: (the descriptor, the byte).
+fn recv_fd(sock: BorrowedFd<'_>) -> Result<Option<(OwnedFd, u8)>> {
+    let mut data = [0u8];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr().cast::<c_void>(),
+        iov_len: 1,
+    };
+    let mut space = [0u64; 4];
+    // SAFETY: as in send_fd; the descriptor read is the one the kernel
+    // installed in this process.
+    unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = space.as_mut_ptr().cast::<c_void>();
+        msg.msg_controllen = std::mem::size_of_val(&space) as _;
+        let n = libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC);
+        if n < 0 {
+            return Err(last());
+        }
+        let cm = libc::CMSG_FIRSTHDR(&msg);
+        if n == 0 || cm.is_null() || (*cm).cmsg_type != libc::SCM_RIGHTS {
+            return Ok(None);
+        }
+        let fd = std::ptr::read_unaligned(libc::CMSG_DATA(cm).cast::<c_int>());
+        Ok(Some((owned(fd)?, data[0])))
+    }
+}
+
+/// Whether `pid` runs in a pid namespace below this process's.
+fn nested(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("NSpid:").map(|v| v.split_whitespace().count() > 1)))
+        .unwrap_or(false)
+}
+
+/// The supervisor of a process [`command_with_supervisor`] started: a
+/// thread that answers each call the filter tells it of with `decide`
+/// until no process holds the filter (or a minute passes), and returns the
+/// calls and whether the child had to set `no_new_privs` itself.
+pub fn supervise(
+    sock: OwnedFd,
+    mut decide: impl FnMut(&Call) -> Answer + Send + 'static,
+) -> std::thread::JoinHandle<(Vec<Call>, bool)> {
+    std::thread::spawn(move || {
+        let mut calls = Vec::new();
+        let Ok(Some((listener, nnp))) = recv_fd(sock.as_fd()) else {
+            return (calls, false);
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            let mut p = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd.
+            if unsafe { libc::poll(&mut p, 1, 200) } <= 0 {
+                continue;
+            }
+            if p.revents & libc::POLLIN == 0 {
+                // POLLHUP: no process holds the filter now.
+                break;
+            }
+            // SAFETY: a zeroed seccomp_notif, as the kernel asks for.
+            let mut n: libc::seccomp_notif = unsafe { std::mem::zeroed() };
+            // SAFETY: RECV fills the struct passed.
+            if unsafe { libc::ioctl(listener.as_raw_fd(), libc::SECCOMP_IOCTL_NOTIF_RECV, &mut n) } < 0 {
+                continue;
+            }
+            let pid = i32::try_from(n.pid).unwrap_or(0);
+            let call = Call {
+                pid,
+                nested: nested(pid),
+                nr: n.data.nr,
+                args: n.data.args,
+            };
+            let (error, flags) = match decide(&call) {
+                Answer::Continue => (0, u32::try_from(libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE).unwrap_or(1)),
+                Answer::Fail(e) => (-e, 0),
+                Answer::Pretend => (0, 0),
+            };
+            let mut r = libc::seccomp_notif_resp {
+                id: n.id,
+                val: 0,
+                error,
+                flags,
+            };
+            // SAFETY: SEND reads the struct passed; ENOENT (the caller
+            // ended meanwhile) is no matter.
+            unsafe { libc::ioctl(listener.as_raw_fd(), libc::SECCOMP_IOCTL_NOTIF_SEND, &mut r) };
+            calls.push(call);
+        }
+        (calls, nnp == 1)
+    })
+}
+
 /// The uid and pid of the peer of a connected Unix socket (`SO_PEERCRED`):
 /// who connected, as the kernel recorded it at `connect`.
 pub fn peer(sock: BorrowedFd<'_>) -> Result<(u32, i32)> {
@@ -802,6 +1298,55 @@ pub mod probe {
     pub fn ptrace_traceme() -> Result<()> {
         // SAFETY: TRACEME takes no pointers.
         check_long(unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) }).map(drop)
+    }
+
+    /// One forbidden form of a call the server makes, as a raw system call
+    /// on `dir` (a directory in the share): each must end the process.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Form {
+        /// `utimensat(dir, "f", NULL, 0)`: a path, where futimens has none.
+        UtimensatPath,
+        /// `linkat(dir, "f", dir, "g", AT_SYMLINK_FOLLOW)`.
+        LinkatFollow,
+        /// `linkat(dir, "", dir, "g", AT_EMPTY_PATH)`.
+        LinkatEmptyPath,
+        /// `newfstatat(dir, "f", buf, 0)`: one that follows a final link.
+        FstatatFollow,
+        /// `statx(dir, "f", 0, STATX_BASIC_STATS, buf)`: the same.
+        StatxFollow,
+        /// `unlinkat(dir, "f", 1)`: a flag the server never passes.
+        UnlinkatFlag,
+        /// `mkdirat(dir, "m", 0o755)`: another mode than the server's.
+        MkdiratMode,
+        /// `renameat2(dir, "f", dir, "g", RENAME_WHITEOUT)`.
+        RenameWhiteout,
+        /// `fchmod(dir, 0o4700)`: setuid.
+        FchmodSetuid,
+    }
+
+    /// Makes the call `form` names; its result if the filter lets it through.
+    pub fn form(dir: BorrowedFd<'_>, form: Form) -> Result<()> {
+        let d = dir.as_raw_fd();
+        let (f, g, m, empty) = (c"f".as_ptr(), c"g".as_ptr(), c"m".as_ptr(), c"".as_ptr());
+        // Room for the stat calls to fill.
+        let mut buf = [0u8; 512];
+        let b = buf.as_mut_ptr();
+        // SAFETY: every pointer is a NUL-terminated name above or the
+        // buffer, live across the call; the rest are integers.
+        let r = unsafe {
+            match form {
+                Form::UtimensatPath => libc::syscall(libc::SYS_utimensat, d, f, std::ptr::null::<u8>(), 0),
+                Form::LinkatFollow => libc::syscall(libc::SYS_linkat, d, f, d, g, libc::AT_SYMLINK_FOLLOW),
+                Form::LinkatEmptyPath => libc::syscall(libc::SYS_linkat, d, empty, d, g, libc::AT_EMPTY_PATH),
+                Form::FstatatFollow => libc::syscall(libc::SYS_newfstatat, d, f, b, 0),
+                Form::StatxFollow => libc::syscall(libc::SYS_statx, d, f, 0, libc::STATX_BASIC_STATS, b),
+                Form::UnlinkatFlag => libc::syscall(libc::SYS_unlinkat, d, f, 1),
+                Form::MkdiratMode => libc::syscall(libc::SYS_mkdirat, d, m, 0o755),
+                Form::RenameWhiteout => libc::syscall(libc::SYS_renameat2, d, f, d, g, libc::RENAME_WHITEOUT),
+                Form::FchmodSetuid => libc::syscall(libc::SYS_fchmod, d, 0o4700),
+            }
+        };
+        check_long(r).map(drop)
     }
 
     /// `mmap` of one anonymous executable page.
