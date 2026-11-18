@@ -1393,6 +1393,48 @@ it means layer 1 let the request through.
     :9124), so its profiles list none of the three and it refuses to apply one to a process the kernel records a ring
     for (SECURITY.md, Heap); wick-fsd runs libmalloc's default mode and keeps its entries.
 
+    Paths into the kernel that libSystem or libmalloc takes only in a state the tests do not make, by source, each
+    with where it stands in the profile (a call no list names is killed):
+
+    | Call | Path (source) | Reached when | In the profile | Why, and what holds it |
+    | --- | --- | --- | --- | --- |
+    | `_kernelrpc_mach_vm_allocate_trap` (10) | libmalloc-715.140.5 magazine_large.c `large_try_realloc_in_place`: `vm_allocate` at a fixed address | a large block, past the medium allocator's 8 MiB, grown in place; the medium allocator is engaged on arm64 and under Rosetta and is off only on native Intel under 32 GiB (malloc.c :357) | no | native Intel under 32 GiB only, not a host; and no buffer the server grows passes 2 MiB (next rows) |
+    | `vm_copy` (MIG) | libmalloc-715.140.5 magazine_malloc.c :592 | a realloc that moves more than 2 MiB (`VM_COPY_THRESHOLD`) | no | every buffer the server grows stays at or under 2 MiB: the frame's payload, a READDIR reply, a dirent, a LISTXATTR answer (`test_the_buffers_the_server_grows_stay_under_a_vm_copy`, whose message names these two routines for a larger one); the node and handle tables are hash tables, which grow by a new allocation |
+    | `mach_vm_copy` (MIG) | libmalloc-812.100.31 xzone_malloc.c :5754 | the same past `XZM_LARGE_BLOCK_SIZE_MAX` (2 MiB) | no | the same test |
+    | `_kernelrpc_mach_port_construct_trap` (24) | xnu-12377.1.9 libsyscall/mach/mig_reply_port.c :64 `mig_get_reply_port` | a MIG call on a thread with no reply port: a new thread's first, or the main thread's after the next row (measured on 27.2: a new thread's slot is empty at its start, the main thread's is set before `main`) | no (Firecracker's lists have it) | the server has one thread, its main one (nothing in crates/fs/fsd/src makes a thread), so only after the next row |
+    | `_kernelrpc_mach_port_mod_refs_trap` (19), `_kernelrpc_mach_port_deallocate_trap` (18) | mig_reply_port.c :85 `mig_dealloc_reply_port`, which a MIG stub calls when `mach_msg` fails other than with `MACH_SEND_INVALID_DATA`, `_DEST` or `_HEADER` (mig's `__MachMsgErrorWithoutTimeout`, in every stub it generates) | an exchange with the kernel (`mach_vm_reallocate`, the ring's routines) failing at the transport: the kernel out of message buffers, the reply port gone | no (Firecracker's lists have them) | in no run; measured on 27.2: on the main thread the call clears the slot, so the next MIG call makes trap 24; a kill if it happens, its crash report naming the trap |
+    | `mach_vm_reclaim_update_kernel_accounting_trap` (63), `mach_vm_deferred_reclamation_buffer_resize`, `_flush` | the ring's timer and its full or raced ring (above) | from macOS 26, the first free 10 s after the last sample; a full ring; a lost race | yes, where libsandbox knows the names | above |
+    | `getentropy` (500) | Libc's `arc4random`: a reseed at the first draw 5 s or more after the last (measured on 27.2: every 5.05 s, by time) | an `arc4random` draw after confinement | no (Firecracker's lists have it) | not reached, measured: the server draws nothing random once confined (fs-server-report at 34626765, the idle test included); a thread made later that makes a `HashMap` draws its keys (std's `RandomState`), a rule question then |
+
+    Each entry of the profile's lists against Firecracker's (overlay/vmm/ext/sandbox.rs, after the microVM is built:
+    "run"; before: "setup"; the API process: "API"), then the calls Firecracker's lists have for libSystem's own
+    paths that wick-fsd's do not:
+
+    | wick-fsd's entry | Firecracker | Note |
+    | --- | --- | --- |
+    | `recvfrom` (29), `sendto` (133) | run, API | frames |
+    | `sigaltstack` (53), `munmap` (73) | run, API | std's stack-overflow handler at exit |
+    | `madvise` (75) | run, API (API: `MADV_DONTNEED` only, the compatibility libc's check) | libmalloc |
+    | `fcntl` (92), `fcntl_nocancel` (406) | run, API | commands below |
+    | `fsync` (95), `pread` (153), `lseek` (199), `ftruncate` (201), `fstatfs64` (346), `fstatat64` (470) | run | the host's file calls |
+    | `gettimeofday` (116), `fstat64` (339) | run, API | |
+    | `getdirentries64` (344) | setup | Firecracker reads a directory only while it builds the microVM |
+    | `fsetattrlist` (229), `fgetxattr` (235), `flistxattr` (241), `readlinkat` (473), `mkdirat` (475), `getattrlistat` (476), `renameatx_np` (488) | none | a file server's own: times, attributes, links, directories, the stored name, RENAME2 |
+    | fcntl `F_GETFD`, `F_SETFD` | run, API | |
+    | fcntl `F_FULLFSYNC`, `F_PUNCHHOLE` | run | |
+    | fcntl `F_PREALLOCATE` | none | FALLOCATE that allocates (Firecracker's fallocate only punches) |
+    | `_kernelrpc_mach_vm_deallocate_trap` (12), `_kernelrpc_mach_vm_map_trap` (15) | run, API | libmalloc |
+    | `mach_msg2_trap` (47) | run | the MIG calls below; the API process sends no message |
+    | `mach_vm_reclaim_update_kernel_accounting_trap` (63) | none (from e3613478) | Firecracker runs libmalloc in its space-efficient mode, which makes no ring, and refuses a profile to a process that has one |
+    | `mach_vm_reallocate` (MIG) | setup, where defined | Firecracker grows guest memory only while it builds the microVM |
+    | `mach_vm_deferred_reclamation_buffer_resize`, `_flush` (MIG) | none | as trap 63 |
+    | Firecracker's only: `_kernelrpc_mach_vm_allocate_trap` (10) | run, API | the first table's first row |
+    | Firecracker's only: `_kernelrpc_mach_port_construct_trap` (24), `_mod_refs_trap` (19), `_deallocate_trap` (18), `_destruct_trap` | run, API | MIG reply ports: the first table; Firecracker makes threads, wick-fsd does not |
+    | Firecracker's only: `semaphore_*` traps, `psynch_*`, `ulock_*`, `swtch_pri`, `syscall_thread_switch` | run, API | a contended lock waits or yields; wick-fsd's one thread contends with nothing |
+    | Firecracker's only: `__semwait_signal` | run | `nanosleep`: wick-fsd never sleeps |
+    | Firecracker's only: `getentropy` (500) | run, API | the first table's last row |
+    | Firecracker's only: `__pthread_canceled` | run, API | a cancellation point's `EINTR` from a handled signal: wick-fsd's only handlers are std's for a stack overflow (SIGSEGV, SIGBUS), raised by a fault, not inside a blocking call |
+
   - **How the lists were made, and the limit of that.** A discovery build (`--cfg wick_fsd_discovery`, never
     released) ends the profile with `(allow default (with report))` and allows unlisted calls with a report;
     the confined tests are run under it and each `Sandbox:` report line read (`/usr/bin/log show`). What that

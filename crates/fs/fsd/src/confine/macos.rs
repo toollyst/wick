@@ -543,6 +543,41 @@ mod tests {
         drop_to: Some((65534, 65534)),
     };
 
+    // libmalloc moves a block it cannot grow in place with a VM copy once
+    // the data moved passes 2 MiB: `mach_vm_copy` in xzone
+    // (libmalloc-812.100.31 xzone_malloc.c :5754, past
+    // XZM_LARGE_BLOCK_SIZE_MAX), `vm_copy` in the magazine allocator
+    // (libmalloc-715.140.5 magazine_malloc.c :592, past VM_COPY_THRESHOLD).
+    // Neither MIG routine is in the profile, so every buffer the server
+    // grows by realloc stays at or under 2 MiB:
+    // - the frame's payload (serve.rs `next`: one Vec, resized to each
+    //   frame's payload), at most MAX_PAYLOAD_LEN;
+    // - a READDIR reply, made with its whole capacity (`Vec::with_capacity`
+    //   of at most MAX_READ, never grown past it), and each dirent's
+    //   encoding (fuse::encode `Out`), one entry's;
+    // - a LISTXATTR answer (session.rs `listxattr`, grown name by name):
+    //   the guest's names, at most the node's budget
+    //   (limits::DEFAULT_XATTR_BUDGET);
+    // - a READDIR batch (READDIR_BATCH entries) and a directory's names
+    //   (host::unix::NAMES_MAX).
+    // The node and handle tables are hash tables, which grow by a new
+    // allocation, never by realloc. The READ buffer (`vec![0; want]`, then
+    // truncated) is never grown.
+    #[test]
+    fn test_the_buffers_the_server_grows_stay_under_a_vm_copy() {
+        const VM_COPY_PAST: usize = 2 << 20;
+        let need = "a larger one would need the MIG routines `mach_vm_copy` (xzone) and `vm_copy` (magazine) in \
+                    MIG_ROUTINES, where libmalloc's realloc copies past 2 MiB; measure them first";
+        for (name, size) in [
+            ("wick_fs_frame::MAX_FRAME_LEN", wick_fs_frame::MAX_FRAME_LEN),
+            ("wick_fs_frame::MAX_PAYLOAD_LEN", wick_fs_frame::MAX_PAYLOAD_LEN),
+            ("limits::MAX_READ + OUT_HEADER_LEN", crate::limits::MAX_READ + crate::fuse::OUT_HEADER_LEN),
+            ("limits::DEFAULT_XATTR_BUDGET", crate::limits::DEFAULT_XATTR_BUDGET),
+        ] {
+            assert!(size <= VM_COPY_PAST, "{name} is {size} bytes, over 2 MiB: {need}");
+        }
+    }
+
     #[test]
     fn test_first_uses_refused_by_name_where_the_root_is_no_directory() {
         let file = std::fs::File::open("/etc/hosts").unwrap();
