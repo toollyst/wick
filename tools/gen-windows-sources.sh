@@ -19,10 +19,12 @@
 # - vhost: tests that expect Linux `recvmsg` behaviour expect it on Windows
 #   too, where the ScmSocket of vmm-sys-util follows it;
 # - polling: its waitable sources' removal returns once the thread pool no
-#   longer waits on the handle nor runs a callback for it, a change to
+#   longer waits on the handle nor runs a callback for it, and a source's
+#   wait is registered again without an allocation, a change to
 #   src/iocp/mod.rs made by tools/gen-windows-sources-polling.py (which says
 #   why: STATUS_THREADPOOL_HANDLE_EXCEPTION after an eventfd's epoll delete
-#   and close);
+#   and close; an allocation in each wait after one that took a waitable's
+#   packet);
 # - upstream tests that need what Windows does not have are compiled out, each
 #   listed in EXCLUDED_TESTS with the reason.
 # Nothing else changes. Linux and macOS use the upstream crate unchanged.

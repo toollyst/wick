@@ -1163,7 +1163,12 @@ impl Epoll {
     /// for the event manager's 256 events), on every pass of the VMM's
     /// event loop, as the macOS instance did (d0dbe31;
     /// `test_a_wait_allocates_nothing`). Looking at an instance nested in
-    /// this one (`Nest::ready_now`) allocates nothing either. A nested
+    /// this one (`Nest::ready_now`) allocates nothing either, nor does the
+    /// wait after one that took a waitable's packet, which registers its
+    /// thread-pool wait again: polling keeps one callback context for each
+    /// source (`tools/gen-windows-sources-polling.py`), where it made one at
+    /// each registration; the pool's registration itself
+    /// (`RegisterWaitForSingleObject`) is the system's, not counted. A nested
     /// instance's own packets (`Nest::take`) and a console in line input
     /// mode (`line_ready`) still allocate when they are there.
     pub fn wait(&self, timeout: i32, events: &mut [EpollEvent]) -> io::Result<usize> {
@@ -1354,15 +1359,34 @@ mod tests {
     }
 
     /// Counts the calling thread's allocations, for
-    /// [`test_a_wait_allocates_nothing`].
+    /// [`test_a_wait_allocates_nothing`]; inside [`allocations_in`] it also
+    /// keeps where the first one was made.
     struct Counting;
     thread_local! {
         static ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Set inside `allocations_in` until its first allocation.
+        static WATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static FIRST: std::cell::RefCell<Option<std::backtrace::Backtrace>> =
+            const { std::cell::RefCell::new(None) };
     }
     // SAFETY: the system allocator's, with a count beside it.
     unsafe impl std::alloc::GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
             let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+            if WATCH.try_with(|w| w.replace(false)) == Ok(true) {
+                // The first allocation of the window: where it was made. The
+                // capture's own allocations are not the window's.
+                let count = ALLOCATIONS.try_with(std::cell::Cell::get);
+                let trace = std::backtrace::Backtrace::force_capture();
+                let _ = FIRST.try_with(|f| {
+                    if let Ok(mut f) = f.try_borrow_mut() {
+                        *f = Some(trace);
+                    }
+                });
+                if let Ok(count) = count {
+                    let _ = ALLOCATIONS.try_with(|n| n.set(count));
+                }
+            }
             // SAFETY: the caller's layout.
             unsafe { std::alloc::System.alloc(layout) }
         }
@@ -1374,14 +1398,39 @@ mod tests {
     #[global_allocator]
     static COUNTING: Counting = Counting;
 
+    /// The calling thread's allocations while `f` runs, and where the first
+    /// was made (a backtrace, resolved once `f` has returned), so that a
+    /// count above 0 names its path.
+    fn allocations_in(f: impl FnOnce()) -> (usize, String) {
+        // Initialised outside the window (its destructor's registration).
+        FIRST.with(|first| first.borrow_mut().take());
+        let before = ALLOCATIONS.with(std::cell::Cell::get);
+        WATCH.with(|w| w.set(true));
+        f();
+        WATCH.with(|w| w.set(false));
+        let count = ALLOCATIONS.with(std::cell::Cell::get) - before;
+        let first = FIRST.with(|first| first.borrow_mut().take());
+        (count, first.map_or_else(String::new, |t| format!("the first:\n{t}")))
+    }
+
     // A wait allocates nothing once its thread has waited before, as
     // Linux's epoll_wait writes into the caller's array, and as the macOS
     // instance's does since d0dbe31 (its wait allocated 70 MB in one vsock
     // test). Each wait here allocated the port's packets (room for twice
     // the caller's events), the list of what was ready and the map of a
-    // descriptor to its slot, on every pass of the VMM's event loop. Both
-    // ways a wait ends: with eventfds found ready by the direct check, and
-    // with nothing ready, through the completion port.
+    // descriptor to its slot, on every pass of the VMM's event loop. The
+    // ways a wait ends: with eventfds found ready by the direct check; with
+    // nothing ready, through the completion port; an outer instance's look at
+    // a nested one; and the wait after one woken through the port by a
+    // waitable, whose thread-pool wait it registers again: polling made a
+    // new callback context for each, so the VMM's event loop allocated once
+    // for each eventfd whose packet it took. By the code, that was the one
+    // allocation of CI run 44260251749's nested case: the nested instance's
+    // forwarder took the eventfd's packet only after the outer's look before
+    // the window had found none pending, so it set the instance's event
+    // then; one wait of the window took the packet that event posted to the
+    // outer port, and the next registered its wait again.
+    // A count above 0 prints where the first allocation was made.
     #[test]
     fn test_a_wait_allocates_nothing() {
         let epoll = Epoll::new().unwrap();
@@ -1394,21 +1443,27 @@ mod tests {
         }
         let mut ready = [EpollEvent::default(); 256];
         assert_eq!(epoll.wait(0, &mut ready).unwrap(), 3);
-        let before = ALLOCATIONS.with(std::cell::Cell::get);
-        for _ in 0..100 {
-            assert_eq!(epoll.wait(0, &mut ready).unwrap(), 3);
-        }
-        let ready_ones = ALLOCATIONS.with(std::cell::Cell::get) - before;
+        let ready_ones = allocations_in(|| {
+            for _ in 0..100 {
+                assert_eq!(epoll.wait(0, &mut ready).unwrap(), 3);
+            }
+        });
         for evt in &evts {
             evt.read().unwrap();
         }
         assert_eq!(epoll.wait(0, &mut ready).unwrap(), 0);
-        let before = ALLOCATIONS.with(std::cell::Cell::get);
-        for _ in 0..100 {
-            assert_eq!(epoll.wait(0, &mut ready).unwrap(), 0);
-        }
-        let none = ALLOCATIONS.with(std::cell::Cell::get) - before;
-        assert_eq!((ready_ones, none), (0, 0), "allocations in 100 waits with 3 eventfds ready, and in 100 with none");
+        let none = allocations_in(|| {
+            for _ in 0..100 {
+                assert_eq!(epoll.wait(0, &mut ready).unwrap(), 0);
+            }
+        });
+        assert_eq!(
+            (ready_ones.0, none.0),
+            (0, 0),
+            "allocations in 100 waits with 3 eventfds ready, and in 100 with none; {} {}",
+            ready_ones.1,
+            none.1
+        );
         // An outer instance's look at a nested one (`Nest::ready_now`):
         // ready, and then with only stale packets left once the source was
         // read. The forwarder's allocations are its own thread's.
@@ -1418,20 +1473,51 @@ mod tests {
             .unwrap();
         evts[0].write(1).unwrap();
         assert_eq!(outer.wait(2000, &mut ready).unwrap(), 1);
-        let before = ALLOCATIONS.with(std::cell::Cell::get);
-        for _ in 0..100 {
-            assert_eq!(outer.wait(0, &mut ready).unwrap(), 1);
-        }
-        let nested_ready = ALLOCATIONS.with(std::cell::Cell::get) - before;
+        let nested_ready = allocations_in(|| {
+            for _ in 0..100 {
+                assert_eq!(outer.wait(0, &mut ready).unwrap(), 1);
+            }
+        });
         evts[0].read().unwrap();
         assert_eq!(outer.wait(0, &mut ready).unwrap(), 0);
-        let before = ALLOCATIONS.with(std::cell::Cell::get);
-        for _ in 0..100 {
-            assert_eq!(outer.wait(0, &mut ready).unwrap(), 0);
-        }
-        let nested_none = ALLOCATIONS.with(std::cell::Cell::get) - before;
-        assert_eq!((nested_ready, nested_none), (0, 0), "allocations in 100 outer waits with the nested instance ready, and in 100 with it not");
+        let nested_none = allocations_in(|| {
+            for _ in 0..100 {
+                assert_eq!(outer.wait(0, &mut ready).unwrap(), 0);
+            }
+        });
+        assert_eq!(
+            (nested_ready.0, nested_none.0),
+            (0, 0),
+            "allocations in 100 outer waits with the nested instance ready, and in 100 with it not; {} {}",
+            nested_ready.1,
+            nested_none.1
+        );
         drop(outer);
+        // The wait after one woken through the completion port: a waitable
+        // handle other than an eventfd (an event here) has no direct check,
+        // so the wait that reports it took its packet from the port, and
+        // polling queued its thread-pool wait to be registered again, which
+        // the next wait does.
+        let event = new_event(true).unwrap();
+        let lone = Epoll::new().unwrap();
+        let fd = from_handle(event.as_raw_handle());
+        lone.ctl(ControlOperation::Add, fd, EpollEvent::new(EventSet::IN, 5)).unwrap();
+        // Its wait registered, on an event not yet signalled.
+        assert_eq!(lone.wait(0, &mut ready).unwrap(), 0);
+        // SAFETY: an open event.
+        unsafe { SetEvent(event.as_raw_handle()) };
+        assert_eq!(lone.wait(2000, &mut ready).unwrap(), 1);
+        // SAFETY: as above.
+        unsafe { ResetEvent(event.as_raw_handle()) };
+        let after_port = allocations_in(|| {
+            for _ in 0..100 {
+                assert_eq!(lone.wait(0, &mut ready).unwrap(), 0);
+            }
+        });
+        assert_eq!(after_port.0, 0, "allocations in 100 waits after one woken through the port; {}", after_port.1);
+        lone.ctl(ControlOperation::Delete, fd, EpollEvent::default()).unwrap();
+        drop(lone);
+        drop(event);
     }
 
     // A rate limiter's timer (vmm's rng test_bandwidth_rate_limiter: the

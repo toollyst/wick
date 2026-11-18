@@ -79,7 +79,8 @@ firecracker binary, vmm   (upstream source + patches/)
         polling (by path from the Windows vmm-sys-util) → crates/compat/polling
             Linux, macOS: empty, with no dependency (nothing of wick's uses it there,
                 and a build compiles upstream's units with upstream's features)
-            Windows: polling 3.11.0's source, its waitable removal fixed (below)
+            Windows: polling 3.11.0's source, its waitable removal fixed and its
+                waits registered again without an allocation (below)
 ```
 
 ## How it is built
@@ -434,7 +435,16 @@ semantics on Win32. The details are in the comments of each
   disabled), event-manager's removal of a subscriber's events (a device
   reset or unplugged), the serial input removed at its end, a pipe's
   watcher event and an epoll nested in another (vsock); each now waits for
-  at most one callback, which only posts a packet. Level-triggered is the default and `ONE_SHOT` is supported. Sockets
+  at most one callback, which only posts a packet. A waitable's wait is
+  registered again by the `wait` after one that took its packet; polling
+  3.11.0 boxed a new callback there each time (wick's first change kept that,
+  in an `Arc`), so the VMM's event loop allocated once for each eventfd whose
+  packet woke it. wick's polling keeps one callback context for each source,
+  made when it is added, which holds the packet the callback posts
+  (`test_a_wait_allocates_nothing`'s last part, a wait after one woken
+  through the port by a waitable; first run: CI); the pool's registration
+  itself (`RegisterWaitForSingleObject`) allocates in the system's heap, not
+  counted there. Level-triggered is the default and `ONE_SHOT` is supported. Sockets
   also support `EDGE_TRIGGERED`: IOCP is level-triggered, so edges come from
   the edge contract that the reader reads until `EAGAIN` (the compatibility
   `libc`'s `read` and `recv` report `EAGAIN` through `wick_fd::drained`, which

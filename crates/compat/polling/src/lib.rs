@@ -11,7 +11,10 @@
 //!   pipes, the console and nested instances): a removal returns once the
 //!   thread pool no longer waits on the handle nor runs a callback for it, so
 //!   that the handle may be closed, as Linux's `EPOLL_CTL_DEL` leaves nothing
-//!   behind (tools/gen-windows-sources-polling.py says what upstream did).
+//!   behind; and a source's wait registered again (by the `wait` after one
+//!   that took its packet) allocates nothing, as Linux's `epoll_wait`
+//!   allocates nothing (tools/gen-windows-sources-polling.py says what
+//!   upstream did).
 
 #[cfg(windows)]
 // Upstream code: lints capped as cargo caps them for upstream crates.
