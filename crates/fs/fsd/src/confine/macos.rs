@@ -142,9 +142,14 @@ pub const MACH_TRAPS: &[(&str, &str)] = &[
 /// The kernel MIG routines the server makes once confined, with why.
 pub const MIG_ROUTINES: &[(&str, &str)] = &[];
 
-/// MIG routines allowed where the kernel defines them (macOS 26 added them;
-/// on macOS 15 a profile naming them does not compile, as Firecracker's
-/// profile found).
+/// MIG routines allowed where the kernel defines them: `mach_vm_reallocate`
+/// is in xnu's osfmk/mach/mach_vm.defs from xnu-12377.101.15 (a macOS 26
+/// release) on, and a profile naming it does not compile on an older kernel
+/// (macOS 15, as Firecracker's profile found, and macOS 26 before that
+/// release). Where it is not defined libmalloc cannot call it; there a large
+/// realloc copies instead (libmalloc-715.140.5, macOS 15: `memcpy` up to
+/// 2 MiB, `vm_copy` beyond, magazine_malloc.c :592), which confine_probe's
+/// "a realloc of a block past 2 MiB" measures on each major.
 pub const MIG_ROUTINES_IF_DEFINED: &[(&str, &str)] =
     &[("mach_vm_reallocate", "libmalloc grows a large block (realloc), measured as the traps are")];
 
@@ -452,24 +457,49 @@ mod tests {
         sb::compile(&ro).unwrap();
     }
 
+    /// The first xnu release (`xnu-A.B`) that defines each name the profile
+    /// emits only where it is defined, from the source
+    /// (apple-oss-distributions/xnu): the graft checks
+    /// `mpo_graft_check_graft` and `mpo_graft_check_ungraft` are in
+    /// security/mac_policy.h from xnu-12377.1.9 (macOS 26.0), not in
+    /// xnu-11417.140.69 (macOS 15); the routine `mach_vm_reallocate` is in
+    /// osfmk/mach/mach_vm.defs from xnu-12377.101.15, not in xnu-12377.81.4
+    /// or any earlier release.
+    const DEFINED_SINCE_XNU: &[(&str, (u32, u32))] =
+        &[("file-graft", (12377, 1)), ("file-ungraft", (12377, 1)), ("mach_vm_reallocate", (12377, 101))];
+
+    /// This kernel's `xnu-A.B` (`uname -v`, `root:xnu-A.B.C~...`).
+    fn xnu() -> (u32, u32) {
+        let out = std::process::Command::new("/usr/bin/uname").arg("-v").output().unwrap();
+        let version = String::from_utf8(out.stdout).unwrap();
+        let rest = version.split("xnu-").nth(1).unwrap_or_else(|| panic!("no xnu- in {version:?}"));
+        let mut parts = rest.split(['.', '~', '/']).map(|p| p.parse::<u32>());
+        match (parts.next(), parts.next()) {
+            (Some(Ok(a)), Some(Ok(b))) => (a, b),
+            _ => panic!("no xnu-A.B in {version:?}"),
+        }
+    }
+
     /// Every symbol the profile names (operations, filters, actions, trap and
     /// MIG names, fcntl commands) is bound in this macOS's libsandbox, each
     /// checked on its own (`(define wick-probe-symbol <symbol>)`), so that
     /// one run names every missing one where the profile's compile stops at
-    /// the first. The names a rule emits only where they are defined
-    /// (`ERROR_IN_SHARE_IF_DEFINED`, the `(when (defined? '...))` lines) are
-    /// unbound exactly on macOS 15 (Darwin 24) and bound from macOS 26 (Darwin
-    /// 25) on, so none of them is dropped where it exists.
+    /// the first. The names a rule emits only where they are defined (every
+    /// `(when (defined? '...))` of the profile, read from its text) are bound
+    /// exactly from the xnu release that defines each
+    /// ([`DEFINED_SINCE_XNU`]), so none of them is dropped where it exists.
     #[test]
     fn test_every_name_of_the_profile_is_defined_on_this_macos() {
-        let darwin: u32 = {
-            let out = std::process::Command::new("/usr/bin/uname").arg("-r").output().unwrap();
-            let release = String::from_utf8(out.stdout).unwrap();
-            release.trim().split('.').next().unwrap().parse().unwrap()
-        };
+        let xnu = xnu();
         let bound = |sym: &str| sb::compile(&format!("(version 1)\n(define wick-probe-symbol {sym})\n")).is_ok();
         let mut symbols = std::collections::BTreeSet::new();
+        let mut optional = std::collections::BTreeSet::new();
         for text in [profile(Path::new("/private/tmp/share"), false).unwrap(), profile(Path::new("/private/tmp/share"), true).unwrap()] {
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("(when (defined? '") {
+                    optional.insert(rest.split(')').next().unwrap().to_string());
+                }
+            }
             // Strings out (the share's path, the info type), then each token
             // that is not a number or a quoted symbol.
             let mut plain = String::new();
@@ -488,19 +518,34 @@ mod tests {
                 }
             }
         }
-        let optional: Vec<String> = ERROR_IN_SHARE_IF_DEFINED.iter().map(|(o, _)| (*o).to_string()).collect();
-        let unbound: Vec<&String> = symbols.iter().filter(|s| !optional.contains(s) && !bound(s)).collect();
+        let unbound: Vec<&String> = symbols.iter().filter(|s| !optional.contains(*s) && !bound(s)).collect();
         let optional_unbound: Vec<&String> = optional.iter().filter(|o| !bound(o)).collect();
         println!(
-            "Darwin {darwin}: {} symbols of the profile, unbound: {unbound:?}; emitted where defined, unbound: {optional_unbound:?}",
+            "xnu-{}.{}: {} symbols of the profile, unbound: {unbound:?}; emitted where defined: {optional:?}, unbound: \
+             {optional_unbound:?}",
+            xnu.0,
+            xnu.1,
             symbols.len()
         );
-        assert!(unbound.is_empty(), "the profile names symbols this macOS (Darwin {darwin}) does not define: {unbound:?}");
-        if darwin <= 24 {
-            assert_eq!(optional_unbound, optional.iter().collect::<Vec<_>>(), "Darwin {darwin}: expected none of {optional:?} defined");
-        } else {
-            assert!(optional_unbound.is_empty(), "Darwin {darwin}: {optional_unbound:?} not defined, so their rules would be dropped");
+        assert!(unbound.is_empty(), "the profile names symbols this macOS (xnu-{}.{}) does not define: {unbound:?}", xnu.0, xnu.1);
+        let since: std::collections::BTreeMap<&str, (u32, u32)> = DEFINED_SINCE_XNU.iter().copied().collect();
+        for name in &optional {
+            let first = since
+                .get(name.as_str())
+                .unwrap_or_else(|| panic!("{name} is emitted where defined: DEFINED_SINCE_XNU must say from which xnu"));
+            let expected = xnu >= *first;
+            assert_eq!(
+                bound(name),
+                expected,
+                "{name} on xnu-{}.{}: defined since xnu-{}.{}, so expected {}",
+                xnu.0,
+                xnu.1,
+                first.0,
+                first.1,
+                if expected { "bound" } else { "unbound (its rule dropped)" }
+            );
         }
+        assert_eq!(since.len(), optional.len(), "DEFINED_SINCE_XNU names one the profile does not emit");
     }
 
     /// The whole text, pinned for a read-write and a read-only share

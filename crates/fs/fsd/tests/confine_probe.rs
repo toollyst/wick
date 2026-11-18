@@ -158,6 +158,15 @@ mod macos {
         ok(probe::fcntl_command(f.as_fd(), command))
     }
 
+    /// 3 MiB written, grown to 8 MiB by realloc, both ends read back: 1.
+    fn realloc_past_copy_threshold() -> i32 {
+        let mut v = vec![1u8; 3 << 20];
+        v.reserve_exact(5 << 20);
+        v.resize(8 << 20, 2);
+        let v = std::hint::black_box(v);
+        i32::from(v[(3 << 20) - 1] == 1 && v[(8 << 20) - 1] == 2)
+    }
+
     /// `/.vol/<dev>/<ino>` of `path`: the same file by its volume id.
     fn by_volume_id(path: &Path) -> PathBuf {
         let m = std::fs::symlink_metadata(path).unwrap();
@@ -295,6 +304,13 @@ mod macos {
             ("a graft onto the share", |c| in_share(c, InShare::Graft), KILLED),
             ("an ungraft of the share", |c| in_share(c, InShare::Ungraft), KILLED),
             ("exec of a file of the share", |c| ok(std::process::Command::new(c.inside).status()), KILLED),
+            // What the server's own allocations make, allowed: a block past
+            // libmalloc's 2 MiB copy threshold grown by realloc, which is
+            // `mach_vm_reallocate` where the kernel defines it (macOS 27.2,
+            // measured) and a copy where it does not (macOS 15's libmalloc:
+            // `vm_copy` beyond 2 MiB), so each major says here whether its
+            // way is in the profile.
+            ("a realloc of a block past 2 MiB", |_| realloc_past_copy_threshold(), 1),
             // `..` of the root is refused beneath it, by the backend's open.
             (".. beneath the root", |c| ok(sys::open_dir(c.root, b"..")), 0),
         ];

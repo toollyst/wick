@@ -1099,8 +1099,11 @@ it means layer 1 let the request through.
     mac-syscalls are killed unless listed, and so are generated code (`dynamic-code-generation`) and the issue of
     sandbox extensions. The lists are by number or name, each entry with why (table below): `SYSCALLS`,
     `MACH_TRAPS` (libmalloc's `_kernelrpc_mach_vm_map_trap` and `mach_msg2_trap`, for a frame of up to 2 MiB and
-    the node tables), and `mach_vm_reallocate` where the kernel defines it (`(when (defined? ...))`: macOS 15's
-    libsandbox does not compile the name). Seatbelt does not check the number of some calls at all (Firecracker's
+    the node tables), and `mach_vm_reallocate` where the kernel defines it (`(when (defined? ...))`: the routine is in
+    xnu from xnu-12377.101.15, so macOS 15 and the macOS 26 releases before it do not compile the name; there a large
+    realloc copies instead, `vm_copy` beyond 2 MiB in macOS 15's libmalloc-715.140.5, which confine_probe's "a realloc
+    of a block past 2 MiB" measures on each major; `test_every_name_of_the_profile_is_defined_on_this_macos` checks
+    each such name bound exactly from its first xnu). Seatbelt does not check the number of some calls at all (Firecracker's
     `UNFILTERED_SYSCALLS` in `overlay/vmm/ext/sandbox.rs`: `openat`, `close`, `write`, `pwrite`, `fchmod`,
     `fsetxattr`, `fremovexattr`, `linkat`, `unlinkat` among those wick-fsd makes); for those the file rules decide.
     `fcntl`'s command is checked too (`system-fcntl`, below).
