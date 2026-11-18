@@ -19,7 +19,9 @@
 //! (`fcntl(F_GETFD)` over every number below the soft limit) cannot be
 //! made to lie for one call without lying for every `fcntl` the server
 //! makes; the list before the profile, which the same equality checks, is
-//! (`test_refused_when_a_descriptor_survives_its_close`).
+//! (`test_refused_when_a_descriptor_survives_its_close`). What the walk
+//! finds is a refusal, not a kill
+//! (`test_refused_when_the_apply_leaves_a_descriptor`).
 
 #![cfg(target_os = "macos")]
 // An integration test file is itself the test crate.
@@ -37,6 +39,7 @@ use wick_fs_sys as sys;
 /// no value it changes nothing.
 const LIBRARY: &str = r#"
 #include <errno.h>
+#include <fcntl.h>
 #include <grp.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -59,6 +62,9 @@ static void *compile_fails(const char *profile, void *params, char **error) {
 }
 static int apply_fails(const void *profile) {
     if (is("apply")) { errno = EPERM; return -1; }
+    /* The apply leaves a descriptor open: found by the walk under the
+       profile, which names it by its kind alone. */
+    if (is("apply-opens") && open("/dev/null", O_RDONLY) < 0) abort();
     return sandbox_apply(profile);
 }
 /* The drop: a server that is not root is taken for root, so that it drops,
@@ -195,6 +201,19 @@ fn test_refused_when_the_id_drop_fails() {
 #[test]
 fn test_refused_when_a_descriptor_survives_its_close() {
     refused_when("ref-listener", "listener", "descriptors open that wick-fsd did not open or keep");
+}
+
+/// A descriptor the apply left open is found under the profile and named
+/// by its kind alone: asking for its path (`F_GETPATH`) is an `fcntl`
+/// command the profile kills, so the refusal would be a kill without its
+/// message.
+#[test]
+fn test_refused_when_the_apply_leaves_a_descriptor() {
+    refused_when(
+        "ref-applyopen",
+        "apply-opens",
+        "confinement: under the profile, descriptors open that wick-fsd did not open or keep: ",
+    );
 }
 
 #[test]

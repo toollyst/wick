@@ -1530,16 +1530,21 @@ pub fn command_with_inherited(cmd: &mut std::process::Command, fds: Vec<(OwnedFd
 }
 
 /// What descriptor `fd` of this process is, for a message: its file type
-/// and where the host can say it, its path (macOS `F_GETPATH`, Linux the
-/// `/proc/self/fd` link, which names a pipe or socket by its inode).
-pub fn descriptor_described(fd: c_int) -> String {
+/// (`fstat`) alone, for a process whose sandbox does not let it ask for the
+/// path (macOS: wick-fsd's profile kills `F_GETPATH`).
+pub fn descriptor_kind(fd: c_int) -> String {
+    match kind_of(fd) {
+        Ok(kind) => format!("{fd}: {kind}"),
+        Err(e) => format!("{fd}: {e:?}"),
+    }
+}
+
+fn kind_of(fd: c_int) -> Result<&'static str> {
     // SAFETY: an output buffer of the right type.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: as above.
-    if unsafe { libc::fstat(fd, &mut st) } < 0 {
-        return format!("{fd}: {:?}", last());
-    }
-    let kind = match st.st_mode & libc::S_IFMT {
+    check(unsafe { libc::fstat(fd, &mut st) })?;
+    Ok(match st.st_mode & libc::S_IFMT {
         libc::S_IFREG => "file",
         libc::S_IFDIR => "directory",
         libc::S_IFCHR => "character device",
@@ -1548,6 +1553,16 @@ pub fn descriptor_described(fd: c_int) -> String {
         libc::S_IFSOCK => "socket",
         libc::S_IFLNK => "link",
         _ => "other",
+    })
+}
+
+/// What descriptor `fd` of this process is, for a message: its file type
+/// and where the host can say it, its path (macOS `F_GETPATH`, Linux the
+/// `/proc/self/fd` link, which names a pipe or socket by its inode).
+pub fn descriptor_described(fd: c_int) -> String {
+    let kind = match kind_of(fd) {
+        Ok(kind) => kind,
+        Err(e) => return format!("{fd}: {e:?}"),
     };
     #[cfg(target_os = "macos")]
     let path = {

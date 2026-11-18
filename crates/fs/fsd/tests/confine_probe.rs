@@ -43,7 +43,7 @@ mod macos {
     use std::path::{Path, PathBuf};
 
     use wick_fs_sys as sys;
-    use wick_fs_sys::seatbelt::probe::{self, Ended, Forked, InShare};
+    use wick_fs_sys::seatbelt::probe::{self, Ended, Fcntl, Forked, InShare};
     use wick_fsd::confine::macos::{Plan, confine};
     use wick_fsd::host::unix::{HostDir, Options};
     use wick_fsd::limits::Limits;
@@ -152,6 +152,12 @@ mod macos {
 
     const EPERM: i32 = 1;
 
+    /// [`probe::fcntl_command`] on the share's file: 1 done, 0 not.
+    fn fcntl_on_file(c: &Ctx<'_>, command: Fcntl) -> i32 {
+        let Ok(f) = std::fs::File::open(c.inside) else { return 3 };
+        ok(probe::fcntl_command(f.as_fd(), command))
+    }
+
     /// `/.vol/<dev>/<ino>` of `path`: the same file by its volume id.
     fn by_volume_id(path: &Path) -> PathBuf {
         let m = std::fs::symlink_metadata(path).unwrap();
@@ -226,8 +232,16 @@ mod macos {
             // By fsetattrlist, a call the server makes (SETATTR of the
             // times): the share's rule refuses it.
             ("Finder information of a file of the share", |c| in_share(c, InShare::FinderInfo), 0),
-            // By fcntl, a call the server makes (with any command).
-            ("an fcntl lock on a file of the share", |c| in_share(c, InShare::FcntlLock), 0),
+            // By fcntl, a call the server makes: the command is not one of
+            // FCNTL_COMMANDS, so system-fcntl kills it before the share's
+            // file-lock rule is asked.
+            ("an fcntl lock on a file of the share", |c| in_share(c, InShare::FcntlLock), KILLED),
+            // fcntl commands the server does not make, on a file of the
+            // share (confine::macos::FCNTL_COMMANDS), and one it makes.
+            ("fcntl F_GETPATH (the host path)", |c| fcntl_on_file(c, Fcntl::GetPath), KILLED),
+            ("fcntl F_DUPFD", |c| fcntl_on_file(c, Fcntl::DupFd), KILLED),
+            ("fcntl F_SETFL", |c| fcntl_on_file(c, Fcntl::SetFl), KILLED),
+            ("fcntl F_GETFD", |c| fcntl_on_file(c, Fcntl::GetFd), 1),
             // Killed, not refused by the share's rule: what they ask is
             // decided outside the share (unconfined, the kernel refuses
             // them to this user too: on record below).

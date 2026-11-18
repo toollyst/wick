@@ -422,6 +422,45 @@ pub mod probe {
         Ok(found)
     }
 
+    /// An `fcntl` command the server does not make, on `fd`: `GetPath` asks
+    /// for its host path, `DupFd` makes another descriptor of it, `SetFl`
+    /// clears its status flags. `Ok` when it was done.
+    pub fn fcntl_command(fd: BorrowedFd<'_>, command: Fcntl) -> Result<()> {
+        let fd = fd.as_raw_fd();
+        match command {
+            Fcntl::GetPath => {
+                let mut buf = [0u8; libc::PATH_MAX as usize];
+                // SAFETY: F_GETPATH writes at most MAXPATHLEN bytes, the buffer's.
+                check(unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) }).map(drop)
+            }
+            Fcntl::DupFd => {
+                // SAFETY: a descriptor number; the new one is closed at once.
+                let new = check(unsafe { libc::fcntl(fd, libc::F_DUPFD, 0) })?;
+                // SAFETY: the descriptor just made, this function's.
+                unsafe { libc::close(new) };
+                Ok(())
+            }
+            Fcntl::SetFl => {
+                // SAFETY: a descriptor number; no status flag set.
+                check(unsafe { libc::fcntl(fd, libc::F_SETFL, 0) }).map(drop)
+            }
+            Fcntl::GetFd => {
+                // SAFETY: a descriptor number.
+                check(unsafe { libc::fcntl(fd, libc::F_GETFD) }).map(drop)
+            }
+        }
+    }
+
+    /// The commands [`fcntl_command`] makes.
+    #[derive(Clone, Copy, Debug)]
+    pub enum Fcntl {
+        GetPath,
+        DupFd,
+        SetFl,
+        /// One the server makes, for a control.
+        GetFd,
+    }
+
     /// The metadata of `path`, not following a last link: `fstatat` from
     /// the working directory, the call the server makes beneath its held
     /// directories.
@@ -475,7 +514,8 @@ pub mod probe {
                 InShare::Lock => libc::flock(f, libc::LOCK_SH | libc::LOCK_NB),
                 InShare::Fifo => libc::mkfifoat(r, c"fifo".as_ptr(), 0o644),
                 InShare::FcntlLock => {
-                    // fcntl is a listed call: this reaches file-lock's rule.
+                    // fcntl is a listed call, F_SETLK not a listed command:
+                    // system-fcntl kills it before file-lock's rule is asked.
                     let mut l: libc::flock = std::mem::zeroed();
                     l.l_type = libc::F_RDLCK;
                     // SEEK_SET, 0: the lock from the file's start.
@@ -527,7 +567,8 @@ pub mod probe {
         Lock,
         /// `mkfifoat` (`file-mknod`).
         Fifo,
-        /// `fcntl(F_SETLK)` of a read lock (`file-lock`, by a listed call).
+        /// `fcntl(F_SETLK)` of a read lock (`file-lock`, by a listed call;
+        /// under wick-fsd's profile `system-fcntl` decides first).
         FcntlLock,
         /// `fsetattrlist` of the Finder information
         /// (`file-write-finderinfo`).

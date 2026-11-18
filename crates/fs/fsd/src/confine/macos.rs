@@ -28,7 +28,7 @@ use std::path::Path;
 use wick_fs_sys as sys;
 use wick_fs_sys::seatbelt as sb;
 
-use super::held_exactly;
+use super::{held_exactly, held_exactly_named};
 use crate::host::unix::Refusal;
 
 /// What [`confine`] needs besides the share.
@@ -83,12 +83,7 @@ pub const SYSCALLS: &[(u16, &str, &str)] = &[
     (29, "recvfrom", "frames from the VMM (std's read of a stream socket)"),
     (53, "sigaltstack", "at exit: std takes down the main thread's stack-overflow handler"),
     (73, "munmap", "at exit: std unmaps that handler's stack"),
-    (
-        92,
-        "fcntl",
-        "an open's flags (F_GETFL), FSYNC (F_FULLFSYNC), FALLOCATE (F_PREALLOCATE, F_PUNCHHOLE), and the \
-         read-back's walk over the descriptors (F_GETFD)",
-    ),
+    (92, "fcntl", "the commands of FCNTL_COMMANDS, each checked (`system-fcntl`)"),
     (
         95,
         "fsync",
@@ -105,7 +100,7 @@ pub const SYSCALLS: &[(u16, &str, &str)] = &[
     (339, "fstat64", "a held descriptor's attributes and identity (GETATTR, a node found again)"),
     (344, "getdirentries64", "READDIR and READDIRPLUS (libc's readdir)"),
     (346, "fstatfs64", "STATFS (fstatvfs), FALLOCATE's hole punching (the block size)"),
-    (406, "fcntl_nocancel", "the directory stream READDIR reads through (libc's fdopendir)"),
+    (406, "fcntl_nocancel", "libc's fdopendir (the directory stream READDIR reads through): a command of FCNTL_COMMANDS"),
     (470, "fstatat64", "LOOKUP and GETATTR beneath a held directory, never following a link"),
     (475, "mkdirat", "MKDIR"),
     (
@@ -116,6 +111,21 @@ pub const SYSCALLS: &[(u16, &str, &str)] = &[
     ),
     (476, "getattrlistat", "a name as stored on disk (`stored_name`: LOOKUP's exact-name check)"),
     (488, "renameatx_np", "RENAME, with RENAME_EXCHANGE and RENAME_NOREPLACE"),
+];
+
+/// The `fcntl` commands the server makes once confined (`F_<name>`,
+/// <sys/fcntl.h>), each with why. Seatbelt checks the command of every
+/// `fcntl` and `fcntl_nocancel` (`system-fcntl`, filter `fcntl-command`), so
+/// any other command is killed, as Linux's filter allows `fcntl` with
+/// `F_GETFL` and `F_GETFD` only. Taken from the code and measured: the
+/// confined tests (requests, corpus, links) pass with exactly these, and
+/// each is needed, a run without it killed (docs/design-fs.md §6.2).
+pub const FCNTL_COMMANDS: &[(&str, &str)] = &[
+    ("F_GETFD", "the read-back's walk over the descriptors under the profile (step 4)"),
+    ("F_SETFD", "libc's fdopendir marks the directory stream's descriptor close-on-exec (READDIR)"),
+    ("F_FULLFSYNC", "FSYNC"),
+    ("F_PREALLOCATE", "FALLOCATE that allocates"),
+    ("F_PUNCHHOLE", "FALLOCATE that punches a hole"),
 ];
 
 /// The Mach traps the server makes once confined, by `MSC_` name, with why.
@@ -221,6 +231,12 @@ pub fn profile(canonical: &Path, read_only: bool) -> Result<String, Refusal> {
     for (name, _) in MIG_ROUTINES_IF_DEFINED {
         p.push_str(&format!("(when (defined? '{name}) (allow syscall-mig (kernel-mig-routine {name})))\n"));
     }
+    // Not covered by the default rule (measured: the server's commands ran
+    // under it before this rule), so denied here.
+    let commands: Vec<String> = FCNTL_COMMANDS.iter().map(|(c, _)| (*c).to_string()).collect();
+    p.push_str("(deny system-fcntl (with send-signal SIGKILL))\n");
+    p.push_str(&list("system-fcntl", "fcntl-command", commands.iter().cloned()));
+    p.push_str(&fcntl_discovery_rule(&commands));
     p.push_str(&discovery_rule());
     Ok(p)
 }
@@ -248,6 +264,17 @@ fn list(op: &str, filter: &str, items: impl Iterator<Item = String>) -> String {
 fn discovery_rule() -> String {
     #[cfg(wick_fsd_discovery)]
     return "(allow default (with report))\n(allow syscall-unix syscall-mach syscall-mig (with report))\n".into();
+    #[allow(unreachable_code)]
+    String::new()
+}
+
+/// The discovery build's rule for `fcntl`: a command outside `commands` is
+/// allowed and reported (a rule with a filter, which decides over the
+/// plain deny, as Firecracker's discovery rule for its commands does).
+#[allow(unexpected_cfgs, unused_variables)]
+fn fcntl_discovery_rule(commands: &[String]) -> String {
+    #[cfg(wick_fsd_discovery)]
+    return format!("(allow system-fcntl (require-not (fcntl-command {})) (with report))\n", commands.join(" "));
     #[allow(unreachable_code)]
     String::new()
 }
@@ -289,10 +316,11 @@ pub fn confine(plan: Plan, canonical: &Path, held: &[RawFd]) -> Result<(), Refus
     if ours {
         sb::apply(&compiled).map_err(|e| refuse("applying the profile", e))?;
     }
-    // Under the profile, by number (fcntl): nothing the apply opened is
-    // left, and every descriptor it could have opened is below the soft
-    // limit.
-    held_exactly("under the profile", &sys::descriptors_below(soft), held)?;
+    // Under the profile, by number (fcntl F_GETFD): nothing the apply opened
+    // is left, and every descriptor it could have opened is below the soft
+    // limit. One that is left is named by its kind: the profile kills the
+    // fcntl that asks for its path.
+    held_exactly_named("under the profile", &sys::descriptors_below(soft), held, sys::descriptor_kind)?;
     check(plan, &ids, ours)
 }
 
@@ -436,6 +464,8 @@ mod tests {
 (allow syscall-unix (syscall-number 29 53 73 92 95 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
 (allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
 (when (defined? 'mach_vm_reallocate) (allow syscall-mig (kernel-mig-routine mach_vm_reallocate)))
+(deny system-fcntl (with send-signal SIGKILL))
+(allow system-fcntl (fcntl-command F_GETFD F_SETFD F_FULLFSYNC F_PREALLOCATE F_PUNCHHOLE))
 "#;
 
     const PINNED_RO: &str = r#"(version 1)
@@ -454,6 +484,8 @@ mod tests {
 (allow syscall-unix (syscall-number 29 53 73 92 95 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
 (allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
 (when (defined? 'mach_vm_reallocate) (allow syscall-mig (kernel-mig-routine mach_vm_reallocate)))
+(deny system-fcntl (with send-signal SIGKILL))
+(allow system-fcntl (fcntl-command F_GETFD F_SETFD F_FULLFSYNC F_PREALLOCATE F_PUNCHHOLE))
 "#;
 
     /// Every file operation this macOS's libsandbox knows has a rule of its

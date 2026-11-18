@@ -24,8 +24,21 @@ use crate::host::unix::Refusal;
 /// and each expected one not open, `when`.
 #[cfg(unix)]
 pub fn held_exactly(when: &str, open: &[RawFd], expected: &[RawFd]) -> Result<(), Refusal> {
+    held_exactly_named(when, open, expected, sys::descriptor_described)
+}
+
+/// [`held_exactly`], each other descriptor named by `name`: on macOS under
+/// the profile its kind alone (`descriptor_kind`), as the profile kills the
+/// `fcntl` that asks for a descriptor's path.
+#[cfg(unix)]
+pub fn held_exactly_named(
+    when: &str,
+    open: &[RawFd],
+    expected: &[RawFd],
+    name: fn(RawFd) -> String,
+) -> Result<(), Refusal> {
     let expected: Vec<RawFd> = [0, 1, 2].iter().chain(expected).copied().collect();
-    let other: Vec<String> = open.iter().filter(|fd| !expected.contains(fd)).map(|&fd| sys::descriptor_described(fd)).collect();
+    let other: Vec<String> = open.iter().filter(|fd| !expected.contains(fd)).map(|&fd| name(fd)).collect();
     let missing: Vec<RawFd> = expected.iter().filter(|fd| !open.contains(fd)).copied().collect();
     let mut not = Vec::new();
     if !other.is_empty() {

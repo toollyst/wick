@@ -1007,9 +1007,11 @@ it means layer 1 let the request through.
     (`test_refused_when_a_descriptor_survives_its_close`), `seteuid(0)` said done at the read-back
     (`test_refused_when_a_saved_id_is_left`), and another profile with a denial applied before `main`
     (`test_refused_under_another_profile`). With the library inserted and doing nothing the server serves
-    (`test_the_inserted_library_alone_changes_nothing`). Not made to fail: the descriptor walk under the profile
-    (`fcntl(F_GETFD)` below the soft limit), which cannot lie for one call without lying for every `fcntl` the
-    server makes; the equality it checks is tested before the profile.
+    (`test_the_inserted_library_alone_changes_nothing`). The apply leaving a descriptor open is found by the walk
+    under the profile and refused, the descriptor named by its kind alone, as asking for its path (`F_GETPATH`)
+    is a command the profile kills (`test_refused_when_the_apply_leaves_a_descriptor`). Not made to fail: the walk
+    itself (`fcntl(F_GETFD)` below the soft limit), which cannot lie for one call without lying for every `fcntl`
+    the server makes; the equality it checks is tested before the profile.
   - **The profile** (`BASE` and `profile`): `(deny default (with send-signal SIGKILL))`, so whatever no rule
     allows ends the process inside the call; a denial means the server's own checks let a request through, and it
     dies loudly (the VMM sees the connection close). System calls, Mach traps, MIG routines and Sandbox
@@ -1020,20 +1022,32 @@ it means layer 1 let the request through.
     libsandbox does not compile the name). Seatbelt does not check the number of some calls at all (Firecracker's
     `UNFILTERED_SYSCALLS` in `overlay/vmm/ext/sandbox.rs`: `openat`, `close`, `write`, `pwrite`, `fchmod`,
     `fsetxattr`, `fremovexattr`, `linkat`, `unlinkat` among those wick-fsd makes); for those the file rules decide.
+    `fcntl`'s command is checked too (`system-fcntl`, below).
 
-    What the listed calls still allow, since Seatbelt filters a call by its number and not its arguments:
-    - `fcntl` (92) and `fcntl_nocancel` (406) with any command. The server uses `F_GETFL` (OPEN), `F_FULLFSYNC`
-      (FSYNC), `F_PREALLOCATE` and `F_PUNCHHOLE` (FALLOCATE), `F_GETFD` (step 4's walk), and libc's `fdopendir`
-      sets `FD_CLOEXEC`. A server taken over could use the rest on the descriptors it holds (the connection, the
-      share's root, held directories and open files of the share): `F_GETPATH` gives the host path of the share
-      and what is in it; `F_SETFL` changes its own descriptors' flags; `F_DUPFD` makes more descriptors to the
-      same objects, up to the soft `RLIMIT_NOFILE` (`limits::descriptors`); `F_NOCACHE` and `F_RDADVISE` change
-      caching. Each acts on an object it already holds; none opens another. A lock by `F_SETLK`, which host
-      processes would see, is checked as `file-lock`, which the share refuses (`confine_probe`'s "an fcntl lock on
-      a file of the share").
+    What the listed calls still allow. Seatbelt checks most of them by number alone; `fcntl`'s command it checks
+    too (libsandbox's own filter names, read from the loaded library, and compile checks on macOS 27.2):
+    - `fcntl` (92) and `fcntl_nocancel` (406) with the commands of `FCNTL_COMMANDS` only:
+      `(deny system-fcntl (with send-signal SIGKILL))` and `(allow system-fcntl (fcntl-command ...))`, as
+      Firecracker's profile does for its own (`fcntl_rule`; the filter compiled and held on macOS 15 and 26 in CI
+      run 44287648054, the macos-seatbelt jobs). The default rule does not cover `system-fcntl`: before this rule
+      the server's commands ran under it. The commands: `F_GETFD` (step 4's walk), `F_SETFD` (libc's `fdopendir`
+      marks the stream's descriptor close-on-exec: READDIR), `F_FULLFSYNC` (FSYNC), `F_PREALLOCATE` and
+      `F_PUNCHHOLE` (FALLOCATE); no `F_GETFL` (Linux's filter allows `F_GETFL` and `F_GETFD`). Measured: the
+      confined tests pass with exactly these, and each is needed, a run of requests, corpus and links without it
+      killed with Seatbelt's report naming the command's number (`deny(1) system-fcntl 1`, `2`, `51`, `42`, `99`
+      respectively; macOS 27.2). Any other command is the kill, before a rule on what it asks:
+      `F_GETPATH` (the host path of a held descriptor), `F_DUPFD`, `F_SETFL` and a lock by `F_SETLK` are
+      `confine_probe` cases, each killed (reported `system-fcntl 50`, `0`, `4`, `8`), with `F_GETFD` done.
     - `sendto` (133) and `recvfrom` (29) on the one connection only: `socket`, `connect`, `socketpair` and
       `accept` are not listed, so no other socket can be made, and `sendmsg`/`recvmsg` are not either, so no
-      descriptor passes over the connection.
+      descriptor passes over the connection. Seatbelt has no filter on a send's or a receive's flags or length;
+      `network-outbound` and `network-inbound` with their address filters decide a send that names an address
+      only.
+    - `fsetattrlist` (229) and `getattrlistat` (476): no filter on the attributes asked (`file-attribute` matches
+      properties of the file, such as `datavault` or `sip-protected`, not attribute-list bits); each is decided by
+      the file operation it makes (`file-write-times`, `file-write-finderinfo`, `file-read-metadata`, in the
+      share).
+    - `lseek` (199): no operation and no filter; its number alone.
     - `mach_msg2_trap` (47), which libmalloc needs, sends any Mach message to a port the process holds (its task
       port, the bootstrap port). Behind it, a kernel MIG routine not listed is killed by the `syscall-mig` rule
       (`mach_vm_reallocate` alone is listed): `task_info` of its own task, `deny(1) syscall-mig 195` in the crash
@@ -1095,7 +1109,7 @@ it means layer 1 let the request through.
     | `fs-snapshot*` | the call, unlisted: killed | `fs_snapshot_create`: killed; EPERM |
     | `file-chroot` | the call, unlisted: killed | `chroot`: killed; EPERM |
     | `file-revoke` | the call, unlisted: killed | `revoke`: killed; ENOTSUP |
-    | `file-lock` | the call, unlisted: killed | `flock`: killed; done |
+    | `file-lock` | the call, unlisted: killed; `fcntl(F_SETLK)`, a command `system-fcntl` does not list: killed | `flock`: killed; done. `fcntl(F_SETLK)` of a read lock: killed; done |
     | `file-mknod` | the call, unlisted: killed | `mkfifoat`: killed; done |
     | `file-map-executable` | the call, unlisted (`mmap`, 197): killed | a share file mapped executable: killed |
     | `process-exec` | the call, unlisted: killed | exec of a file of the share: killed |
@@ -1127,13 +1141,13 @@ it means layer 1 let the request through.
     | UNLINK, RMDIR | `unlinkat` (unchecked) |
     | RENAME | `renameatx_np` (488) |
     | LINK | `linkat` (unchecked), `unlinkat` to undo a link it cannot keep |
-    | OPEN | `openat`, `fcntl(F_GETFL)` (92), `fstat64` |
+    | OPEN | `openat`, `fstat64` |
     | READ, WRITE | `pread` (153), `pwrite` (unchecked) |
     | STATFS | `fstatfs64` (346), with `vfs.disk-space` |
     | RELEASE, RELEASEDIR | `close` (unchecked) |
     | FSYNC | `fcntl(F_FULLFSYNC)`, `fsync` (95) where the file system has no `F_FULLFSYNC` (from the code, never run: the volumes the tests make, APFS, have it) |
     | GETXATTR, LISTXATTR, SETXATTR, REMOVEXATTR | `fgetxattr` (235), `flistxattr` (241), `fsetxattr`, `fremovexattr` (unchecked) |
-    | OPENDIR, READDIR, READDIRPLUS | `fcntl_nocancel` (406, libc's `fdopendir`), `getdirentries64` (344), `lseek` (199), `fstatat64`, `close` |
+    | OPENDIR, READDIR, READDIRPLUS | `fcntl_nocancel` (406, libc's `fdopendir`: `F_SETFD`), `getdirentries64` (344), `lseek` (199), `fstatat64`, `close` |
     | FALLOCATE | `fstat64`, `lseek`, `pwrite`, `fcntl(F_PREALLOCATE, F_PUNCHHOLE)`, `ftruncate`, `fstatfs64` |
     | step 4's read-back | `fcntl(F_GETFD)` |
 
