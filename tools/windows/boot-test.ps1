@@ -124,7 +124,8 @@ param(
     [string]$WorkDir = (Join-Path $env:LOCALAPPDATA 'wick-boot-test'),
     # Stage names, comma-separated or as a list; `all` runs every stage that
     # needs no input or setting (not gdb, diff-nospace, linux-snapshot,
-    # foreign-snapshot), and may be given with others.
+    # foreign-snapshot, x2apic, fuzzing, instrumented), and may be given with
+    # others.
     [string[]]$Stage = @('all'),
     # Stages to leave out of those -Stage names.
     [string[]]$Except = @(),
@@ -146,6 +147,15 @@ param(
     # kvm-ioctls' whp-x2apic-record feature (default: the kit's
     # lib\firecracker\build\x2apic\release\firecracker.exe).
     [string]$X2ApicFirecracker,
+    # For the fuzzing stage (not part of `all`): a Firecracker built with the
+    # fuzzing feature, as upstream's build_fuzzing builds it (debug; default:
+    # the kit's lib\firecracker\build\fuzzing\debug\firecracker.exe).
+    [string]$FuzzingFirecracker,
+    # For the instrumented stage (not part of `all`): a Firecracker built with
+    # the tracing feature on sources clippy-tracing instrumented, as upstream's
+    # build_instrumented_binary builds it (release; default: the kit's
+    # lib\firecracker\build\instrumented\release\firecracker.exe).
+    [string]$InstrumentedFirecracker,
     # Checks the harness itself against stand-ins for Firecracker's sockets
     # (no WHP, no downloads) and exits.
     [switch]$SelfTest
@@ -1923,7 +1933,7 @@ function Base-Config([int]$vcpus, [int]$mem = 256, [string]$bootArgs = $BootArgs
 # `$config` may be $null (a VM restored through the API). With -Api the VM gets
 # an API socket, returned as the `ApiSock` note property and waited for.
 # -LogPath gives Firecracker another --log-path (a named pipe) than the
-# stage's file.
+# stage's file; -Level its --level (Debug unless given).
 # The patterns of tools/guest-health.txt for the guest `$arch`, read as the
 # file's header says, by the rules tools/linux/boot-test.sh's guest_health
 # and tools/macos/boot-test.py's read it with: a line that is empty or
@@ -2007,7 +2017,7 @@ function Get-SockBound([string[]]$names) {
     return [int]($names | ForEach-Object { [Text.Encoding]::UTF8.GetByteCount($_) } | Measure-Object -Maximum).Maximum
 }
 
-function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api, [string]$LogPath = '') {
+function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api, [string]$LogPath = '', [string]$Level = 'Debug') {
     $dir = Join-Path $Results $name
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     if ($LogPath) {
@@ -2017,7 +2027,7 @@ function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api, [st
         # Firecracker opens the log file, it does not create it.
         New-Item -ItemType File -Force -Path $logPath | Out-Null
     }
-    $fcArgs = "--log-path `"$logPath`" --level Debug --show-level --show-log-origin"
+    $fcArgs = "--log-path `"$logPath`" --level $Level --show-level --show-log-origin"
     if ($config) {
         $cfgPath = Join-Path $dir 'vm-config.json'
         $config | ConvertTo-Json -Depth 8 | Set-Content -Encoding ASCII $cfgPath
@@ -4283,6 +4293,102 @@ continue
     return "gdb $how`: hardware breakpoint at start_kernel, its bytes and the kernel's start through the direct map as in the vmlinux, software breakpoint at rest_init, the guest boots on"
 }
 
+# Upstream's test_fuzzing_warning (tests/integration_tests/functional/
+# test_fuzzing.py, v1.18.0), its assertions on the log of a VM a fuzzing
+# build started, line by line; the failures, none if both hold:
+# :21 to :23  "built with the `fuzzing` feature enabled" in the log;
+# :24 to :26  "+fuzzing" (the version string's suffix) in the log.
+function Test-FuzzingLog([string]$log) {
+    $f = @()
+    if (-not $log.Contains('built with the `fuzzing` feature enabled')) { $f += 'Fuzzing warning not found in logs' }
+    if (-not $log.Contains('+fuzzing')) { $f += 'Version string missing +fuzzing suffix' }
+    return $f
+}
+
+# Upstream's test_log_instrument_firecracker_basic_functionality
+# (tests/integration_tests/functional/test_instrumented_firecracker.py,
+# v1.18.0), its assertions on the log before (`$pre`) and after (`$post`) a
+# PUT /logger to level Trace and a GET / after it, line by line; the
+# failures, none if all hold. MARKER_REGEX (:22) is log-instrument's entry
+# and exit marker, `ThreadId\(\d+\).*?(?:>>|<<)`, matched within a line as
+# Python's re.findall matches it:
+# :95 to :97    "TRACE" not in the log before;
+# :99 to :103   no marker in the log before;
+# :107 to :109  "TRACE" in the log after;
+# :111 to :115  a marker in the log after;
+# :117 to :121  an entry marker (">>") and an exit marker ("<<") after;
+# :123 to :133  each of vmm, request and response, in any case, in some
+#               marker after.
+function Test-InstrumentedLog([string]$pre, [string]$post) {
+    $marker = 'ThreadId\(\d+\).*?(?:>>|<<)'
+    $f = @()
+    if ($pre.Contains('TRACE')) { $f += 'TRACE level logs were found before setting log level to TRACE' }
+    $before = @([regex]::Matches($pre, $marker) | ForEach-Object { $_.Value })
+    if ($before.Count -ne 0) { $f += "Expected no log-instrument traces in logs before enabling TRACE, but found: $($before[0..([Math]::Min(4, $before.Count - 1))] -join ' | ')" }
+    if (-not $post.Contains('TRACE')) { $f += 'Expected TRACE level logs in output' }
+    $after = @([regex]::Matches($post, $marker) | ForEach-Object { $_.Value })
+    if ($after.Count -eq 0) { $f += "Expected to find log-instrument traces in logs, but found none. Log data: $($post.Substring(0, [Math]::Min(1000, $post.Length)))..." }
+    if (@($after | Where-Object { $_.Contains('>>') }).Count -eq 0) { $f += 'Expected to find function entry traces (>>)' }
+    if (@($after | Where-Object { $_.Contains('<<') }).Count -eq 0) { $f += 'Expected to find function exit traces (<<)' }
+    foreach ($k in 'vmm', 'request', 'response') {
+        if (@($after | Where-Object { $_.ToLowerInvariant().Contains($k) }).Count -eq 0) {
+            $f += "Expected to find traces from meaningful keywords vmm, request, response, but none has '$k'; traces were: $($after[0..([Math]::Min(9, [Math]::Max(0, $after.Count - 1)))] -join ' | ')"
+        }
+    }
+    return $f
+}
+
+# Upstream's test_fuzzing_warning on this host: a VM started by a Firecracker
+# built with the fuzzing feature (upstream's build_fuzzing: debug, `--features
+# fuzzing`), its log checked by upstream's two assertions (Test-FuzzingLog).
+# Upstream's test spawns, configures and starts the VM (uvm.start: the
+# InstanceStart answered); here the guest is also waited for to its shell.
+function Stage-Fuzzing {
+    $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $fc = if ($FuzzingFirecracker) { (Resolve-Path $FuzzingFirecracker).Path } else { Join-Path $root 'lib\firecracker\build\fuzzing\debug\firecracker.exe' }
+    Check (Test-Path $fc) "no Firecracker built with the fuzzing feature at $fc (cargo build -p firecracker --features fuzzing, CARGO_TARGET_DIR=build\fuzzing; or pass -FuzzingFirecracker)"
+    $saved = $script:Fc
+    $script:Fc = $fc
+    try { $vm = Start-Vm 'fuzzing' (Base-Config 1) } finally { $script:Fc = $saved }
+    Wait-Shell $vm
+    $log = Get-Content -Raw $vm.LogPath
+    $failed = @(Test-FuzzingLog $log)
+    Check ($failed.Count -eq 0) "$($failed -join '; '): $log"
+    $version = ([regex]::Match($log, 'Running Firecracker v\S+')).Value
+    $vm.Kill()
+    return "the fuzzing build's VM booted, its log has the fuzzing warning and the +fuzzing version suffix ('$version')"
+}
+
+# Upstream's test_log_instrument_firecracker_basic_functionality on this
+# host: a Firecracker built with the tracing feature on sources clippy-tracing
+# instrumented (upstream's build_instrumented_binary: main.rs, api_server,
+# vmm's lib.rs and builder.rs), spawned with its API at level Info, showing
+# level and origin; GET / and GET /machine-config; the log read; PUT /logger
+# to level Trace, showing level and origin; GET /; the log read again; the
+# two checked by upstream's assertions (Test-InstrumentedLog). No guest, as
+# upstream's test starts none.
+function Stage-Instrumented {
+    $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $fc = if ($InstrumentedFirecracker) { (Resolve-Path $InstrumentedFirecracker).Path } else { Join-Path $root 'lib\firecracker\build\instrumented\release\firecracker.exe' }
+    Check (Test-Path $fc) "no instrumented Firecracker at $fc (clippy-tracing --action fix on upstream's paths, then cargo build --release -p firecracker --features tracing, CARGO_TARGET_DIR=build\instrumented; or pass -InstrumentedFirecracker)"
+    $saved = $script:Fc
+    $script:Fc = $fc
+    try { $vm = Start-Vm 'instrumented' $null -Api -Level Info } finally { $script:Fc = $saved }
+    Invoke-Api $vm 'GET' '/' | Out-Null
+    Invoke-Api $vm 'GET' '/machine-config' | Out-Null
+    $pre = Get-Content -Raw $vm.LogPath
+    if ($null -eq $pre) { $pre = '' }
+    Invoke-Api $vm 'PUT' '/logger' ([ordered]@{ level = 'Trace'; show_level = $true; show_log_origin = $true }) | Out-Null
+    Invoke-Api $vm 'GET' '/' | Out-Null
+    $post = Get-Content -Raw $vm.LogPath
+    if ($null -eq $post) { $post = '' }
+    $failed = @(Test-InstrumentedLog $pre $post)
+    Check ($failed.Count -eq 0) ($failed -join '; ')
+    $markers = [regex]::Matches($post, 'ThreadId\(\d+\).*?(?:>>|<<)').Count
+    $vm.Kill()
+    return "the instrumented build's log: no TRACE and no marker before PUT /logger Trace, then TRACE and $markers entry and exit markers, vmm, request and response among them"
+}
+
 function Stage-MemoryHotplug {
     $cfg = Base-Config 2 512 ($BootArgs + ' memhp_default_state=online_movable')
     $cfg['memory-hotplug'] = [ordered]@{ total_size_mib = 1024; slot_size_mib = 128; block_size_mib = 2 }
@@ -4380,9 +4486,11 @@ $Stages = [ordered]@{
     'memory-hotplug' = { Stage-MemoryHotplug }
     x2apic   = { Stage-X2Apic }
     gdb      = { Stage-Gdb }
+    fuzzing  = { Stage-Fuzzing }
+    instrumented = { Stage-Instrumented }
 }
 # Stages `all` leaves out: they need what a plain kit does not have.
-$NotInAll = @('gdb', 'diff-nospace', 'linux-snapshot', 'foreign-snapshot', 'x2apic')
+$NotInAll = @('gdb', 'diff-nospace', 'linux-snapshot', 'foreign-snapshot', 'x2apic', 'fuzzing', 'instrumented')
 
 # --- run ------------------------------------------------------------------------
 
@@ -4443,6 +4551,31 @@ if ($SelfTest) {
             return 'ending: a Firecracker that answered that its VMM ended is waited for (both exit lines logged, exit 1); one that never exits fails at the bound, killed, its logs and the summary saying so'
         }
         pipe   = { [Wick.PipeSelfTest]::Run() }
+        'upstream-logs' = {
+            # The fuzzing and instrumented stages' checks (upstream's
+            # assertions) against logs written to pass and to fail each one.
+            $fuzzOk = "2026-11-18T09:00:00 [anonymous-instance:main:WARN:src/firecracker/src/main.rs:1] This Firecracker was built with the ``fuzzing`` feature enabled`n[anonymous-instance:main:INFO:src/firecracker/src/main.rs:2] Running Firecracker v1.18.0+fuzzing`n"
+            Check (@(Test-FuzzingLog $fuzzOk).Count -eq 0) "fuzzing: a log with both fails: $(Test-FuzzingLog $fuzzOk)"
+            Check ((@(Test-FuzzingLog 'Running Firecracker v1.18.0+fuzzing') -join ';') -eq 'Fuzzing warning not found in logs') 'fuzzing: no warning is not the one failure'
+            Check ((@(Test-FuzzingLog 'built with the `fuzzing` feature enabled; Running Firecracker v1.18.0') -join ';') -eq 'Version string missing +fuzzing suffix') 'fuzzing: no suffix is not the one failure'
+            $pre = "[anonymous-instance:fc_api:INFO:src/firecracker/src/api_server/mod.rs:1] The API server received a Get request on `"/`".`n"
+            # log-instrument's lines (src/log-instrument/src/lib.rs :37, :54):
+            # the thread, the enclosing spans, then >> or << and the function.
+            $post = $pre + "[anonymous-instance:fc_api:TRACE:src/firecracker/src/api_server/mod.rs:2] ThreadId(2)>>serve_vmm_action_request`n" +
+                "[anonymous-instance:fc_api:TRACE:src/firecracker/src/api_server/mod.rs:3] ThreadId(2)::serve_vmm_action_request>>parse_request`n" +
+                "[anonymous-instance:fc_api:TRACE:src/firecracker/src/api_server/mod.rs:4] ThreadId(2)::serve_vmm_action_request::json_response<<body`n"
+            Check (@(Test-InstrumentedLog $pre $post).Count -eq 0) "instrumented: a log that holds every assertion fails: $(Test-InstrumentedLog $pre $post)"
+            Check ((@(Test-InstrumentedLog ($pre + 'x TRACE y') $post) -join ';') -eq 'TRACE level logs were found before setting log level to TRACE') 'instrumented: TRACE before is not the one failure'
+            Check (@(Test-InstrumentedLog ($pre + "ThreadId(9) >> early`n") $post)[0].StartsWith('Expected no log-instrument traces in logs before enabling TRACE')) 'instrumented: a marker before is not caught'
+            Check ((@(Test-InstrumentedLog $pre ($post -replace 'TRACE', 'DEBUG')) -join ';') -eq 'Expected TRACE level logs in output') 'instrumented: no TRACE after is not the one failure'
+            $f = @(Test-InstrumentedLog $pre ($pre + "[x:TRACE:y] nothing`n"))
+            Check ($f[0].StartsWith('Expected to find log-instrument traces in logs, but found none') -and $f.Count -eq 6) "instrumented: no marker after: $($f -join ';')"
+            Check ((@(Test-InstrumentedLog $pre ($post -replace '<<', '>>')) -join ';') -eq 'Expected to find function exit traces (<<)') 'instrumented: no exit marker is not the one failure'
+            Check ((@(Test-InstrumentedLog $pre ($post -replace 'response', 'answer')) -join ';').Contains("none has 'response'")) 'instrumented: no response keyword is not caught'
+            # Within a line, as re.findall: a marker's >> on the next line is no marker.
+            Check (@([regex]::Matches("ThreadId(1) x`n>> y", 'ThreadId\(\d+\).*?(?:>>|<<)')).Count -eq 0) 'the marker pattern crosses a line'
+            return 'upstream-logs: the fuzzing and instrumented stages pass a log that holds upstream''s assertions and fail each one broken, with upstream''s message'
+        }
         relay  = {
             # The gdb stage's TCP relay, against a stand-in for the gdb stub.
             $path = Join-Path $dir 'gdb.sock'

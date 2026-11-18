@@ -1423,8 +1423,10 @@ jobs:
   # and the firecracker binary on the WHP backend.
   windows:
     runs-on: windows-latest
-    # The unit-test step builds every package's tests (vmm's among them).
-    timeout-minutes: 60
+    # The unit-test step builds every package's tests (vmm's among them);
+    # the fuzzing and instrumented builds add up to 15 minutes cold (two
+    # builds of firecracker, one release), a few on a cache's start.
+    timeout-minutes: 75
     # Whether the kit was uploaded: windows-guest runs on it.
     outputs:
       kit: ${{ steps.kit.outcome }}
@@ -1651,6 +1653,82 @@ jobs:
         run: |
           kvm=$(cargo pkgid --locked --manifest-path ../../crates/compat/kvm-ioctls/Cargo.toml)
           CARGO_TARGET_DIR=build/x2apic cargo build --locked --release -p firecracker -p "$kvm" --features kvm-ioctls/whp-x2apic-record
+      # The fuzzing and instrumented builds, for boot-test.ps1 fuzzing and
+      # instrumented (the windows-guest job), each in a target directory of
+      # its own, as upstream's tests build them. Cached together, keyed on
+      # the lock file and every source the builds read, with the last cache
+      # as the start of a miss's build (only what changed is built again);
+      # the incremental directories are left out. A failed build fails its
+      # step; the kit is uploaded without the binary, and its stage then
+      # fails on the missing file, never skips.
+      - name: Restore the fuzzing and instrumented builds
+        id: fuzz-cache
+        if: (success() || failure()) && steps.setup.outcome == 'success'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            lib/firecracker/build/fuzzing
+            lib/firecracker/build/instrumented
+            !lib/firecracker/build/fuzzing/**/incremental
+            !lib/firecracker/build/instrumented/**/incremental
+          key: fuzz-instrumented-${{ hashFiles('lib/firecracker/Cargo.lock', 'lib/firecracker/src/**', 'patches/**', 'crates/**', 'overlay/**') }}
+          restore-keys: fuzz-instrumented-
+      # Upstream's build_fuzzing (tests/host_tools/cargo_build.py :156 to
+      # :167): the dev profile with the fuzzing feature (a release build is
+      # refused by main.rs :4 to :8).
+      - name: Build the fuzzing Firecracker
+        if: (success() || failure()) && steps.setup.outcome == 'success'
+        working-directory: lib/firecracker
+        run: |
+          start=$SECONDS
+          CARGO_TARGET_DIR=build/fuzzing cargo build --locked -p firecracker --features fuzzing
+          echo "FUZZBUILD fuzzing: $((SECONDS - start)) s (cache hit: ${{ steps.fuzz-cache.outputs.cache-hit == 'true' }})"
+      # Upstream's build_instrumented_binary (tests/integration_tests/
+      # functional/test_instrumented_firecracker.py :33 to :51): clippy-tracing
+      # adds log-instrument's attribute, under the tracing feature, to every
+      # function of main.rs, the API server and vmm's lib.rs and builder.rs,
+      # and a release build with the tracing feature. The sources are put
+      # back from a copy taken first (upstream strips the attribute again,
+      # :54 to :59), and checked the same, so that no later build of this
+      # job sees them instrumented.
+      - name: Build the instrumented Firecracker
+        if: (success() || failure()) && steps.setup.outcome == 'success'
+        working-directory: lib/firecracker
+        run: |
+          start=$SECONDS
+          paths=(src/firecracker/src/main.rs src/firecracker/src/api_server src/vmm/src/lib.rs src/vmm/src/builder.rs)
+          keep=$(mktemp -d)
+          tar -cf "$keep/sources.tar" "${paths[@]}"
+          sum() { find "${paths[@]}" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum; }
+          before=$(sum)
+          status=0
+          CARGO_TARGET_DIR=build/instrumented cargo build --locked --release -p clippy-tracing || status=$?
+          if ((status == 0)); then
+            for p in "${paths[@]}"; do
+              build/instrumented/release/clippy-tracing.exe --action fix --suffix log_instrument:: --cfg-attr 'feature ="tracing"' --path "$p" || status=$?
+            done
+          fi
+          if ((status == 0)); then
+            [[ "$(sum)" != "$before" ]] || { echo "::error::clippy-tracing changed none of ${paths[*]}"; status=1; }
+          fi
+          if ((status == 0)); then
+            CARGO_TARGET_DIR=build/instrumented cargo build --locked --release -p firecracker --features tracing || status=$?
+          fi
+          rm -rf "${paths[@]}"
+          tar -xf "$keep/sources.tar"
+          [[ "$(sum)" == "$before" ]] || { echo "::error::the instrumented sources were not put back"; exit 1; }
+          echo "FUZZBUILD instrumented: $((SECONDS - start)) s (cache hit: ${{ steps.fuzz-cache.outputs.cache-hit == 'true' }}), exit $status"
+          exit $status
+      - name: Save the fuzzing and instrumented builds
+        if: (success() || failure()) && steps.fuzz-cache.outputs.cache-hit != 'true' && steps.setup.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            lib/firecracker/build/fuzzing
+            lib/firecracker/build/instrumented
+            !lib/firecracker/build/fuzzing/**/incremental
+            !lib/firecracker/build/instrumented/**/incremental
+          key: fuzz-instrumented-${{ hashFiles('lib/firecracker/Cargo.lock', 'lib/firecracker/src/**', 'patches/**', 'crates/**', 'overlay/**') }}
       # Firecracker's gdb stub (upstream's test_gdb builds it), for
       # boot-test.ps1 gdb on a WHP machine. Built right before the kit's
       # upload, after every step before it that builds the workspace's
@@ -1694,6 +1772,8 @@ jobs:
             lib/firecracker/build/cargo_target/release/examples/uffd_on_demand_handler.exe
             lib/firecracker/build/cargo_target/debug/firecracker.exe
             lib/firecracker/build/x2apic/release/firecracker.exe
+            lib/firecracker/build/fuzzing/debug/firecracker.exe
+            lib/firecracker/build/instrumented/release/firecracker.exe
             lib/firecracker/build/vhost-user-blk/release/vhost-user-blk.exe
             winprobe.exe
             tools/windows/boot-test.ps1
@@ -2622,8 +2702,8 @@ jobs:
       # Every stage of `all`, as a PC's default run has them, but hugepages
       # (its own step below), and diff-nospace, which needs the elevation
       # this runner has. Not in `all`: foreign-snapshot (it wants a state of
-      # another architecture, which no job makes), linux-snapshot and gdb
-      # (steps of their own). A stage that fails does not stop the others;
+      # another architecture, which no job makes), linux-snapshot, gdb,
+      # fuzzing and instrumented (steps of their own). A stage that fails does not stop the others;
       # the script's exit status fails the step.
       - name: boot-test.ps1
         run: |
@@ -2841,6 +2921,19 @@ jobs:
           & C:\msys64\ucrt64\bin\gdb-multiarch.exe --version | Select-Object -First 1
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage gdb `
             -Gdb C:\msys64\ucrt64\bin\gdb-multiarch.exe
+          exit $LASTEXITCODE
+      # Upstream's test_fuzzing_warning and
+      # test_log_instrument_firecracker_basic_functionality, their assertions
+      # as boot-test.ps1's fuzzing and instrumented stages make them (the
+      # stages' comments name them line by line), on the kit's fuzzing and
+      # instrumented builds: a guest booted by the first, none by the second,
+      # as upstream's. About a minute together; their builds are the windows
+      # job's (cached). A build that failed there leaves no binary in the
+      # kit, and the stage fails naming the missing file.
+      - name: boot-test.ps1 fuzzing and instrumented
+        if: (success() || failure()) && steps.kit.outcome == 'success'
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage fuzzing,instrumented
           exit $LASTEXITCODE
       - name: What ran, and what stays with the PC
         if: always()
