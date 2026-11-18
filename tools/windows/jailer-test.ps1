@@ -111,12 +111,19 @@ function Stop-Jailed {
 # (`unmap_at_exit`); one still running after 10 s is killed, and the drive
 # it leaves is reported by the end's `drives` check. Killing a jailer first
 # left its drive mapped for the logon session (run 43428124115's parent
-# stage: Y: and Z:).
+# stage: Y: and Z:). The jailed processes are looked for again until the
+# jailers have exited: a jailer stopped before it started its jailed process
+# starts it after a single look, which then keeps it past its 10 s, and the
+# jailer killed then leaves its drive (isolation at de8805f4: its probe's
+# jailer killed, X: left mapped, no probe found to kill).
 function Stop-Jailers([object[]]$jailers) {
-    Stop-Alive (Get-Process firecracker, jail-probe -ErrorAction SilentlyContinue)
-    foreach ($j in $jailers) {
-        if ($j -and -not $j.WaitForExit(10000)) { Stop-Alive $j }
-    }
+    $t = [DateTime]::Now.AddSeconds(10)
+    do {
+        Stop-Alive (Get-Process firecracker, jail-probe -ErrorAction SilentlyContinue)
+        $alive = @($jailers | Where-Object { $_ -and -not $_.HasExited })
+        if ($alive.Count) { Start-Sleep -Milliseconds 200 }
+    } while ($alive.Count -and [DateTime]::Now -lt $t)
+    foreach ($j in $alive) { Stop-Alive $j }
 }
 
 # A fresh chroot base for a stage.
@@ -823,8 +830,25 @@ function Invoke-JailedWithGrant([string]$base, [string]$id, [string[]]$grant, [s
         Check ($null -ne $sid) "the jail's SID did not appear on ${root}: $((Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join '')"
         $user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         foreach ($f in $grant) {
-            $r = icacls $f /inheritance:r /grant:r "*${user}:(F)" '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' "*${sid}:(R)" 2>&1
-            Check ($LASTEXITCODE -eq 0) "giving $f a read entry for the jail's SID: $r"
+            # The DACL as SDDL, set through .NET with the SIDs as they are:
+            # icacls looks a `*SID` up and refuses one no account has, as
+            # the jail's (S-1-9, the resource manager authority) is ("No
+            # mapping between account names and security IDs was done",
+            # ERROR_NONE_MAPPED: CI's links and isolation at de8805f4).
+            # Protected, so nothing is inherited; FR is FILE_GENERIC_READ,
+            # icacls's (R).
+            $fs = New-Object System.Security.AccessControl.FileSecurity
+            $fs.SetSecurityDescriptorSddlForm("D:P(A;;FA;;;$user)(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;$sid)", [System.Security.AccessControl.AccessControlSections]::Access)
+            (Get-Item -LiteralPath $f).SetAccessControl($fs)
+            # Read back by SID: exactly these entries, allowed, not
+            # inherited, the jail's FILE_GENERIC_READ (0x120089) and nothing
+            # more.
+            $back = (Get-Item -LiteralPath $f).GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
+            $rules = @($back.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+            $seen = @($rules | ForEach-Object { "$($_.IdentityReference.Value)=$($_.AccessControlType)/$(if ($_.IsInherited) { 'inherited' } else { 'own' })/0x$('{0:x}' -f [int]$_.FileSystemRights)" })
+            $jail = @($rules | Where-Object { $_.IdentityReference.Value -eq $sid })
+            $want = @($user, 'S-1-5-18', 'S-1-5-32-544', $sid | Select-Object -Unique).Count
+            Check ($back.AreAccessRulesProtected -and $rules.Count -eq $want -and $jail.Count -eq 1 -and $jail[0].AccessControlType -eq 'Allow' -and -not $jail[0].IsInherited -and [int]$jail[0].FileSystemRights -eq 0x120089) "giving $f a read entry for the jail's SID ${sid}: the DACL reads $($seen -join ', ')"
             $kept = (Get-Acl $f).Sddl
             Check ($kept -notmatch ';;;(WD|BU|AU|IU|S-1-1-0|S-1-5-32-545|S-1-5-11|S-1-5-4)\)') "$f still grants a group of the jail's token: $kept"
         }
