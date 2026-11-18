@@ -261,7 +261,10 @@ fn parse_cpu(value: &str) -> Result<u8, JailError> {
     }
 }
 
-/// The hand-over value: `<uid>:<gid>:<root>`.
+/// The hand-over value: `<uid>:<gid>:<root>`. Read where a jailer hands one
+/// over (macOS, Windows); Linux's jailer sets Firecracker up itself, so no
+/// Linux build reads one (its tests do).
+#[cfg(any(target_os = "macos", windows, test))]
 #[derive(Debug, PartialEq, Eq)]
 struct Spec {
     uid: u32,
@@ -269,6 +272,7 @@ struct Spec {
     root: String,
 }
 
+#[cfg(any(target_os = "macos", windows, test))]
 fn parse(value: &str) -> Result<Spec, JailError> {
     let bad = || JailError::Format(value.to_owned());
     let mut parts = value.splitn(3, ':');

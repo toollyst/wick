@@ -172,15 +172,22 @@ jobs:
       - name: Build firecracker
         working-directory: lib/firecracker
         run: cargo build --locked -p firecracker
+      # The macOS job's line: what is cfg'd for one host is linted on it.
+      - name: Install clippy
+        working-directory: lib/firecracker
+        run: rustup component add clippy
+      - name: Clippy
+        working-directory: lib/firecracker
+        run: cargo clippy --locked -p vmm -p firecracker -p wick-ext -p jailer --lib --bins --tests -- -D warnings
       # Host folder sharing's device (crates/ext/src/fs, docs/design-fs.md
-      # §4.1), built only with Firecracker's `fs` feature: its tests with the
-      # feature, and no fs code in the default build above
+      # §4.1), built only with Firecracker's `fs` feature: its lints and its
+      # tests with the feature, and no fs code in the default build above
       # (tools/check-fs-off.sh, against wick-ext's test binary with the
-      # feature, which has it). Its lints are the macOS job's (the same unix
-      # code): no job lints the Firecracker workspace on Linux yet.
+      # feature, which has it).
       - name: virtio-fs device (fs feature)
         working-directory: lib/firecracker
         run: |
+          cargo clippy --locked -p vmm -p firecracker -p wick-ext -p jailer --features firecracker/fs --lib --bins --tests -- -D warnings
           cargo test --locked -p wick-ext --features fs
           fs=$(cargo test --locked -p wick-ext --features fs --no-run --message-format=json |
             python3 -I -c 'import json, sys; print(*[m["executable"] for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m.get("executable") and m["target"]["name"] == "wick_ext"])')

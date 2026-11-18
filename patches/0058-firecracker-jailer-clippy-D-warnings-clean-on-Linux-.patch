@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 19 Nov 2026 00:29:33 +0900
+Subject: [PATCH] =?UTF-8?q?firecracker,=20jailer:=20clippy=20-D=20warnings?=
+ =?UTF-8?q?=20clean=20on=20Linux=20=E2=80=94=20ApiProcess=20only=20where?=
+ =?UTF-8?q?=20it=20is=20made,=20the=20jailer's=20Linux=20tests=20in=20a=20?=
+ =?UTF-8?q?module=20clippy=20takes=20for=20one?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Linux lint of the Firecracker workspace (cargo clippy --locked -p vmm
+-p firecracker -p wick-ext -p jailer --lib --bins --tests -- -D warnings,
+with and without --features firecracker/fs, Docker wick-linux-builder
+1.97.0) failed on two things of wick's patches:
+
+- api_server_adapter's ApiServerError::ApiProcess is made only where the
+  API server runs in a process of its own (macOS, Windows): on Linux it was
+  a variant never constructed (dead_code). It is now cfg(any(macos,
+  windows)), as vmm::ext::api_process is.
+- env.rs's tests, which patch 0016 put behind cfg(all(test, target_os =
+  "linux")): clippy's tests_outside_test_module (upstream's workspace lint,
+  warn) takes a module for a test module only by a cfg attribute that
+  names `test` itself, so each of its 13 tests was flagged. Now two
+  attributes, cfg(test) and cfg(target_os = "linux").
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/firecracker/src/api_server_adapter.rs | 4 +++-
+ src/jailer/src/env.rs                     | 6 +++++-
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/firecracker/src/api_server_adapter.rs b/src/firecracker/src/api_server_adapter.rs
+index 9af4ed487af0c25dc8cfca974bc70972c6bc421a..1e69649865bbe0d5773a7d2a16d5a0cb0e17795e 100644
+--- a/src/firecracker/src/api_server_adapter.rs
++++ b/src/firecracker/src/api_server_adapter.rs
+@@ -41,8 +41,10 @@ pub enum ApiServerError {
+     MissingSeccompFilter,
+     /// Failed to install vmm seccomp filter: {0}
+     SeccompFilter(vmm::seccomp::InstallationError),
+-    // wick: see vmm::ext::api_process.
++    // wick: see vmm::ext::api_process; only where the API server runs in a
++    // process of its own (macOS, Windows), so not on Linux.
+     /// Failed to start the API server process: {0}
++    #[cfg(any(target_os = "macos", windows))]
+     ApiProcess(vmm::ext::api_process::ApiProcessError),
+ }
+ 
+diff --git a/src/jailer/src/env.rs b/src/jailer/src/env.rs
+index 7ce292a10bf7659f89577d1c2fe8436c295bb347..bffb10a08842b7b73973599c460aef2488d50b32 100644
+--- a/src/jailer/src/env.rs
++++ b/src/jailer/src/env.rs
+@@ -912,7 +912,11 @@ impl Env {
+ 
+ // wick: upstream's tests use Linux's cgroup files, device numbers and MetadataExt;
+ // the other hosts' backends have their own (overlay/jailer/platform).
+-#[cfg(all(test, target_os = "linux"))]
++// wick: two attributes, not cfg(all(test, ...)): clippy's
++// tests_outside_test_module takes a module for a test module by a cfg
++// attribute that names `test` itself.
++#[cfg(test)]
++#[cfg(target_os = "linux")]
+ mod tests {
+     #![allow(clippy::undocumented_unsafe_blocks)]
+ 
