@@ -56,7 +56,12 @@
   in the jail as the jailer makes it, with the checks that are not names, a
   DLL loaded after the revert, HKLM, TCP and AF_UNIX; one `reach` line per
   name reached and a `reach-summary` per type, the format the allowlist will
-  read; `jail-reach.rs`). With a
+  read; then `jail-probe smb`, this host's administrative shares, `IPC$` and
+  the `srvsvc` pipe through `\Device\Mup`, the LanMan redirector and a UNC
+  name, and the RDP client drives, opened by the operator, in the jail and in
+  the jail with `--netns`, each open's NTSTATUS or granted access recorded;
+  the records kept as `reach-record.txt` and `reach-objects.txt` in the work
+  directory for CI's upload; `jail-reach.rs`). With a
   guest: `netguest` (frames through the endpoint in the jail's own directory of the network),
   `isolation` (`jail-probe.rs`, run through the jailer as the jailed binary,
   may not read the user's files or SAM, write files outside its jail, reach another

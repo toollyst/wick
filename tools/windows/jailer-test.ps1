@@ -864,9 +864,17 @@ function Stage-Isolation {
 # bind, a pipe and a mailslot made, the pipes listed (tools/windows/
 # jail-reach.rs). Its lines (`reach <type> <path> <how>`, `reach-check
 # <name> <result>`, `reach-summary <type> tried <n> reached <m>`) are
-# printed here whole: the format the allowlist will read. It asserts
-# nothing of what is reached, only that the record is whole: the list made,
-# the jailed probe's end line, a summary. Needs no guest.
+# printed here whole: the format the allowlist will read. Then jail-probe
+# `smb`: this host's files and pipes through the network redirectors
+# (\Device\Mup, \Device\LanmanRedirector, a UNC name, the RDP client drives
+# through \Device\RdpDrPort), which no device security guards beneath their
+# names: run by the operator (the control: which shares this host serves
+# itself), in the jail, and in the jail with --netns (elevated only: its
+# filters), with the server service's state and the shares, all recorded.
+# The records are kept as reach-record.txt and reach-objects.txt in the
+# work directory, which CI's upload takes. It asserts nothing of what is
+# reached, only that the record is whole: the list made, the jailed probe's
+# end line, a summary, each SMB run's end line. Needs no guest.
 function Stage-Reach([string]$External = '8.8.8.8:53') {
     $probe = Get-Probe
     $base = New-Base 'reach'
@@ -880,15 +888,46 @@ function Stage-Reach([string]$External = '8.8.8.8:53') {
     $listener.Start()
     try {
         $port = $listener.LocalEndpoint.Port
-        $r = Invoke-Jailer @('--id', 'r', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', "reach:/objects.txt:${port}:$External") 900000
+        # The SMB control, outside any jail: whether this host serves its
+        # administrative shares to itself, so that a refusal in the jail is
+        # told from a share it does not have.
+        $server = try { "LanmanServer $((Get-Service LanmanServer -ErrorAction Stop).Status)" } catch { "LanmanServer: $($_.Exception.Message)" }
+        $shares = try { "shares: $(@(Get-SmbShare -ErrorAction Stop | ForEach-Object { $_.Name }) -join ', ')" } catch { "shares: $($_.Exception.Message)" }
+        $control = @(& $probe 'smb:0' | Where-Object { $_ } | ForEach-Object { "operator: $_" })
+        $r = Invoke-Jailer @('--id', 'r', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', 'smb:0', "reach:/objects.txt:${port}:$External") 900000
         $lines = @($r[1] -split "`r?`n" | Where-Object { $_ })
         foreach ($l in $lines) { Write-Host "     $l" }
+        # The same SMB opens in a jail with a network of its own: --netns's
+        # filters are the jail's token's, and a redirector's connection is
+        # the system's.
+        $netLines = if ($elevated) {
+            $net = Join-Path $base 'net'
+            New-Item -ItemType Directory -Force -Path $net | Out-Null
+            $n = Invoke-Jailer @('--id', 'n', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--netns', $net, '--', 'smb:0') 300000
+            @(@($n[1] -split "`r?`n" | Where-Object { $_ }) | ForEach-Object { "netns: $_" })
+        } else { @('netns: not run: not elevated (--netns adds Windows Filtering Platform filters)') }
+        $head = "operator: $server; $shares"
+        foreach ($l in @($head) + $control + $netLines) { Write-Host "     $l" }
+        # Kept for CI's upload (the stage's own directory goes when it passes).
+        Set-Content -Path (Join-Path $WorkDir 'reach-record.txt') -Value (@($head) + $control + $lines + $netLines)
+        Copy-Item (Join-Path $root 'objects.txt') (Join-Path $WorkDir 'reach-objects.txt') -ErrorAction SilentlyContinue
+        # Each SMB run's end line, and its opens, a form and a word each.
+        $smbOf = {
+            param([string[]]$ls, [string]$prefix, [string]$who)
+            $end = $ls | Where-Object { $_ -match "^${prefix}smb:0 done \d+ of \d+ opened$" } | Select-Object -First 1
+            Check ($null -ne $end) "the SMB record ($who) did not end: $(($ls | Select-Object -Last 3) -join ' | ')"
+            $each = @($ls | Where-Object { $_.StartsWith("${prefix}smb-open ") } | ForEach-Object { $f = $_ -split "`t"; "$(($f[0] -split ' ')[-1]) $(@(($f[2] -replace '^allowed granted ', 'allowed ') -split ' ')[0..1] -join ' ')" })
+            "$($end -replace "^${prefix}smb:0 done ", '') ($($each -join ', '))"
+        }
+        $smbControl = & $smbOf $control 'operator: ' 'the operator'
+        $smbJailed = & $smbOf $lines '' 'jailed'
+        $smbNet = if ($elevated) { & $smbOf $netLines 'netns: ' 'jailed with --netns' } else { 'not run, not elevated' }
         $done = $lines | Where-Object { $_ -match '^reach:\S+ done \d+ of \d+ names reached$' } | Select-Object -First 1
         Check ($r[0] -eq 0 -and $done) "the jailed record did not end: exit $($r[0]): $(($lines | Select-Object -Last 3) -join ' | ')"
         $summary = @($lines | Where-Object { $_.StartsWith('reach-summary ') } | ForEach-Object { $_.Substring('reach-summary '.Length) })
         Check ($summary.Count -gt 0) 'the jailed record has no reach-summary line'
         $checks = @($lines | Where-Object { $_.StartsWith('reach-check ') })
-        "a record under today's token, nothing asserted: the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks"
+        "a record under today's token, nothing asserted: the operator's list $($made -replace '^reachlist:\S+ allowed ', ''); jailed, $($done -replace '^reach:\S+ done ', ''): $($summary -join '; '); $($checks.Count) other checks; SMB ($server; $shares): the operator $smbControl; jailed $smbJailed; jailed with --netns $smbNet"
     } finally {
         $listener.Stop()
         Stop-Jailed

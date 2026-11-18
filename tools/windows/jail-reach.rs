@@ -112,6 +112,7 @@ extern "system" {
     fn LoadLibraryW(name: *const u16) -> HANDLE;
     fn CreateNamedPipeW(name: *const u16, mode: u32, pipe: u32, max: u32, out: u32, inb: u32, timeout: u32, sa: *const c_void) -> HANDLE;
     fn CreateMailslotW(name: *const u16, max: u32, timeout: u32, sa: *const c_void) -> HANDLE;
+    fn GetComputerNameW(buf: *mut u16, len: *mut u32) -> i32;
 }
 #[link(name = "advapi32")]
 extern "system" {
@@ -282,6 +283,67 @@ pub(super) fn list(file: &str) -> String {
         Ok(()) => format!("allowed {} names ({} objects, {} pipes, {} mailslots)", lines.len(), objs.len(), pipes.len(), slots.len()),
         Err(e) => format!("denied {e}"),
     }
+}
+
+/// `smb:0`: the host's own files and pipes through the network
+/// redirectors, opened by their NT names as a jailed process may name them
+/// (`\Device\Mup` and `\Device\RdpDrPort` have no
+/// `FILE_DEVICE_SECURE_OPEN`: a name beneath them is the redirector's to
+/// decide, not the device's security, `reach`'s record), each form once:
+/// the administrative shares of this machine by 127.0.0.1, `localhost` and
+/// its NetBIOS name, `ADMIN$`, the `IPC$` share and the `srvsvc` pipe
+/// beneath it, the same through `\Device\LanmanRedirector` and by a Win32
+/// UNC name, and the RDP client drives (`tsclient`). One line each,
+/// `smb-open <form>\t<path>\t<result>`: the NTSTATUS, or the access
+/// granted and, for a file, the bytes of a read. Records; asserts nothing.
+/// Run by the operator too, so a refusal is told from a share this host
+/// does not have (jailer-test.ps1 `reach`).
+pub(super) fn smb(_arg: &str) -> String {
+    let mut name = [0u16; 64];
+    let mut len = name.len() as u32;
+    // SAFETY: a buffer of `len` characters.
+    let host = if unsafe { GetComputerNameW(name.as_mut_ptr(), &mut len) } != 0 {
+        String::from_utf16_lossy(&name[..len as usize])
+    } else {
+        format!("<no computer name: {}>", last())
+    };
+    println!("smb-computer-name {host}");
+    let file = FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT;
+    let any = FILE_SYNCHRONOUS_IO_NONALERT;
+    let forms: Vec<(&str, String, u32)> = vec![
+        ("c$-127.0.0.1", r"\Device\Mup\127.0.0.1\C$\Windows\win.ini".into(), file),
+        ("c$-localhost", r"\Device\Mup\localhost\C$\Windows\win.ini".into(), file),
+        ("c$-computer-name", format!(r"\Device\Mup\{host}\C$\Windows\win.ini"), file),
+        ("admin$-127.0.0.1", r"\Device\Mup\127.0.0.1\ADMIN$\win.ini".into(), file),
+        ("ipc$-127.0.0.1", r"\Device\Mup\127.0.0.1\IPC$".into(), any),
+        ("pipe-srvsvc-127.0.0.1", r"\Device\Mup\127.0.0.1\PIPE\srvsvc".into(), file),
+        ("pipe-srvsvc-localhost", r"\Device\Mup\localhost\PIPE\srvsvc".into(), file),
+        ("c$-lanmanredirector", r"\Device\LanmanRedirector\127.0.0.1\C$\Windows\win.ini".into(), file),
+        ("c$-unc", r"\??\UNC\127.0.0.1\C$\Windows\win.ini".into(), file),
+        ("tsclient-mup", r"\Device\Mup\tsclient\C".into(), any),
+        ("tsclient-rdpdrport", r"\Device\RdpDrPort\tsclient\C".into(), any),
+        ("rdpdrport-beneath", r"\Device\RdpDrPort\x".into(), any),
+    ];
+    let mut opened = 0;
+    for (form, path, opts) in &forms {
+        let r = match nt_open(path, MAXIMUM_ALLOWED, *opts) {
+            Ok(h) => {
+                opened += 1;
+                let mut line = format!("allowed granted {:#x}", granted(h.0));
+                if *opts & FILE_NON_DIRECTORY_FILE != 0 && path.ends_with(".ini") {
+                    let mut io = IO_STATUS_BLOCK { status: 0, info: 0 };
+                    let mut buf = [0u8; 64];
+                    // SAFETY: a synchronous handle; a buffer of its length.
+                    let st = unsafe { NtReadFile(h.0, null_mut(), null(), null(), &mut io, buf.as_mut_ptr().cast(), 64, null(), null()) };
+                    line += &format!(" read {:#010x} ({} bytes)", st as u32, if st >= 0 { io.info } else { 0 });
+                }
+                line
+            }
+            Err(st) => format!("denied {:#010x}", st as u32),
+        };
+        println!("smb-open {form}\t{path}\t{r}");
+    }
+    format!("done {opened} of {} opened", forms.len())
 }
 
 /// Waits up to `ms` for an operation that returned `st` on an asynchronous

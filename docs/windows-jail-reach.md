@@ -66,7 +66,16 @@ In short:
   that are not names (a DLL loaded and HKLM read after the revert, TCP to loopback, the link-local metadata address
   and 8.8.8.8:53, an AF_UNIX bind, a pipe and a mailslot made, the pipes listed). Its output, one `reach` line per
   name reached and a `reach-summary` per type, is the format the fix's allowlist will read; it asserts nothing yet;
-  the fix makes it an assertion against one exact allowlist. First run: CI.
+  the fix makes it an assertion against one exact allowlist. Then `jail-probe smb` opens this host's own files and
+  pipes through the network redirectors, which no device security guards beneath their names (`\Device\Mup` and
+  `\Device\RdpDrPort` have no `FILE_DEVICE_SECURE_OPEN`): `C$\Windows\win.ini` by 127.0.0.1, `localhost` and the
+  computer's name, `ADMIN$`, `IPC$` and its `srvsvc` pipe, the same through `\Device\LanmanRedirector` and a UNC
+  name, and the RDP client drives (`tsclient`), each line the NTSTATUS or the access granted and a read. It runs as
+  the operator (the control: which of them this host serves itself), in the jail, and in the jail with `--netns`,
+  whose filters are the jail's token's while the redirector's connection is the system's; with the server service's
+  state and the shares. Whether a redirector carries the jail's open to the host's shares with the user's
+  credentials is what it records, under each token. The records are kept for CI's upload (`reach-record.txt`,
+  `reach-objects.txt`). First run: CI.
 
 ## What the jail reaches
 

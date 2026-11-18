@@ -29,13 +29,13 @@
 //!                               namedjob:<object name> namespace:0
 //!                               dacl:<path> owner:<path> deleteopen:<path>
 //!                               reachlist:<file>
-//!                               reach:<file>:<port>:<ip>:<port>
+//!                               reach:<file>:<port>:<ip>:<port> smb:0
 //! (<pid> may be `parent`: in a jail, the jailer.)
 //! jail-probe medium <program> <argument>...
 //! ```
 //!
 //! Prints one line per check: `<check> allowed` or `<check> denied <error>`;
-//! `reach` prints its record's lines before its own (jail-reach.rs).
+//! `reach` and `smb` print their records' lines before their own (jail-reach.rs).
 //! No dependencies: `rustc -O jail-probe.rs` builds it.
 
 #![allow(non_snake_case, clippy::upper_case_acronyms)]
@@ -44,8 +44,9 @@
 #[path = "../../overlay/vmm/ext/jail_preload.rs"]
 mod preload;
 
-/// The `reachlist` and `reach` checks: what the jail reaches of the host's
-/// named objects (jailer-test.ps1's `reach` stage).
+/// The `reachlist`, `reach` and `smb` checks: what the jail reaches of the
+/// host's named objects and, through the network redirectors, of its files
+/// (jailer-test.ps1's `reach` stage).
 #[path = "jail-reach.rs"]
 mod reach;
 
@@ -507,6 +508,7 @@ fn check(c: &str) -> String {
     match kind {
         "reachlist" => reach::list(arg),
         "reach" => reach::reach(arg),
+        "smb" => reach::smb(arg),
         "read" => io(std::fs::File::open(arg).and_then(|mut f| f.read(&mut [0u8; 1]).map(drop))),
         "write" => io(std::fs::OpenOptions::new()
             .create(true)
