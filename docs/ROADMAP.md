@@ -186,7 +186,10 @@ dd657f4 those stages, `diff` and `memory-hotplug` passed 5 of 5 runs in a row. `
 - Not done: Nitro Enclaves (docs/COMPATIBILITY.md, `GET`, `PUT /enclave`). AWS documents Windows Server parents for
   enclaves and nested Hyper-V, which WHP needs, on instance types that are in both lists, so a Windows host can meet
   an enclave; Windows's side, AWS's `AWSNitroEnclavesWindows` package, has no documented programmatic interface to
-  build the backend on. Until one exists, the start is refused as on a Linux host without the device.
+  build the backend on, and AWS's open nitro-cli sources hold the Linux driver only. Not impossible: the device is the
+  Nitro Enclaves PCI device, whose commands are in that Linux driver (`ne_pci_dev.h`), and AWS's Windows driver drives
+  it. The backend needs that driver's interface or a signed driver of its own, and an enclave-capable Windows
+  instance to test on. Until then, the start is refused as on a Linux host without the device.
 
 ## M4. Linux: upstream parity
 
