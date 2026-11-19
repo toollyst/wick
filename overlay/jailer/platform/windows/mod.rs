@@ -3286,11 +3286,23 @@ mod tests {
 
     // The pid file is made new, as upstream's (create_new): whatever has its
     // name, a file of a run before or a link, is refused and left as it was.
-    // (That a reader holding it from its first moment refuses nothing is
-    // `jailer-test.ps1 freeze`'s, which runs the whole jailer.)
+    // A plain file, a hard link, a symbolic link or a dangling one is refused
+    // with ERROR_FILE_EXISTS, as upstream's EEXIST; a directory junction of
+    // that name is refused with ERROR_ACCESS_DENIED, because CreateFileW over a
+    // name that is a directory (a junction is a directory reparse point)
+    // without FILE_FLAG_BACKUP_SEMANTICS is access-denied before the exists
+    // check (measured on build 20348 through this exact std open: raw_os_error
+    // 5, not 80; CI's windows-guest build 26100 showed only that it is not 80,
+    // by failing this assertion when it demanded 80). Either way the write is
+    // refused, the name is left the reparse point it was
+    // (FILE_FLAG_OPEN_REPARSE_POINT: not followed), and the file it names is
+    // untouched. (That a reader holding it from its first moment refuses
+    // nothing is `jailer-test.ps1 freeze`'s, which runs the whole jailer.)
     #[test]
     fn test_the_pid_file_is_made_new() {
-        use windows_sys::Win32::Foundation::ERROR_FILE_EXISTS;
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_EXISTS};
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
         let dir = std::env::temp_dir().join(format!("wick-jailer-pid-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3327,7 +3339,19 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "mklink /J: {out:?}");
-        assert!(exists(write_pid_file(&junction, 4242)));
+        // Refused (ERROR_ACCESS_DENIED, not ERROR_FILE_EXISTS, for a directory
+        // junction: see the test's comment), the junction left unfollowed and a
+        // reparse point, nothing created at its name.
+        let r = write_pid_file(&junction, 4242);
+        assert!(
+            r.as_ref().is_err_and(|e| matches!(
+                e.raw_os_error(),
+                Some(c) if c == ERROR_ACCESS_DENIED.cast_signed() || c == ERROR_FILE_EXISTS.cast_signed()
+            )),
+            "a directory junction is refused, access-denied or exists: {r:?}"
+        );
+        let attrs = std::fs::symlink_metadata(&junction).unwrap().file_attributes();
+        assert!(attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0, "the junction was followed or replaced: {attrs:#x}");
         assert_eq!(std::fs::read(&target).unwrap(), content);
         std::fs::remove_dir_all(&dir).unwrap();
     }
