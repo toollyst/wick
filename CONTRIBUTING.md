@@ -459,7 +459,8 @@ the runner image (`macos-15`) is GitHub's and changes over time.
   wick-fsd as root in the Linux CI, with the same kind of payload in
   Firecracker's place: refusals and failing servers leave no process, and a
   real server is the payload's child, in the jail's cgroup, its socket 0600
-  and the jail's, its descriptor limit its own (docs/design-fs.md §8).
+  and the jail's, its descriptor limit its own, and gone with its socket
+  within 5 s of the payload's end (the parent watch; docs/design-fs.md §8).
 - `tools/linux/guest-ram-grain.c` and `tools/linux/guest-ram-record.py` print
   Linux's side of the lazy-RAM grain, in the Linux CI under THP `madvise`
   and `always`. The first is KVM guest RAM mapped as upstream maps it, with

@@ -1185,16 +1185,151 @@ pub fn connect_as(path: &std::path::Path, uid: u32, gid: u32) -> std::result::Re
     }
 }
 
+/// A process's end as a descriptor: readable once the process has ended,
+/// never before, with nothing to read from it (docs/design-fs.md §8,
+/// Jailer, the parent watch). Linux: a pidfd (`pidfd_open`, poll reports
+/// it readable when the process exits: kernel/pid.c, v6.12, `pidfd_poll`).
+/// macOS: a kqueue holding one `EVFILT_PROC` `NOTE_EXIT` registration on
+/// the pid, added here; a kqueue descriptor is reported readable by
+/// poll/select when an event is pending (xnu bsd/kern/kern_event.c,
+/// `kqueue_select`), and this one can have no other. Either way the
+/// waiting is a `poll` on the descriptor (see [`wait_ready`]); nothing
+/// after the open reads or adds an event. Opening on a pid that already
+/// ended fails (Linux ESRCH; macOS ESRCH from `kevent`), so open first,
+/// then check the pid is still the one meant (`getppid`).
+#[derive(Debug)]
+pub struct ProcessEnd {
+    fd: OwnedFd,
+    pid: i32,
+}
+
+impl ProcessEnd {
+    /// The watch on `pid`'s end.
+    pub fn open(pid: i32) -> Result<ProcessEnd> {
+        if pid <= 0 {
+            return Err(HostErrno(libc::EINVAL));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: pidfd_open takes a pid and flags.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            let fd = c_int::try_from(fd).map_err(|_| HostErrno(libc::EOVERFLOW))?;
+            Ok(ProcessEnd { fd: owned(fd)?, pid })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: kqueue takes nothing.
+            let fd = owned(unsafe { libc::kqueue() })?;
+            // SAFETY: a valid kqueue; the descriptor is close-on-exec.
+            check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+            let change = libc::kevent {
+                ident: usize::try_from(pid).map_err(|_| HostErrno(libc::EINVAL))?,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // SAFETY: one change in, no events out, no wait.
+            check(unsafe { libc::kevent(fd.as_raw_fd(), &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) })?;
+            Ok(ProcessEnd { fd, pid })
+        }
+    }
+
+    /// The pid watched.
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
+
+    /// The descriptor to wait on: readable once the process has ended.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.fd.as_fd()
+    }
+
+    /// Whether the process has ended, without waiting.
+    pub fn ended(&self) -> Result<bool> {
+        Ok(wait_readable(&[self.as_fd()], 0)?[0])
+    }
+}
+
+/// Waits until one of `fds` is readable, hung up or in error, or
+/// `timeout_ms` passes (-1: no bound); which ones are. [`wait_ready`]
+/// for reading on each.
+pub fn wait_readable(fds: &[BorrowedFd<'_>], timeout_ms: c_int) -> Result<Vec<bool>> {
+    let want: Vec<(BorrowedFd<'_>, bool)> = fds.iter().map(|fd| (*fd, false)).collect();
+    wait_ready(&want, timeout_ms)
+}
+
+/// Waits until one of `fds` is ready, for writing where its flag says so
+/// and else for reading (hung up and in error count as ready), or
+/// `timeout_ms` passes (-1: no bound); which ones are. One `poll` call
+/// (macOS: `poll`, syscall 230, measured under the reporting profile;
+/// Linux: `ppoll` made directly, the one call on every architecture, as
+/// aarch64 has no `poll`), EINTR waited again.
+pub fn wait_ready(fds: &[(BorrowedFd<'_>, bool)], timeout_ms: c_int) -> Result<Vec<bool>> {
+    let mut p: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|(fd, write)| libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: if *write { libc::POLLOUT } else { libc::POLLIN },
+            revents: 0,
+        })
+        .collect();
+    loop {
+        #[cfg(target_os = "linux")]
+        let r = {
+            let ts = libc::timespec {
+                tv_sec: libc::time_t::from(timeout_ms.max(0) / 1000),
+                tv_nsec: libc::c_long::from(timeout_ms.max(0) % 1000) * 1_000_000,
+            };
+            let tsp = if timeout_ms < 0 { std::ptr::null() } else { &raw const ts };
+            // SAFETY: valid pollfds and timespec; no signal mask (NULL).
+            let r = unsafe {
+                libc::syscall(libc::SYS_ppoll, p.as_mut_ptr(), p.len(), tsp, std::ptr::null::<libc::sigset_t>(), 0usize)
+            };
+            c_int::try_from(r).unwrap_or(-1)
+        };
+        #[cfg(target_os = "macos")]
+        // SAFETY: valid pollfds.
+        let r = unsafe { libc::poll(p.as_mut_ptr(), libc::nfds_t::try_from(p.len()).unwrap_or(0), timeout_ms) };
+        match check(r) {
+            Ok(_) => break,
+            Err(HostErrno(libc::EINTR)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let ready = libc::POLLIN | libc::POLLOUT | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    Ok(p.iter().map(|x| x.revents & ready != 0).collect())
+}
+
+/// The parent's pid (`getppid`).
+pub fn parent_pid() -> i32 {
+    // SAFETY: getppid cannot fail.
+    unsafe { libc::getppid() }
+}
+
+/// For tests run as root, in a process started for it: no supplementary
+/// group, then `gid`, then `uid`, for good (a launcher that drops to the
+/// jail's ids after starting a server, as the jailer does).
+pub fn drop_ids_here(uid: u32, gid: u32) -> Result<()> {
+    // SAFETY: system calls on integers.
+    unsafe {
+        check(libc::setgroups(0, std::ptr::null()))?;
+        check(libc::setgid(gid))?;
+        check(libc::setuid(uid))?;
+    }
+    Ok(())
+}
+
 /// [`connect_as`] in this process, which it leaves at `uid`:`gid` for good:
 /// for a process started for that alone (macOS's tests start one with
 /// posix_spawn instead of a fork). The same results as [`connect_as`].
 pub fn connect_as_here(path: &std::path::Path, uid: u32, gid: u32) -> std::result::Result<(), String> {
     let (addr, len) = unix_addr(path)?;
+    drop_ids_here(uid, gid).map_err(|_| "the child could not drop to the uid and gid".to_string())?;
     // SAFETY: system calls on integers and the address built above.
     unsafe {
-        if libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
-            return Err("the child could not drop to the uid and gid".into());
-        }
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
         if fd < 0 {
             return Err("socket failed in the child".into());
@@ -1773,6 +1908,34 @@ pub fn set_nofile_exact(n: u64) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
+
+    /// The watch on a process's end: not readable while it runs (a 300 ms
+    /// wait times out), readable within 5 s of its kill, and still readable
+    /// after (nothing reads the event); a pid that is gone is refused at
+    /// the open (ESRCH). Linux's pidfd; macOS's kqueue with its one
+    /// NOTE_EXIT, waited on with poll, never kevent.
+    #[test]
+    fn test_process_end_is_readable_at_the_end_and_not_before() {
+        // std spawns without a fork here (no pre_exec): posix_spawn on macOS.
+        let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let w = ProcessEnd::open(pid).unwrap();
+        assert_eq!(w.pid(), pid);
+        assert!(!w.ended().unwrap());
+        let t = std::time::Instant::now();
+        assert_eq!(wait_readable(&[w.as_fd()], 300).unwrap(), [false]);
+        assert!(t.elapsed() >= std::time::Duration::from_millis(250), "{:?}", t.elapsed());
+        child.kill().unwrap();
+        let t = std::time::Instant::now();
+        assert_eq!(wait_readable(&[w.as_fd()], 5000).unwrap(), [true]);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+        assert!(w.ended().unwrap() && w.ended().unwrap());
+        child.wait().unwrap();
+        assert!(w.ended().unwrap());
+        drop(w);
+        assert_eq!(ProcessEnd::open(pid).unwrap_err(), HostErrno(libc::ESRCH));
+        assert_eq!(ProcessEnd::open(0).unwrap_err(), HostErrno(libc::EINVAL));
+    }
 
     /// In a process of its own (the test binary again, with descriptors at
     /// 140 and 141 left open as a launcher leaves them): every descriptor

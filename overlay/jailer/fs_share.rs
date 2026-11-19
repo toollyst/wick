@@ -19,7 +19,8 @@
 //! - Each server is started just before the chroot, after the cgroup is
 //!   set (it shares the jail's), from the process that execs Firecracker,
 //!   which so becomes its parent: as root, with `--uid U --gid G --peer-uid
-//!   <jail uid> --ready-fd 3`, standard input `/dev/null`, its output the
+//!   <jail uid> --ready-fd 3 --parent-pid <this pid>`, so it ends with
+//!   Firecracker, before its connection too; standard input `/dev/null`, its output the
 //!   jailer's, and the `RLIMIT_NOFILE` and `RLIMIT_FSIZE` the jailer was
 //!   started with ([`HostLimits`]), not the jail's: `--resource-limit` is
 //!   Firecracker's (its `no-file`, 2048 by default, is below the 2112
@@ -386,6 +387,11 @@ impl FsShares {
             share.gid.to_string().into(),
             "--ready-fd".into(),
             "3".into(),
+            // The process that forks the server and then execs Firecracker
+            // (the same pid): the server watches it and ends with it, also
+            // before the VMM connected (wick-fsd's parent watch).
+            "--parent-pid".into(),
+            std::process::id().to_string().into(),
         ];
         if share.read_only {
             a.push("--read-only".into());
@@ -517,7 +523,8 @@ mod tests {
             args.join(" "),
             format!(
                 "--share-dir {d} --socket /srv/jailer/firecracker/a/root/fs-data.sock --id data --peer-uid 123 \
-                 --uid 500 --gid 500 --ready-fd 3 --read-only"
+                 --uid 500 --gid 500 --ready-fd 3 --parent-pid {} --read-only",
+                std::process::id()
             )
         );
         // Neither flag: nothing to start.

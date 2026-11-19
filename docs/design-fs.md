@@ -58,7 +58,7 @@ documented or measured; **measure** = the fix is designed, a measurement on the 
 | 1 | Guest name escapes the share: `..`, `/`, absolute name in SYMLINK/RENAME/LINK (Kata CVE-2026-47243; virtiofsd name checks only 2026-11-06) | Layer 1, same code on all hosts: every guest name must be one component, not `.`/`..`, no `/` or NUL, at most 255 bytes of UTF-8, and none of the code points the Windows escape writes (U+F001–U+F01F, U+F022, U+F02A, U+F02F, U+F03A, U+F03C, U+F03E, U+F03F, U+F05C, U+F07C; `crates/fs/fsd/src/fuse/name.rs`, `test_every_name_taking_opcode_refuses_what_is_not_a_name`, `test_name_refuses_every_escape_image`), and every operation is relative to a held directory handle. Layer 2: L `openat2 RESOLVE_BENEATH\|NO_SYMLINKS\|NO_MAGICLINKS\|NO_XDEV` / M `O_RESOLVE_BENEATH` + `O_NOFOLLOW_ANY` (on macOS 27.2, 2026-11-13, a test program's `openat(dirfd, name, O_RESOLVE_BENEATH)` returned ENOTCAPABLE for `..`, `/etc/hosts` and `../etc/hosts` and opened `.`; the program is not in the repository) / W `NtCreateFile(RootDirectory, one component, OBJ_DONT_REPARSE)`, rename via `FILE_RENAME_INFORMATION.RootDirectory`. Layer 3: the OS sandbox (row 4) | Traversal corpus over every name-taking opcode, on every CI host, no VM; canaries outside the share untouched; **any refusal from layer 2 or 3 fails the test** (layer 1 must stop it); raw-virtqueue guest replay as in the Kata PoC. Host side: `test_traversal_corpus` (38 names × every name-taking opcode, Linux and macOS) | now (L, M); measure `OBJ_DONT_REPARSE` on W |
 | 2 | Symlink/junction swapped in mid-operation (TOCTOU; CVE-2016-9602) | Never follow links: L `RESOLVE_NO_SYMLINKS` / M `O_NOFOLLOW_ANY` / W `OBJ_DONT_REPARSE` + `FileAttributeTagInformation` after open, so any reparse point is shown as a link object and never traversed. Guest-made symlinks are emulated (regular file + record), so the host never has a real link the guest made | Race suite: host threads swap dirs ↔ symlinks/junctions/mount points for 10⁶ iterations while the harness operates; same assertions as 1. Host side: `test_swap_race` (a directory ↔ a symlink to outside, swapped atomically without pause, 10⁵ rounds of about ten requests) | now (L, M); measure on W |
 | 3 | Aliases: case folding, Unicode normalisation, 8.3 names (`PROGRA~1`), `/.vol`, ADS `file:stream` | Identity by (dev, ino) / FileId, never by name. M: compare the stored name (`fgetattrlist ATTR_CMN_NAME`) with the request, mismatch = ENOENT/EEXIST; never build `/.vol` paths. W: reject `:`; compare `FileNormalizedNameInformation` with the request (catches 8.3) | Corpus entries for each alias form; case/NFD variants (`test_alias_names_refused`, `test_case_collision_is_eexist`) | now (M); measure 8.3 check on W |
-| 4 | The file server itself is taken over (parser bug) | Confine it so a takeover reaches only the share: L user/mount/pid/net namespaces + `pivot_root` into the share + seccomp (crosvm's fs list minus mknod/setresuid/capset) + `no_new_privs` + Landlock when present / M Seatbelt `(deny default (with send-signal SIGKILL))`, each file operation the server makes allowed only `(subpath share)`, the system calls, Mach traps and MIG routines it makes listed and every other killed, no network/exec/fork/IOKit, as root the drop to `--uid`/`--gid` (§6.2) / W LPAC token (per-share AppContainer SID) + ACE on the share only + Job (memory, CPU, 1 process, kill on close) + wick's mitigation profile. **If any control cannot be set, wick-fsd does not start** | Per-host sandbox checks (`Seccomp: 2`, `CapEff: 0`; profile test; `TokenIsLessPrivilegedAppContainer`); an outside open from inside the server fails; one test per control proving refusal to start. L: `test_confined_status` (`Seccomp: 2`, `NoNewPrivs: 1`, every capability set empty, other namespaces, `/` = the share), `test_outside_open_fails`, `confine_probe` (inside the confined process: `openat`, `socket`, `execve`, `ptrace` and an executable `mmap` killed by SIGSYS; the host's paths not there), and `test_refused_without_unshare`, `_fork`, `_mount`, `_pivot_root`, `_id_drop`, `_capability_drop`, `_no_new_privs`, `_seccomp`, `test_refused_when_landlock_fails`, each under a filter that makes that step's call fail. M: `confine_probe` (inside the confined process: the outside canary by its path, metadata, `/.vol` and firmlink alias, `/etc/passwd`, exec, fork, a TCP connection, ptrace, `MAP_JIT`, executable mappings, a sysctl and the host's privileged port killed; the share's refused operations of §6.2 refused), `test_every_request_confined_answered_as_unconfined`, and one refusal test per step (`test_refused_when_the_profile_is_not_applied`, `test_refused_when_the_id_drop_fails`, `test_refused_when_a_descriptor_survives_its_close`, `test_refused_when_a_saved_id_is_left`, `test_refused_under_another_profile`, §6.2) | now (L, M); measure LPAC + AF_UNIX + inherited handles on W |
+| 4 | The file server itself is taken over (parser bug) | Confine it so a takeover reaches only the share: L user/mount/pid/net namespaces + `pivot_root` into the share + seccomp (crosvm's fs list minus mknod/setresuid/capset) + `no_new_privs` + Landlock when present / M Seatbelt `(deny default (with send-signal SIGKILL))`, each file operation the server makes allowed only `(subpath share)`, the system calls, Mach traps and MIG routines it makes listed and every other killed, no network/exec/fork/IOKit, as root the drop to `--uid`/`--gid` (§6.2) / W LPAC token (per-share AppContainer SID) + ACE on the share only + Job (memory, CPU, 1 process, kill on close) + wick's mitigation profile. **If any control cannot be set, wick-fsd does not start** | Per-host sandbox checks (`Seccomp: 2`, `CapEff: 0`; profile test; `TokenIsLessPrivilegedAppContainer`); an outside open from inside the server fails; one test per control proving refusal to start. L: `test_confined_status` (`Seccomp: 2`, `NoNewPrivs: 1`, every capability set empty, other namespaces, `/` = the share), `test_outside_open_fails`, `confine_probe` (inside the confined process: `openat`, `socket`, `execve`, `ptrace` and an executable `mmap` killed by SIGSYS; the host's paths not there), and `test_refused_without_unshare`, `_fork`, `_mount`, `_pivot_root`, `_id_drop`, `_capability_drop`, `_no_new_privs`, `_seccomp`, `test_refused_when_landlock_fails`, each under a filter that makes that step's call fail. M: `confine_probe` (inside the confined process: the outside canary by its path, metadata, `/.vol` and firmlink alias, `/etc/passwd`, exec, fork, a TCP connection, ptrace, `MAP_JIT`, executable mappings, a sysctl and the host's privileged port killed; a new kqueue and every call that could add a registration to the held parent watch (`kevent`, `kevent64`, `kevent_qos`, `kevent_id`) killed, `poll` on it done; the share's refused operations of §6.2 refused), `test_every_request_confined_answered_as_unconfined`, and one refusal test per step (`test_refused_when_the_profile_is_not_applied`, `test_refused_when_the_id_drop_fails`, `test_refused_when_a_descriptor_survives_its_close`, `test_refused_when_a_saved_id_is_left`, `test_refused_under_another_profile`, §6.2) | now (L, M); measure LPAC + AF_UNIX + inherited handles on W |
 | 5 | Taken-over server attacks the VMM | It never gets guest memory (unlike vhost-user) and no handle to the VMM; the VMM validates every reply length/unique and caps frames | `fs_proxy` fuzz target: hostile descriptor chains **and** hostile replies | now |
 | 6 | FUSE parser bugs from guest-controlled lengths | Bounded decoder in its own crate; fuzzed like wick's existing targets | `fs_decode`, `fs_session` fuzz targets on CI (1 min) + nightly | now |
 | 7 | Host device nodes, FIFOs, sockets, setuid files (CVE-2020-35517, CVE-2023-2861, CVE-2022-0358) | Only regular files and directories are ever opened for I/O (`fstat` on the handle first); `mknod` never called; ownership, modes, setuid, devices, FIFOs live in a wick-private metadata record; server has no capabilities | Corpus: host FIFO/device/socket in the share; setuid bit never reaches the host (`test_special_files_never_opened`, `test_host_device_node_never_opened`, `test_setuid_never_reaches_host`) | now |
@@ -452,7 +452,9 @@ lay them out); fuzz target `fs_proxy`. No guest has used it yet (commit 12's boo
   - only then set up the confinement (§6), with the connected socket and the share root its only handles.
 - Built for Linux (`crates/fs/fsd/src/main.rs`): `wick-fsd --share-dir DIR --socket PATH --id ID [--read-only]
   [--cache auto|never|always] [--cache-timeout-ms N] [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD (3 or more)]
-  [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]`. It refuses a socket path that exists
+  [--parent-pid PID] [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]`. It
+  lives for its parent (`--parent-pid`, which must be its parent; by default the parent at its start; Jailer, §8, the
+  parent watch) and ends when that ends, before or after the VMM connected. It refuses a socket path that exists
   (it never removes what it did not make), says it is ready (a byte on `--ready-fd`, else a `ready` line; a server
   that refuses before that holds `--ready-fd` until its refusal is on stderr, so a launcher that kills it at the
   pipe's end, as the jailer does, never cuts the reason off), accepts
@@ -858,7 +860,7 @@ share root with the server user's rights".
 | 14 | **Server access to guest memory** | none in design C | none | none | B would give all of it [doc] |
 | 15 | **Guest-controlled lengths/fields** in FUSE frames | decoder bounds, fuzzing (§11); the VMM caps frames | same | same | |
 | 16 | **Hostile server → VMM** (a compromised wick-fsd) | VMM validates replies (§4.1); the server cannot reach guest memory or the VMM process | same | same; no `PROCESS_DUP_HANDLE` either way | |
-| 17 | **Socket hijack / impersonation** | accept once, `SO_PEERCRED`, unlink (connection.rs: `test_second_connection_refused`, `test_wrong_peer_refused`) | accept once, `LOCAL_PEERCRED`, unlink (the same tests) | accept once, `SIO_AF_UNIX_GETPEERPID` → token SID [meas: works across the AppContainer boundary, a probe of Windows sandbox mechanisms on Windows Server 2022 build 20348, 2026-11-10; the probe is not in the repository] | |
+| 17 | **Socket hijack / impersonation** | accept once, `SO_PEERCRED`, unlink (connection.rs: `test_second_connection_refused`, `test_wrong_peer_refused`) | accept once, `LOCAL_PEERCRED`, unlink (the same tests; `test_second_connection_refused` failed once in 120 runs on macOS 27.2, its confined server not ended 30 s after the test closed the connection: cause not established, the test's wait now records the server's state before its kill) | accept once, `SIO_AF_UNIX_GETPEERPID` → token SID [meas: works across the AppContainer boundary, a probe of Windows sandbox mechanisms on Windows Server 2022 build 20348, 2026-11-10; the probe is not in the repository] | |
 | 18 | **Directory moved out of the share by the host** while the guest holds it | pivot_root does not stop it for held fds, but Landlock checks the hierarchy at access time [inf]; document | Seatbelt `subpath` is evaluated on the current path at access time [inf]; document | the DACL travels with the moved directory, so it **stays reachable**; document | trusted-host action in Firecracker's model |
 | 19 | **Host consumers of guest-written content** (Spotlight/QuickLook, Defender, indexers, IDEs following symlinks) | doc: dedicated dir, exclude it from indexers | doc: `.metadata_never_index`, a dedicated volume | doc; antivirus exclusions weaken the host and are not recommended | residual risk on every host |
 | 20 | **Untrusted server configuration** | operator-only command line; the VMM never forwards guest data into it | same | same | CVE-2026-44210 |
@@ -952,9 +954,13 @@ it means layer 1 let the request through.
     2. `fork`: the child is pid 1 of the new pid namespace. The parent drops the connection and everything else it
        holds but its end of the pipe the child watches and the standard streams, then confines itself: the child's
        `--uid`/`--gid` when root-started, every capability dropped, not dumpable, `no_new_privs`, and a seccomp filter
-       of its own, `PARENT_SYSCALLS` (`wait4`, `write`/`writev` for its one line, `rt_sigreturn`, `restart_syscall`,
-       `exit_group`, `exit`; anything else kills it). It takes no input and needs to signal nothing (the child dies
-       with it), but it lives as long as the share, so it keeps nothing it does not need
+       of its own, `PARENT_SYSCALLS` (`ppoll` on its two pidfds, `wait4`, `write`/`writev` for its one line,
+       `rt_sigreturn`, `restart_syscall`, `exit_group`, `exit`; anything else kills it). It takes no input and needs to
+       signal nothing (the child dies with it). It holds, beyond the standard streams and its end of the pipe, two
+       pidfds opened before its filter: the parent watch's (Jailer, §8) and the child's; it waits on both with `ppoll`
+       (made directly, the one call on x86_64 and aarch64), exits 1 naming the parent when that ends (the child goes
+       with it, its parent-death signal), and else `wait4`s the child. It lives as long as the share, so it keeps
+       nothing it does not need
        (`test_confined_status` reads its `/proc/<pid>/status` as the child's). A step that fails ends it, and the
        child with it. It waits and exits as the child did, by `_exit` (a child killed by the filter shows as signal
        31, SIGSYS, logged);
@@ -1423,6 +1429,7 @@ it means layer 1 let the request through.
     | wick-fsd's entry | Firecracker | Note |
     | --- | --- | --- |
     | `recvfrom` (29), `sendto` (133) | run, API | frames |
+    | `poll` (230) | run, API | the parent watch: the connection and the watch's kqueue descriptor, both held before the profile, as are the kqueue and its one registration, so it cannot add one (Jailer, below). Measured on 27.2: fs-server-report's one line with the watch, `allow syscall-unix 230`, 2 of 2 runs over every request test; `confine_probe` polls the held watch, done, and a new kqueue, a registration by `kevent` or `kevent64`, and `kevent_qos` and `kevent_id` by number are each killed. 15 and 26: a source reading (the same xnu path) until CI's `parent.rs` and `confine_probe` have run there |
     | `sigaltstack` (53), `munmap` (73) | run, API | std's stack-overflow handler at exit |
     | `madvise` (75) | run, API (API: `MADV_DONTNEED` only, the compatibility libc's check) | libmalloc |
     | `fcntl` (92), `fcntl_nocancel` (406) | run, API | commands below |
@@ -1628,25 +1635,45 @@ it means layer 1 let the request through.
     runs as root).
   - **Parent, reaping, early end.** The exec makes Firecracker of the process that forked the servers, so
     Firecracker is their parent; it never waits for them. A server that ends while Firecracker runs stays a zombie
-    (a process-table entry, no memory) until Firecracker ends, when it is reparented and reaped; a server ends when
-    its connection does, so on Firecracker's end too, but **not before its connection** (a known limit of this
-    version): a server whose Firecracker ends before the device connected (no boot was started) waits for its
-    connection, as root in stage 0, until it is killed; the jailer-test `fs` stage and `jailer-fs-check.py` record
-    it. A parent-death signal cannot end it on Linux, and macOS has none: the kernel sends `PR_SET_PDEATHSIG`'s
-    signal as the dying parent (kernel/exit.c `forget_original_parent`) through the kill permission check
-    (kernel/signal.c `check_kill_permission`, `kill_ok_by_cred`: a uid of the sender must match the target's, or
-    the sender needs `CAP_KILL`), and the parent is Firecracker at the jail's uid with no capabilities while the
-    server is root, so the signal is dropped (measured on Linux 7.0.14: a root child's signal fires when its root
-    parent ends, not when the parent dropped to another uid first). The next item below ends it with the VMM by a
-    descriptor on the parent instead (Linux `pidfd_open`, macOS a kqueue `EVFILT_PROC`), which no such check
-    governs. A server that dies early is seen by the device as the
+    (a process-table entry, no memory) until Firecracker ends, when it is reparented and reaped.
+  - **The parent watch: a server ends with its parent.** The jailer starts each server with `--parent-pid <its own
+    pid>`, the pid that then execs Firecracker. wick-fsd opens a watch on that pid before its ready byte (Linux:
+    `pidfd_open`; macOS: a kqueue with one `EVFILT_PROC` `NOTE_EXIT` registration), then checks the pid is still its
+    parent, so a parent that ended first is seen (the reaper is then its parent); `--parent-pid` must be the parent,
+    and by default it is the parent at the start. A parent that is pid 1 is refused unless named: the launcher may
+    have ended already, or init or launchd started the server, and only the operator knows (`--parent-pid 1` serves
+    with a watch that never fires). Then:
+    - before the VMM connects, the server waits on the listener and the watch at once (one `poll`); the parent's
+      end removes the socket and exits 1, "its parent, pid P, ended before the VMM connected";
+    - while it serves, on Linux the waiting parent (§6.1, step 2) waits on the watch and the confined child at
+      once (`ppoll` on two pidfds) and exits 1 when the parent ends, the child going with it (its parent-death
+      signal, now from a process of its own uid); on macOS the one process's connection is non-blocking and each
+      read or write that would wait polls the connection and the watch's kqueue descriptor (`poll`, which reports a
+      kqueue readable when an event is pending: xnu bsd/kern/kern_event.c `kqueue_select`; nothing reads or adds an
+      event after the profile, which kills each call that could: `confine_probe`), so a parent's end is seen within one request whatever the VMM does: idle, inside a
+      frame, or not reading a reply.
+    The watch needs no permission over the parent: a pidfd's open and poll make no credential check, and xnu's
+    `filt_procattach` checks one only for `NOTE_EXITSTATUS`, which is not asked. A parent-death signal could not do
+    this on Linux, and macOS has none: the kernel sends `PR_SET_PDEATHSIG`'s signal as the dying parent
+    (kernel/exit.c `forget_original_parent`) through the kill permission check (kernel/signal.c
+    `check_kill_permission`, `kill_ok_by_cred`: a uid of the sender must match the target's, or the sender needs
+    `CAP_KILL`), and the parent is Firecracker at the jail's uid with no capabilities while the server is root, so
+    the signal is dropped (measured on Linux 7.0.14: a root child's signal fires when its root parent ends, not
+    when the parent dropped to another uid first). Tests: `parent.rs` kills the parent before the VMM connected,
+    while the server waits for a frame, and while it is held writing 64 READ replies of 1 MiB the VMM does not read,
+    and each time the server (on Linux both its processes) is gone within 5 s, saying why; as root the parent drops
+    to another uid after starting the server first, as the jailer does. `--parent-pid` that is not the parent is
+    refused (`test_parent_pid_must_be_the_parent`), and pid 1 by default (`test_parent_watch_pid`). The jailer-test
+    `fs` stage and `jailer-fs-check.py` check that a server whose Firecracker ended before it connected is gone
+    within 5 s with its socket. Windows (its port, not built): the same with a process handle, `OpenProcess`
+    (`SYNCHRONIZE`) on the parent before ready, checked against the parent's pid, and the wait on the listener or
+    the connection and that handle at once (`WaitForMultipleObjects`). A server that dies early is seen by the device as the
     connection's end: the share's requests fail from then on and the device's metrics count the server's EOF
     (§4.1); the rest of the VM goes on.
   - **Stated limit of this version: neither `--daemonize` nor `--new-pid-ns` with `--fs-share`** (refused by
     name). Each leaves the process that would be the servers' parent behind (the daemonizing fork's parent exits;
-    the new PID namespace's first process is a fork of it), so a server could outlive the jail. Next item (ROADMAP
-    M7): the server watches its parent by a descriptor until its connection, so it ends when the VMM ends before
-    it connected; then the parent it watches passed by the jailer in a form that holds across those two (a
+    the new PID namespace's first process is a fork of it), so a server would end with that parent, not with the
+    VMM. Next item (ROADMAP M7): the watched process passed by the jailer in a form that holds across those two (a
     daemonizing fork, a new PID namespace), which lifts this limit.
   - **What the server inherits from the jailer, and what it does not** (so nothing surprises as `no-file` did):
 

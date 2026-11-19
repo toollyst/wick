@@ -43,7 +43,7 @@ mod macos {
     use std::path::{Path, PathBuf};
 
     use wick_fs_sys as sys;
-    use wick_fs_sys::seatbelt::probe::{self, Ended, Fcntl, Forked, InShare};
+    use wick_fs_sys::seatbelt::probe::{self, Ended, Fcntl, Forked, InShare, Kqueue};
     use wick_fsd::confine::macos::{Plan, confine, first_uses};
     use wick_fsd::host::unix::{HostDir, Options};
     use wick_fsd::limits::Limits;
@@ -61,6 +61,13 @@ mod macos {
         /// The outside canary's `/.vol/<dev>/<ino>`, read before the
         /// profile (its `lstat` is a call the server does not make).
         vol: &'a Path,
+        /// The parent watch, as wick-fsd's main opens it before the profile
+        /// (a kqueue with one EVFILT_PROC NOTE_EXIT registration, on this
+        /// probe, the case's parent) and holds it.
+        watch: BorrowedFd<'a>,
+        /// The pid the watch is on, read before the profile (`getppid` is
+        /// not a call the server makes).
+        parent: i32,
     }
 
     type Act = fn(&Ctx<'_>) -> i32;
@@ -128,8 +135,18 @@ mod macos {
         };
         let Ok(root) = sys::open_root(&canonical) else { return 6 };
         let vol = by_volume_id(&outside.join("secret"));
+        let parent = probe::parent();
+        let watch = match sys::ProcessEnd::open(parent) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("the watch on the parent: {e:?}");
+                return 8;
+            }
+        };
         let confined = match how {
-            How::Confined => confine(plan, &canonical, first, &[dir_root, root.as_raw_fd()]).map_err(|r| r.0),
+            How::Confined => {
+                confine(plan, &canonical, first, &[dir_root, root.as_raw_fd(), watch.as_fd().as_raw_fd()]).map_err(|r| r.0)
+            }
             How::Reported => reported(&canonical),
         };
         if let Err(r) = confined {
@@ -141,6 +158,8 @@ mod macos {
             inside: &inside,
             root: root.as_fd(),
             vol: &vol,
+            watch: watch.as_fd(),
+            parent,
         });
         drop(dir);
         code
@@ -557,7 +576,7 @@ mod macos {
             }, KILLED),
             ("a TCP connection", |_| ok(std::net::TcpStream::connect("127.0.0.1:9")), KILLED),
             ("ptrace", |_| ok(probe::ptrace_traceme()), KILLED),
-            ("a signal to another process", |_| ok(probe::signal_check(probe::parent())), KILLED),
+            ("a signal to another process", |c| ok(probe::signal_check(c.parent)), KILLED),
             ("MAP_JIT", |_| ok(probe::mmap_jit()), KILLED),
             // mmap is not a call the server makes: killed at its number
             // (197), before file-map-executable is asked.
@@ -582,6 +601,21 @@ mod macos {
             // made by number, so the case does not depend on the race.
             ("gettimeofday by its number (libc's fallback of a wall-clock read)", |_| ok(probe::gettimeofday_by_number()), 1),
             ("a bootstrap lookup", |_| ok(probe::bootstrap_look_up("com.apple.system.notification_center")), KILLED),
+            // The parent watch: the server polls its kqueue (poll, 230,
+            // listed) and adds nothing to it after the profile, so every
+            // call that could add a registration, or make a kqueue to add
+            // one to, is killed at its number (unconfined each is done: on
+            // record below).
+            ("poll on the parent watch (the call the server makes)", |c| ok(sys::wait_readable(&[c.watch], 0)), 1),
+            ("a new kqueue", |c| ok(probe::kqueue_call(Kqueue::New, c.watch, c.parent)), KILLED),
+            ("a registration on the parent watch's kqueue by kevent", |c| {
+                ok(probe::kqueue_call(Kqueue::Kevent, c.watch, c.parent))
+            }, KILLED),
+            ("a registration on the parent watch's kqueue by kevent64", |c| {
+                ok(probe::kqueue_call(Kqueue::Kevent64, c.watch, c.parent))
+            }, KILLED),
+            ("kevent_qos by its number", |c| ok(probe::kqueue_call(Kqueue::KeventQos, c.watch, c.parent)), KILLED),
+            ("kevent_id by its number", |c| ok(probe::kqueue_call(Kqueue::KeventId, c.watch, c.parent)), KILLED),
             // The share's operations refused there with an error, not the
             // kill (confine::macos::ERROR_IN_SHARE: LINK's evaluation reaches
             // them): each still refused, by its rule or before it, killed at
@@ -697,6 +731,14 @@ mod macos {
         // The two Mach cases unconfined: each works, so the kill above is the profile's.
         assert_eq!(probe::task_info(), Ok(()), "task_info unconfined");
         assert_eq!(probe::bootstrap_look_up("com.apple.system.notification_center"), Ok(()), "bootstrap lookup unconfined");
+        // The kqueue calls unconfined: each done, so the kill above is the
+        // profile's (kevent64 on a kqueue of its own: the watch's is
+        // kevent's kind, which xnu keeps to that kind).
+        let watch = sys::ProcessEnd::open(probe::parent()).expect("the watch, unconfined");
+        let own = probe::new_kqueue().expect("a kqueue, unconfined");
+        for (which, kq) in [(Kqueue::New, watch.as_fd()), (Kqueue::Kevent, watch.as_fd()), (Kqueue::Kevent64, own.as_fd())] {
+            assert_eq!(probe::kqueue_call(which, kq, probe::parent()), Ok(()), "{which:?} unconfined");
+        }
         let _ = std::fs::remove_file(share.join("clone"));
         let _ = std::fs::remove_file(share.join("fifo"));
         remove(&base);
@@ -751,7 +793,16 @@ mod linux {
                 return 2;
             }
         };
-        let (root, (), watch) = match enter(checked, plan, (), &[]) {
+        // The launcher watch, as wick-fsd's main opens it: on this probe's
+        // parent (the test), which outlives it.
+        let launcher = match sys::ProcessEnd::open(sys::parent_pid()) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("the watch on the parent: {e:?}");
+                return 3;
+            }
+        };
+        let (root, (), watch) = match enter(checked, plan, (), &[], launcher) {
             Ok(x) => x,
             Err(r) => {
                 eprintln!("{}", r.0);

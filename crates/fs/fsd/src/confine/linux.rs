@@ -124,11 +124,19 @@ pub struct ParentWatch(std::os::fd::OwnedFd);
 /// in the parent before it waits.
 /// `kept`: the descriptors of `keep` (the connection), which the child
 /// goes on holding.
+/// `launcher`: the watch on the process the server lives for (main.rs,
+/// `--parent-pid`). The waiting parent keeps it and ends when that process
+/// does, and the child with it (its parent-death signal); the child drops
+/// it. A pidfd needs no permission over the process it watches, so a
+/// launcher of another uid (the jailed Firecracker, the server root) is
+/// seen to end, where a parent-death signal from it would be refused
+/// (design-fs.md §8, Jailer).
 pub fn enter<T>(
     checked: Checked,
     plan: Plan,
     keep: T,
     kept: &[RawFd],
+    launcher: sys::ProcessEnd,
 ) -> Result<(std::os::fd::OwnedFd, T, ParentWatch), Refusal> {
     let root_user = sys::euid() == 0;
     match (root_user, plan.drop_to) {
@@ -170,12 +178,41 @@ pub fn enter<T>(
             // Held open until this process ends: the child's sign that its
             // parent lives.
             let _alive = alive;
+            // The child's end as a descriptor too, opened before the filter:
+            // the parent waits on the child and the launcher at once.
+            let served = match sys::ProcessEnd::open(child) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("wick-fsd: the waiting parent: the watch on the confined server: {e:?}");
+                    c::exit_now(1);
+                }
+            };
             // It takes no input but lives as long as the share: nothing it
             // does not need. Failing, it ends, and so does the child (the
             // pipe, then the parent-death signal).
             if let Err(r) = confine_parent(plan) {
                 eprintln!("wick-fsd: {}", r.0);
                 c::exit_now(1);
+            }
+            // Under its filter: ppoll on these two pidfds (the only
+            // descriptors it holds beyond 0 to 2 and its end of the pipe),
+            // then wait4 once the child has ended.
+            loop {
+                match sys::wait_readable(&[launcher.as_fd(), served.as_fd()], -1) {
+                    Ok(r) if r[1] => break,
+                    Ok(r) if r[0] => {
+                        eprintln!(
+                            "wick-fsd: its parent, pid {}, ended while it served; the confined server ends with it",
+                            launcher.pid()
+                        );
+                        c::exit_now(1);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("wick-fsd: the waiting parent's wait failed: {e:?}");
+                        c::exit_now(1);
+                    }
+                }
             }
             let code = match c::wait(child) {
                 Ok(c::Ended::Exited(code)) => code,
@@ -198,6 +235,7 @@ pub fn enter<T>(
         }
         c::Forked::Child => {}
     }
+    drop(launcher);
     drop(alive);
     c::die_with_parent(watch.as_fd()).map_err(|e| refuse("PR_SET_PDEATHSIG", e))?;
     c::not_dumpable().map_err(|e| refuse("PR_SET_DUMPABLE", e))?;

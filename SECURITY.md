@@ -1933,11 +1933,13 @@ started. The server gets the jailer's own `RLIMIT_NOFILE` and `RLIMIT_FSIZE` bac
 descriptor limit, soft and hard, to exactly what its share's limits may hold. Its memory and CPU are the jail's
 cgroups' on Linux; on macOS, where the jail's limits are a jetsam limit set at Firecracker's exec and a CPU limit
 Firecracker applies to itself, the server has its own caps only (design-fs.md §8, Jailer, has every inherited
-limit). Known and stated: not with `--daemonize` or `--new-pid-ns` in this version (refused by name); **a server
-whose Firecracker ends before the device connected waits, as root in its first stage, until it is killed** (its
-socket only the jail's uid can reach, so nothing else connects; no parent-death signal can end it, since the kernel
-refuses one from Firecracker, at the jail's uid, to a root process: design-fs.md §8, Jailer), until the next item
-ends it with its parent; and **a server
+limit). Each server lives for the process that execs Firecracker (`--parent-pid`): it watches that process by a
+descriptor (Linux a pidfd, macOS a kqueue's `NOTE_EXIT`, waited on with `poll`) and ends when it does, before the
+VMM connected (its socket removed) or while it serves, within one request; no parent-death signal could, since
+the kernel refuses one from Firecracker, at the jail's uid, to a root process (design-fs.md §8, Jailer, the parent
+watch; `parent.rs`). Until the commit that added the watch, a server whose Firecracker ended before the device
+connected waited, as root in its first stage, until it was killed. Known and stated: not with `--daemonize` or
+`--new-pid-ns` in this version (refused by name); and **a server
 under an `RLIMIT_FSIZE` (one the operator's shell gave it, or the jailer's launcher) ends with SIGXFSZ when a guest
 writes past it**, which loses that guest's own share and nothing else, until the follow-up that ignores the signal
 so the write fails with `EFBIG`.

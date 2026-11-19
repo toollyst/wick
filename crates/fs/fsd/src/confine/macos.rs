@@ -118,6 +118,17 @@ pub const SYSCALLS: &[(u16, &str, &str)] = &[
     (199, "lseek", "READDIR from an offset (the directory stream's seek), FALLOCATE's walk over holes (SEEK_HOLE/SEEK_DATA)"),
     (201, "ftruncate", "SETATTR of the size, FALLOCATE past the end"),
     (229, "fsetattrlist", "SETATTR of the times (libc's futimens)"),
+    (
+        230,
+        "poll",
+        "waits on the connection and the parent watch's descriptor, both held before the profile; cannot add a \
+         registration (the watch is a kqueue whose one EVFILT_PROC NOTE_EXIT on the parent was added before the \
+         profile, and poll only reports it readable: xnu bsd/kern/kern_event.c `kqueue_select`). Measured: \
+         reported `allow syscall-unix 230` by fs-server-report.py on macOS 27.2 (2 of 2 runs, every request test), \
+         the only call the watch added; confine_probe: poll on the held watch done, a new kqueue and every call \
+         that could add a registration (kevent, kevent64, kevent_qos, kevent_id) killed. macOS 15 and 26: a source \
+         reading (the same xnu path) until CI's parent.rs and confine_probe run there; main.rs `Watched`",
+    ),
     (235, "fgetxattr", "the metadata record and GETXATTR"),
     (241, "flistxattr", "LISTXATTR"),
     (339, "fstat64", "a held descriptor's attributes and identity (GETATTR, a node found again)"),
@@ -815,7 +826,7 @@ mod tests {
 (allow file-read* file-read-data file-read-metadata file-read-xattr file-test-existence (subpath "/private/tmp/share"))
 (allow file-write* file-write-create file-write-data file-write-mode file-write-times file-write-unlink file-write-xattr file-link (subpath "/private/tmp/share"))
 (deny file-mount file-mount-update file-unmount (subpath "/private/tmp/share") (with send-signal SIGKILL))
-(allow syscall-unix (syscall-number 29 53 73 75 92 95 116 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
+(allow syscall-unix (syscall-number 29 53 73 75 92 95 116 133 153 199 201 229 230 235 241 339 344 346 406 470 475 473 476 488))
 (allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_deallocate_trap MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
 (when (defined? 'mach_vm_reallocate) (allow syscall-mig (kernel-mig-routine mach_vm_reallocate)))
 (when (defined? 'MSC_mach_vm_reclaim_update_kernel_accounting_trap) (allow syscall-mach (machtrap-number MSC_mach_vm_reclaim_update_kernel_accounting_trap)))
@@ -840,7 +851,7 @@ mod tests {
 (when (defined? 'file-ungraft) (deny file-ungraft (subpath "/private/tmp/share")))
 (allow file-read* file-read-data file-read-metadata file-read-xattr file-test-existence (subpath "/private/tmp/share"))
 (deny file-mount file-mount-update file-unmount file-write* file-write-create file-write-data file-write-mode file-write-times file-write-unlink file-write-xattr file-link (subpath "/private/tmp/share") (with send-signal SIGKILL))
-(allow syscall-unix (syscall-number 29 53 73 75 92 95 116 133 153 199 201 229 235 241 339 344 346 406 470 475 473 476 488))
+(allow syscall-unix (syscall-number 29 53 73 75 92 95 116 133 153 199 201 229 230 235 241 339 344 346 406 470 475 473 476 488))
 (allow syscall-mach (machtrap-number MSC__kernelrpc_mach_vm_deallocate_trap MSC__kernelrpc_mach_vm_map_trap MSC_mach_msg2_trap))
 (when (defined? 'mach_vm_reallocate) (allow syscall-mig (kernel-mig-routine mach_vm_reallocate)))
 (when (defined? 'MSC_mach_vm_reclaim_update_kernel_accounting_trap) (allow syscall-mach (machtrap-number MSC_mach_vm_reclaim_update_kernel_accounting_trap)))

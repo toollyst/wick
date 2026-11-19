@@ -295,9 +295,9 @@ nothing a guest has used yet (the boot stages are next). The plan:
   share; Windows: an LPAC token with an ACE on the share, a Job Object and wick's mitigation profile), and refuses to
   start if any of that fails.
 - The jailer starts it next to Firecracker. In the first version not with `--daemonize` or `--new-pid-ns`, each
-  of which leaves the server's parent behind (refused by name). Next: the server watches its parent by a descriptor
-  until its connection (Linux pidfd, macOS kqueue; no parent-death signal can, design-fs.md §8), so it ends with a
-  VMM that ended first; then the watched parent passed by the jailer across `--daemonize` and `--new-pid-ns`; then
+  of which leaves the server's parent behind (refused by name). Done: the server watches its parent by a descriptor
+  (Linux pidfd, macOS kqueue; no parent-death signal can, design-fs.md §8), so it ends with the VMM, before its
+  connection too. Next: the watched parent passed by the jailer across `--daemonize` and `--new-pid-ns`; then
   a socket pair made by the jailer instead of a socket in the jail root; then per-share limits on `--fs-share`
   (nodes, handles, bytes) and, on macOS, the server's own jetsam and CPU limits (the jail's are Firecracker's
   alone there; design-fs.md §8, Jailer).

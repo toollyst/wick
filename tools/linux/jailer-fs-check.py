@@ -12,8 +12,8 @@ Firecracker's place, as tools/linux/jailer-cgroup-check.py runs it:
   v1 freezer hierarchy mounted here, as the jailer attaches itself to it),
   with its socket in the jail's root, 0600 and the jail's uid:gid, and its
   descriptor limit, soft and hard, its own need, not the jail's no-file;
-- on record: whether it still waits after the payload's end (the known
-  limit of this version: it does, until killed).
+- after the payload's end (before any connection), the server ends within
+  5 s, its socket removed (the parent watch: --parent-pid, a pidfd).
 
     sudo python3 -I tools/linux/jailer-fs-check.py --jailer PATH --wick-fsd PATH [--workdir DIR]
 """
@@ -176,13 +176,16 @@ def case_server(ctx):
         except ProcessLookupError:
             pass
         proc.wait()
-        time.sleep(1)
         if pid is not None:
+            t0 = time.time()
+            while [r for r in processes_naming(f"--socket {sock}") if r[0] == pid] and time.time() - t0 < 5:
+                time.sleep(0.05)
             still = [r for r in processes_naming(f"--socket {sock}") if r[0] == pid]
-            print(f"   on record: after the payload's end, wick-fsd pid {pid} "
-                  f"{'still waits for its connection (the known limit)' if still else 'ended'}", flush=True)
             if still:
                 os.kill(pid, signal.SIGKILL)
+            check(not still, f"wick-fsd pid {pid} gone within 5 s of the payload's end, before any connection")
+            check(not os.path.lexists(sock), f"{sock} removed with it")
+            print(f"   after the payload's end, wick-fsd pid {pid} ended ({time.time() - t0:.1f} s)", flush=True)
         proc.stdout.close()
 
 

@@ -24,6 +24,33 @@ pub enum End {
     Frame(frame::FrameError),
     /// The connection closed inside a frame.
     Truncated,
+    /// The process the server lives for (its parent, `--parent-pid`)
+    /// ended while the connection waited (docs/design-fs.md §8, Jailer, the
+    /// parent watch): a read or write of the connection said so with
+    /// [`ParentEnded`].
+    ParentEnded(i32),
+}
+
+/// What a connection that also watches the server's parent (main.rs on
+/// macOS) gives as its I/O error when the parent ended while it waited.
+#[derive(Debug)]
+pub struct ParentEnded(pub i32);
+
+impl std::fmt::Display for ParentEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "its parent, pid {}, ended", self.0)
+    }
+}
+
+impl std::error::Error for ParentEnded {}
+
+/// A connection's I/O error as the end: [`End::ParentEnded`] if the
+/// connection said the parent ended, else [`End::Io`].
+fn io_end(e: std::io::Error) -> End {
+    match e.get_ref().and_then(|x| x.downcast_ref::<ParentEnded>()) {
+        Some(ParentEnded(pid)) => End::ParentEnded(*pid),
+        None => End::Io(e),
+    }
 }
 
 impl std::fmt::Display for End {
@@ -33,6 +60,7 @@ impl std::fmt::Display for End {
             End::Io(e) => write!(f, "the connection failed: {e}"),
             End::Frame(e) => write!(f, "a frame broke a rule: {e:?}"),
             End::Truncated => f.write_str("the connection closed inside a frame"),
+            End::ParentEnded(pid) => write!(f, "its parent, pid {pid}, ended while it served"),
         }
     }
 }
@@ -47,7 +75,7 @@ fn read_all(conn: &mut impl Read, buf: &mut [u8]) -> Result<bool, End> {
             Ok(0) => return Err(End::Truncated),
             Ok(n) => done += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(End::Io(e)),
+            Err(e) => return Err(io_end(e)),
         }
     }
     Ok(true)
@@ -72,7 +100,7 @@ fn next(conn: &mut impl Read, buf: &mut Vec<u8>) -> Result<Option<Header>, End> 
 
 /// The hellos: this side's, then the VMM's, which must name `id`.
 pub fn hello(conn: &mut (impl Read + Write), id: &str) -> Result<(), End> {
-    conn.write_all(&frame::hello_frame(id).map_err(End::Frame)?).map_err(End::Io)?;
+    conn.write_all(&frame::hello_frame(id).map_err(End::Frame)?).map_err(io_end)?;
     let mut buf = Vec::new();
     let Some(header) = next(conn, &mut buf)? else {
         return Err(End::Truncated);
@@ -105,7 +133,7 @@ pub fn serve<D: ConfinedDir>(conn: &mut (impl Read + Write), session: &mut Sessi
         out.extend_from_slice(&head.encode());
         out.extend_from_slice(&reply);
         if let Err(e) = conn.write_all(&out) {
-            return End::Io(e);
+            return io_end(e);
         }
     }
 }

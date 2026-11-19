@@ -821,9 +821,17 @@ pub const SERVER_SYSCALLS: &[(c_long, &str, Args)] = &[
 ];
 
 /// Every system call the waiting parent makes once it has forked the
-/// confined child (docs/design-fs.md §6.1, step 2): it waits for the child,
-/// may write one line to stderr, and exits as the child did.
+/// confined child (docs/design-fs.md §6.1, step 2): it waits for the child
+/// or the launcher's end, may write one line to stderr, and exits as the
+/// child did (or 1 when the launcher ended first).
 pub const PARENT_SYSCALLS: &[(c_long, &str, Args)] = &[
+    (
+        libc::SYS_ppoll,
+        "waits on the two pidfds it opened before its filter, the launcher's (the parent watch) and the confined \
+         child's; it holds no other descriptor but 0 to 2 and its end of the child's pipe (made directly, the one \
+         call on every architecture: wait_readable)",
+        Args::Any,
+    ),
     (libc::SYS_wait4, "waitpid for the confined child", Args::Any),
     (libc::SYS_write, "the line saying how the child ended (stderr)", Args::Any),
     (libc::SYS_writev, "the same, vectored", Args::Any),

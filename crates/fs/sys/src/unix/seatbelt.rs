@@ -407,6 +407,108 @@ pub mod probe {
         if r == -1 { Err(last()) } else { Ok(()) }
     }
 
+    /// A kqueue call the server does not make after its profile (it makes
+    /// its parent watch's kqueue and that kqueue's one registration before
+    /// it, then only `poll`s the kqueue: wick-fsd's main.rs `Watched`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Kqueue {
+        /// A new kqueue (`kqueue`, 362).
+        New,
+        /// A registration by `kevent` (363): EVFILT_PROC NOTE_EXIT on a pid.
+        Kevent,
+        /// The same registration by `kevent64` (369).
+        Kevent64,
+        /// `kevent_qos` (374) by its number, with no changes and no events
+        /// (KEVENT_FLAG_IMMEDIATE): whatever it would register, the number
+        /// is what the profile decides on.
+        KeventQos,
+        /// `kevent_id` (375) by its number, as `KeventQos`.
+        KeventId,
+    }
+
+    /// A new kqueue (`kqueue`, 362), close-on-exec.
+    pub fn new_kqueue() -> Result<std::os::fd::OwnedFd> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // SAFETY: kqueue takes nothing.
+        let fd = check(unsafe { libc::kqueue() })?;
+        // SAFETY: the descriptor just made, owned from here.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: a valid descriptor.
+        check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+        Ok(fd)
+    }
+
+    /// One [`Kqueue`] call on `kq` (registering on `pid` where it
+    /// registers). A kqueue keeps to the kind of the first `kevent` call
+    /// made on it (32-bit, 64-bit or QoS; xnu bsd/kern/kern_event.c): the
+    /// parent watch's is `kevent`'s, and `Kevent64` on it is EINVAL
+    /// unconfined (measured on macOS 27.2), so its control uses a kqueue of
+    /// its own. `Ok` when it was done (for the two by number: when it
+    /// returned, whatever the kernel answered).
+    pub fn kqueue_call(which: Kqueue, kq: BorrowedFd<'_>, pid: libc::pid_t) -> Result<()> {
+        use libc::c_uint;
+        const SYS_KEVENT_QOS: c_int = 374;
+        const SYS_KEVENT_ID: c_int = 375;
+        const KEVENT_FLAG_IMMEDIATE: c_uint = 0x1;
+        let ident = usize::try_from(pid).map_err(|_| HostErrno(libc::EINVAL))?;
+        match which {
+            Kqueue::New => new_kqueue().map(drop),
+            Kqueue::Kevent => {
+                let change = libc::kevent {
+                    ident,
+                    filter: libc::EVFILT_PROC,
+                    flags: libc::EV_ADD | libc::EV_CLEAR,
+                    fflags: libc::NOTE_EXIT,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                };
+                // SAFETY: one change in, no events out, no wait.
+                check(unsafe { libc::kevent(kq.as_raw_fd(), &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) })
+                    .map(drop)
+            }
+            Kqueue::Kevent64 => {
+                let change = libc::kevent64_s {
+                    ident: u64::try_from(ident).map_err(|_| HostErrno(libc::EINVAL))?,
+                    filter: libc::EVFILT_PROC,
+                    flags: libc::EV_ADD | libc::EV_CLEAR,
+                    fflags: libc::NOTE_EXIT,
+                    data: 0,
+                    udata: 0,
+                    ext: [0; 2],
+                };
+                // SAFETY: one change in, no events out, no wait.
+                check(unsafe {
+                    libc::kevent64(kq.as_raw_fd(), &change, 1, std::ptr::null_mut(), 0, 0, std::ptr::null())
+                })
+                .map(drop)
+            }
+            Kqueue::KeventQos | Kqueue::KeventId => {
+                let (number, first) = if which == Kqueue::KeventQos {
+                    (SYS_KEVENT_QOS, u64::try_from(kq.as_raw_fd()).map_err(|_| HostErrno(libc::EBADF))?)
+                } else {
+                    (SYS_KEVENT_ID, 0)
+                };
+                // SAFETY: (kq or id, changelist, nchanges, eventlist,
+                // nevents, data_out, data_available, flags): no changes, no
+                // events, no data, return at once.
+                unsafe {
+                    libc::syscall(
+                        number,
+                        first,
+                        std::ptr::null::<c_void>(),
+                        0_i32,
+                        std::ptr::null_mut::<c_void>(),
+                        0_i32,
+                        std::ptr::null_mut::<c_void>(),
+                        std::ptr::null_mut::<usize>(),
+                        KEVENT_FLAG_IMMEDIATE,
+                    )
+                };
+                Ok(())
+            }
+        }
+    }
+
     /// `task_info(MACH_TASK_BASIC_INFO)` of this task: a kernel MIG
     /// routine (3409) sent by `mach_msg2_trap` to the task's own port
     /// (`mach_task_self_`, a variable: no trap to get it). `Ok` when the

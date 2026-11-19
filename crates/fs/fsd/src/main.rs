@@ -45,13 +45,16 @@ struct Args {
     peer_uid: Option<u32>,
     drop_to: Option<(u32, u32)>,
     ready_fd: Option<i32>,
+    /// The process the server lives for (`--parent-pid`, else its parent at
+    /// the start): its end ends the server (the parent watch).
+    parent_pid: Option<i32>,
     case_insensitive_ok: bool,
     limits: Limits,
 }
 
 const USAGE: &str = "usage: wick-fsd --share-dir DIR --socket PATH --id ID [--read-only] [--cache auto|never|always] \
                      [--cache-timeout-ms N] [--peer-uid UID] [--uid UID --gid GID] [--ready-fd FD (3 or more)] \
-                     [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]; \
+                     [--parent-pid PID] [--case-insensitive-ok] [--max-nodes N] [--max-held N] [--max-handles N] [--max-bytes N]; \
                      or wick-fsd --version";
 
 /// `parse`'s answer to `--version`: the line is printed, nothing served.
@@ -67,6 +70,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let (mut read_only, mut case_insensitive_ok) = (false, false);
     let (mut cache, mut timeout) = ("auto".to_string(), DEFAULT_TIMEOUT_MS);
     let (mut peer_uid, mut uid, mut gid, mut ready_fd) = (None, None, None, None);
+    let mut parent_pid = None;
     let mut limits = Limits::default();
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -81,6 +85,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--uid" => uid = Some(number(&flag, it.next())?),
             "--gid" => gid = Some(number(&flag, it.next())?),
             "--ready-fd" => ready_fd = Some(number(&flag, it.next())?),
+            "--parent-pid" => parent_pid = Some(number(&flag, it.next())?),
             "--max-nodes" => limits.max_nodes = number(&flag, it.next())?,
             "--max-held" => limits.max_held = number(&flag, it.next())?,
             "--max-handles" => limits.max_handles = number(&flag, it.next())?,
@@ -97,6 +102,11 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         && fd < 3
     {
         return Err(format!("--ready-fd {fd}: 0 to 2 are the standard streams and below 0 is none; give 3 or more"));
+    }
+    if let Some(p) = parent_pid
+        && p < 1
+    {
+        return Err(format!("--parent-pid {p}: a pid is 1 or more"));
     }
     if limits.max_nodes > MAX_NODES_LIMIT {
         return Err(format!(
@@ -130,6 +140,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         peer_uid,
         drop_to,
         ready_fd,
+        parent_pid,
         case_insensitive_ok,
         limits,
     })
@@ -288,7 +299,10 @@ fn socket_dir_is_private(socket: &std::path::Path, peer_uid: u32, euid: u32) -> 
 /// the socket bound, ready said, one connection accepted, the listener
 /// unlinked, and the peer checked.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn accept_one(args: &Args, start: &mut Start) -> Result<(wick_fsd::stage0::Checked, std::os::unix::net::UnixStream), String> {
+fn accept_one(
+    args: &Args,
+    start: &mut Start,
+) -> Result<(wick_fsd::stage0::Checked, std::os::unix::net::UnixStream, wick_fs_sys::ProcessEnd), String> {
     use std::io::Write;
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixListener;
@@ -317,6 +331,7 @@ fn accept_one(args: &Args, start: &mut Start) -> Result<(wick_fsd::stage0::Check
         return Err(format!("RLIMIT_NOFILE is {now:?} (soft, hard) after setting both to {need}"));
     }
     eprintln!("wick-fsd: {}: RLIMIT_NOFILE {need} (soft and hard)", args.id);
+    let watch = parent_watch(args)?;
     socket_dir_is_private(&args.socket, args.peer_uid.unwrap_or_else(sys::euid), sys::euid())?;
     if args.socket.symlink_metadata().is_ok() {
         return Err(format!("{} exists; wick-fsd never removes what it did not make", args.socket.display()));
@@ -331,6 +346,28 @@ fn accept_one(args: &Args, start: &mut Start) -> Result<(wick_fsd::stage0::Check
         Some(fd) => std::fs::File::from(fd).write_all(b"R").map_err(|e| format!("--ready-fd: {e}"))?,
         None => println!("ready"),
     }
+    // The connection or the parent's end, whichever comes first: a server
+    // whose launcher ended before the VMM connected does not wait on.
+    loop {
+        let ready = sys::wait_readable(&[listener.as_fd(), watch.as_fd()], -1);
+        match ready {
+            Ok(r) if r[1] => {
+                drop(listener);
+                let _ = std::fs::remove_file(&args.socket);
+                return Err(format!(
+                    "its parent, pid {}, ended before the VMM connected; the socket is removed",
+                    watch.pid()
+                ));
+            }
+            Ok(r) if r[0] => break,
+            Ok(_) => {}
+            Err(e) => {
+                drop(listener);
+                let _ = std::fs::remove_file(&args.socket);
+                return Err(format!("waiting for the connection: {e:?}"));
+            }
+        }
+    }
     let accepted = listener.accept();
     // Exactly one connection: the listener goes whatever the accept gave.
     drop(listener);
@@ -344,7 +381,31 @@ fn accept_one(args: &Args, start: &mut Start) -> Result<(wick_fsd::stage0::Check
     if uid != peer_uid {
         return Err(format!("the peer (pid {pid}) is uid {uid}, not --peer-uid {peer_uid}: connection refused"));
     }
-    Ok((checked, conn))
+    Ok((checked, conn, watch))
+}
+
+/// The parent watch (docs/design-fs.md §8, Jailer): opened on `--parent-pid`
+/// (else the parent at this moment), then the parent checked to be that pid
+/// still, so a parent that ended before the open is seen (the server's
+/// parent is then the reaper). `--parent-pid` must be the parent: the
+/// server lives for the process that started it. A parent that is pid 1
+/// is refused unless named: the launcher may have ended already, or init
+/// or launchd started the server, and only the operator knows which;
+/// `--parent-pid 1` serves with a watch that never ends.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn parent_watch(args: &Args) -> Result<wick_fs_sys::ProcessEnd, String> {
+    use wick_fs_sys as sys;
+
+    let pid = parent_watch_pid(args.parent_pid, sys::parent_pid())?;
+    let watch = sys::ProcessEnd::open(pid).map_err(|e| format!("the watch on its parent, pid {pid}: {e:?}"))?;
+    let after = sys::parent_pid();
+    if after != pid {
+        return Err(format!(
+            "--parent-pid {pid} is not its parent (pid {after}{}); the server lives for the process that started it",
+            if args.parent_pid.is_none() { ": the parent ended as it started" } else { "" }
+        ));
+    }
+    Ok(watch)
 }
 
 /// The backend and the session over the confined root.
@@ -377,7 +438,7 @@ fn session_over(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn serve_all(
     args: &Args,
-    conn: &mut std::os::unix::net::UnixStream,
+    conn: &mut (impl std::io::Read + std::io::Write),
     session: &mut wick_fsd::session::Session<wick_fsd::host::unix::HostDir>,
 ) -> Result<(), String> {
     use wick_fsd::serve;
@@ -413,15 +474,16 @@ fn run(args: &Args, start: &mut Start) -> Result<(), String> {
 
     use wick_fsd::confine::linux::{self as confine, Plan};
 
-    let (checked, conn) = accept_one(args, start)?;
+    let (checked, conn, parent) = accept_one(args, start)?;
     let plan = Plan {
         read_only: args.read_only,
         drop_to: args.drop_to,
     };
     // The waiting parent drops the connection; only the confined child
-    // serves it.
+    // serves it. The waiting parent keeps the parent watch, and ends when
+    // the parent does (the child with it); the child drops it.
     let conn_fd = conn.as_raw_fd();
-    let (root, mut conn, watch) = confine::enter(checked, plan, conn, &[conn_fd]).map_err(|r| r.0)?;
+    let (root, mut conn, watch) = confine::enter(checked, plan, conn, &[conn_fd], parent).map_err(|r| r.0)?;
     let root_fd = root.as_raw_fd();
     let mut session = session_over(args, root)?;
     // What it holds when it serves: the connection and the share's root,
@@ -433,6 +495,7 @@ fn run(args: &Args, start: &mut Start) -> Result<(), String> {
         args.id,
         locked.landlock.map_or_else(String::new, |abi| format!(", Landlock ABI {abi}"))
     );
+    // The waiting parent watches the parent: nothing to wait on here.
     serve_all(args, &mut conn, &mut session)
 }
 
@@ -442,7 +505,7 @@ fn run(args: &Args, start: &mut Start) -> Result<(), String> {
 
     use wick_fsd::confine::macos::{self as confine, Plan};
 
-    let (checked, mut conn) = accept_one(args, start)?;
+    let (checked, conn, parent) = accept_one(args, start)?;
     let plan = Plan {
         read_only: args.read_only,
         drop_to: args.drop_to,
@@ -454,15 +517,106 @@ fn run(args: &Args, start: &mut Start) -> Result<(), String> {
     let mut session = session_over(args, checked.root)?;
     // What it holds when it serves, as on Linux: the connection and the
     // share's root (the backend holds no other descriptor before a request).
-    confine::confine(plan, &canonical, first, &[conn_fd, root_fd]).map_err(|r| r.0)?;
+    // The parent watch, a kqueue made before the profile, is held too, and
+    // the connection is made non-blocking now: under the profile each read
+    // or write that would wait waits on the connection and the watch at
+    // once (`Watched`).
+    let watch_fd = parent.as_fd().as_raw_fd();
+    conn.set_nonblocking(true).map_err(|e| format!("the connection made non-blocking: {e}"))?;
+    confine::confine(plan, &canonical, first, &[conn_fd, root_fd, watch_fd]).map_err(|r| r.0)?;
     eprintln!("wick-fsd: {}: confined (Seatbelt profile of the share, ids dropped)", args.id);
     discovery_control();
+    let mut conn = Watched { conn, parent };
     serve_all(args, &mut conn, &mut session)
+}
+
+/// The connection on macOS, non-blocking, with the parent watch: a read or
+/// a write that would wait waits on the connection and the watch at once
+/// (one `poll`; the kqueue's one registration, the parent's `NOTE_EXIT`,
+/// was made before the profile, and nothing reads or adds an event), and
+/// fails with [`wick_fsd::serve::ParentEnded`] once the parent has ended.
+/// So a server whose parent ends is gone within one request, whatever the
+/// VMM does: idle, inside a frame, or not reading a reply.
+/// The pid the parent watch is opened on: `--parent-pid`, else the parent
+/// `now`, refused when that is pid 1 (only the operator knows whether the
+/// launcher ended or init or launchd started the server).
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn parent_watch_pid(named: Option<i32>, now: i32) -> Result<i32, String> {
+    match named {
+        Some(p) => Ok(p),
+        None if now == 1 => Err("its parent is pid 1: its launcher ended already, or init or launchd started it; \
+                                 give --parent-pid 1 to serve with no parent to outlive"
+            .into()),
+        None => Ok(now),
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct Watched {
+    conn: std::os::unix::net::UnixStream,
+    parent: wick_fs_sys::ProcessEnd,
+}
+
+#[cfg(target_os = "macos")]
+impl Watched {
+    fn wait(&self, write: bool) -> std::io::Result<()> {
+        use std::os::fd::AsFd;
+
+        match wick_fs_sys::wait_ready(&[(self.conn.as_fd(), write), (self.parent.as_fd(), false)], -1) {
+            Ok(r) if r[1] => Err(std::io::Error::other(wick_fsd::serve::ParentEnded(self.parent.pid()))),
+            Ok(_) => Ok(()),
+            Err(e) => Err(std::io::Error::from_raw_os_error(e.0)),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::io::Read for Watched {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            match self.conn.read(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.wait(false)?,
+                other => return other,
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::io::Write for Watched {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        loop {
+            match self.conn.write(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.wait(true)?,
+                other => return other,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parent_watch_pid() {
+        assert_eq!(parent_watch_pid(None, 42), Ok(42));
+        assert_eq!(parent_watch_pid(Some(42), 42), Ok(42));
+        assert_eq!(parent_watch_pid(Some(1), 1), Ok(1));
+        let e = parent_watch_pid(None, 1).unwrap_err();
+        assert!(e.starts_with("its parent is pid 1:") && e.contains("--parent-pid 1"), "{e}");
+        assert!(with_parent("0").unwrap_err().contains("--parent-pid 0: a pid is 1 or more"));
+        assert_eq!(with_parent("7").unwrap().parent_pid, Some(7));
+    }
+
+    fn with_parent(p: &str) -> Result<Args, String> {
+        let argv = ["--share-dir", "/s", "--socket", "/s.sock", "--id", "t", "--parent-pid", p];
+        parse(argv.iter().map(|a| (*a).to_string()))
+    }
 
     fn with_nodes(n: &str) -> Result<Args, String> {
         let argv = ["--share-dir", "/s", "--socket", "/s.sock", "--id", "t", "--max-nodes", n];

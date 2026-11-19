@@ -19,6 +19,12 @@ use std::os::unix::net::UnixStream;
 use common::remote::{Remote, Server, base_args, confined_over, give_share, socket_in};
 use common::*;
 
+/// Open item: on macOS 27.2 this failed once in 120 runs (20 runs after
+/// alias.rs at load 17): the confined server had not ended 30 s after the
+/// test closed the connection, and the wait killed it. Not seen in the 100
+/// runs since; no crash report and no Seatbelt line for it. The cause is not
+/// established: `Server::wait` now records the server's state before such a
+/// kill (common/remote.rs), so the next one says where it was.
 #[test]
 fn test_second_connection_refused() {
     let base = scratch("conn-second");

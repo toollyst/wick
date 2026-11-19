@@ -1678,17 +1678,19 @@ def stage_fs(ctx):
           f"wick-fsd pid {pid}: parent {ppid}, uid {uid}; wanted Firecracker's pid {vm.proc.pid}, root")
     vm.kill()
     ctx.vms.remove(vm)
-    # Known limit of this version (design-fs §8, Jailer): a server whose VMM
-    # ended before it connected waits for its connection until it is
-    # killed. On record, then killed here.
-    time.sleep(1)
+    # The parent watch (design-fs §8, Jailer): a server whose VMM ended
+    # before it connected ends too, its socket removed, within 5 s.
+    t0 = time.time()
+    while [r for r in processes_naming(f"--socket {sock}") if r[0] == pid] and time.time() - t0 < 5:
+        time.sleep(0.05)
     still = [r for r in processes_naming(f"--socket {sock}") if r[0] == pid]
-    print(f"   after Firecracker's end, wick-fsd pid {pid} {'still waits (the known limit)' if still else 'ended'}",
-          flush=True)
     if still:
         os.kill(pid, signal.SIGKILL)
+    check(not still, f"wick-fsd pid {pid} still waits 5 s after Firecracker ended before it connected")
+    check(not os.path.lexists(sock), f"{sock} left after the server ended")
     return (f"{len(refusals)} refusals and 2 failing servers left no process; wick-fsd pid {pid} was "
-            f"Firecracker's child, its socket 0600 {UID}:{GID}")
+            f"Firecracker's child, its socket 0600 {UID}:{GID}, and ended with Firecracker before its connection "
+            f"({time.time() - t0:.1f} s)")
 
 
 STAGES = {
