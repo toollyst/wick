@@ -1971,10 +1971,11 @@ VMM connected (its socket removed) or while it serves, within one request; no pa
 the kernel refuses one from Firecracker, at the jail's uid, to a root process (design-fs.md §8, Jailer, the parent
 watch; `parent.rs`). Until the commit that added the watch, a server whose Firecracker ended before the device
 connected waited, as root in its first stage, until it was killed. Known and stated: not with `--daemonize` or
-`--new-pid-ns` in this version (refused by name); and **a server
-under an `RLIMIT_FSIZE` (one the operator's shell gave it, or the jailer's launcher) ends with SIGXFSZ when a guest
-writes past it**, which loses that guest's own share and nothing else, until the follow-up that ignores the signal
-so the write fails with `EFBIG`.
+`--new-pid-ns` in this version (refused by name). A server
+under an `RLIMIT_FSIZE` (one the operator's shell gave it, or the jailer's launcher) **ignores SIGXFSZ**, so a guest's
+write past the limit fails with `EFBIG` and the server serves on, never ending that guest's share: the signal is
+ignored in stage 0, before the fork and the confinement, so neither the seccomp filter nor the Seatbelt profile is
+asked (design-fs.md §4.2; `tests/fsize.rs`).
 
 The device adds no rule or system call to the VMM's sandbox, connects to its server before the sandbox narrows and
 never again, and never blocks the event loop on the server (`test_server_hang_never_blocks_the_loop`); the reply

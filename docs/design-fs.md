@@ -425,7 +425,11 @@ lay them out); fuzz target `fs_proxy`. No guest has used it yet (commit 12's boo
     `proc_pidinfo(PROC_PIDLISTFDS)` lists, which has no bound to miss), then that list read back: a descriptor left
     open (a close that failed, or said done and was not) is a refusal naming each, by what it is, before the socket
     is bound; standard input made `/dev/null`, read-only
-    (wick-fsd reads none); `--ready-fd` required to be 3 or more (the parse refuses 0 to 2, the standard streams,
+    (wick-fsd reads none); SIGXFSZ ignored, so a guest's WRITE past a file-size limit (an `RLIMIT_FSIZE` the
+    operator's shell or the jailer's launcher gave it) fails with `EFBIG` and the server serves on, never the
+    signal's default end of the process, done here before the fork and the confinement so the confined process has
+    it too and neither the filter nor the profile is asked (`sys::ignore_file_size_signal`, `tests/fsize.rs`);
+    `--ready-fd` required to be 3 or more (the parse refuses 0 to 2, the standard streams,
     and anything below 0: closed after the ready byte, a standard stream's number would be taken by the next open, the
     connection, and the log would go into it; `test_ready_fd_is_never_a_standard_stream`), a pipe's write end or a
     socket, and closed once its one byte is written. Nothing else closes or re-takes 0 to 2 after the first step: only
@@ -1685,7 +1689,7 @@ it means layer 1 let the request through.
     | Limit | Linux | macOS | What it means for wick-fsd |
     |---|---|---|---|
     | `--resource-limit no-file` (default 2048, soft = hard) | not inherited: the forked child sets back the jailer's own `RLIMIT_NOFILE`, read before the jail's is installed (`HostLimits`) | same | wick-fsd sets both its limits to exactly its need (2112 by default, above the jail's 2048); `test_fs_share_server_gets_the_jailer_s_limits` |
-    | `--resource-limit fsize` | not inherited, as above | same | `fsize` bounds files Firecracker writes; the share's growth is the server's own budget (`--max-bytes`, 64 GiB by default). An `RLIMIT_FSIZE` the operator's shell gave the jailer is the server's: a guest write past it ends the server with SIGXFSZ until the follow-up that ignores the signal (SECURITY) |
+    | `--resource-limit fsize` | not inherited, as above | same | `fsize` bounds files Firecracker writes; the share's growth is the server's own budget (`--max-bytes`, 64 GiB by default). An `RLIMIT_FSIZE` the operator's shell gave the jailer is the server's: wick-fsd ignores SIGXFSZ (stage 0, before the fork and the confinement, so no filter or profile rule), so a guest write past it fails with `EFBIG` and the server serves on (§4.2; `tests/fsize.rs`; SECURITY) |
     | other rlimits (`RLIMIT_AS`, `DATA`, `STACK`, `NPROC`, `MEMLOCK`, `CORE`, `CPU`) | inherited from the jailer's launcher, as Firecracker inherits them; the jailer sets none | same | the operator's; wick-fsd's caps (below) do not depend on them |
     | cgroup `memory`, `cpu`, `pids`, `freezer` | **inherited**: the server is in the jail's cgroups and shares their budget with Firecracker; `pids.max` counts its threads; freezing the jail freezes the server too | no cgroups: the memory cgroup is a jetsam limit set at Firecracker's exec (`posix_spawnattr_setjetsam_ext`), the CPU cgroup a limit Firecracker applies to itself (`WICK_JAIL_CPU`, platform `set_cpu_limit_percent`): **neither applies to the server**; the freezer's supervisor suspends Firecracker and, before listing them, its children (`proc_listchildpids`, `overlay/jailer/platform/macos/freezer.rs`), and after the exec the server is Firecracker's child, so a frozen jail's server is suspended too [src; the jailer-test `fs` stage measures it] | macOS: the server's memory and CPU are bounded by its own caps only (below); its own jetsam and CPU limits are ROADMAP M7 |
     | `--netns` | joined before the fork: the server is in it, and makes a network namespace of its own (§6.1) | no network namespaces | none: the server has no network |

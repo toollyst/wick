@@ -184,6 +184,13 @@ fn start(args: &Args) -> Result<Start, String> {
         ));
     }
     sys::stdin_from_null().map_err(|e| format!("standard input from /dev/null: {e:?}"))?;
+    // Under a file size limit (an operator's `ulimit -f`), a guest's WRITE
+    // past it is EFBIG to the guest, never the server's end by SIGXFSZ
+    // (tests/fsize.rs); before the fork and the confinement, so the confined
+    // process has it too and neither filter nor profile is asked.
+    sys::ignore_file_size_signal().map_err(|e| {
+        format!("ignoring SIGXFSZ (so that a write past a file size limit is EFBIG, not the server's end): {e:?}")
+    })?;
     let ready = match args.ready_fd {
         None => None,
         Some(fd) => {

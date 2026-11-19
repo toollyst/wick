@@ -1892,6 +1892,43 @@ pub fn set_nofile(soft: u64) -> Result<()> {
     check(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) }).map(drop)
 }
 
+/// Ignores SIGXFSZ, then reads its disposition back: a write past the file
+/// size limit (`RLIMIT_FSIZE`) is then the write's EFBIG alone, never the
+/// signal's default action, the process's end (Linux mm/filemap.c
+/// `generic_write_check_limits` sends it and returns EFBIG; xnu the same
+/// pair). Inherited by a forked child.
+pub fn ignore_file_size_signal() -> Result<()> {
+    // SAFETY: an all-zero sigaction is a valid value to fill in.
+    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    act.sa_sigaction = libc::SIG_IGN;
+    // SAFETY: a valid sigaction for one signal, no old action asked.
+    check(unsafe { libc::sigaction(libc::SIGXFSZ, &act, std::ptr::null_mut()) })?;
+    // SAFETY: as above, the new action left out, the old one read.
+    let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: no new action; a valid buffer for the current one.
+    check(unsafe { libc::sigaction(libc::SIGXFSZ, std::ptr::null(), &mut now) })?;
+    if now.sa_sigaction == libc::SIG_IGN { Ok(()) } else { Err(HostErrno(libc::EINVAL)) }
+}
+
+/// Sets the soft `RLIMIT_FSIZE` to `bytes` (at most the hard limit): the
+/// largest file this process and its children may write, as an operator's
+/// `ulimit -f` sets it (wick-fsd's tests/fsize.rs).
+pub fn set_file_size_limit(bytes: u64) -> Result<()> {
+    let mut r = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: a valid output buffer.
+    check(unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut r) })?;
+    #[allow(clippy::useless_conversion)]
+    {
+        let bytes: libc::rlim_t = bytes.try_into().map_err(|_| HostErrno(libc::EINVAL))?;
+        r.rlim_cur = bytes.min(r.rlim_max);
+    }
+    // SAFETY: a valid input buffer.
+    check(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &r) }).map(drop)
+}
+
 /// Sets the soft and the hard `RLIMIT_NOFILE` to `n`: the hard limit is
 /// never raised again by a process without privilege, so a server that drops
 /// its ids after this keeps at most `n` whatever its launcher's hard limit
