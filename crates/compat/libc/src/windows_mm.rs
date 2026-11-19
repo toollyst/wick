@@ -2275,6 +2275,29 @@ pub(crate) fn guard_seen(id: u32) -> Option<GuardSeen> {
     })
 }
 
+/// Tests: the GUARDSEEN record of the thread `id` whose stack reserve (its
+/// TEB's DeallocationStack) is `reserve`, the newest if the ring holds two:
+/// one thread's own record, which a later thread given the same ID does not
+/// hide or stand in for.
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn guard_seen_of(id: u32, reserve: usize) -> Option<GuardSeen> {
+    use std::sync::atomic::Ordering::Acquire;
+    let next = GUARD_SEEN_NEXT.load(Acquire);
+    (0..next.min(GUARD_SEEN_LEN)).map(|k| (next - 1 - k) % GUARD_SEEN_LEN).find_map(|i| {
+        let r = &GUARD_SEEN[i];
+        (r[0].load(Acquire) == id as usize && r[3].load(Acquire) == reserve).then(|| GuardSeen {
+            reason: r[1].load(Acquire),
+            limit: r[2].load(Acquire),
+            reserve,
+            guard_before: r[4].load(Acquire),
+            guard_after: r[5].load(Acquire),
+            guarantee_before: r[6].load(Acquire),
+            guarantee_after: r[7].load(Acquire),
+            error: r[8].load(Acquire),
+        })
+    })
+}
+
 /// Tests: how many GUARDSEEN records were written, one a thread's start
 /// (the ring keeps the newest [`GUARD_SEEN_LEN`]).
 #[cfg(all(test, target_arch = "x86_64"))]

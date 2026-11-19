@@ -6764,7 +6764,18 @@ mod tests {
     /// guarantee that the loader attaches and that must have it (made after
     /// the callback, or starting outside ntdll) is read again for up to
     /// 2 s, and fails the test by name unless it was given it by then (it
-    /// was listed before its attach ran: said). A thread the loader never
+    /// was listed before its attach ran: said). One that ends before it is
+    /// read with the guarantee (a short-lived thread, another test's) is
+    /// judged by its own GUARDSEEN record, the one of its ID whose stack
+    /// reserve (DeallocationStack) is the one its TEB had when listed, so
+    /// that a reused ID's record cannot stand for it: it passes if the
+    /// record shows `SetThreadStackGuarantee` succeeded (error 0) with the
+    /// guarantee and the guard pages an overflow needs, and fails by name
+    /// with no such record or with one that shows a failure. CI run
+    /// 44461134914 failed without this rule on thread 2204, listed with the
+    /// guarantee 0 before its attach and gone 65 ms later, whose record said
+    /// guard pages 0 -> 28672 B, guarantee 0 -> 24576 B, error 0: the
+    /// callback had given it the guarantee. A thread the loader never
     /// attaches (SkipThreadAttach or LoaderWorker) runs no TLS callback,
     /// wick's included, and fails if it starts outside ntdll. The process's
     /// main thread (made before the callback, given the guarantee by its
@@ -6841,8 +6852,30 @@ mod tests {
         // TLS callbacks run in the thread itself, before its start address)
         // has no guarantee yet. Each one without it that the loader does
         // attach (no skip bit) and that must have it is read again for up
-        // to 2 s: given it by then, it was early; gone, or still without,
-        // it fails by name.
+        // to 2 s: given it by then, it was early; still without, it fails by
+        // name. One that is gone before it is seen with it passes on its own
+        // GUARDSEEN record alone: the record of its ID whose stack reserve is
+        // the one its TEB had when listed (so a reused ID's record does not
+        // stand for it), showing SetThreadStackGuarantee succeeded with the
+        // guarantee and the guard pages; gone with no such record, or with
+        // one that shows a failure, it fails by name.
+        let by_its_record = |id: u32, ms: u128| -> std::string::String {
+            let reserve = threads.iter().find(|t| t.id == id).and_then(|t| t.reserve);
+            let own = reserve.and_then(|at| crate::windows_mm::guard_seen_of(id, at));
+            match own {
+                Some(r) if r.error == 0 && r.guarantee_after >= want && r.guard_after >= need => std::format!(
+                    "given the guarantee by the callback after it was listed, by its own {} (its ID and stack reserve {:#x}); gone {ms} ms later",
+                    Seen(own),
+                    r.reserve
+                ),
+                Some(_) => std::format!("gone {ms} ms later; its own {} shows the call did not give it", Seen(own)),
+                None => std::format!(
+                    "gone {ms} ms later, without the guarantee when last read, and no GUARDSEEN record of its own (its stack reserve {reserve:#x?}; \
+                     the ring's newest for its ID: {})",
+                    Seen(crate::windows_mm::guard_seen(id))
+                ),
+            }
+        };
         let mut pending: std::vec::Vec<u32> = threads
             .iter()
             .filter(|t| short(t) && !skipped(t) && (t.created >= attached || t.start != "ntdll.dll"))
@@ -6855,7 +6888,7 @@ mod tests {
             let now = threads_of_this_process();
             pending.retain(|id| match now.iter().find(|t| t.id == *id) {
                 None => {
-                    outcome.insert(*id, std::format!("gone {} ms later, without the guarantee when last read", since.elapsed().as_millis()));
+                    outcome.insert(*id, by_its_record(*id, since.elapsed().as_millis()));
                     false
                 }
                 Some(t) if !short(t) => {
@@ -7071,6 +7104,11 @@ mod tests {
         start_at: usize,
         /// Its TEB's SameTebFlags ([`TEB_SAME_TEB_FLAGS`]), if it could be read.
         flags: Option<u16>,
+        /// Its TEB's DeallocationStack, the low end of its stack's reserve,
+        /// if it could be read: fixed for the thread's life (StackLimit moves
+        /// as the stack grows), so with the ID it names the thread's own
+        /// GUARDSEEN record (`GuardSeen::reserve` is the same field).
+        reserve: Option<usize>,
     }
 
     /// The x86-64 TEB's SameTebFlags (a `USHORT` at 0x17EE, ntdll's public
@@ -7187,7 +7225,7 @@ mod tests {
                     // way, and the guard pages below the one, walked to the
                     // other (a record: the thread may be growing its stack).
                     let mut stack = [0usize; 2];
-                    let guard = (read
+                    let stack_read = read
                         && [0x10usize, 0x1478].iter().zip(stack.iter_mut()).all(|(&at, out)| {
                             // SAFETY: this process; a buffer of the size passed.
                             let ok = unsafe {
@@ -7200,9 +7238,9 @@ mod tests {
                                 )
                             };
                             ok != 0
-                        })
-                        && stack[0] > stack[1])
-                        .then(|| crate::windows_mm::guard_below(stack[0], stack[0] - stack[1]));
+                        });
+                    let guard = (stack_read && stack[0] > stack[1]).then(|| crate::windows_mm::guard_below(stack[0], stack[0] - stack[1]));
+                    let reserve = (stack_read && stack[1] != 0).then_some(stack[1]);
                     let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
                     let (mut c, mut x, mut k, mut u) = (zero, zero, zero, zero);
                     // SAFETY: the thread's handle and four out-pointers.
@@ -7220,6 +7258,7 @@ mod tests {
                         created: (u64::from(c.dwHighDateTime) << 32) | u64::from(c.dwLowDateTime),
                         start_at,
                         flags,
+                        reserve,
                     });
                     // SAFETY: our handle.
                     unsafe { CloseHandle(h) };
