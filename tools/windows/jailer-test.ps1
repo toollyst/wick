@@ -3205,6 +3205,47 @@ function Stage-Freeze {
             Check (& $until { (& $procs 'kj').Count -eq 0 }) "the frozen jail outlived its jailer: $((& $procs 'kj').Count) processes"
             'the frozen jail ended with it'
         }
+        # The start cases below find Firecracker by reading the pid file every 50 ms. The jailer once
+        # wrote it twice, its own pid (upstream's write, before an exec) and then, over 100 ms later,
+        # Firecracker's through a handle that shared nothing: a reader that had the file open then
+        # failed the jail's start ("the pid file: ... being used by another process (os error 32)",
+        # CI run 44435909393, 1 start in 9), and one that read before read the jailer's pid. Here a
+        # reader opens the file the moment it exists (sharing reading, writing and deleting, as `type`
+        # and Get-Content do) and holds it until Firecracker runs: every value it reads must be
+        # Firecracker's pid, or empty for the moment the file is being written (as on Linux).
+        & $case 'a reader holds the pid file from its first moment' {
+            $f = Join-Path (& $dirOf 'rd') "root\$exe.pid"
+            $t0 = [DateTime]::Now
+            $p = & $start 'rd' @()
+            $s = $null
+            $end = $t0.AddSeconds(20)
+            while ($null -eq $s -and [DateTime]::Now -lt $end -and -not $p.HasExited) {
+                # Unbuffered (a buffer of 1): a FileStream's buffer would give an earlier read back.
+                try { $s = [IO.FileStream]::new($f, 'Open', 'Read', 'ReadWrite, Delete', 1) } catch { }
+            }
+            if ($null -eq $s) { Check $false "the reader never opened the pid file: $(& $saw 'rd' $p $t0)" }
+            $opened = & $at ([DateTime]::Now) $t0
+            $seen = [Collections.Generic.List[string]]::new()
+            try {
+                $buf = New-Object byte[] 64
+                $look = {
+                    $s.Position = 0
+                    $v = [Text.Encoding]::ASCII.GetString($buf, 0, $s.Read($buf, 0, $buf.Length))
+                    if ($seen.Count -eq 0 -or $seen[$seen.Count - 1] -ne $v) { $seen.Add($v) }
+                }
+                & $look
+                $ran = & $until { & $look; $null -ne (& $fc 'rd') } 10000
+                if (-not $ran) { Check $false "the jail did not start while a reader held the pid file (it read $(@($seen | ForEach-Object { "'$_'" }) -join ', ')): $(& $saw 'rd' $p $t0)" }
+                & $look
+            } finally { $s.Dispose() }
+            $fcPid = (& $fc 'rd').Id
+            $other = @($seen | Where-Object { $_ -ne '' -and $_ -ne "$fcPid" })
+            Check ($other.Count -eq 0) "the pid file named another process than Firecracker ($fcPid) while the reader held it: $(@($seen | ForEach-Object { "'$_'" }) -join ', ')"
+            Check (-not $p.HasExited) "the jailer ended (exit $($p.ExitCode)): $(& $said 'rd')"
+            & $stop 'rd'
+            Check ($p.WaitForExit(10000)) 'the jailer did not end with its jail'
+            "the reader opened it at $opened from the jailer's start and held it; the jail started, the file read $(@($seen | ForEach-Object { "'$_'" }) -join ' then ') (Firecracker $fcPid)"
+        }
         $n = 0
         foreach ($flags in @(@(), @('--daemonize'), @('--new-pid-ns'), @('--daemonize', '--new-pid-ns'))) {
             $name = "FROZEN at the start$(if ($flags) { ' with ' + ($flags -join ' ') } else { '' })"

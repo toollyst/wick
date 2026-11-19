@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=AC=EC=83=81=EC=9B=90?= <dev.chamomile@gmail.com>
+Date: Thu, 19 Nov 2026 11:31:43 +0900
+Subject: [PATCH] jailer: on Windows the pid file is the platform's to write,
+ once, with Firecracker's pid (overlay/jailer/platform/windows)
+
+Upstream writes the jailer's pid before its exec, which the exec keeps for
+Firecracker. On Windows Firecracker is a child the platform starts: that
+write named the jailer until the platform wrote the file again, and a
+reader holding the file failed the rewrite with a sharing violation.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/jailer/src/env.rs | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/jailer/src/env.rs b/src/jailer/src/env.rs
+index a71c5da918bb99c0dd9c8265da3fd876f373d00f..ce16dcb9573d7995085a473e695a637bb2a2b590 100644
+--- a/src/jailer/src/env.rs
++++ b/src/jailer/src/env.rs
+@@ -408,7 +408,8 @@ impl Env {
+     #[cfg(windows)]
+     fn exec_into_new_pid_ns(&mut self, chroot_exec_file: PathBuf) -> Result<(), JailerError> {
+         crate::platform::new_pid_ns()?;
+-        self.save_exec_file_pid(id().try_into().unwrap(), chroot_exec_file.clone())?;
++        // wick: the keeper's pid is not Firecracker's: the platform writes Firecracker's to the
++        // pid file, as without the flag (`run`).
+         Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
+     }
+ 
+@@ -957,6 +958,12 @@ impl Env {
+         if self.new_pid_ns {
+             self.exec_into_new_pid_ns(chroot_exec_file)
+         } else {
++            // wick: on Windows no exec keeps the jailer's pid: Firecracker is a child the
++            // platform starts, and the platform writes its pid to this file, once, made new as
++            // here, before Firecracker runs (overlay/jailer/platform/windows, `exec`). A pid
++            // written here first and then rewritten named the jailer for that time, and a reader
++            // holding the file then failed the rewrite (a sharing violation).
++            #[cfg(not(windows))]
+             self.save_exec_file_pid(id().try_into().unwrap(), chroot_exec_file.clone())?;
+             Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
+         }

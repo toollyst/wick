@@ -1100,6 +1100,29 @@ fn open_own(path: &Path) -> Result<std::fs::File, NotOwn> {
     Ok(file)
 }
 
+/// Writes upstream's pid file, `<exec file name>.pid` in the jail, holding
+/// `pid`: once, made new as upstream makes it (`create_new`, `CREATE_NEW`
+/// here), so a file, a symbolic link, a junction or a hard link of that name
+/// (a jail's earlier run, or planted) is refused and left as it was, and
+/// nothing is followed. Readers may open it while it is written
+/// (`FILE_SHARE_READ`), as on Linux, where a reader can find it empty for that
+/// moment. Upstream's own write (`env.rs`, the jailer's pid) is not made on
+/// Windows: rewritten here, the file named the jailer until then, and a
+/// reader holding it open failed the rewrite with a sharing violation (CI's
+/// `jailer-test.ps1 freeze`, whose start cases read it every 50 ms; its case
+/// "a reader holds the pid file from its first moment" makes that certain).
+fn write_pid_file(path: &Path, pid: u32) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    write!(file, "{pid}")
+}
+
 /// Copies the operator's binary into the jail, as upstream does: a copy, so
 /// two Firecracker processes never share its memory; never through a link
 /// planted there ([`open_own`]). Upstream copies over an existing file of the
@@ -2639,9 +2662,10 @@ fn exec(
     };
     terminal.started();
     // Upstream's pid file holds the jailer's pid, which an exec keeps; here it
-    // is Firecracker's.
+    // is Firecracker's, written here alone, before Firecracker runs
+    // ([`write_pid_file`]).
     let pid_file = jail.root.join(format!("{}.pid", name.to_string_lossy()));
-    if let Err(e) = open_own(&pid_file).map_err(io::Error::from).and_then(|mut f| write!(f, "{}", fc.pid)) {
+    if let Err(e) = write_pid_file(&pid_file, fc.pid) {
         return Err(kill("the pid file", e));
     }
     // Frozen now if the file says so: a process resumed in a frozen job does
@@ -3257,6 +3281,54 @@ mod tests {
         std::fs::write(&old, b"a longer binary of a previous run").unwrap();
         copy_exec(&src, &old).unwrap();
         assert_eq!(std::fs::read(&old).unwrap(), b"binary");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The pid file is made new, as upstream's (create_new): whatever has its
+    // name, a file of a run before or a link, is refused and left as it was.
+    // (That a reader holding it from its first moment refuses nothing is
+    // `jailer-test.ps1 freeze`'s, which runs the whole jailer.)
+    #[test]
+    fn test_the_pid_file_is_made_new() {
+        use windows_sys::Win32::Foundation::ERROR_FILE_EXISTS;
+        let dir = std::env::temp_dir().join(format!("wick-jailer-pid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exists = |r: io::Result<()>| r.is_err_and(|e| e.raw_os_error() == Some(ERROR_FILE_EXISTS.cast_signed()));
+
+        let fresh = dir.join("fresh.exe.pid");
+        write_pid_file(&fresh, 4242).unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"4242");
+
+        let target = dir.join("target.txt");
+        let content = b"the operator's file".as_slice();
+        std::fs::write(&target, content).unwrap();
+        // A run before's file: refused, left as it was (upstream: EEXIST).
+        let old = dir.join("old.exe.pid");
+        std::fs::write(&old, b"1234").unwrap();
+        assert!(exists(write_pid_file(&old, 4242)));
+        assert_eq!(std::fs::read(&old).unwrap(), b"1234");
+        let hard = dir.join("hard.exe.pid");
+        std::fs::hard_link(&target, &hard).unwrap();
+        assert!(exists(write_pid_file(&hard, 4242)));
+        let sym = dir.join("sym.exe.pid");
+        std::os::windows::fs::symlink_file(&target, &sym)
+            .expect("a symbolic link (the test needs SeCreateSymbolicLinkPrivilege: run it elevated)");
+        assert!(exists(write_pid_file(&sym, 4242)));
+        let dangling = dir.join("dangling.exe.pid");
+        std::os::windows::fs::symlink_file(dir.join("nowhere.txt"), &dangling).unwrap();
+        assert!(exists(write_pid_file(&dangling, 4242)));
+        assert!(!dir.join("nowhere.txt").exists());
+        let junction = dir.join("junction.exe.pid");
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "mklink /J: {out:?}");
+        assert!(exists(write_pid_file(&junction, 4242)));
+        assert_eq!(std::fs::read(&target).unwrap(), content);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -59,3 +59,4 @@
 0057-vmm-the-virtio-fs-device-s-dependencies-in-Cargo.loc.patch
 0058-firecracker-jailer-clippy-D-warnings-clean-on-Linux-.patch
 0059-jailer-fs-server-and-fs-share-one-wick-fsd-per-share.patch
+0060-jailer-on-Windows-the-pid-file-is-the-platform-s-to-.patch

@@ -238,6 +238,23 @@ has the per-control details and results.
   with an error, a sysctl write is refused, and that the API process makes no socket at all). The rule is now the same
   with and without a network: Unix sockets in the jail, and with one, in the jail's directory there and directly in
   the network.
+- **Windows: a reader of a jail's pid file could fail the jail's start, and read the jailer's pid for Firecracker's**
+  (the jailer's pid since 5579ea53, the Windows jailer; the failed start since d75d0eba; in no release; fixed in the
+  commit that adds this entry). Upstream writes the pid file before its exec, with the jailer's pid, which the exec
+  keeps for Firecracker. On Windows Firecracker is a child the jailer starts, so that write named the jailer, and the
+  jailer wrote the file again with Firecracker's pid once it had started it (about 0.13 s later in the start that
+  failed), through an open that shared the file with no one: a reader that had it open at that moment (`type`,
+  `Get-Content`, any reader) failed the start with "the pid file: The process cannot access the file because it is
+  being used by another process. (os error 32)", and the jail's processes were ended. Not a jail's doing: the jail's
+  processes are suspended until after the write, and no other jail can open the file. Seen once in CI, in
+  `jailer-test.ps1 freeze`, whose start cases read the file every 50 ms; the cause is by source and by that failure's
+  own record (the file still held the operator's jailer's pid, upstream's write; which reader held it was not
+  recorded, and the stage's own reads are the ones known). Now upstream's write is not
+  made on Windows, and the jailer writes the pid file once, with Firecracker's pid, before Firecracker runs, made new
+  as upstream makes it (a file or link of its name is refused and left as it was), sharing reading
+  (`test_the_pid_file_is_made_new`; `jailer-test.ps1 freeze`'s case "a reader holds the pid file from its first
+  moment", whose reader opens the file the moment it exists and holds it until Firecracker runs, every value it reads
+  Firecracker's pid, which fails on the code before by the cause above; neither run yet).
 - **Windows: a guest's MMIO read could end its own VM while the reclaim moved the chunk holding its page tables, and
   string port I/O through a page-table page still missing after a userfaultfd restore failed the run** (the first
   since b81d58ae, the reclaim at the memory limit, and the second since c56eb138, string I/O done in the VMM; in no
