@@ -2381,11 +2381,19 @@ jobs:
           # An access to a missing page whose fill is held after its commit
           # and before its content (a host thread's read, the guest's read,
           # the guest's write): in the fault until the fill ends, then the
-          # fill's content or the guest's write (FILLWINDOW lines; first
-          # run: CI). And what WHP gives the guest of a section page in the
-          # states a fill passes through (COMMITVIEW lines, a record).
+          # fill's content or the guest's write (FILLWINDOW lines). And what
+          # WHP gives the guest of a section page in the states a fill
+          # passes through (COMMITVIEW lines, a record).
           alone whp::vcpu::fpu_tests::test_an_access_during_a_fill_waits_for_the_pages_content
           alone whp::vcpu::fpu_tests::test_a_page_committed_closed_through_the_guests_view_on_record
+          # For SWAPSTRESS's round 87 (a read of 0, no exit at the page): a
+          # page the guest has read, its chunk discarded, is in the fault
+          # at the guest's next access, never what WHP mapped before
+          # (DISCARDMAP lines; first run: CI); and whether WHP, mapping a
+          # page the guest exited at, gives the guest pages beside it that
+          # the guest's view closes (NEIGHBOURVIEW lines, a record).
+          alone whp::vcpu::fpu_tests::test_a_guest_access_after_its_chunks_discard_faults_again
+          alone whp::vcpu::fpu_tests::test_pages_beside_one_the_guest_exited_at_on_record
           # SWAPSTRESS's chunk moved by the reclaim at a job's memory limit (its
           # live pages copied into a new section) under the guest's reads and
           # then its writes, 20 rounds each in a child held at the limit with

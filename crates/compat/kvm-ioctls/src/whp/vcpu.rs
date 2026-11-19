@@ -8527,6 +8527,125 @@ mod fpu_tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// DISCARDMAP, for SWAPSTRESS's round 87 (a guest read 0 with no exit
+    /// at the page): a page of guest RAM the guest has read, its chunk then
+    /// discarded whole (`MADV_DONTNEED`, the chunk swapped for a new section:
+    /// `wick_uffd::discarding`), is missing again for the guest as Linux's
+    /// zap makes it (v6.1 mm/madvise.c `madvise_dontneed_single_vma`, and
+    /// KVM's MMU notifier drops the stage-2 entry,
+    /// `kvm_mmu_notifier_invalidate_range_start`): the guest's next access
+    /// to it is in the fault, never a read of what WHP mapped before. The
+    /// guest's RAM (4 MiB) registered as SWAPSTRESS's; three pages of its
+    /// second 2 MiB (its first, one in the middle, its last), each filled
+    /// with `OLD` and read by the guest twice (mapped in WHP by then); the
+    /// chunk discarded, each page's host state printed (`VirtualQuery`
+    /// through the guest's view: reserved after a swap, committed and
+    /// closed after a discard in place); then, a page at a time, the
+    /// guest's read decided by the first of two ends, both final while no
+    /// fill is made: in the fault (`test_hooks::in_fault`), or done (WHP
+    /// gave the guest a page: its value printed, 0 the new section's or
+    /// `OLD` the old one's); then the page filled with `NEW`, which the
+    /// guest must read. DISCARDMAP lines; asserted.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_guest_access_after_its_chunks_discard_faults_again() {
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
+        const CHUNK: u64 = 2 << 20;
+        const PAGES: [u64; 3] = [0x20_0000, 0x30_0000, 0x3F_F000];
+        const OLD: u64 = 0x01D0_01D0_01D0_01D0;
+        const NEW: u64 = 0x0E30_0E30_0E30_0E30;
+        // mov rax, [rbx]; out 0x85, al; jmp back to the mov.
+        const PROGRAM: [u8; 7] = [0x48, 0x8B, 0x03, 0xE6, 0x85, 0xEB, 0xF9];
+        let say = |l: String| eprintln!("DISCARDMAP {l}");
+        let mut uffd = None;
+        let (vm, vcpu, m) = mmio_guest_with(&PROGRAM, |m| {
+            let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+            libc::wick_uffd::register(ctx, m as u64, MEM as u64).unwrap();
+            uffd = Some((ctx, user));
+        });
+        let (ctx, user) = uffd.unwrap();
+        let at = m as u64;
+        let fill = |gpa: u64, v: u64| {
+            let data: Vec<u8> = std::iter::repeat_n(v.to_le_bytes(), 512).flatten().collect();
+            // SAFETY: a page-sized buffer; the registered range's page.
+            unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), at + gpa, 4096, true) }
+        };
+        // The guest's read of `gpa`'s first qword on a thread of its own.
+        let read = |mut vcpu: VcpuFd, gpa: u64| {
+            std::thread::spawn(move || {
+                vcpu.set_regs(&kvm_regs { rip: MMIO_PROGRAM, rsp: 0x9000, rflags: 2, rbx: gpa, ..Default::default() }).unwrap();
+                let mut reads = 0;
+                let e = one_run(&mut vcpu, &[], &mut reads);
+                let rax = vcpu.get_regs().unwrap().rax;
+                (vcpu, e, rax)
+            })
+        };
+        let shows = |gpa: u64| {
+            // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            unsafe { VirtualQuery((at + gpa) as *const _, &mut mbi, std::mem::size_of_val(&mbi)) };
+            format!("state {:#x} protection {:#x}", mbi.State, mbi.Protect)
+        };
+        let mut wrong = Vec::new();
+        let mut vcpu = vcpu;
+        for &gpa in &PAGES {
+            assert_eq!(fill(gpa, OLD), Ok(4096), "the first fill of {gpa:#x}");
+            for k in 0..2 {
+                let (back, e, rax) = read(vcpu, gpa).join().unwrap();
+                vcpu = back;
+                if !e.starts_with("out 0x85") || rax != OLD {
+                    wrong.push(format!("{gpa:#x}: read {k} before the discard: {e}, {rax:#x}"));
+                }
+            }
+        }
+        // SAFETY: the chunk of guest RAM, discarded.
+        let ret = unsafe { libc::madvise((at + CHUNK) as *mut libc::c_void, CHUNK as usize, libc::MADV_DONTNEED) };
+        assert_eq!(ret, 0, "the chunk's discard");
+        for &gpa in &PAGES {
+            let missing = libc::wick_uffd::is_missing(at + gpa);
+            let state = shows(gpa);
+            let runner = read(vcpu, gpa);
+            let t = Instant::now();
+            let decided = loop {
+                if runner.is_finished() {
+                    break "done with no fill: WHP gave the guest a page";
+                }
+                if libc::wick_uffd::test_hooks::in_fault(at + gpa) {
+                    break if runner.is_finished() { "in the fault, and done" } else { "in the fault" };
+                }
+                if t.elapsed() > Duration::from_secs(10) {
+                    break "neither within 10 s";
+                }
+                std::thread::yield_now();
+            };
+            let filled = fill(gpa, NEW);
+            let t = Instant::now();
+            while !runner.is_finished() {
+                assert!(t.elapsed() < Duration::from_secs(20), "the guest's read of {gpa:#x} did not end once filled");
+                std::thread::yield_now();
+            }
+            let (back, e, rax) = runner.join().unwrap();
+            vcpu = back;
+            say(format!(
+                "{gpa:#x} after the chunk's discard (missing {missing}, the guest's view: {state}): the guest's read, no fill made: \
+                 {decided}; then the fill {filled:?}; the run {e}; RAX {rax:#x} (old {OLD:#x}, new {NEW:#x})"
+            ));
+            if !missing || decided != "in the fault" || filled != Ok(4096) || !e.starts_with("out 0x85") || rax != NEW {
+                wrong.push(format!("{gpa:#x}: missing {missing}, {decided}, fill {filled:?}, run {e}, RAX {rax:#x}"));
+            }
+        }
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: closes the user end; the test's mapping, no VM left using it.
+        unsafe {
+            libc::close(user);
+            assert_eq!(libc::munmap(m.cast(), MEM), 0);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// Where the legacy page (`WHvGetVirtualProcessorInterruptControllerState`,
     /// the backend's) keeps the IRR and the ISR: eight words of 32 vectors,
     /// 4 bytes apart (vector `v` in the word at `+ 4 * (v / 32)`), where the
@@ -13567,6 +13686,197 @@ mod fpu_tests {
         drop(vcpu);
         drop(vm);
         // SAFETY: as above.
+        unsafe {
+            for v in [a, b] {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ });
+            }
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            assert_eq!(libc::munmap(m.cast(), MEM), 0);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// NEIGHBOURVIEW, for SWAPSTRESS's round 87 (the guest's exit at one
+    /// page ended by its fill, then a read of 0 with no exit at the next
+    /// page, whose fill had begun): whether WHP, mapping a page the guest
+    /// exited at once it is accessible, also gives the guest pages around
+    /// it that the guest's view does not allow. A `SEC_RESERVE` section's
+    /// view A mapped in WHP, B a second view (the alias); per case a block
+    /// of 16 pages, 64 KiB aligned: its page 0 reserved, pages 1 to 15 in
+    /// the case's state:
+    /// 0. committed through A with `PAGE_NOACCESS`, nothing written (a
+    ///    fill's window, the state of round 87's page);
+    /// 1. as 0, with 0x5A written through B;
+    /// 2. reserved, never committed.
+    ///
+    /// The guest reads page 0: its exit, ended as a fill ends it (committed
+    /// no-access through A, 0x77 written through B, A opened read-write),
+    /// and the read run again. Then the guest reads pages 1, 2, 8 and 15 in
+    /// turn: an exit at the page (A's protection honoured), counted, after
+    /// which 0x5B is written through B and A's page opened, and the read run
+    /// again; or the byte read with no exit. Then 0x5C written through B and
+    /// each read again: 0x5C, or a page WHP kept. COMMITVIEW's scaffolding.
+    /// NEIGHBOURVIEW lines; printed, asserted only that each read ended at
+    /// its `out`.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_pages_beside_one_the_guest_exited_at_on_record() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, VirtualAlloc, VirtualProtect, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS,
+            MEM_COMMIT, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READWRITE, SEC_RESERVE,
+        };
+        const PROGRAM: u64 = 0xB000;
+        const LEN: usize = 2 << 20;
+        const SECTION_GPA: u64 = 0x400_0000;
+        const BLOCK: usize = 0x1_0000;
+        const CASES: [&str; 3] = [
+            "committed through A no-access, nothing written",
+            "committed through A no-access, 0x5A written through B",
+            "reserved, never committed",
+        ];
+        const READ: [usize; 4] = [1, 2, 8, 15];
+        let say = |l: String| eprintln!("NEIGHBOURVIEW {l}");
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        put(m, 0x3000 + (SECTION_GPA >> 21) * 8, &(SECTION_GPA | 0x83).to_le_bytes());
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot: 0,
+                flags: 0,
+                guest_phys_addr: 0,
+                memory_size: MEM as u64,
+                userspace_addr: m as u64,
+            })
+        }
+        .unwrap();
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+        let (part, vp) = (vcpu.part(), vcpu.vp());
+        // SAFETY: an unnamed pagefile-backed section, closed below.
+        let section = unsafe {
+            CreateFileMappingW(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_RESERVE, 0, LEN as u32, std::ptr::null())
+        };
+        assert!(!section.is_null());
+        // SAFETY: two views of the test's section, unmapped below.
+        let (a, b) = unsafe { (MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, LEN).Value as usize, MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, LEN).Value as usize) };
+        assert!(a != 0 && b != 0);
+        let rwx = whv::WHvMapGpaRangeFlagRead | whv::WHvMapGpaRangeFlagWrite | whv::WHvMapGpaRangeFlagExecute;
+        // SAFETY: view A stays mapped while the VM has it; unmapped below.
+        let hres = unsafe { whv::WHvMapGpaRange(part, a as *const _, SECTION_GPA, LEN as u64, rwx) };
+        assert_eq!(hres, 0, "WHvMapGpaRange of view A");
+        // SAFETY: pages of the test's views.
+        let commit = |at: usize, prot: PAGE_PROTECTION_FLAGS| !unsafe { VirtualAlloc(at as *const _, 4096, MEM_COMMIT, prot) }.is_null();
+        let protect = |at: usize, prot: PAGE_PROTECTION_FLAGS| {
+            let mut old = 0;
+            // SAFETY: as above.
+            unsafe { VirtualProtect(at as *const _, 4096, prot, &mut old) != 0 }
+        };
+        // SAFETY: a byte of a committed page of the test's view B.
+        let write = |at: usize, v: u8| unsafe { (at as *mut u8).write_volatile(v) };
+        // The page at offset `off` of both views as a fill leaves it: committed
+        // no-access through A, `v` written through B, A opened read-write.
+        let as_filled = |off: usize, v: u8| {
+            commit(a + off, PAGE_NOACCESS);
+            write(b + off, v);
+            protect(a + off, PAGE_READWRITE);
+        };
+        // The guest's read of `gpa`'s byte: the exits at its page, each
+        // followed by `on_exit`, and how the read ended.
+        let mut guest_read = |gpa: u64, on_exit: &dyn Fn()| {
+            let mut program = vec![0x8A, 0x04, 0x25];
+            program.extend_from_slice(&u32::try_from(gpa).unwrap().to_le_bytes());
+            program.extend_from_slice(&[0xE6, PORT as u8, 0xF4, 0xEB, 0xFD]);
+            put(m, PROGRAM, &program);
+            regs::set_rip(part, vp, PROGRAM).unwrap();
+            let watchdog = super::Watchdog::arm(&vcpu);
+            let mut exits = 0;
+            let end = loop {
+                if exits > 4 {
+                    break Err("more than 4 exits at the page".to_string());
+                }
+                if vcpu.shared.immediate_exit.load(Ordering::SeqCst) != 0 {
+                    break Err("no end within 5 s (kicked)".to_string());
+                }
+                let ctx = match super::super::ffi::run_vp(part, vp) {
+                    Ok(c) => c,
+                    Err(e) => break Err(format!("run failed, errno {}", e.errno())),
+                };
+                match ctx.ExitReason {
+                    // SAFETY: the union arm matches the exit reason.
+                    whv::WHvRunVpExitReasonX64IoPortAccess => break Ok((unsafe { ctx.Anonymous.IoPortAccess.Rax } & 0xff) as u8),
+                    whv::WHvRunVpExitReasonMemoryAccess => {
+                        // SAFETY: the union arm matches the exit reason.
+                        let at = unsafe { ctx.Anonymous.MemoryAccess.Gpa };
+                        if (at & !0xfff) != gpa {
+                            break Err(format!("a memory exit at {at:#x}"));
+                        }
+                        exits += 1;
+                        on_exit();
+                    }
+                    reason => break Err(format!("exit reason {reason:#x} at RIP {:#x}", ctx.VpContext.Rip)),
+                }
+            };
+            drop(watchdog);
+            vcpu.set_kvm_immediate_exit(0);
+            (exits, end)
+        };
+        let mut wrong = Vec::new();
+        for (c, case) in CASES.iter().enumerate() {
+            let base = c * BLOCK;
+            for p in 1..16 {
+                let off = base + p * 4096;
+                match c {
+                    0 => {
+                        commit(a + off, PAGE_NOACCESS);
+                    }
+                    1 => {
+                        commit(a + off, PAGE_NOACCESS);
+                        write(b + off, 0x5A);
+                    }
+                    _ => {}
+                }
+            }
+            let gpa0 = SECTION_GPA + base as u64;
+            let first = guest_read(gpa0, &|| as_filled(base, 0x77));
+            let mut line = format!("case {c} ({case}): page 0 read: {} exits, then {:x?}", first.0, first.1);
+            if first.1 != Ok(0x77) {
+                wrong.push(format!("case {c}: page 0 {first:?}"));
+            }
+            for &p in &READ {
+                let off = base + p * 4096;
+                let gpa = SECTION_GPA + off as u64;
+                let open = || {
+                    if c == 2 {
+                        as_filled(off, 0x5B);
+                    } else {
+                        write(b + off, 0x5B);
+                        protect(a + off, PAGE_READWRITE);
+                    }
+                };
+                let next = guest_read(gpa, &open);
+                // Opened by now if it exited; if it did not, opened here for
+                // the read again.
+                if next.0 == 0 {
+                    open();
+                }
+                write(b + off, 0x5C);
+                let again = guest_read(gpa, &|| {});
+                line += &format!("; page {p}: {} exits, then {:x?}, 0x5C written through B, read again {} exits, then {:x?}", next.0, next.1, again.0, again.1);
+                if next.1.is_err() || again.1.is_err() {
+                    wrong.push(format!("case {c} page {p}: {next:?} {again:?}"));
+                }
+            }
+            say(line);
+        }
+        // SAFETY: the range mapped above, unmapped before the VM goes.
+        unsafe {
+            whv::WHvUnmapGpaRange(part, SECTION_GPA, LEN as u64);
+        }
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's views and section, and its memory.
         unsafe {
             for v in [a, b] {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ });
