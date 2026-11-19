@@ -2385,8 +2385,27 @@ jobs:
           # A 2 MiB chunk of userfaultfd guest RAM swapped (discarded
           # whole) under a vCPU's scan and a host writer, 100 rounds
           # (SWAPSTRESS lines; a page read wrong, its "round N: page" line:
-          # its value, the events around its read, the vCPU's exits).
-          alone whp::vcpu::fpu_tests::test_a_chunk_swapped_under_a_vcpu_and_a_host_writer_keeps_their_memory
+          # its value, the events around its read, the vCPU's exits, and its
+          # "SWAPTRACE" line: libc's steps at the page and its neighbours,
+          # where the guest's reads fell against its fill, and which of
+          # the readings (i) to (iii) the record fits). Run up to 30 times,
+          # each alone, for at most 10 minutes, and stopped at its second
+          # failing run: it read a page wrong in 1 of about 5 CI runs
+          # (SECURITY.md, "Not at parity yet").
+          swapstress_end=$((SECONDS + 600))
+          swapstress_failed=0
+          for i in $(seq 30); do
+            if [ "$SECONDS" -ge "$swapstress_end" ] || [ "$swapstress_failed" -ge 2 ]; then
+              echo "SWAPSTRESS loop: stopped after $((i - 1)) runs ($swapstress_failed failed, $SECONDS s into the step)"
+              break
+            fi
+            before=$failed
+            failed=0
+            alone whp::vcpu::fpu_tests::test_a_chunk_swapped_under_a_vcpu_and_a_host_writer_keeps_their_memory
+            if [ "$failed" -ne 0 ]; then swapstress_failed=$((swapstress_failed + 1)); fi
+            if [ "$before" -ne 0 ]; then failed=1; fi
+            echo "SWAPSTRESS loop: run $i done, $swapstress_failed failed"
+          done
           # An access to a missing page whose fill is held after its commit
           # and before its content (a host thread's read, the guest's read,
           # the guest's write): in the fault until the fill ends, then the

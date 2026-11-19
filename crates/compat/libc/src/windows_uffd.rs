@@ -931,6 +931,7 @@ pub fn fault(addr: u64, write: bool) -> bool {
     else {
         return false;
     };
+    trace::note(trace::FAULT_ENTERED, page_addr, || u64::from(write));
     // Claim a waiter slot.
     let (index, slot) = loop {
         if let Some(found) = WAITERS.iter().enumerate().find(|(_, w)| {
@@ -977,8 +978,10 @@ pub fn fault(addr: u64, write: bool) -> bool {
     let same = range.gen.load(Ordering::SeqCst) == g1;
     // Woken already (by a wake of its page, or spuriously: a wake that read the
     // slot's page of a waiter before): no record, the access runs again.
-    if report && same && word.load(Ordering::SeqCst) == tag {
+    let posted = report && same && word.load(Ordering::SeqCst) == tag;
+    if posted {
         let flags = if write { proto::FLAG_WRITE } else { 0 };
+        trace::note(trace::FAULT_POSTED, page_addr, || 0);
         post(ctx, [proto::EVENT_PAGEFAULT2, addr, flags, tag]);
         while word.load(Ordering::SeqCst) == tag {
             // SAFETY: a semaphore created at init.
@@ -989,6 +992,7 @@ pub fn fault(addr: u64, write: bool) -> bool {
     leave(ctx);
     slot.ctx.store(usize::MAX, Ordering::SeqCst);
     slot.page.store(0, Ordering::SeqCst);
+    trace::note(trace::FAULT_LEFT, page_addr, || u64::from(posted));
     true
 }
 
@@ -2415,6 +2419,7 @@ fn fill(
         }
         let at = dst + done * PAGE;
         let mut bytes = n * PAGE;
+        trace::pages(trace::COMMIT_BEGIN, at, bytes, |_| 0);
         #[allow(clippy::cast_possible_truncation)]
         if range.reserved.load(Ordering::Acquire) && !uffd_commit(at, bytes) {
             // The pages that fit, a page at a time.
@@ -2456,9 +2461,14 @@ fn fill(
             }
             bytes = fits;
         }
+        trace::pages(trace::COMMIT_END, at, bytes, |_| 0);
         #[cfg(any(test, feature = "wick-test-hooks"))]
         fill_hook();
+        trace::pages(trace::CONTENT_BEGIN, at, bytes, |_| 0);
         fill((alias + (at - base)) as *mut u8, bytes as usize, (at - dst) as usize);
+        // The first qword of each page as the alias reads it now.
+        // SAFETY: the alias of the pages just filled.
+        trace::pages(trace::CONTENT_END, at, bytes, |pg| unsafe { ptr::read_volatile((alias + (pg - base)) as *const u64) });
         // Each page with the protection `mprotect` gave it (one filled while
         // `PROT_NONE` stays closed, as Linux's copy fills a page of a
         // `PROT_NONE` vma).
@@ -2467,6 +2477,11 @@ fn fill(
             if result.is_ok() {
                 result = protect_as(r, n, prot);
             }
+            // The first qword of each page as the guest's view reads it now,
+            // where its protection lets it be read (u64::MAX where not).
+            let opened = result.is_ok() && prot != PAGE_NOACCESS;
+            // SAFETY: a page of the range just filled, its protection read.
+            trace::pages(trace::OPENED, r, n, |pg| if opened { unsafe { ptr::read_volatile(pg as *const u64) } } else { u64::MAX });
         });
         if let Err(e) = result {
             break e.raw_os_error().unwrap_or(crate::EIO);
@@ -2475,6 +2490,7 @@ fn fill(
         for page in from..from + bytes / PAGE {
             Range::set(&range.missing, page, false);
         }
+        trace::pages(trace::MISSING_CLEARED, at, bytes, |_| 0);
         done += bytes / PAGE;
         if done == pages {
             break 0;
@@ -2490,6 +2506,7 @@ fn fill(
     // :1216).
     if wake_up && bytes > 0 {
         wake_ctx(ctx, dst, bytes);
+        trace::pages(trace::WOKEN, dst, bytes, |_| 0);
     }
     drop(guard);
     match (ended, bytes) {
@@ -2513,6 +2530,123 @@ fn fill_hook() {
     if hook != 0 {
         // SAFETY: only `fn()` values are stored.
         unsafe { core::mem::transmute::<usize, fn()>(hook)() };
+    }
+}
+
+/// SWAPTRACE (tests, and kvm-ioctls' WHP tests through
+/// `test_hooks::set_trace_clock`): a ring of the steps a registered page
+/// goes through, each stamped with a test's clock (a `fetch_add` on it, so
+/// the steps, the test's own events and the guest's reads of the clock
+/// fall in one order), the thread and the CPU it ran on. Without the
+/// `wick-test-hooks` feature (and outside tests) every call is empty and
+/// its value is never computed. The WHP backend's kinds and the reader
+/// are used through `test_hooks` alone.
+#[allow(dead_code)]
+pub(crate) mod trace {
+    #[cfg(any(test, feature = "wick-test-hooks"))]
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// A discard of registered memory begins: the start, the bytes.
+    pub(crate) const DISCARD_BEGIN: u64 = 1;
+    /// A page made missing by a discard.
+    pub(crate) const MISSING_SET: u64 = 2;
+    /// A chunk swapped for a new section at a discard: its view, 1 swapped
+    /// or 0 not (refused, or at a range's edge).
+    pub(crate) const SWAPPED: u64 = 3;
+    /// The discard's end.
+    pub(crate) const DISCARD_END: u64 = 4;
+    /// An access's fault: the page missing at its lookup (1 a write).
+    pub(crate) const FAULT_ENTERED: u64 = 5;
+    /// Its record posted; it waits.
+    pub(crate) const FAULT_POSTED: u64 = 6;
+    /// Its wait over (1: a record was posted), the access to run again.
+    pub(crate) const FAULT_LEFT: u64 = 7;
+    /// A fill's commit of the page begins, and its end.
+    pub(crate) const COMMIT_BEGIN: u64 = 8;
+    pub(crate) const COMMIT_END: u64 = 9;
+    /// The fill's content written through the alias begins, and its end
+    /// (the page's first qword as the alias reads it).
+    pub(crate) const CONTENT_BEGIN: u64 = 10;
+    pub(crate) const CONTENT_END: u64 = 11;
+    /// The page opened through the guest's view (its first qword read
+    /// there, `u64::MAX` where its protection does not read).
+    pub(crate) const OPENED: u64 = 12;
+    /// Its missing bit cleared.
+    pub(crate) const MISSING_CLEARED: u64 = 13;
+    /// Its waiters woken.
+    pub(crate) const WOKEN: u64 = 14;
+    /// The WHP backend's: a vCPU's memory access exit at the page (1 a
+    /// write), and the vCPU let run again after it (how: kvm-ioctls'
+    /// `exit_ring` kinds, 5 committed, 6 another pass).
+    pub(crate) const VCPU_EXIT: u64 = 20;
+    pub(crate) const VCPU_RERUN: u64 = 21;
+
+    /// The entries kept, the last ones by clock.
+    #[cfg(any(test, feature = "wick-test-hooks"))]
+    pub(crate) const LEN: usize = 1 << 16;
+    /// The address of the test's clock (an `AtomicU64`), 0 for no record.
+    #[cfg(any(test, feature = "wick-test-hooks"))]
+    pub(crate) static CLOCK: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(any(test, feature = "wick-test-hooks"))]
+    static RING: [[AtomicU64; 4]; LEN] = [const { [const { AtomicU64::new(0) }; 4] }; LEN];
+
+    /// Keeps a step of `kind` at `addr`; `extra` is asked only while a
+    /// record is kept.
+    #[cfg_attr(not(any(test, feature = "wick-test-hooks")), allow(unused_variables))]
+    #[inline]
+    pub(crate) fn note(kind: u64, addr: u64, extra: impl FnOnce() -> u64) {
+        #[cfg(any(test, feature = "wick-test-hooks"))]
+        {
+            let clock = CLOCK.load(Ordering::Relaxed);
+            if clock == 0 {
+                return;
+            }
+            let value = extra();
+            // SAFETY: plain calls.
+            let (tid, cpu) = unsafe {
+                (
+                    windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+                    windows_sys::Win32::System::Threading::GetCurrentProcessorNumber(),
+                )
+            };
+            // SAFETY: the test keeps its clock alive while CLOCK holds it.
+            let n = unsafe { &*(clock as *const AtomicU64) }.fetch_add(1, Ordering::SeqCst);
+            #[allow(clippy::cast_possible_truncation)]
+            let e = &RING[n as usize % LEN];
+            e[1].store(kind | u64::from(cpu & 0xff_ffff) << 8 | u64::from(tid) << 32, Ordering::Relaxed);
+            e[2].store(addr, Ordering::Relaxed);
+            e[3].store(value, Ordering::Relaxed);
+            e[0].store(n + 1, Ordering::Release);
+        }
+    }
+
+    /// [`note`] for each page of `[start, start + len)`, `extra` given the
+    /// page.
+    #[cfg_attr(not(any(test, feature = "wick-test-hooks")), allow(unused_variables))]
+    #[inline]
+    pub(crate) fn pages(kind: u64, start: u64, len: u64, extra: impl Fn(u64) -> u64) {
+        #[cfg(any(test, feature = "wick-test-hooks"))]
+        if CLOCK.load(Ordering::Relaxed) != 0 {
+            let mut page = start - start % super::PAGE;
+            while page < start + len {
+                note(kind, page, || extra(page));
+                page += super::PAGE;
+            }
+        }
+    }
+
+    /// The step kept at clock `n`, if it is still there: (kind, CPU,
+    /// thread, address, extra).
+    #[cfg(any(test, feature = "wick-test-hooks"))]
+    pub(crate) fn at(n: u64) -> Option<(u64, u32, u32, u64, u64)> {
+        #[allow(clippy::cast_possible_truncation)]
+        let e = &RING[n as usize % LEN];
+        if e[0].load(Ordering::Acquire) != n + 1 {
+            return None;
+        }
+        let w = e[1].load(Ordering::Relaxed);
+        #[allow(clippy::cast_possible_truncation)]
+        Some((w & 0xff, (w >> 8 & 0xff_ffff) as u32, (w >> 32) as u32, e[2].load(Ordering::Relaxed), e[3].load(Ordering::Relaxed)))
     }
 }
 
@@ -2755,6 +2889,7 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
         return ret;
     }
     let _guard = lock();
+    trace::note(trace::DISCARD_BEGIN, start, || len);
     let ret = discard(&mut done);
     // Released ranges' pages: those no registration tracks.
     released_discard(&done, |p| find(p).is_some_and(|(r, page)| r.owned(page)));
@@ -2772,6 +2907,7 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
             for page in first..last {
                 if r.owned(page) {
                     Range::set(&r.missing, page, true);
+                    trace::note(trace::MISSING_SET, s + page * PAGE, || 0);
                     any = true;
                 }
             }
@@ -2794,7 +2930,8 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
                     }
                     if (c..c_end).all(|p| r.owned(p)) {
                         #[allow(clippy::cast_possible_truncation)]
-                        crate::windows_mm::uffd_swap_chunk((s + c * PAGE) as usize, ((c_end - c) * PAGE) as usize, (alias + c * PAGE) as usize, (s as usize, e as usize));
+                        let swapped = crate::windows_mm::uffd_swap_chunk((s + c * PAGE) as usize, ((c_end - c) * PAGE) as usize, (alias + c * PAGE) as usize, (s as usize, e as usize));
+                        trace::note(trace::SWAPPED, s + c * PAGE, || u64::from(swapped));
                     }
                     c += chunk;
                 }
@@ -2835,6 +2972,7 @@ pub fn discarding(start: u64, len: u64, discard: impl FnOnce(&mut Vec<(u64, u64)
             }
         }
     }
+    trace::note(trace::DISCARD_END, start, || len);
     ret
 }
 
@@ -4031,6 +4169,51 @@ pub mod test_hooks {
     /// given the page, and waits for its fill once its record is posted.
     pub fn in_fault(page: u64) -> bool {
         super::WAITERS.iter().any(|w| w.page.load(core::sync::atomic::Ordering::SeqCst) == page)
+    }
+
+    /// Starts (the address of the test's clock, an `AtomicU64` the test
+    /// keeps alive until it calls this with `None`) or stops SWAPTRACE's
+    /// record (`super::trace`).
+    pub fn set_trace_clock(clock: Option<&'static core::sync::atomic::AtomicU64>) {
+        super::trace::CLOCK.store(clock.map_or(0, |c| core::ptr::from_ref(c) as usize), core::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Keeps a step of the WHP backend's in SWAPTRACE's record
+    /// ([`TRACE_VCPU_EXIT`], [`TRACE_VCPU_RERUN`]).
+    pub fn trace(kind: u64, addr: u64, extra: u64) {
+        super::trace::note(kind, addr, || extra);
+    }
+
+    /// SWAPTRACE's kinds for the WHP backend's steps.
+    pub const TRACE_VCPU_EXIT: u64 = super::trace::VCPU_EXIT;
+    pub const TRACE_VCPU_RERUN: u64 = super::trace::VCPU_RERUN;
+
+    /// The step SWAPTRACE kept at clock `n`, if it is still there: its
+    /// kind's name, the CPU, the thread, the address and the extra word.
+    pub fn traced(n: u64) -> Option<(&'static str, u32, u32, u64, u64)> {
+        use super::trace as t;
+        t::at(n).map(|(kind, cpu, tid, addr, extra)| {
+            let name = match kind {
+                t::DISCARD_BEGIN => "discard begun",
+                t::MISSING_SET => "missing set",
+                t::SWAPPED => "chunk swapped (1) or not (0)",
+                t::DISCARD_END => "discard ended",
+                t::FAULT_ENTERED => "fault entered",
+                t::FAULT_POSTED => "fault posted",
+                t::FAULT_LEFT => "fault left",
+                t::COMMIT_BEGIN => "commit begun",
+                t::COMMIT_END => "commit ended",
+                t::CONTENT_BEGIN => "content begun",
+                t::CONTENT_END => "content ended",
+                t::OPENED => "opened",
+                t::MISSING_CLEARED => "missing cleared",
+                t::WOKEN => "woken",
+                t::VCPU_EXIT => "vCPU exit",
+                t::VCPU_RERUN => "vCPU run again",
+                _ => "?",
+            };
+            (name, cpu, tid, addr, extra)
+        })
     }
 }
 

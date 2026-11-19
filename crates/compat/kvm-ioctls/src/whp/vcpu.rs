@@ -2307,6 +2307,8 @@ impl VcpuFd {
                         let came = exit_ring::stamp();
                         let mut block = 0..0;
                         let page = host & !0xfff;
+                        #[cfg(test)]
+                        libc::wick_uffd::test_hooks::trace(libc::wick_uffd::test_hooks::TRACE_VCPU_EXIT, page, u64::from(write));
                         let again = ram_committed.contains(&page);
                         let next = loop {
                             let next = super::exit::ram_access(
@@ -2342,6 +2344,8 @@ impl VcpuFd {
                             #[cfg(test)]
                             exit_ring::note(came, mem.Gpa, exit_ring::PASS, ram_retries.count());
                             #[cfg(test)]
+                            libc::wick_uffd::test_hooks::trace(libc::wick_uffd::test_hooks::TRACE_VCPU_RERUN, page, 6);
+                            #[cfg(test)]
                             RAM_RERUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             ram_retries.note();
                             // Another pass runs no guest: a yield every 64,
@@ -2368,6 +2372,8 @@ impl VcpuFd {
                                     ram_committed = [page, ram_committed[0]];
                                 }
                                 ram_retries.reset();
+                                #[cfg(test)]
+                                libc::wick_uffd::test_hooks::trace(libc::wick_uffd::test_hooks::TRACE_VCPU_RERUN, page, 5);
                                 continue;
                             }
                             super::exit::RamExit::OutOfMemory(err) => libc::wick_mm::out_of_memory(host as usize, err),
@@ -2375,6 +2381,8 @@ impl VcpuFd {
                                 #[cfg(test)]
                                 exit_ring::note(came, mem.Gpa, exit_ring::FAULTED, ram_retries.count());
                                 ram_retries.reset();
+                                #[cfg(test)]
+                                libc::wick_uffd::test_hooks::trace(libc::wick_uffd::test_hooks::TRACE_VCPU_RERUN, page, exit_ring::FAULTED);
                                 continue;
                             }
                             super::exit::RamExit::RunAgain => {
@@ -2384,6 +2392,8 @@ impl VcpuFd {
                                 RAM_RERUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 ram_retries.note();
                                 std::thread::yield_now();
+                                #[cfg(test)]
+                                libc::wick_uffd::test_hooks::trace(libc::wick_uffd::test_hooks::TRACE_VCPU_RERUN, page, exit_ring::RERUN);
                                 continue;
                             }
                             super::exit::RamExit::AnotherPass => unreachable!("taken by the loop above"),
@@ -8091,7 +8101,18 @@ mod fpu_tests {
     /// scan's end, the events around the read and the page's own in the
     /// round, and the vCPU's memory access exits of the round
     /// ([`super::exit_ring`]): at the page, around the read, and how many
-    /// ran again because their page was not missing at the check.
+    /// ran again because their page was not missing at the check. Then its
+    /// SWAPTRACE line: libc's record of each page's steps on the same clock
+    /// (`libc::wick_uffd::test_hooks::set_trace_clock`: a discard, its
+    /// swap and each page made missing; a fault entered, posted and left;
+    /// a fill's commit, content and open, with the page's first qword as
+    /// the alias and then the guest's view read it; the missing bit
+    /// cleared; the wake; the vCPU's exits and runs again), each with its
+    /// thread and CPU, at the page and its two neighbours; where each of
+    /// the guest's two reads fell against the fill's steps; and which of
+    /// three readings the record fits (see `trace_dump`). The threads'
+    /// ids and starting CPUs are said first, the CPUs their steps ran on
+    /// last.
     #[test]
     #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
     fn test_a_chunk_swapped_under_a_vcpu_and_a_host_writer_keeps_their_memory() {
@@ -8159,14 +8180,39 @@ mod fpu_tests {
         };
         let last_written: Arc<Vec<AtomicU64>> = Arc::new((0..512).map(|_| AtomicU64::new(0)).collect());
         super::exit_ring::CLOCK.store(std::ptr::from_ref(mailbox(CLOCK)) as usize, Ordering::SeqCst);
+        // SWAPTRACE: libc's record of each page's steps on the same clock.
+        // SAFETY: guest memory, mapped until the record is stopped below.
+        let clock: &'static AtomicU64 = unsafe { &*((at + (MAILBOX + 8 * CLOCK) as usize) as *const AtomicU64) };
+        libc::wick_uffd::test_hooks::set_trace_clock(Some(clock));
+        // The threads' ids and the CPU each started on: the handler, the
+        // writer, the vCPU's, this one (the discards'). 0 until set.
+        let roles = ["handler", "writer", "vCPU", "discards"];
+        let tids: Arc<[std::sync::atomic::AtomicU32; 4]> = Arc::new(Default::default());
+        let started_on: Arc<[std::sync::atomic::AtomicU32; 4]> = Arc::new(Default::default());
+        let mark = {
+            let (tids, started_on) = (Arc::clone(&tids), Arc::clone(&started_on));
+            move |i: usize| {
+                // SAFETY: plain calls.
+                let (tid, cpu) = unsafe {
+                    (
+                        windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+                        windows_sys::Win32::System::Threading::GetCurrentProcessorNumber(),
+                    )
+                };
+                tids[i].store(tid, Ordering::SeqCst);
+                started_on[i].store(cpu, Ordering::SeqCst);
+            }
+        };
+        mark(3);
         let fill_round = Arc::new(AtomicU64::new(0));
         // Odd while a discard runs.
         let discards = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         // The handler: each page fault filled with this round's qwords.
         let handler = {
-            let (fill_round, event) = (Arc::clone(&fill_round), event.clone());
+            let (fill_round, event, mark) = (Arc::clone(&fill_round), event.clone(), mark.clone());
             std::thread::spawn(move || {
+                mark(0);
                 let mut faults = 0u64;
                 let mut rec = [0u8; libc::wick_uffd::proto::RECORD];
                 loop {
@@ -8206,8 +8252,9 @@ mod fpu_tests {
         };
         // The host writer.
         let writer = {
-            let (discards, stop, last_written) = (Arc::clone(&discards), Arc::clone(&stop), Arc::clone(&last_written));
+            let (discards, stop, last_written, mark) = (Arc::clone(&discards), Arc::clone(&stop), Arc::clone(&last_written), mark.clone());
             std::thread::spawn(move || {
+                mark(1);
                 let (mut writes, mut lost) = (0u64, Vec::new());
                 let mut seq = 0u64;
                 while !stop.load(Ordering::SeqCst) {
@@ -8233,6 +8280,7 @@ mod fpu_tests {
         };
         // The vCPU, scanning when asked.
         let runner = std::thread::spawn(move || {
+            mark(2);
             let mut vcpu = vcpu;
             let mut reads = 0;
             loop {
@@ -8242,6 +8290,20 @@ mod fpu_tests {
                 }
             }
         });
+        // The threads' ids and starting CPUs (SWAPTRACE's roles).
+        let t = std::time::Instant::now();
+        while tids.iter().any(|t| t.load(Ordering::SeqCst) == 0) {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "a thread of the test did not start");
+            std::thread::yield_now();
+        }
+        say(format!(
+            "threads: {}",
+            (0..4)
+                .map(|i| format!("the {} tid {} started on CPU {}", roles[i], tids[i].load(Ordering::SeqCst), started_on[i].load(Ordering::SeqCst)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        let role = |tid: u32| tids.iter().position(|t| t.load(Ordering::SeqCst) == tid).map_or("another thread", |i| roles[i]);
         let discard = |r: u64| {
             discards.fetch_add(1, Ordering::SeqCst);
             event(DISCARD_BEGUN, r, 0);
@@ -8318,6 +8380,77 @@ mod fpu_tests {
                 exits.len()
             )
         };
+        // SWAPTRACE for round `r`'s first bad page: libc's and the backend's
+        // steps from the ask to the scan's end at the page and its two
+        // neighbours, and the chunk's discard; then where each of the
+        // guest's two reads fell against the page's fill (a guest's load of
+        // the clock giving `v` came after every step stamped below `v` and
+        // before every one stamped `v` or above), and which of three
+        // readings the record fits: (i) the guest read the page between its
+        // commit's end and its content's end; (ii) it read 0 again after the
+        // page was opened, while the guest's view read the content there
+        // (the guest's mapping not the page the alias wrote); (iii) a
+        // discard of the page between its fill's open and the read.
+        let trace_dump = |r: u64, asked: (u64, u64), seen: (u64, u64)| {
+            let q = |i: u64| mailbox(i).load(Ordering::SeqCst);
+            let (gpa, value, before, after, again, after_again) = (q(6), q(7), q(8), q(9), q(10), q(11));
+            let page = at as u64 + gpa;
+            let near = |a: u64| a == page || a == page.wrapping_sub(4096) || a == page + 4096;
+            let mut steps = Vec::new();
+            let mut last: std::collections::HashMap<&'static str, (u64, u64)> = std::collections::HashMap::new();
+            let mut discards_after: Vec<u64> = Vec::new();
+            for c in asked.0..seen.0 {
+                let Some((name, cpu, tid, addr, extra)) = libc::wick_uffd::test_hooks::traced(c) else { continue };
+                let chunkwide = matches!(name, "discard begun" | "discard ended" | "chunk swapped (1) or not (0)");
+                if !near(addr) && !chunkwide {
+                    continue;
+                }
+                if addr == page {
+                    last.insert(name, (c, extra));
+                }
+                if (addr == page && name == "missing set") || (chunkwide && name != "discard ended") {
+                    discards_after.push(c);
+                }
+                if steps.len() < 160 {
+                    steps.push(format!("{c} {name} {:#x} {} {tid} CPU {cpu} {extra:#x}", addr.wrapping_sub(at as u64), role(tid)));
+                }
+            }
+            let at_step = |name: &str| last.get(name).copied();
+            let place = |lo: u64, hi: u64| {
+                ["commit ended", "content ended", "opened", "missing cleared"]
+                    .iter()
+                    .map(|n| match at_step(n) {
+                        None => format!("{n}: none in the round"),
+                        Some((c, _)) if hi <= c => format!("{n} ({c}): the read before it"),
+                        Some((c, _)) if lo > c => format!("{n} ({c}): the read after it"),
+                        Some((c, _)) => format!("{n} ({c}): the read around it"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let (ce, te, op) = (at_step("commit ended"), at_step("content ended"), at_step("opened"));
+            let mut fits = Vec::new();
+            if ce.zip(te).is_some_and(|((c, _), (t, _))| (before > c && after <= t) || (after > c && after_again <= t)) {
+                fits.push("(i) a read between the commit's end and the content's end");
+            }
+            if let Some((op, through_a)) = op {
+                if again == 0 && after > op && through_a == (FILL | r) {
+                    fits.push("(ii) 0 read again after the open, while the guest's view read the content");
+                }
+                if discards_after.iter().any(|&d| d > op && d < after_again) {
+                    fits.push("(iii) a discard of the page between its fill's open and the reads");
+                }
+            }
+            format!(
+                "round {r} SWAPTRACE page {gpa:#x}: first read {value:#x} in [{before}, {after}): {}; read again {again:#x} in [{after}, {after_again}): {}; \
+                 the content as the alias read it {:?}, the page as the guest's view read it once opened {:?}; fits {fits:?}; steps (clock, step, GPA, \
+                 thread, tid, CPU, extra) {steps:?}",
+                place(before, after),
+                place(after, after_again),
+                te.map(|t| format!("{:#x}", t.1)),
+                op.map(|o| format!("{:#x}", o.1)),
+            )
+        };
         let begun = std::time::Instant::now();
         let mut problems = Vec::new();
         let mut written = 0;
@@ -8328,6 +8461,7 @@ mod fpu_tests {
                 problems.push(format!("round {r}: {bad} pages neither filled nor written, least fill round {least}"));
                 if bad != 0 && problems.len() <= 3 {
                     say(record(r, asked, ended));
+                    say(trace_dump(r, asked, ended));
                 }
             }
         }
@@ -8349,6 +8483,17 @@ mod fpu_tests {
         unsafe { libc::close(user) };
         let faults = handler.join().unwrap();
         super::exit_ring::CLOCK.store(0, Ordering::SeqCst);
+        // The CPUs each thread's steps were kept on, over the record's last
+        // entries.
+        let last_clock = clock.load(Ordering::SeqCst);
+        let mut cpus: std::collections::BTreeMap<&str, std::collections::BTreeSet<u32>> = std::collections::BTreeMap::new();
+        for c in last_clock.saturating_sub(1 << 16)..last_clock {
+            if let Some((_, cpu, tid, _, _)) = libc::wick_uffd::test_hooks::traced(c) {
+                cpus.entry(role(tid)).or_default().insert(cpu);
+            }
+        }
+        libc::wick_uffd::test_hooks::set_trace_clock(None);
+        say(format!("the CPUs each thread's steps ran on (SWAPTRACE's last entries): {cpus:?}"));
         say(format!("the vCPU's last exit {end}; the handler filled {faults} faults"));
         assert!(problems.is_empty() && lost.is_empty(), "{problems:?} {lost:?}");
         assert_eq!((bad, least, seen), (0, ROUNDS + 1, 0), "the scan alone");
@@ -14036,7 +14181,7 @@ mod fpu_tests {
             FILE_MAP_ALL_ACCESS, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MEM_COMMIT, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS,
             PAGE_READWRITE, SEC_RESERVE,
         };
-        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, SetThreadAffinityMask};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, GetProcessAffinityMask, SetThreadAffinityMask};
         const PROGRAM: u64 = 0xB000;
         const LEN: usize = 2 << 20;
         const PAGES: usize = LEN / 4096;
@@ -14067,7 +14212,18 @@ mod fpu_tests {
         let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         let commit_cpu = if cpus >= 3 { 2 } else { 1 % cpus };
         // SAFETY: plain call, this thread.
-        let vcpu_pinned = cpus > 1 && unsafe { SetThreadAffinityMask(GetCurrentThread(), 1) } != 0;
+        // The process's and the system's affinity masks, and each pin's
+        // result with its error: in run 44431280523 the committing thread's
+        // was read before the thread had made it (said false).
+        let (mut process_mask, mut system_mask) = (0usize, 0usize);
+        // SAFETY: plain call, our process, two out-values.
+        let masks = unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process_mask, &mut system_mask) } != 0;
+        let pin = |cpu: usize| {
+            // SAFETY: plain call, this thread.
+            let old = unsafe { SetThreadAffinityMask(GetCurrentThread(), 1 << cpu) };
+            if old == 0 { format!("refused ({})", std::io::Error::last_os_error()) } else { format!("done (was {old:#x})") }
+        };
+        let vcpu_pinned = if cpus > 1 { pin(0) } else { "not tried, 1 CPU".to_string() };
         // One clock for both threads: nanoseconds since `base`, never 0.
         let base = Instant::now();
         let now = move || u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX) + 1;
@@ -14077,12 +14233,12 @@ mod fpu_tests {
         let req = Arc::new((AtomicUsize::new(0), AtomicU32::new(0), AtomicU64::new(0)));
         let done = Arc::new((AtomicU64::new(0), AtomicU64::new(0), AtomicBool::new(false)));
         let stop = Arc::new(AtomicBool::new(false));
-        let commit_pinned = Arc::new(AtomicBool::new(false));
+        let commit_pinned = Arc::new(std::sync::Mutex::new(None::<String>));
         let committer = {
             let (req, done, stop, commit_pinned) = (Arc::clone(&req), Arc::clone(&done), Arc::clone(&stop), Arc::clone(&commit_pinned));
             std::thread::spawn(move || {
                 // SAFETY: plain call, this thread.
-                commit_pinned.store(cpus > 1 && unsafe { SetThreadAffinityMask(GetCurrentThread(), 1 << commit_cpu) } != 0, Ordering::SeqCst);
+                *commit_pinned.lock().unwrap() = Some(if cpus > 1 { pin(commit_cpu) } else { "not tried, 1 CPU".to_string() });
                 while !stop.load(Ordering::SeqCst) {
                     let at = req.0.load(Ordering::SeqCst);
                     if at == 0 {
@@ -14321,8 +14477,19 @@ mod fpu_tests {
         };
         let mut wrong = Vec::new();
         say(format!(
-            "{cpus} CPUs; the vCPU's thread pinned to CPU 0: {vcpu_pinned}; the committing thread to CPU {commit_cpu}: {}",
-            commit_pinned.load(Ordering::SeqCst)
+            "{cpus} CPUs; the process's affinity mask {process_mask:#x}, the system's {system_mask:#x} (read: {masks}); the vCPU's thread \
+             pinned to CPU 0: {vcpu_pinned}; the committing thread to CPU {commit_cpu}: {}",
+            {
+                // The committing thread's pin, once it has made it.
+                let t = Instant::now();
+                loop {
+                    if let Some(r) = commit_pinned.lock().unwrap().clone() {
+                        break r;
+                    }
+                    assert!(t.elapsed() < Duration::from_secs(10), "the committing thread did not start");
+                    std::thread::yield_now();
+                }
+            }
         ));
         if let Some((s, a, b, given, made, failed)) = case("stopped (no-access through A before the run)", false, false, PAGE_NOACCESS, true) {
             unviews((s, a, b));
