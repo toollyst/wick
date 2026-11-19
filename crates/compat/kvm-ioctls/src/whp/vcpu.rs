@@ -8895,6 +8895,175 @@ mod fpu_tests {
         }
     }
 
+    /// REFILLWINDOW (the proving test for SWAPSTRESS round 81, a guest read 0
+    /// with no exit in a re-fill's `[commit, content)` window): the scenario
+    /// FILLWINDOW and DISCARDMAP each leave untested. FILLWINDOW holds a fill
+    /// at its commit, but on FRESH pages (never written, so WHP never mapped
+    /// their GPA) and finds the access in the fault; DISCARDMAP discards a
+    /// previously-read page's chunk (swapped) and finds the guest's next
+    /// access in the fault, but reads the UNCOMMITTED post-swap state, not a
+    /// re-fill's commit window. Round 81 is the combination: a page the guest
+    /// read (so WHP mapped its GPA), its chunk discarded whole (swapped to a
+    /// new zeroed section, `wick_uffd::discarding`), then RE-filled, the
+    /// guest reading it in the window after the re-fill committed its page
+    /// (`PAGE_NOACCESS` through the guest's view A) and before the content is
+    /// written through the alias (`test_hooks::set_fill_hook`, held after
+    /// COMMIT_END and before CONTENT_BEGIN, `wick_uffd::fill`). The guest's
+    /// RAM (4 MiB) registered as SWAPSTRESS's; three pages of its second
+    /// 2 MiB (its first, one in the middle, its last). For each: filled with
+    /// `OLD` and read by the guest twice (mapped in WHP by then); its chunk
+    /// discarded; then the re-fill (with `NEW`) held at its commit while the
+    /// guest reads it (`mov rax, [rbx]`, `out 0x85`), the read decided by the
+    /// first of two ends, both final while the re-fill is held: in the fault
+    /// (`test_hooks::in_fault`), or done (WHP gave the guest the page before
+    /// its content: its value, 0 the committed section's). Then the re-fill
+    /// is let go; a read in the fault must then read `NEW`. A read done
+    /// while the re-fill is held (given before its content, 0 the committed
+    /// page's) is the defect round 81 showed; "in the fault" for each page
+    /// keeps the committed window honoured, as for a fresh page, and points
+    /// the cause elsewhere. REFILLWINDOW lines and a summary line; a record
+    /// (the harness's own steps asserted), to be asserted with the fix.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_refill_during_its_commit_window_on_a_swapped_page_on_record() {
+        use std::sync::atomic::AtomicU8;
+        use std::time::{Duration, Instant};
+        const CHUNK: u64 = 2 << 20;
+        const PAGES: [u64; 3] = [0x20_0000, 0x30_0000, 0x3F_F000];
+        const OLD: u64 = 0x01D0_01D0_01D0_01D0;
+        const NEW: u64 = 0x0E30_0E30_0E30_0E30;
+        // mov rax, [rbx]; out 0x85, al; jmp back to the mov.
+        const PROGRAM: [u8; 7] = [0x48, 0x8B, 0x03, 0xE6, 0x85, 0xEB, 0xF9];
+        // The re-fill's hold: 0 none, 1 held (its page committed, its content
+        // not written), 2 let go.
+        static HOLD: AtomicU8 = AtomicU8::new(0);
+        fn hold() {
+            HOLD.store(1, Ordering::SeqCst);
+            let t = Instant::now();
+            while HOLD.load(Ordering::SeqCst) != 2 && t.elapsed() < Duration::from_secs(30) {
+                std::thread::yield_now();
+            }
+            HOLD.store(0, Ordering::SeqCst);
+        }
+        let say = |l: String| eprintln!("REFILLWINDOW {l}");
+        let mut uffd = None;
+        let (vm, vcpu, m) = mmio_guest_with(&PROGRAM, |m| {
+            let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+            libc::wick_uffd::register(ctx, m as u64, MEM as u64).unwrap();
+            uffd = Some((ctx, user));
+        });
+        let (ctx, user) = uffd.unwrap();
+        let at = m as u64;
+        let fill = |gpa: u64, v: u64| {
+            let data: Vec<u8> = std::iter::repeat_n(v.to_le_bytes(), 512).flatten().collect();
+            // SAFETY: a page-sized buffer; the registered range's page.
+            unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), at + gpa, 4096, true) }
+        };
+        // The guest's read of `gpa`'s first qword on a thread of its own.
+        let read = |mut vcpu: VcpuFd, gpa: u64| {
+            std::thread::spawn(move || {
+                vcpu.set_regs(&kvm_regs { rip: MMIO_PROGRAM, rsp: 0x9000, rflags: 2, rbx: gpa, ..Default::default() }).unwrap();
+                let mut reads = 0;
+                let e = one_run(&mut vcpu, &[], &mut reads);
+                let rax = vcpu.get_regs().unwrap().rax;
+                (vcpu, e, rax)
+            })
+        };
+        // The re-fill of `gpa` (with `NEW`), held once its page is committed.
+        let held_refill = |gpa: u64| {
+            libc::wick_uffd::test_hooks::set_fill_hook(Some(hold));
+            let page = at + gpa;
+            let filler = std::thread::spawn(move || {
+                let data: Vec<u8> = std::iter::repeat_n(NEW.to_le_bytes(), 512).flatten().collect();
+                // SAFETY: a page-sized buffer; the registered range's page.
+                unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), page, 4096, true) }
+            });
+            let t = Instant::now();
+            while HOLD.load(Ordering::SeqCst) != 1 {
+                assert!(t.elapsed() < Duration::from_secs(10), "the re-fill of {gpa:#x} was not held: {:?}", filler.is_finished());
+                std::thread::yield_now();
+            }
+            filler
+        };
+        let mut wrong = Vec::new();
+        let mut given = Vec::new();
+        let mut vcpu = vcpu;
+        for &gpa in &PAGES {
+            // Fill with OLD and let the guest read it, so WHP maps its GPA.
+            assert_eq!(fill(gpa, OLD), Ok(4096), "the first fill of {gpa:#x}");
+            for k in 0..2 {
+                let (back, e, rax) = read(vcpu, gpa).join().unwrap();
+                vcpu = back;
+                if !e.starts_with("out 0x85") || rax != OLD {
+                    wrong.push(format!("{gpa:#x}: read {k} before the discard: {e}, {rax:#x}"));
+                }
+            }
+            // Discard the chunk: its pages missing, the chunk swapped for a
+            // new zeroed section.
+            // SAFETY: the chunk of guest RAM, discarded.
+            let ret = unsafe { libc::madvise((at + CHUNK) as *mut libc::c_void, CHUNK as usize, libc::MADV_DONTNEED) };
+            assert_eq!(ret, 0, "the chunk's discard for {gpa:#x}");
+            let missing = libc::wick_uffd::is_missing(at + gpa);
+            // Re-fill held at its commit; the guest reads in the window.
+            let filler = held_refill(gpa);
+            let runner = read(vcpu, gpa);
+            let t = Instant::now();
+            let decided = loop {
+                if runner.is_finished() {
+                    break "done while the re-fill was held: WHP gave the guest the committed page before its content".to_string();
+                }
+                if libc::wick_uffd::test_hooks::in_fault(at + gpa) {
+                    break if runner.is_finished() { "in the fault, and done".to_string() } else { "in the fault".to_string() };
+                }
+                if t.elapsed() > Duration::from_secs(10) {
+                    break "neither within 10 s".to_string();
+                }
+                std::thread::yield_now();
+            };
+            HOLD.store(2, Ordering::SeqCst);
+            let filled = filler.join().unwrap();
+            let t = Instant::now();
+            while !runner.is_finished() {
+                assert!(t.elapsed() < Duration::from_secs(20), "the guest's read of {gpa:#x} did not end once the re-fill was let go");
+                std::thread::yield_now();
+            }
+            let (back, e, rax) = runner.join().unwrap();
+            vcpu = back;
+            say(format!(
+                "{gpa:#x}: re-filled after a swap-discard (missing {missing}), the re-fill held at its commit: the guest's read {decided}; \
+                 the re-fill {filled:?}; the run {e}; RAX {rax:#x} (old {OLD:#x}, new {NEW:#x}, committed-zero 0x0)"
+            ));
+            if !missing {
+                wrong.push(format!("{gpa:#x}: not missing after the discard"));
+            }
+            if filled != Ok(4096) || !e.starts_with("out 0x85") {
+                wrong.push(format!("{gpa:#x}: after let-go: fill {filled:?}, run {e}"));
+            }
+            if decided.starts_with("done") {
+                // The record: the guest given the page before its content.
+                given.push(format!("{gpa:#x} read {rax:#x}"));
+            } else if decided == "in the fault" && rax != NEW {
+                wrong.push(format!("{gpa:#x}: in the fault, then read {rax:#x} (want {NEW:#x})"));
+            } else if decided != "in the fault" {
+                wrong.push(format!("{gpa:#x}: {decided}"));
+            }
+        }
+        say(format!(
+            "given before its content while the re-fill was held: {} of {} pages {given:?}",
+            given.len(),
+            PAGES.len()
+        ));
+        libc::wick_uffd::test_hooks::set_fill_hook(None);
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: closes the user end; the test's mapping, no VM left using it.
+        unsafe {
+            libc::close(user);
+            assert_eq!(libc::munmap(m.cast(), MEM), 0);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// Where the legacy page (`WHvGetVirtualProcessorInterruptControllerState`,
     /// the backend's) keeps the IRR and the ISR: eight words of 32 vectors,
     /// 4 bytes apart (vector `v` in the word at `+ 4 * (v / 32)`), where the

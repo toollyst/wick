@@ -2432,6 +2432,13 @@ jobs:
           # lines, a record). First run: CI.
           alone whp::vcpu::fpu_tests::test_a_no_access_commit_raced_by_the_guests_access_on_record
           alone whp::vcpu::fpu_tests::test_a_fill_raced_by_the_guests_first_access_on_record
+          # For SWAPSTRESS's round 81 (a read of 0, no exit, in a re-fill's
+          # window after its commit and before its content): a page the guest
+          # has read, its chunk discarded (swapped), re-filled with the re-fill
+          # held at its commit while the guest reads it: in the fault, or
+          # given the page before its content (REFILLWINDOW lines and a
+          # summary, a record). First run: CI.
+          alone whp::vcpu::fpu_tests::test_a_refill_during_its_commit_window_on_a_swapped_page_on_record
           # SWAPSTRESS's chunk moved by the reclaim at a job's memory limit (its
           # live pages copied into a new section) under the guest's reads and
           # then its writes, 20 rounds each in a child held at the limit with
