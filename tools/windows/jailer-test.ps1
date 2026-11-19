@@ -91,30 +91,50 @@ function Assert-SockPath([string]$sock) {
     Check ($n -le $SockBound) "the socket path $sock is $n bytes, and an AF_UNIX path holds $SockBound"
 }
 
-# The processes the harness killed while they ran (Stop-Alive), in order: a
-# failed stage's summary line names those of the stage, whose output ends
-# where the kill came.
+# The processes the harness's cleanup killed while they ran (Stop-Alive
+# -Cleanup), in order: a failed stage's summary line names those of the stage,
+# whose output ends where the kill came. A process a stage ends itself, done
+# with it (a control, a Firecracker whose check is over), is not one of them
+# (EndedByStage): macOS's harness named such a kill (jailer-test vmnet's
+# control, CI run 44414358364), as this one did.
 $KilledAlive = New-Object Collections.ArrayList
+$EndedByStage = New-Object Collections.ArrayList
 
-# Kills each of `procs` still running, and records it (KilledAlive, and a
-# line on the host's output), as boot-test.ps1 records a kill of a live VM.
-function Stop-Alive($procs) {
+# Kills each of `procs` still running, and records it, with a line on the
+# host's output, as boot-test.ps1 records a kill of a live VM (Wick.Vm.Kill):
+# with -Cleanup (the cleanup after a stage, a stage's own cleanup in a
+# `finally`, a wait that ran out) in KilledAlive, else as the stage's own end
+# of it in EndedByStage.
+function Stop-Alive($procs, [switch]$Cleanup) {
     foreach ($p in @($procs)) {
         if (-not $p -or $p.HasExited) { continue }
         $what = "$($p.ProcessName) pid $($p.Id)"
         try { $p | Stop-Process -Force -ErrorAction Stop } catch { if (-not $p.HasExited) { throw } }
-        [void]$KilledAlive.Add($what)
-        Write-Host "   jailer-test: killed by the harness while alive: $what ($($p.Path))"
+        if ($Cleanup) {
+            [void]$KilledAlive.Add($what)
+            Write-Host "   jailer-test: killed by the harness while alive: $what ($($p.Path))"
+        } else {
+            [void]$EndedByStage.Add($what)
+            Write-Host "   jailer-test: ended by its stage, done with it: $what ($($p.Path))"
+        }
     }
 }
 
 # Firecracker first: its jailer then exits as after a guest shutdown and
-# removes the jail's drive.
-function Stop-Jailed {
-    Stop-Alive (Get-Process firecracker, jail-probe -ErrorAction SilentlyContinue)
+# removes the jail's drive. A cleanup (Stop-Alive -Cleanup), unless -Done: a
+# stage ending the jails it is done with.
+function Stop-Jailed([switch]$Done) {
+    Stop-Alive (Get-Process firecracker, jail-probe -ErrorAction SilentlyContinue) -Cleanup:(-not $Done)
     $t = [DateTime]::Now.AddSeconds(5)
     while ((Get-Process jailer -ErrorAction SilentlyContinue) -and [DateTime]::Now -lt $t) { Start-Sleep -Milliseconds 100 }
-    Stop-Alive (Get-Process jailer -ErrorAction SilentlyContinue)
+    Stop-Alive (Get-Process jailer -ErrorAction SilentlyContinue) -Cleanup:(-not $Done)
+}
+
+# A failed stage's result line, naming the processes the harness's cleanup
+# killed while they ran (KilledAlive), as boot-test.ps1's Add-KilledAlive.
+function Add-Killed([string]$result, $killed) {
+    if (@($killed).Count -eq 0) { return $result }
+    "$result; killed by the harness while alive: $(@($killed) -join ', ')"
 }
 
 # Ends the jailers a stage started and still runs: their jailed processes
@@ -126,15 +146,16 @@ function Stop-Jailed {
 # jailers have exited: a jailer stopped before it started its jailed process
 # starts it after a single look, which then keeps it past its 10 s, and the
 # jailer killed then leaves its drive (isolation at de8805f4: its probe's
-# jailer killed, X: left mapped, no probe found to kill).
-function Stop-Jailers([object[]]$jailers) {
+# jailer killed, X: left mapped, no probe found to kill). -Cleanup: as
+# Stop-Alive's.
+function Stop-Jailers([object[]]$jailers, [switch]$Cleanup) {
     $t = [DateTime]::Now.AddSeconds(10)
     do {
-        Stop-Alive (Get-Process firecracker, jail-probe -ErrorAction SilentlyContinue)
+        Stop-Alive (Get-Process firecracker, jail-probe -ErrorAction SilentlyContinue) -Cleanup:$Cleanup
         $alive = @($jailers | Where-Object { $_ -and -not $_.HasExited })
         if ($alive.Count) { Start-Sleep -Milliseconds 200 }
     } while ($alive.Count -and [DateTime]::Now -lt $t)
-    foreach ($j in $alive) { Stop-Alive $j }
+    foreach ($j in $alive) { Stop-Alive $j -Cleanup:$Cleanup }
 }
 
 # A fresh chroot base for a stage.
@@ -154,7 +175,7 @@ function Invoke-Jailer([string[]]$argv, [int]$ms = 20000) {
     # Holding the process handle keeps its exit code (else ExitCode is empty
     # once it has exited).
     $null = $p.Handle
-    if (-not $p.WaitForExit($ms)) { Stop-Jailers @($p); throw [Failure]::new("jailer did not exit: $line") }
+    if (-not $p.WaitForExit($ms)) { Stop-Jailers @($p) -Cleanup; throw [Failure]::new("jailer did not exit: $line") }
     @($p.ExitCode, ((Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join ''))
 }
 
@@ -498,7 +519,7 @@ function Stage-Parent {
         Check ($r[0] -eq 0 -and $r[1] -match 'affinity:0 allowed') "a jail given a parent whose name a jailed process used in the session's namespace did not start: exit $($r[0]): $($r[1])"
         "a parent on processor 0 (jail-parent; its memory limit refused): a jail under a level under it ran on processor 0; the tool refused a cgroup v1 level on processor 1 and a change of the parent's processors; the first jail took 200 MiB and ran on processor 0 of the 0-1 it asked for, the second took 200 MiB too; cgroup v1 refused processor 1; with the tool ended, a jail joining the parent ran on processor 0; a jailed process and the parents' namespace: $reach; a job of a parent's name in the session's namespace: $made, and a jail given that parent started"
     } finally {
-        Stop-Jailers @($first, $squat)
+        Stop-Jailers @($first, $squat) -Cleanup
         if (-not $holder.HasExited) { $holder.Kill() }
         if ($inner -and -not $inner.HasExited) { $inner.Kill() }
     }
@@ -535,7 +556,7 @@ function Stage-Weight([int]$Seconds = 6) {
         Check ($ratio -ge 0.3 -and $ratio -le 0.7) ("cpu.weight 50 against 100 on one processor: {0:N2} s against {1:N2} s of CPU (ratio {2:N2}; Linux gives 0.5)" -f $cpu[50], $cpu[100], $ratio)
         "cpu.weight=50 and 100 on one processor: Windows weights 2 and 5, {0:N2} s against {1:N2} s of CPU in {2} s (ratio {3:N2}; Linux gives 0.5)" -f $cpu[50], $cpu[100], $Seconds, $ratio
     } finally {
-        Stop-Jailers @($runs | ForEach-Object { $_.P })
+        Stop-Jailers @($runs | ForEach-Object { $_.P }) -Cleanup
     }
 }
 
@@ -756,7 +777,7 @@ function Wait-Ending([string]$sock) {
     foreach ($p in $fc) { $null = $p.Handle }
     foreach ($p in $fc) {
         if (-not $p.WaitForExit($ExitBoundSec * 1000)) {
-            Stop-Alive $p
+            Stop-Alive $p -Cleanup
             throw [Failure]::new("Firecracker said it was exiting and did not within $ExitBoundSec s; killed by the harness while alive")
         }
     }
@@ -873,7 +894,7 @@ function Invoke-JailedWithGrant([string]$base, [string]$id, [string[]]$grant, [s
         Set-Content (Join-Path $root 'go') 'go'
         if (-not $p.WaitForExit($ms)) { throw [Failure]::new("jailer did not exit: $line") }
     } finally {
-        if (-not $p.HasExited) { Stop-Jailers @($p) }
+        if (-not $p.HasExited) { Stop-Jailers @($p) -Cleanup }
     }
     @($p.ExitCode, ((Get-Content $out, "$out.err" -Raw -ErrorAction SilentlyContinue) -join ''), $sid)
 }
@@ -1951,7 +1972,7 @@ function Stage-Uffd {
         Check ($vm.Sh('mount -t tmpfs tmpfs /tmp; echo snapshot-$((6*7)) > /tmp/mark; cat /tmp/mark', 30) -eq 'snapshot-42') 'the mark was not written'
         Invoke-ApiOk $vm.Sock 'PATCH' '/vm' ([ordered]@{ state = 'Paused' }) | Out-Null
         Invoke-ApiOk $vm.Sock 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = '/snap.state'; mem_file_path = '/snap.mem' }) | Out-Null
-        Stop-Jailed
+        Stop-Jailed -Done
         # The restoring jail: the snapshot, the drives the snapshot names,
         # and the handler's socket, in the jail.
         $root = Join-Path $base 'firecracker.exe\restore\root'
@@ -2136,7 +2157,7 @@ function Stage-Netns {
         Check ($m[0] -ne 0 -and $m[1] -match 'elevated') "a jailer that is not elevated (exit $($m[0])): $($m[1])"
         Check (-not (Get-Process firecracker -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$base*medium*" })) 'a jailer that is not elevated started Firecracker'
         # Ending the jailers ends their filter sessions: IP is back for the jail's binary.
-        Stop-Jailed
+        Stop-Jailed -Done
         $after = Invoke-Jailer @('--id', 'after', '--exec-file', $probe, '--uid', '0', '--gid', '0', '--chroot-base-dir', $base, '--', 'inetwarm:0', "tcp:127.0.0.1:$port") 30000
         Check ($after[1] -match 'inetwarm:0 allowed' -and $after[1] -match 'tcp:\S+ allowed') "after the jailers ended, the jail's binary is still denied IP: $($after[1])"
         $coldTcp = $coldLines | Where-Object { $_.StartsWith('tcp:') } | Select-Object -First 1
@@ -2416,7 +2437,7 @@ function Stage-Shared {
         $labelAfter = [WickJailerTest.Label]::Of($data)
         "a file hard-linked into three jails at once (a guest's read-write drive, two probes): one entry of its own per jail SID, 0x12019f, no inherited jail entry while all run; the guest wrote it before and wrote and read it after the others started; A: $($results['a']); B: $($results['b']); after: no jail SID left, own entries as before; inherited entries and label now the last jail directory's on every name: $after label $labelAfter (before: $before label $labelBefore); while all ran, the file's label $labelDuring beside the jails' tokens (A: $($tokens['a']); B: $($tokens['b']))"
     } finally {
-        Stop-Jailers $jailers
+        Stop-Jailers $jailers -Cleanup
         Stop-Jailed
     }
 }
@@ -3326,13 +3347,31 @@ function Stage-Helpers {
     $null = $j.Handle
     $standIn = "$($j.ProcessName) pid $($j.Id)"
     $before = $KilledAlive.Count
+    $endedBefore = $EndedByStage.Count
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    Stop-Jailers @($j)
+    Stop-Jailers @($j) -Cleanup
     $took = [math]::Round($sw.Elapsed.TotalSeconds, 1)
     $killed = @($KilledAlive | Select-Object -Skip $before)
     Check ($j.HasExited -and $killed -notcontains $standIn) "Stop-Jailers: the stand-in jailer was killed or still runs after $took s (killed: $($killed -join ', '))"
     Check (@($killed | Where-Object { $_ -like 'jail-probe pid *' }).Count -eq 1) "Stop-Jailers: the late jailed process was not found and killed once (killed: $($killed -join ', '))"
-    $msg = "Grant-JailRead gave $sid read alone ($sddl); Stop-Jailers found the jailed process started after its first look and the stand-in jailer exited by itself, in $took s"
+    Check ($EndedByStage.Count -eq $endedBefore) "Stop-Jailers -Cleanup: a kill counted as the stage's own: $(@($EndedByStage | Select-Object -Skip $endedBefore) -join ', ')"
+    # A process a stage ends itself, alive (a control it is done with), is
+    # not one the cleanup killed: a failed stage's line does not name it
+    # (macOS's jailer-test vmnet named its control so: CI run 44414358364);
+    # one the cleanup kills is named.
+    $mine = Start-Process (Join-Path $env:SystemRoot 'System32\PING.EXE') -ArgumentList '-n', '60', '127.0.0.1' -PassThru -WindowStyle Hidden
+    $left = Start-Process (Join-Path $env:SystemRoot 'System32\PING.EXE') -ArgumentList '-n', '60', '127.0.0.1' -PassThru -WindowStyle Hidden
+    $null = $mine.Handle; $null = $left.Handle
+    $mineIs = "$($mine.ProcessName) pid $($mine.Id)"; $leftIs = "$($left.ProcessName) pid $($left.Id)"
+    $before = $KilledAlive.Count; $endedBefore = $EndedByStage.Count
+    Stop-Alive $mine
+    Stop-Alive $left -Cleanup
+    $killed = @($KilledAlive | Select-Object -Skip $before)
+    $ended = @($EndedByStage | Select-Object -Skip $endedBefore)
+    Check ($mine.WaitForExit(5000) -and $left.WaitForExit(5000)) 'Stop-Alive: a process still runs 5 s after its kill'
+    Check (($ended -join ',') -eq $mineIs -and ($killed -join ',') -eq $leftIs) "Stop-Alive: the stage's own end ($mineIs) and the cleanup's kill ($leftIs) read as ended '$($ended -join ',')', killed '$($killed -join ',')'"
+    Check ((Add-Killed 'FAIL  x: why' $killed) -eq "FAIL  x: why; killed by the harness while alive: $leftIs" -and (Add-Killed 'FAIL  x: why' @()) -eq 'FAIL  x: why') "Add-Killed: '$(Add-Killed 'FAIL  x: why' $killed)'"
+    $msg = "Grant-JailRead gave $sid read alone ($sddl); Stop-Jailers found the jailed process started after its first look and the stand-in jailer exited by itself, in $took s; a process the stage ends itself is not named as killed by the harness, one the cleanup kills is"
 
     # reach's SMB share probe, the runs of it that need no jailer.
     if (-not $ReachSmbShare) { return "$msg; reach's share probe not run: not asked (-ReachSmbShare)" }
@@ -3398,19 +3437,28 @@ foreach ($s in $Stage) {
     Write-Host "== $s"
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $killedBefore = $KilledAlive.Count
+    $passed = $false
     try {
         $msg = if ($Stage.Count -gt 1 -and $OwnConsole -contains $s) { Invoke-InOwnConsole $s } else { & "Stage-$((Get-Culture).TextInfo.ToTitleCase($s))" }
         $Results[$s] = "PASS  ${s}: $msg"
+        $passed = $true
+    } catch {
+        $Results[$s] = if ($_.Exception -is [NotApplicable]) { "N/A   ${s}: $($_.Exception.Message)" } else { "FAIL  ${s}: $($_.Exception.Message)" }
+    } finally {
+        # What the stage left running ends with it, whether it passed or not
+        # (before, only after a failure, so what a passing stage left ran on
+        # into the next), as boot-test.ps1's stages and macOS's jailer-test.
+        Stop-Jailed
+    }
+    if ($passed) {
         # A passing stage's jails (guest image copies) go; a failing one's stay to look at.
         $dir = Join-Path $WorkDir $s
         if (Test-Path $dir) { Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue }
-    } catch {
-        $Results[$s] = if ($_.Exception -is [NotApplicable]) { "N/A   ${s}: $($_.Exception.Message)" } else { "FAIL  ${s}: $($_.Exception.Message)" }
-        Stop-Jailed
-        # The processes this stage's cleanup, or the stage, killed while they
-        # ran: their output ends where the kill came.
-        $killed = @($KilledAlive | Select-Object -Skip $killedBefore)
-        if ($killed.Count) { $Results[$s] += "; killed by the harness while alive: $($killed -join ', ')" }
+    } else {
+        # The processes the harness's cleanup killed while they ran in this
+        # stage (not those the stage ended itself): their output ends where
+        # the kill came.
+        $Results[$s] = Add-Killed $Results[$s] @($KilledAlive | Select-Object -Skip $killedBefore)
     }
     Write-Host "   $($Results[$s]) ($([math]::Round($sw.Elapsed.TotalSeconds, 1)) s)"
 }

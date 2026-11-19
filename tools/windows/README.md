@@ -136,8 +136,16 @@
   the stand-in exit by itself; with `-ReachSmbShare`, as CI passes it,
   reach's share probe in the runs that need no jailer, `jail-probe medium`,
   the UAC-filtered token at medium integrity, among them; it passed in CI
-  at 58c37ba2, before the medium run was added); and a check that every
-  jail's drive letter was removed. It needs the boot test's guest files (`-Assets`,
+  at 58c37ba2, before the medium run was added; a process a stage ends
+  itself is told apart from one the cleanup kills, below); and a check that
+  every jail's drive letter was removed. After every stage, passed or not,
+  the harness ends what the stage left running. A failed stage's line names
+  the processes the harness's cleanup killed while they ran (after the
+  stage, in a stage's own `finally`, or after a wait that ran out), whose
+  output ends at the kill; a process a stage ends itself, done with it (a
+  control, a Firecracker whose check is over), is not named, and the host's
+  output says "ended by its stage" for it (`helpers`). `boot-test.ps1` keeps
+  the same two apart (`-SelfTest`'s `ending` case). It needs the boot test's guest files (`-Assets`,
   default `C:\wbt`) and the probe (`jail-probe.exe` from the kit, or
   `rustc` to build it):
 

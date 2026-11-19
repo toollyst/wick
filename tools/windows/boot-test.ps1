@@ -471,8 +471,9 @@ namespace Wick {
         // (-SelfTest's hook: it then lets its stand-in go on).
         public static Action WaitingExit;
 
-        // Killed by the harness while it ran (Kill): its output, and the
-        // log file below, end where the kill came.
+        // Killed by the harness's cleanup while it ran (Kill(true)): its
+        // output, and the log file below, end where the kill came. A stage
+        // that ends a process it is done with (Kill()) does not set it.
         public bool KilledAlive;
 
         // Firecracker's --log-path file, where Kill records a kill of a
@@ -491,7 +492,7 @@ namespace Wick {
             var hook = WaitingExit;
             if (hook != null) hook();
             if (!p.WaitForExit(ExitBoundMs)) {
-                Kill();
+                Kill(true);
                 throw new Failure("Firecracker said it was exiting and did not within " + (ExitBoundMs / 1000) +
                                   " s; killed by the harness while alive; " + ExitReason());
             }
@@ -503,18 +504,26 @@ namespace Wick {
 
         // Ends the process. One still running is killed, which its console
         // log and its Firecracker log record after the last line each got,
-        // so that a log cut short says why (KilledAlive; a failed stage's
-        // summary names it too).
-        public void Kill() {
+        // so that a log cut short says why. A stage ends a process it is done
+        // with (a control, a VM whose test is over) with Kill(); the cleanup
+        // after a stage, a stage's own cleanup (finally) and a wait that ran
+        // out with Kill(true): only those are KilledAlive, the ones a failed
+        // stage's summary names, since their logs end where the stage did not
+        // expect (macOS's harness counted a stage's own end of its control:
+        // jailer-test vmnet, CI run 44414358364).
+        public void Kill() { Kill(false); }
+
+        public void Kill(bool cleanup) {
             TakeHandles();
             bool alive = false;
             try { if (!p.HasExited) { alive = true; p.Kill(); } } catch (InvalidOperationException) { } catch (System.ComponentModel.Win32Exception) { }
             p.WaitForExit(5000);
             outPump.Join(2000);
             errPump.Join(2000);
-            const string line = "boot-test: killed by the harness while alive; its output ends above\n";
+            string line = cleanup ? "boot-test: killed by the harness while alive; its output ends above\n"
+                                  : "boot-test: ended by its stage (killed), done with it; its output ends above\n";
             if (alive) {
-                KilledAlive = true;
+                if (cleanup) KilledAlive = true;
                 if (!string.IsNullOrEmpty(LogFile)) {
                     try { File.AppendAllText(LogFile, line, NoBom); } catch (Exception) { }
                 }
@@ -2059,8 +2068,9 @@ function Start-Vm([string]$name, $config, [string]$extra = '', [switch]$Api, [st
     return $vm
 }
 
-# The names of a stage's VMs the harness killed while they ran (Wick.Vm.Kill,
-# KilledAlive), now or earlier in the stage: their logs end where the kill came.
+# The names of a stage's VMs the harness's cleanup killed while they ran
+# (Wick.Vm.Kill(true), KilledAlive), now or earlier in the stage: their logs end
+# where the kill came. A VM the stage ended itself (Kill()) is not named.
 function Get-KilledAlive($vms, [string]$stage) {
     foreach ($vm in $vms) {
         if ($vm -is [Wick.Vm] -and $vm.KilledAlive) {
@@ -3900,8 +3910,8 @@ function Stage-DiffNoSpace {
         $result = "a diff snapshot with $([math]::Round($left / 1MB)) MiB free fails ($why) and Firecracker stays; with the space back the next one ($([math]::Round($allocated / 1MB)) MiB) restores with the 100 MiB the guest wrote before"
     } finally {
         # Nothing may hold the volume when its disk is detached.
-        if ($vm) { $vm.Kill() }
-        if ($vm2) { $vm2.Kill() }
+        if ($vm) { $vm.Kill($true) }
+        if ($vm2) { $vm2.Kill($true) }
         $r = Invoke-Diskpart $dir $detach
         if ($r[0] -ne 0) { Write-Host "  ! diskpart detach of $vhd`: exit $($r[0]) $($r[1].Trim())" }
     }
@@ -4634,7 +4644,26 @@ if ($SelfTest) {
             $named = @(Get-KilledAlive @($e.Vm, $s.Vm) 'end')
             Check (($named -join ',') -eq 'end/stuck') "the stage's killed VMs: $($named -join ',')"
             Check ((Add-KilledAlive "a`nb" $named) -eq "a; killed by the harness while alive: end/stuck`nb") 'Add-KilledAlive does not name the kill on the summary''s line'
-            return 'ending: a Firecracker that answered that its VMM ended is waited for (both exit lines logged, exit 1); one that never exits fails at the bound, killed, its logs and the summary saying so'
+            # A process the stage ends itself, alive (a control it is done
+            # with), is not one the cleanup killed: its logs say so, and the
+            # cleanup after it (Kill(true) of the ended process) names nothing
+            # (macOS's jailer-test vmnet named its control so: CI run
+            # 44414358364). The stand-in waits for a line it is never sent.
+            $console = Join-Path $dir 'done-console.txt'
+            $fcLog = Join-Path $dir 'done-firecracker.log'
+            Set-Content -Encoding ASCII $fcLog ''
+            $vm = New-Object Wick.Vm("$env:SystemRoot\System32\cmd.exe", '/d /c "set /p x= & exit 0"', $console)
+            $vm | Add-Member -NotePropertyName StageName -NotePropertyValue 'done'
+            $vm.LogFile = $fcLog
+            Start-Sleep -Milliseconds 300
+            $alive = -not $vm.Exited
+            $vm.Kill()
+            $vm.Kill($true)
+            $named = @(Get-KilledAlive @($vm) 'end')
+            $c = [IO.File]::ReadAllText($console); $l = [IO.File]::ReadAllText($fcLog)
+            Check ($alive -and -not $vm.KilledAlive -and $named.Count -eq 0) "done: alive $alive, KilledAlive $($vm.KilledAlive), named '$($named -join ',')'"
+            Check ($c.Contains('boot-test: ended by its stage (killed), done with it') -and $l.Contains('boot-test: ended by its stage (killed), done with it') -and -not ($c + $l).Contains('killed by the harness')) "done: console '$c', log '$l'"
+            return 'ending: a Firecracker that answered that its VMM ended is waited for (both exit lines logged, exit 1); one that never exits fails at the bound, killed, its logs and the summary saying so; one the stage ends itself is not named, its logs saying it was ended by its stage'
         }
         pipe   = { [Wick.PipeSelfTest]::Run() }
         'upstream-logs' = {
@@ -4993,7 +5022,7 @@ foreach ($name in $selected) {
             "script error: $($_.Exception.GetType().Name): $($_.Exception.Message) $($_.InvocationInfo.PositionMessage)"
         }
     } finally {
-        foreach ($vm in $Vms) { $vm.Kill() }
+        foreach ($vm in $Vms) { $vm.Kill($true) }
         # NOFILEREC: each process's handles at its end, read by Kill or
         # Reboot (Wick.Handles).
         foreach ($vm in $Vms) {
