@@ -126,8 +126,9 @@ pub const SYSCALLS: &[(u16, &str, &str)] = &[
          profile, and poll only reports it readable: xnu bsd/kern/kern_event.c `kqueue_select`). Measured: \
          reported `allow syscall-unix 230` by fs-server-report.py on macOS 27.2 (2 of 2 runs, every request test), \
          the only call the watch added; confine_probe: poll on the held watch done, a new kqueue and every call \
-         that could add a registration (kevent, kevent64, kevent_qos, kevent_id) killed. macOS 15 and 26: a source \
-         reading (the same xnu path) until CI's parent.rs and confine_probe run there; main.rs `Watched`",
+         that could add a registration (kevent, kevent64, kevent_qos, kevent_id) killed; the same on macOS 15.8.2 \
+         and 26.7.2 (CI run 44435909393: confine_probe's 45 cases, parent.rs, the report's union empty over 3 \
+         runs); main.rs `Watched`",
     ),
     (235, "fgetxattr", "the metadata record and GETXATTR"),
     (241, "flistxattr", "LISTXATTR"),

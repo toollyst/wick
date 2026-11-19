@@ -431,7 +431,8 @@ lay them out); fuzz target `fs_proxy`. No guest has used it yet (commit 12's boo
     socket, and closed once its one byte is written. Nothing else closes or re-takes 0 to 2 after the first step: only
     `stdin_from_null`'s `dup2` onto 0 touches them, and a stream the launcher closed (`>&-`) is `/dev/null` before
     `main` (`test_a_closed_standard_stream_is_dev_null_at_the_first_step` on Linux and macOS,
-    `test_closed_standard_streams_are_dev_null_to_the_server` on Linux). A launcher's descriptors survive `pivot_root` and a Seatbelt profile, and a read or write on one already
+    `test_closed_standard_streams_are_dev_null_to_the_server` on Linux, which also requires the server waiting for
+    its connection to hold exactly the share's root, the listener and one pidfd, the parent watch, on its parent). A launcher's descriptors survive `pivot_root` and a Seatbelt profile, and a read or write on one already
     open is checked by nothing of the confinement: in CI run 44233741878's fs jobs (the unit-test step's record) a
     step's shell held descriptors 142 and 145, two pipes' ends, on both Ubuntu runners, and 131 and 140, two
     `com.apple.netsrc` control sockets, and 143 and 146, pipes, on macos-latest, which every process it starts
@@ -970,7 +971,10 @@ it means layer 1 let the request through.
        the mount is locked with); then its descriptors, the kernel's whole list from `/proc/self/fd` (the last point
        it is in the root), required to be exactly the standard streams, the connection, its end of the parent's pipe
        and stage 0's root (`held_exactly`): everything opened since the first step is one of these or closed again
-       (the listener and `--ready-fd` after the ready byte, the setgroups and map writes, `/proc/self/task`), so this
+       (the listener and `--ready-fd` after the ready byte, the setgroups and map writes, `/proc/self/task`, and the
+       parent watch's pidfd, inherited at the fork and closed first: the waiting parent keeps it; as root,
+       `test_descriptors_it_was_started_with_are_closed` reads both processes' lists and the pid each pidfd is
+       on, none in the child, the watch's and the child's in the parent), so this
        is an equality, not a subset, and anything else is named and refused; then `pivot_root` into it and the old
        root detached;
     4. `/` opened and checked to be the object stage 0 checked (else refused), and the backend made on it;
@@ -1104,7 +1108,8 @@ it means layer 1 let the request through.
        rights;
     2. as root, `--uid`/`--gid` (required, never 0), its one group the gid's; not root, no `--uid`;
     3. the ids read back; its descriptors, the file table's whole list (`proc_pidinfo`), required to be exactly the
-       standard streams, the connection and the backend's root (`held_exactly`, as on Linux); the soft
+       standard streams, the connection, the backend's root and the parent watch's kqueue (`held_exactly`, as on
+       Linux; Jailer, §8, the parent watch); the soft
        `RLIMIT_NOFILE`; and that no profile is in force yet (`sandbox_check` with no operation). Each of these is a
        call the profile kills, so it is read before it. Then the compiled profile applied (`sandbox_apply`);
     4. under the profile, its descriptors by number (`fcntl(F_GETFD)` below the soft limit) exactly those again,
@@ -1429,7 +1434,7 @@ it means layer 1 let the request through.
     | wick-fsd's entry | Firecracker | Note |
     | --- | --- | --- |
     | `recvfrom` (29), `sendto` (133) | run, API | frames |
-    | `poll` (230) | run, API | the parent watch: the connection and the watch's kqueue descriptor, both held before the profile, as are the kqueue and its one registration, so it cannot add one (Jailer, below). Measured on 27.2: fs-server-report's one line with the watch, `allow syscall-unix 230`, 2 of 2 runs over every request test; `confine_probe` polls the held watch, done, and a new kqueue, a registration by `kevent` or `kevent64`, and `kevent_qos` and `kevent_id` by number are each killed. 15 and 26: a source reading (the same xnu path) until CI's `parent.rs` and `confine_probe` have run there |
+    | `poll` (230) | run, API | the parent watch: the connection and the watch's kqueue descriptor, both held before the profile, as are the kqueue and its one registration, so it cannot add one (Jailer, below). Measured on 27.2: fs-server-report's one line with the watch, `allow syscall-unix 230`, 2 of 2 runs over every request test; `confine_probe` polls the held watch, done, and a new kqueue, a registration by `kevent` or `kevent64`, and `kevent_qos` and `kevent_id` by number are each killed. Measured the same on 15.8.2 and 26.7.2 (CI run 44435909393: `confine_probe`'s 45 cases, `parent.rs`, fs-server-report's union empty over 3 runs) |
     | `sigaltstack` (53), `munmap` (73) | run, API | std's stack-overflow handler at exit |
     | `madvise` (75) | run, API (API: `MADV_DONTNEED` only, the compatibility libc's check) | libmalloc |
     | `fcntl` (92), `fcntl_nocancel` (406) | run, API | commands below |

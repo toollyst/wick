@@ -167,6 +167,20 @@ fn descriptors_of(pid: u32) -> Option<Vec<(i32, String)>> {
     Some(v)
 }
 
+/// The pid each pidfd of process `pid` is on (its `/proc/<pid>/fdinfo`
+/// `Pid:` line).
+fn pidfds_of(pid: u32, fds: &[(i32, String)]) -> Vec<String> {
+    fds.iter()
+        .filter(|(_, what)| what == "anon_inode:[pidfd]")
+        .map(|(fd, _)| {
+            let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).unwrap();
+            info.lines()
+                .find_map(|l| l.strip_prefix("Pid:"))
+                .map_or_else(|| format!("no Pid: line in {info:?}"), |p| p.trim().to_string())
+        })
+        .collect()
+}
+
 /// What wick-fsd was started with is closed before it serves, in its
 /// confined process and its waiting parent alike: a file, a directory and
 /// a socket left open by its launcher, by `close_range` and, where the
@@ -201,14 +215,26 @@ fn test_descriptors_it_was_started_with_are_closed() {
         let parent = r.server.child.id();
         match (descriptors_of(child), descriptors_of(parent)) {
             (Some(theirs), Some(waiting)) => {
-                for (who, fds, n) in [("the confined server", &theirs, 5), ("the waiting parent", &waiting, 4)] {
+                // The standard streams, then: the confined server, the
+                // connection and the share's root, and no pidfd (it closes
+                // the parent watch it inherits at the fork); the waiting
+                // parent, the pipe the child watches and two pidfds, the
+                // parent watch's on this test process (the server's parent)
+                // and the confined server's.
+                let ours = std::process::id().to_string();
+                for (who, pid, fds, n, pidfds) in [
+                    ("the confined server", child, &theirs, 5, vec![]),
+                    ("the waiting parent", parent, &waiting, 6, vec![ours.clone(), child.to_string()]),
+                ] {
                     let left: Vec<_> = fds.iter().filter(|(fd, _)| [40, 41, 42].contains(fd)).collect();
                     assert!(left.is_empty(), "{tag}: {who} holds what it was started with: {fds:?}");
                     assert!(!fds.iter().any(|(_, what)| what.contains("left-open")), "{tag}: {who}: {fds:?}");
-                    // The standard streams, then: the connection and the
-                    // share's root; the pipe the child watches.
                     assert_eq!(fds.len(), n, "{tag}: {who}: {fds:?}");
                     assert_eq!(fds[0].1, "/dev/null", "{tag}: {who}'s standard input: {fds:?}");
+                    let (mut got, mut want) = (pidfds_of(pid, fds), pidfds);
+                    got.sort();
+                    want.sort();
+                    assert_eq!(got, want, "{tag}: {who}'s pidfds (the pids they are on): {fds:?}");
                 }
             }
             _ => eprintln!(

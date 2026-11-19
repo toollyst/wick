@@ -73,7 +73,10 @@ fn test_ready_fd_is_never_a_standard_stream() {
 /// that is closed, before main): its `ready` and its log go nowhere, never
 /// into the connection or the share's root, which take numbers of their
 /// own. Linux reads its descriptors while it waits for its connection
-/// (not yet confined, so a process of the same user may).
+/// (not yet confined, so a process of the same user may): the standard
+/// streams, the share's root, the parent watch and the listener, nothing
+/// else. The watch is exactly one pidfd and it is on this test process,
+/// the server's parent (its `/proc/<pid>/fdinfo` `Pid:` line).
 #[cfg(target_os = "linux")]
 #[test]
 fn test_closed_standard_streams_are_dev_null_to_the_server() {
@@ -94,15 +97,30 @@ fn test_closed_standard_streams_are_dev_null_to_the_server() {
         })
         .collect();
     fds.sort();
+    let watches: Vec<(i32, String)> = fds
+        .iter()
+        .filter(|(_, what)| what == "anon_inode:[pidfd]")
+        .map(|(fd, _)| {
+            let info = std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", child.id())).unwrap();
+            let pid = info.lines().find_map(|l| l.strip_prefix("Pid:")).map(|p| p.trim().to_string());
+            (*fd, pid.unwrap_or_else(|| format!("no Pid: line in {info:?}")))
+        })
+        .collect();
     child.kill().unwrap();
     child.wait().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
     for fd in 0..3 {
         assert_eq!(fds[fd].1, "/dev/null", "{fds:?}");
     }
-    // The share's root and the listener, at numbers of their own.
-    assert!(fds.iter().skip(3).all(|(fd, _)| *fd > 2) && fds.len() == 5, "{fds:?}");
+    // The share's root, the parent watch and the listener, at numbers of
+    // their own.
+    assert!(fds.iter().skip(3).all(|(fd, _)| *fd > 2) && fds.len() == 6, "{fds:?}");
     assert!(fds.iter().any(|(_, what)| what.starts_with("socket:")), "{fds:?}");
+    assert!(
+        watches.len() == 1 && watches[0].1 == std::process::id().to_string(),
+        "the parent watch: one pidfd on this process ({}): {watches:?} in {fds:?}",
+        std::process::id()
+    );
 }
 
 #[test]

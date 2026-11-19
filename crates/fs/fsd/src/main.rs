@@ -231,18 +231,20 @@ fn main() -> ExitCode {
     // `start` (with `--ready-fd`, until the ready byte) is held until the
     // refusal is written: the end of `--ready-fd` without the byte tells the
     // launcher the server ended, and it may kill it then (the jailer does,
-    // overlay/jailer/fs_share.rs), so its reason must be out first.
-    let mut start = start;
-    let ended = run(&args, &mut start);
-    let code = match ended {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("wick-fsd: {}: {e}", args.id);
-            ExitCode::FAILURE
+    // overlay/jailer/fs_share.rs), so its reason must be out first. It is
+    // owned by this block and dropped at its end, after the match that
+    // writes the reason (a scope, not a `drop` call: on a host where `Start`
+    // holds nothing, that call is clippy's drop_non_drop).
+    {
+        let mut start = start;
+        match run(&args, &mut start) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("wick-fsd: {}: {e}", args.id);
+                ExitCode::FAILURE
+            }
         }
-    };
-    drop(start);
-    code
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
