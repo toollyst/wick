@@ -3293,6 +3293,20 @@ jobs:
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage fuzzing,instrumented
           exit $LASTEXITCODE
+      # Upstream's test_cpu_topology and test_cache_topology (1, 2 and 16
+      # vCPUs, smt on and off) and test_cpu_template (C3, T2, T2S, T2CL and
+      # T2A) on this runner, each guest's answers against what upstream's
+      # tests expect on Linux for the same configuration on this processor:
+      # TOPOREC and TMPLREC lines, for docs/COMPATIBILITY.md's smt, static
+      # CPU templates and cache topology rows. A record until it is read: the
+      # stages fail only on their own steps, and the step does not fail the
+      # job.
+      - name: boot-test.ps1 topology and static-templates (a record)
+        if: (success() || failure()) && steps.kit.outcome == 'success'
+        continue-on-error: true
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\boot-test.ps1 -WorkDir $env:WBT -Stage topology,static-templates
+          exit $LASTEXITCODE
       - name: What ran, and what stays with the PC
         if: always()
         run: |

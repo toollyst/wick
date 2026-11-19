@@ -58,6 +58,15 @@
 #          a restore; a template that changes a CPUID leaf the host lacks,
 #          and one that changes an MSR the backend keeps nowhere (0x10a,
 #          as T2S and T2CL do), are refused at the start
+#   topology  (not in `all`: a record for now) upstream's test_cpu_topology
+#          and test_cache_topology: 1, 2 and 16 vCPUs, smt on and off, the
+#          guest's lscpu, hwloc-info and cpuid -1 caches against what
+#          upstream's tests expect on Linux (TOPOREC lines)
+#   static-templates  (not in `all`: a record for now) upstream's
+#          test_cpu_template for C3, T2, T2S, T2CL and T2A: started or
+#          refused, against what Linux does on this processor; a started
+#          guest's CPUID by upstream's checks, also after a restore (TMPLREC
+#          lines)
 #   diff-nospace  (not in `all`: needs an elevated prompt, for diskpart) a
 #          diff snapshot written to a volume without the room fails with
 #          "not enough space on the disk" and leaves the guest as it was;
@@ -3816,6 +3825,341 @@ function Stage-CpuTemplates {
     return "a template through PUT /cpu-config takes $($lost -join ', ') from the guest on both vCPUs, also after a restore and cpu1's restart (spurious LAPIC timer interrupts: $spurious); TSCs agree (after the boot: $warp; after the restore: $warpRestored); a leaf no host has is refused; a modifier of MSR 0x10a is refused ($why)"
 }
 
+# Upstream's check_guest_cpuid_output (tests/framework/utils_cpuid.py) on a
+# guest command's output: the lines before `$header` (if one is given) are
+# skipped; each line after is split at `$sep`, and one of exactly two parts,
+# trimmed, whose key is expected and not seen yet is compared; an empty line
+# ends the reading. Returns, one string each, what upstream's assertions
+# fail on (they stop at the first): a value that differs, and each expected
+# key not found.
+function Compare-GuestKeys([string]$out, [string]$header, [string]$sep, $expected) {
+    $left = [ordered]@{}
+    foreach ($k in @($expected.Keys)) { $left[$k] = $expected[$k] }
+    $bad = @()
+    foreach ($line in ($out -split "`n")) {
+        if ($line -eq '') { break }
+        if ($left.Count -eq 0) { break }
+        if ($header) {
+            if ($line.Trim() -eq $header) { $header = '' }
+            continue
+        }
+        $parts = $line.Split([string[]]@($sep), [StringSplitOptions]::None)
+        if ($parts.Count -ne 2) { continue }
+        $key = $parts[0].Trim()
+        $value = $parts[1].Trim()
+        if ($left.Contains($key)) {
+            if ($value -cne $left[$key]) { $bad += "$key '$value', Linux '$($left[$key])'" }
+            $left.Remove($key)
+        }
+    }
+    foreach ($k in @($left.Keys)) { $bad += "no '$k' (Linux '$($left[$k])')" }
+    return $bad
+}
+
+# Upstream's test_cpu_topology and test_cache_topology (test_topology.py)
+# on this host, as a record: 1, 2 and 16 vCPUs, `smt` on and off, each
+# guest's lscpu, hwloc-info and `cpuid -1` caches 0 to 3 read by upstream's
+# parser (Compare-GuestKeys) against the values upstream's tests expect on
+# Linux for that configuration and this host's vendor. Upstream gives the
+# guest a network interface for its SSH; this guest's shell is its serial
+# console, and the interface no part of what is read. A configuration that
+# does not boot is recorded with Firecracker's reason. TOPOREC lines; the
+# stage fails only on its own steps (a guest that booted and whose commands
+# did not run).
+function Stage-Topology {
+    $vendor = "$((Get-CimInstance Win32_Processor | Select-Object -First 1).Manufacturer)"
+    Check (@('AuthenticAMD', 'GenuineIntel') -contains $vendor) "upstream's cache check knows AMD's and Intel's leaves, and this processor is '$vendor'"
+    # _check_cache_topology_x86: AMD's leaf 0x8000001d as the cpuid tool
+    # names its fields, Intel's leaf 4.
+    $share = if ($vendor -eq 'AuthenticAMD') { 'extra cores sharing this cache' } else { 'maximum IDs for CPUs sharing cache' }
+    $levelKey = if ($vendor -eq 'AuthenticAMD') { 'level' } else { 'cache level' }
+    $online = @{ 1 = '0'; 2 = '0,1'; 16 = '0-15' }
+    $records = @()
+    $asLinux = 0
+    foreach ($n in 1, 2, 16) {
+        foreach ($smt in $true, $false) {
+            $what = '{0} vCPUs, smt {1}' -f $n, $(if ($smt) { 'on' } else { 'off' })
+            $name = 'topology-{0}-{1}' -f $n, $(if ($smt) { 'smt' } else { 'nosmt' })
+            $cfg = Base-Config $n
+            $cfg['machine-config']['smt'] = $smt
+            $tpc = if ($smt -and $n -gt 1) { 2 } else { 1 }
+            $cores = [int]($n / $tpc)
+            $lscpu = [ordered]@{
+                'CPU(s)' = "$n"; 'On-line CPU(s) list' = $online[$n]; 'Thread(s) per core' = "$tpc"
+                'Core(s) per socket' = "$cores"; 'Socket(s)' = '1'; 'NUMA node(s)' = '1'
+            }
+            $hwloc = [ordered]@{
+                'depth 0' = '1 Machine (type #0)'; 'depth 1' = '1 Package (type #1)'; 'depth 2' = '1 L3Cache (type #6)'
+                'depth 3' = "$cores L2Cache (type #5)"; 'depth 4' = "$cores L1dCache (type #4)"
+                'depth 5' = "$cores L1iCache (type #9)"; 'depth 6' = "$cores Core (type #2)"; 'depth 7' = "$n PU (type #3)"
+            }
+            $l1 = if ($smt -and $n -gt 1) { 1 } else { 0 }
+            $l3 = $n - 1
+            $level1 = [ordered]@{ $levelKey = '0x1 (1)'; $share = ('0x{0:x} ({0})' -f $l1) }
+            $level3 = [ordered]@{ $levelKey = '0x3 (3)'; $share = ('0x{0:x} ({0})' -f $l3) }
+            $vm = Start-Vm $name $cfg
+            $booted = $true
+            try {
+                Wait-Shell $vm
+            } catch {
+                $f = Get-Failure $_
+                if (-not $f) { throw }
+                $booted = $false
+                $rec = "TOPOREC $what`: no shell: $($f.Message -replace "`n", ' ')"
+            }
+            if ($booted) {
+                $dir = Join-Path $Results $name
+                $diffs = @()
+                $out = $vm.Sh('lscpu')
+                Set-Content -Encoding UTF8 (Join-Path $dir 'lscpu.txt') $out
+                $diffs += @(Compare-GuestKeys $out '' ':' $lscpu | ForEach-Object { "lscpu $_" })
+                $out = $vm.Sh('hwloc-info')
+                Set-Content -Encoding UTF8 (Join-Path $dir 'hwloc-info.txt') $out
+                $diffs += @(Compare-GuestKeys $out '' ':' $hwloc | ForEach-Object { "hwloc-info $_" })
+                $out = $vm.Sh('cpuid -1', 120000, $true)
+                Set-Content -Encoding UTF8 (Join-Path $dir 'cpuid-1.txt') $out
+                foreach ($c in 0, 1, 2, 3) {
+                    $want = if ($c -lt 3) { $level1 } else { $level3 }
+                    $diffs += @(Compare-GuestKeys $out "--- cache $c ---" '=' $want | ForEach-Object { "cpuid -1 cache $c $_" })
+                }
+                if ($diffs.Count -eq 0) {
+                    $asLinux++
+                    $rec = "TOPOREC $what`: as Linux (lscpu, hwloc-info, cpuid -1 caches 0 to 3)"
+                } else {
+                    $rec = "TOPOREC $what`: $($diffs -join '; ')"
+                }
+                Save-Dmesg $vm $name
+            }
+            $vm.Kill()
+            Write-Host "  $rec"
+            $records += $rec
+        }
+    }
+    return "$asLinux of 6 configurations (1, 2 and 16 vCPUs, smt on and off; $vendor) as upstream's test_cpu_topology and test_cache_topology expect on Linux: $($records -join ' | ')"
+}
+
+# Upstream's check_masked_features (test_cpu_features_x86_64.py) for C3, and
+# for T2 and T2S: a leaf, a subleaf, a register and the bits that must be
+# clear in the guest's CPUID (a leaf the guest lacks counts as clear).
+# Leaves and subleaves in hex, as Get-CpuidTable keys them.
+$TemplateUnset = @{
+    C3 = @(
+        @('1', '0', 'ecx', @(2, 3, 4, 5, 8, 10, 11, 12, 14, 15, 22)),
+        @('1', '0', 'edx', @(18, 21, 22, 27, 29, 31)),
+        @('7', '0', 'ebx', @(2, 3, 4, 5, 8, 10, 11, 12, 14, 15, 16, 17, 18, 19, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31)),
+        @('7', '0', 'ecx', @(1, 2, 3, 4, 11, 14, 16, 22, 30)),
+        @('7', '0', 'edx', @(2, 3)),
+        @('d', '0', 'eax', @(3, 4, 5, 6, 7, 9)),
+        @('d', '1', 'eax', @(1, 2, 3)),
+        @('80000001', '0', 'ecx', @(5, 8)),
+        @('80000001', '0', 'edx', @(26))
+    )
+    T2 = @(
+        @('1', '0', 'ecx', @(2, 3, 4, 5, 6, 7, 8, 10, 11, 14, 15, 18)),
+        @('1', '0', 'edx', @(18, 21, 22, 27, 29, 30, 31)),
+        @('7', '0', 'ebx', @(2, 4, 11, 12, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31)),
+        @('7', '0', 'ecx', @(1, 2, 3, 4, 6, 8, 9, 10, 11, 12, 14, 16, 22, 30)),
+        @('7', '0', 'edx', @(2, 3, 4, 8)),
+        @('d', '0', 'eax', @(3, 4, 5, 6, 7, 9)),
+        @('d', '1', 'eax', @(1, 2, 3)),
+        @('80000001', '0', 'ecx', @(8, 29)),
+        @('80000001', '0', 'edx', @(26)),
+        @('80000008', '0', 'ebx', @(9))
+    )
+}
+
+# Upstream's check_enabled_features: what `cpuid -1` must say "true" of in a
+# guest of C3, T2 or T2S, and what more of T2's.
+$TemplateEnabled = @(
+    'x87 FPU on chip', 'CMPXCHG8B inst.', 'VME: virtual-8086 mode enhancement', 'SSE extensions', 'SSE2 extensions',
+    'DE: debugging extensions', 'PSE: page size extensions', 'TSC: time stamp counter', 'RDMSR and WRMSR support',
+    'PAE: physical address extensions', 'MCE: machine check exception', 'APIC on chip', 'MMX Technology',
+    'SYSENTER and SYSEXIT', 'MTRR: memory type range registers', 'PTE global bit', 'FXSAVE/FXRSTOR',
+    'MCA: machine check architecture', 'CMOV: conditional move/compare instr', 'PAT: page attribute table',
+    'PSE-36: page size extension', 'CLFLUSH instruction', 'PNI/SSE3: Prescott New Instructions', 'PCLMULDQ instruction',
+    'SSSE3 extensions', 'AES instruction', 'CMPXCHG16B instruction', 'PCID: process context identifiers',
+    'SSE4.1 extensions', 'SSE4.2 extensions', 'x2APIC: extended xAPIC support', 'POPCNT instruction',
+    'time stamp counter deadline', 'XSAVE/XSTOR states', 'OS-enabled XSAVE/XSTOR', 'AVX: advanced vector extensions',
+    'F16C half-precision convert instruction', 'RDRAND instruction', 'hypervisor guest status',
+    'ARAT always running APIC timer', 'FSGSBASE instructions', 'IA32_TSC_ADJUST MSR supported',
+    'SMEP supervisor mode exec protection', 'enhanced REP MOVSB/STOSB', 'SMAP: supervisor mode access prevention',
+    'x87 state', 'SSE state', 'AVX state', 'XSAVEOPT instruction', 'SYSCALL and SYSRET instructions',
+    '64-bit extensions technology available', 'execution disable', 'RDTSCP', 'LAHF/SAHF supported in 64-bit mode',
+    'TscInvariant'
+)
+$TemplateEnabledT2 = @(
+    'FMA instruction', 'BMI1 instructions', 'BMI2 instructions', 'AVX2: advanced vector extensions 2',
+    'MOVBE instruction', 'INVPCID instruction'
+)
+
+# Upstream's get_guest_cpuid and build_cpuid_dict (utils_cpuid.py): CPU 0's
+# lines of `cpuid -r`, each "<leaf> <subleaf>: eax=.. ebx=.. ecx=.. edx=..",
+# as a table keyed "<leaf>,<subleaf>,<register>" in hex. Kept in the VM's
+# results as cpuid-r.txt.
+function Get-GuestCpuid($vm, [string]$name) {
+    $out = $vm.Sh("cpuid -r | sed '/CPU 1/q' | grep -v CPU", 120000, $true)
+    Set-Content -Encoding UTF8 (Join-Path (Join-Path $Results $name) 'cpuid-r.txt') $out
+    $table = @{}
+    foreach ($line in ($out.Trim() -split "`n")) {
+        $m = [regex]::Match($line, '^ *(.*) (.*): eax=(.*) ebx=(.*) ecx=(.*) edx=(.*)$')
+        Check $m.Success "a line of the guest's cpuid -r that is not upstream's form: '$line'"
+        $v = @(1..6 | ForEach-Object { [Convert]::ToUInt64($m.Groups[$_].Value.Trim(), 16) })
+        $at = '{0:x},{1:x}' -f $v[0], $v[1]
+        $table["$at,eax"] = $v[2]
+        $table["$at,ebx"] = $v[3]
+        $table["$at,ecx"] = $v[4]
+        $table["$at,edx"] = $v[5]
+    }
+    return $table
+}
+
+# Upstream's check_cpuid_feat_flags with nothing that must be set: each
+# entry's bits that the guest has set, one string each.
+function Test-CpuidUnset($table, $unset) {
+    $bad = @()
+    foreach ($e in $unset) {
+        $key = "$($e[0]),$($e[1]),$($e[2])"
+        if (-not $table.ContainsKey($key)) { continue }
+        $set = @($e[3] | Where-Object { ($table[$key] -shr $_) -band 1 })
+        if ($set.Count) { $bad += "leaf 0x$($e[0]) subleaf $($e[1]) $($e[2]) bits $($set -join ',') set" }
+    }
+    return $bad
+}
+
+# Upstream's checks of a template's guest (test_cpu_template), what they
+# fail on: check_masked_features (none for T2CL and T2A, which the test
+# does not take) and check_enabled_features; and how many of the guest's
+# CPUID registers differ from those of the guest without a template.
+function Test-TemplateGuest($vm, [string]$template, [string]$name, $base) {
+    $table = Get-GuestCpuid $vm $name
+    $bad = @()
+    $masks = if ($template -eq 'T2S') { $TemplateUnset['T2'] } else { $TemplateUnset[$template] }
+    if ($masks) { $bad += @(Test-CpuidUnset $table $masks) }
+    if (@('C3', 'T2', 'T2S') -contains $template) {
+        $out = $vm.Sh('cpuid -1', 120000, $true)
+        Set-Content -Encoding UTF8 (Join-Path (Join-Path $Results $name) 'cpuid-1.txt') $out
+        $enabled = [ordered]@{}
+        foreach ($k in $TemplateEnabled) { $enabled[$k] = 'true' }
+        $bad += @(Compare-GuestKeys $out '' '=' $enabled | ForEach-Object { "cpuid -1 $_" })
+        if ($template -eq 'T2') {
+            $enabled = [ordered]@{}
+            foreach ($k in $TemplateEnabledT2) { $enabled[$k] = 'true' }
+            $bad += @(Compare-GuestKeys $out '' '=' $enabled | ForEach-Object { "cpuid -1 $_" })
+        }
+    }
+    $keys = @(@($table.Keys) + @($base.Keys) | Sort-Object -Unique)
+    $changed = @($keys | Where-Object { $table[$_] -ne $base[$_] }).Count
+    $checks = if ($bad.Count) { "upstream's checks fail on $($bad -join '; ')" } elseif ($masks) { "upstream's checks pass" } else { 'upstream checks no bits of it' }
+    return "$checks; $changed of its CPUID registers differ from the guest's without a template"
+}
+
+# Upstream's test_cpu_template (test_cpu_features_x86_64.py) on this host,
+# as a record, for every static template of x86_64: a 1 vCPU, 256 MiB guest
+# with the template set through PATCH /machine-config, started through the
+# API, as upstream's test (set_cpu_template) does. What Linux does with the same template on
+# this processor is upstream's own choice (custom_cpu_template.rs,
+# get_cpu_template): refused unless the host's vendor is the template's
+# (CpuVendorMismatched) and its family, model and stepping (CPUID leaf 1
+# EAX, which Win32_Processor's ProcessorId ends with) one of the template's
+# (static_cpu_templates/mod.rs, arch/x86_64/cpu_model.rs: InvalidCpuModel);
+# started otherwise, and a started guest of C3, T2 or T2S checked by
+# upstream's check_masked_features and check_enabled_features (T2CL and T2A:
+# test_cpu_template does not take them). Each template's guest that starts
+# is checked so, snapshotted, restored in a new process and checked again,
+# as upstream's test does. TMPLREC lines; the stage fails only on its own
+# steps.
+function Stage-StaticTemplates {
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $vendor = "$($cpu.Manufacturer)"
+    $id = "$($cpu.ProcessorId)"
+    Check ($id -match '^[0-9A-Fa-f]{16}$') "the processor's ProcessorId '$id' is not CPUID leaf 1's EDX and EAX"
+    $eax = [Convert]::ToUInt32($id.Substring(8), 16)
+    $fms = '{0:x},{1:x},{2:x},{3:x},{4:x}' -f (($eax -shr 20) -band 0xff), (($eax -shr 16) -band 0xf), (($eax -shr 8) -band 0xf), (($eax -shr 4) -band 0xf), ($eax -band 0xf)
+    # arch/x86_64/cpu_model.rs: extended family, extended model, family,
+    # model, stepping.
+    $models = @{ skylake = '0,5,6,5,4'; cascadelake = '0,5,6,5,7'; icelake = '0,6,6,a,6'; milan = 'a,0,f,1,1' }
+    $templates = [ordered]@{
+        C3   = @('GenuineIntel', @('skylake', 'cascadelake', 'icelake'))
+        T2   = @('GenuineIntel', @('skylake', 'cascadelake', 'icelake'))
+        T2S  = @('GenuineIntel', @('skylake', 'cascadelake'))
+        T2CL = @('GenuineIntel', @('cascadelake', 'icelake'))
+        T2A  = @('AuthenticAMD', @('milan'))
+    }
+    $cfg = Base-Config 1
+    $vm = Start-Vm 'static-none' $cfg
+    Wait-Shell $vm
+    $base = Get-GuestCpuid $vm 'static-none'
+    $vm.Kill()
+    $dir = Join-Path $Scratch 'static-templates'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $records = @()
+    $asLinux = 0
+    foreach ($t in @($templates.Keys)) {
+        $linux = 'started'
+        if ($vendor -ne $templates[$t][0]) { $linux = 'refused (CpuVendorMismatched)' }
+        elseif (@($templates[$t][1] | ForEach-Object { $models[$_] }) -notcontains $fms) { $linux = 'refused (InvalidCpuModel)' }
+        $name = "static-$t"
+        $vm = Start-Vm $name $null -Api
+        Invoke-Api $vm 'PUT' '/boot-source' $cfg['boot-source'] | Out-Null
+        Invoke-Api $vm 'PUT' '/drives/rootfs' $cfg['drives'][0] | Out-Null
+        Invoke-Api $vm 'PUT' '/machine-config' $cfg['machine-config'] | Out-Null
+        $status = 0
+        $out = Invoke-ApiCall $vm 'PATCH' '/machine-config' ('{"cpu_template":"' + $t + '"}') 30000 ([ref]$status)
+        $here = $null
+        $checks = $null
+        if ($status -lt 200 -or $status -ge 300) {
+            $here = "refused at PATCH /machine-config ($status $out)"
+        } else {
+            $out = Invoke-ApiCall $vm 'PUT' '/actions' '{"action_type":"InstanceStart"}' 120000 ([ref]$status)
+            if ($status -lt 200 -or $status -ge 300) {
+                $why = ([regex]::Match($out, '"fault_message":\s*"(.*)"')).Groups[1].Value
+                if (-not $why) { $why = $out }
+                if ($why -match 'CPU vendor mismatched') { $here = 'refused (CpuVendorMismatched)' }
+                elseif ($why -match 'not permitted to apply the CPU template') { $here = 'refused (InvalidCpuModel)' }
+                else { $here = "refused ($status $why)" }
+            }
+        }
+        if (-not $here) {
+            try {
+                Wait-Shell $vm
+                $here = 'started'
+            } catch {
+                $f = Get-Failure $_
+                if (-not $f) { throw }
+                $here = "started, no shell: $($f.Message -replace "`n", ' ')"
+            }
+        }
+        if ($here -eq 'started') {
+            $checks = Test-TemplateGuest $vm $t $name $base
+            $vm.Sh('A=before-$((6*7))') | Out-Null
+            $state = Join-Path $dir "$t.state"
+            $mem = Join-Path $dir "$t.mem"
+            Invoke-Api $vm 'PATCH' '/vm' @{ state = 'Paused' } | Out-Null
+            Invoke-Api $vm 'PUT' '/snapshot/create' ([ordered]@{ snapshot_type = 'Full'; snapshot_path = $state; mem_file_path = $mem }) | Out-Null
+            Save-Dmesg $vm $name
+            $vm.Kill()
+            $vm = Start-Vm "$name-restored" $null -Api
+            Invoke-Api $vm 'PUT' '/snapshot/load' ([ordered]@{
+                snapshot_path = $state
+                mem_backend   = [ordered]@{ backend_type = 'File'; backend_path = $mem }
+                resume_vm     = $true
+            }) | Out-Null
+            $out = $vm.Sh('echo restored $A')
+            Check ($out -eq 'restored before-42') "$t after the restore: '$out'"
+            $checks += "; after a restore: $(Test-TemplateGuest $vm $t "$name-restored" $base)"
+            Save-Dmesg $vm "$name-restored"
+            Remove-Item -Force $state, $mem -ErrorAction SilentlyContinue
+        }
+        $vm.Kill()
+        if ($here -eq $linux) { $asLinux++ }
+        $rec = "TMPLREC $t`: Linux $linux, here $here"
+        if ($checks) { $rec += "; $checks" }
+        Write-Host "  $rec"
+        $records += $rec
+    }
+    return "$asLinux of 5 static templates started or refused as Linux would on this $vendor processor (family, model, stepping $fms): $($records -join ' | ')"
+}
+
 # Upstream's test_diff_snapshot_works_after_error
 # (test_snapshot_not_losing_dirty_pages.py): a diff snapshot that fails for
 # lack of space must not lose the dirty pages, so that the next one, with
@@ -4577,6 +4921,8 @@ $Stages = [ordered]@{
     'no-seccomp' = { Stage-NoSeccomp }
     'foreign-snapshot' = { Stage-ForeignSnapshot }
     'cpu-templates' = { Stage-CpuTemplates }
+    topology = { Stage-Topology }
+    'static-templates' = { Stage-StaticTemplates }
     'diff-nospace' = { Stage-DiffNoSpace }
     'linux-snapshot' = { Stage-LinuxSnapshot }
     'memory-hotplug' = { Stage-MemoryHotplug }
@@ -4586,7 +4932,7 @@ $Stages = [ordered]@{
     instrumented = { Stage-Instrumented }
 }
 # Stages `all` leaves out: they need what a plain kit does not have.
-$NotInAll = @('gdb', 'diff-nospace', 'linux-snapshot', 'foreign-snapshot', 'x2apic', 'fuzzing', 'instrumented')
+$NotInAll = @('gdb', 'diff-nospace', 'linux-snapshot', 'foreign-snapshot', 'x2apic', 'fuzzing', 'instrumented', 'topology', 'static-templates')
 
 # --- run ------------------------------------------------------------------------
 
