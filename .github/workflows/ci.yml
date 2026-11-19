@@ -3397,3 +3397,139 @@ jobs:
           path: ${{ runner.temp }}/results.tsv
           if-no-files-found: ignore
           retention-days: 14
+
+  # The guest artifacts upstream's integration tests take with its default
+  # kernel, 6.1: the kernel and Amazon Linux 2023's root file system with an
+  # SSH key in it, from upstream's CI bucket at tools/linux/integration-
+  # tests.sh's PREFIX and prepared by upstream's tools/setup-ci-artifacts.sh
+  # as that script prepares them (as root, as in upstream's container), for
+  # windows-integration. On a PC tools/windows/integration/setup-artifacts.ps1
+  # prepares the same in WSL, which the Windows runner does not have. The
+  # ext4 images, the original squashfs and the debug kernel are left out:
+  # the two tests below boot the read-only squashfs on the 6.1 kernel
+  # (tests/conftest.py, `rootfs`).
+  windows-it-artifacts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Prepare the artifacts
+        run: |
+          prefix=$(sed -n 's/^PREFIX="\(.*\)"$/\1/p' tools/linux/integration-tests.sh)
+          [[ -n "$prefix" ]] || { echo "::error::no PREFIX in tools/linux/integration-tests.sh"; exit 1; }
+          sudo apt-get install -y -q squashfs-tools
+          art="$RUNNER_TEMP/art"
+          mkdir -p "$art/debug"
+          # setup-ci-artifacts.sh ends by unpacking the *.debug.gz files and
+          # fails when there is none.
+          for name in vmlinux-6.1.188 vmlinux-6.1.188.config amazonlinux-2023.squashfs amazonlinux-2023.manifest \
+              debug/vmlinux-6.1.188.debug.gz; do
+            curl -fsSL --retry 3 -o "$art/$name" "https://s3.amazonaws.com/spec.ccfc.min/$prefix/x86_64/$name"
+          done
+          cp lib/firecracker/tools/setup-ci-artifacts.sh "$art/"
+          printf 'say() { echo "== $*"; }\n' >"$art/functions"
+          sudo bash "$art/setup-ci-artifacts.sh" "$art"
+          sudo chown -R "$(id -u):$(id -g)" "$art"
+          rm -rf "$art/debug" "$art/setup-ci-artifacts.sh" "$art/functions" "$art"/*.orig "$art"/*.ext4
+          ls -la "$art"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-it-artifacts
+          path: ${{ runner.temp }}/art
+          if-no-files-found: error
+          retention-days: 1
+
+  # Upstream's test_net_change_mac_address and test_high_ingress_traffic run
+  # by the Windows harness (tools/windows/integration-tests.ps1, as on a PC)
+  # on this commit's kit and windows-it-artifacts' guest: docs/
+  # COMPATIBILITY.md's "Guest changes its MAC" and "High ingress traffic,
+  # transmit queue length" rows, by the tests' own assertions, Linux's pass
+  # criteria. The host's iperf3 is Chocolatey's package, pinned; the Python
+  # environment upstream's development container's (venv.ps1, Python 3.12
+  # as its pyproject.toml asks). A record until it is read: the job does not
+  # fail the run, and the harness's comparison with Linux (both tests are
+  # listed [bug]) is printed, not asserted.
+  windows-integration:
+    needs: [windows, windows-it-artifacts]
+    if: ${{ !cancelled() && needs.windows.outputs.kit == 'success' && needs.windows-it-artifacts.result == 'success' }}
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: ./.github/actions/upstream
+      - name: Set up upstream and the patch series
+        id: setup
+        shell: bash
+        run: tools/setup.sh
+      - name: The kit of this commit
+        id: kit
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wick-windows-x86_64-${{ github.sha }}
+          path: .
+      - name: The guest artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-it-artifacts
+          path: ${{ runner.temp }}/it-artifacts
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # Upstream tests put sockets and files under /tmp, which Windows
+      # resolves to \tmp on the current drive.
+      - name: The harness's environment
+        run: |
+          New-Item -ItemType Directory -Force -Path "$((Get-Location).Drive.Name):\tmp" | Out-Null
+          New-Item -ItemType Directory -Force -Path lib\firecracker\build | Out-Null
+          [IO.File]::WriteAllText((Join-Path $PWD 'lib\firecracker\build\current_artifacts'), "$env:RUNNER_TEMP\it-artifacts")
+          choco install iperf3 --version 3.20.0 -y --no-progress
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          (Get-Command iperf3).Source
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\integration\venv.ps1
+          exit $LASTEXITCODE
+      - name: The two tests
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows\integration-tests.ps1 -Out "$env:RUNNER_TEMP\it" `
+            -Pytest 'integration_tests/functional/test_net_config_space.py::test_net_change_mac_address integration_tests/functional/test_net.py::test_high_ingress_traffic'
+          Get-Content "$env:RUNNER_TEMP\it\comparison.md" -ErrorAction SilentlyContinue
+          exit 0
+      - name: Results in one format
+        if: always() && steps.setup.outcome == 'success'
+        env:
+          WICK_RESULTS_JOB: windows-integration
+        run: |
+          $f = "$env:RUNNER_TEMP\it\test-report.json"
+          $r = Join-Path $env:RUNNER_TEMP 'results.tsv'
+          if (Test-Path $f) {
+            python -I tools\ci-results.py add pytest-json $f --tree wick --out $r
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            python -I tools\ci-results.py validate $r
+            exit $LASTEXITCODE
+          }
+          Write-Host 'no results: the tests wrote no report'
+      - name: Upload the results
+        if: always() && steps.setup.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-windows-integration
+          path: ${{ runner.temp }}/results.tsv
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload logs
+        if: always() && steps.setup.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-integration-logs
+          path: ${{ runner.temp }}/it
+          if-no-files-found: warn
+          retention-days: 14

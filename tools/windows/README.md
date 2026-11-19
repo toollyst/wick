@@ -343,6 +343,17 @@ result on Windows Server, elevated. What only a PC shows, and is run there:
 Whether a stage has passed on the runner is in docs/COMPATIBILITY.md with
 the run, once one has; until then its claims are the PC's.
 
+Upstream's integration tests run in CI only as a record for now: the
+`windows-integration` job runs `test_net_change_mac_address` and
+`test_high_ingress_traffic` through `integration-tests.ps1` on the kit, in
+a checkout set up by `tools/setup.sh`, with Python 3.12 for `venv.ps1` and
+Chocolatey's iperf3 3.20.0 on `PATH`. Its guest artifacts (the 6.1 kernel
+and Amazon Linux 2023's squashfs with the SSH key in it) are prepared by the
+`windows-it-artifacts` job on Linux with upstream's
+`tools/setup-ci-artifacts.sh`, as `integration/setup-artifacts.ps1` prepares
+them in WSL on a PC (the runner has no WSL). The job does not fail the run;
+its logs are the artifact `windows-integration-logs`.
+
 ## Running it on a Windows PC
 
 Needs Windows 10 (1803 or later) or 11 on x86_64, virtualization turned on in

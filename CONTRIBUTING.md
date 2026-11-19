@@ -58,7 +58,11 @@ measures the host mechanisms the sandbox and jailer backends use. CI's
 `windows-guest` job runs both scripts on GitHub's runner, which has the
 feature, from the `windows` job's binaries; the jailer unelevated, Windows
 11 and a console someone types at are run on a PC
-(`tools/windows/README.md`, "What CI runs of the two scripts").
+(`tools/windows/README.md`, "What CI runs of the two scripts"). CI's
+`windows-integration` job runs upstream's `test_net_change_mac_address` and
+`test_high_ingress_traffic` through `tools/windows/integration-tests.ps1`
+on that kit, with the guest artifacts the `windows-it-artifacts` job
+prepares on Linux: a record for now, which does not fail the run.
 
 Editors: `.vscode/settings.json` points rust-analyzer at
 `lib/firecracker/Cargo.toml`; other editors need the same.
@@ -147,7 +151,7 @@ and the main checkout use; they never set the variable.
   The Windows jobs' rows are the compatibility crates' and WHP tests', the
   unit tests against their listed differences, and each `boot-test.ps1` and
   `jailer-test.ps1` stage's PASS or FAIL line (`results-windows`,
-  `results-windows-guest`). A stage a job expects to
+  `results-windows-guest`, and upstream's tests of `results-windows-integration`). A stage a job expects to
   fail on its host is recorded `xfail` (`add --xfail NAME=REASON`), the
   reason the line the job itself printed (macos-15-root-vmnet's
   `kern.hv_support`), never `fail` in a green job. A probe that once showed something is
