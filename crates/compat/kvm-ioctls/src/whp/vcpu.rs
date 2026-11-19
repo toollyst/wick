@@ -8646,6 +8646,110 @@ mod fpu_tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// FILLRACE, for SWAPSTRESS's round 87 (COMMITRACE's question in the
+    /// product): a missing page's fill (`wick_uffd::copy`, on a thread of
+    /// its own) made while the guest's first access to the page is under
+    /// way: the guest reads the fill's content, whether it came before the
+    /// fill (it waits in the fault) or after. The guest's RAM (4 MiB)
+    /// registered as SWAPSTRESS's; each round, the second 2 MiB discarded
+    /// (swapped, from the second round), then each of its 512 pages: the
+    /// filling thread spins 0 to 1008 rounds (by page) and fills it with
+    /// `FILL | round` while the guest, started at once, counts down 1 to 64
+    /// (by page) and reads it (`dec rcx`, `jnz`, `mov rax, [rbx]`, `out
+    /// 0x85`). Counted: reads that are not the fill's, the first 16 printed
+    /// with their page, value and delays. 8 rounds. FILLRACE lines; a
+    /// record, to be asserted with the fix.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_fill_raced_by_the_guests_first_access_on_record() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        const CHUNK: u64 = 2 << 20;
+        const ROUNDS: u64 = 8;
+        const FILL: u64 = 0xF << 60;
+        // dec rcx; jnz to it; mov rax, [rbx]; out 0x85, al; hlt; jmp to the hlt.
+        const PROGRAM: [u8; 13] = [0x48, 0xFF, 0xC9, 0x75, 0xFB, 0x48, 0x8B, 0x03, 0xE6, 0x85, 0xF4, 0xEB, 0xFD];
+        let say = |l: String| eprintln!("FILLRACE {l}");
+        let mut uffd = None;
+        let (vm, vcpu, m) = mmio_guest_with(&PROGRAM, |m| {
+            let (ctx, user) = libc::wick_uffd::create(0, false, true).unwrap();
+            libc::wick_uffd::register(ctx, m as u64, MEM as u64).unwrap();
+            uffd = Some((ctx, user));
+        });
+        let (ctx, user) = uffd.unwrap();
+        let at = m as u64;
+        // The filling thread: a request is the page (0 none), the value and
+        // the spins before the fill; the fill's result is kept.
+        let req = Arc::new((AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)));
+        let result = Arc::new(std::sync::Mutex::new(Ok(0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let filler = {
+            let (req, result, stop) = (Arc::clone(&req), Arc::clone(&result), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let page = req.0.load(Ordering::SeqCst);
+                    if page == 0 {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    let data: Vec<u8> = std::iter::repeat_n(req.1.load(Ordering::SeqCst).to_le_bytes(), 512).flatten().collect();
+                    for _ in 0..req.2.load(Ordering::SeqCst) {
+                        std::hint::spin_loop();
+                    }
+                    // SAFETY: a page-sized buffer; the registered range's page.
+                    *result.lock().unwrap() = unsafe { libc::wick_uffd::copy(ctx, data.as_ptr(), page, 4096, true) };
+                    req.0.store(0, Ordering::SeqCst);
+                }
+            })
+        };
+        let mut vcpu = vcpu;
+        let (mut trials, mut wrong, mut refused) = (0, Vec::new(), 0);
+        for r in 1..=ROUNDS {
+            if r > 1 {
+                // SAFETY: the chunk of guest RAM, discarded.
+                assert_eq!(unsafe { libc::madvise((at + CHUNK) as *mut libc::c_void, CHUNK as usize, libc::MADV_DONTNEED) }, 0);
+            }
+            for i in 0..512u64 {
+                let gpa = CHUNK + i * 4096;
+                vcpu.set_regs(&kvm_regs { rip: MMIO_PROGRAM, rsp: 0x9000, rflags: 2, rbx: gpa, rcx: 1 + (i * 7) % 64, ..Default::default() }).unwrap();
+                req.1.store(FILL | r, Ordering::SeqCst);
+                req.2.store((i * 13) % 64 * 16, Ordering::SeqCst);
+                req.0.store(at + gpa, Ordering::SeqCst);
+                let mut reads = 0;
+                let e = one_run(&mut vcpu, &[], &mut reads);
+                let rax = vcpu.get_regs().unwrap().rax;
+                while req.0.load(Ordering::SeqCst) != 0 {
+                    std::hint::spin_loop();
+                }
+                trials += 1;
+                if *result.lock().unwrap() != Ok(4096) {
+                    refused += 1;
+                }
+                if !e.starts_with("out 0x85") || rax != (FILL | r) {
+                    wrong.push(format!(
+                        "round {r} page {gpa:#x}: {e}, RAX {rax:#x} (the fill's {:#x}), the guest's count {}, the filler's spins {}",
+                        FILL | r,
+                        1 + (i * 7) % 64,
+                        (i * 13) % 64 * 16
+                    ));
+                }
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        filler.join().unwrap();
+        say(format!(
+            "{trials} trials, {} reads not the fill's, {refused} fills not made whole; {:?}",
+            wrong.len(),
+            wrong.iter().take(16).collect::<Vec<_>>()
+        ));
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: closes the user end; the test's mapping, no VM left using it.
+        unsafe {
+            libc::close(user);
+            assert_eq!(libc::munmap(m.cast(), MEM), 0);
+        }
+    }
+
     /// Where the legacy page (`WHvGetVirtualProcessorInterruptControllerState`,
     /// the backend's) keeps the IRR and the ISR: eight words of 32 vectors,
     /// 4 bytes apart (vector `v` in the word at `+ 4 * (v / 32)`), where the
@@ -13884,6 +13988,392 @@ mod fpu_tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
             assert_eq!(libc::munmap(m.cast(), MEM), 0);
         }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// COMMITRACE, for SWAPSTRESS's round 87 (a read of 0, no exit at the
+    /// page, as the page's fill committed it): whether a page committed
+    /// with `PAGE_NOACCESS` through the guest's view A of a `SEC_RESERVE`
+    /// section is given to a guest that is accessing it while the commit is
+    /// made. An inference to test (FILLWINDOW, COMMITVIEW and NEIGHBOURVIEW
+    /// found a completed no-access commit honoured): the commit and A's
+    /// no-access (a protection of A's alone: SECTREC-h) may be applied in
+    /// two steps, and WHP's resolution of the guest's access between them
+    /// would see a committed page with A's view protection. Each trial, a
+    /// page of a fresh section: the guest reads it (`mov al, [P]`, `out`)
+    /// and each exit at it is run again at once, nothing opened, so the vCPU
+    /// keeps asking WHP for it; after `k` exits (1 to 16, by page) the
+    /// committing thread (pinned to another CPU than the vCPU's thread, as
+    /// `SetThreadAffinityMask` allows) spins 0 to 1984 rounds (by page) and
+    /// commits; the trial ends when the guest's read completes (given: the
+    /// value, the exits before and after the commit's return, the time of
+    /// the read less the call's return on one clock, A's `VirtualQuery`
+    /// then) or 64 exits after the call returned (held). Cases, 512 pages
+    /// each:
+    /// - stopped: the no-access commit through A made before the guest
+    ///   runs: 0 given, asserted (a "0 of" below is a measurement);
+    /// - B read-write: a read-write commit through B (A shows its view's
+    ///   read-write: SECTREC-h): 512 given, asserted (the loop sees a
+    ///   completion);
+    /// - raced: the no-access commit through A, 8 rounds (4096 trials):
+    ///   given counted and the first 16 printed; a record;
+    /// - V: A mapped `PAGE_NOACCESS` (`MapViewOfFile3`; refused, the error,
+    ///   and A mapped read-write and made no-access by `VirtualProtect`, its
+    ///   result), a read-write commit through B raced as above (a record),
+    ///   then 16 pages written through B and opened through A
+    ///   (`VirtualProtect`), read by the guest (a record), and whether a page
+    ///   never committed is reserved through B (the view mapped commits
+    ///   nothing: S1's charge as filled).
+    ///
+    /// Bounded at 4 minutes, the trials made said. COMMITRACE lines.
+    #[test]
+    #[ignore = "needs WHP: run on a WHP machine with --ignored --nocapture"]
+    fn test_a_no_access_commit_raced_by_the_guests_access_on_record() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MapViewOfFile, MapViewOfFile3, UnmapViewOfFile, VirtualAlloc, VirtualProtect, VirtualQuery,
+            FILE_MAP_ALL_ACCESS, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MEM_COMMIT, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS,
+            PAGE_READWRITE, SEC_RESERVE,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, SetThreadAffinityMask};
+        const PROGRAM: u64 = 0xB000;
+        const LEN: usize = 2 << 20;
+        const PAGES: usize = LEN / 4096;
+        const SECTION_GPA: u64 = 0x400_0000;
+        const RACED_ROUNDS: usize = 8;
+        const AFTER: u32 = 64;
+        const BOUND: Duration = Duration::from_secs(240);
+        let say = |l: String| eprintln!("COMMITRACE {l}");
+        let begun = Instant::now();
+        let vm = super::super::VmFd::create().unwrap();
+        let m = guest();
+        put(m, 0x3000 + (SECTION_GPA >> 21) * 8, &(SECTION_GPA | 0x83).to_le_bytes());
+        // SAFETY: the memory stays mapped while the VM has it.
+        unsafe {
+            vm.set_user_memory_region(kvm_bindings::kvm_userspace_memory_region {
+                slot: 0,
+                flags: 0,
+                guest_phys_addr: 0,
+                memory_size: MEM as u64,
+                userspace_addr: m as u64,
+            })
+        }
+        .unwrap();
+        let vcpu = vm.create_vcpu(0).unwrap();
+        start(&vcpu);
+        vcpu.set_regs(&kvm_regs { rip: PROGRAM, rsp: 0x9000, rflags: 2, ..Default::default() }).unwrap();
+        let (part, vp) = (vcpu.part(), vcpu.vp());
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let commit_cpu = if cpus >= 3 { 2 } else { 1 % cpus };
+        // SAFETY: plain call, this thread.
+        let vcpu_pinned = cpus > 1 && unsafe { SetThreadAffinityMask(GetCurrentThread(), 1) } != 0;
+        // One clock for both threads: nanoseconds since `base`, never 0.
+        let base = Instant::now();
+        let now = move || u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX) + 1;
+        // The committing thread: a request is the address (0 none), the
+        // protection and the spins before the call; it records when the call
+        // began and returned, and whether it was made.
+        let req = Arc::new((AtomicUsize::new(0), AtomicU32::new(0), AtomicU64::new(0)));
+        let done = Arc::new((AtomicU64::new(0), AtomicU64::new(0), AtomicBool::new(false)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let commit_pinned = Arc::new(AtomicBool::new(false));
+        let committer = {
+            let (req, done, stop, commit_pinned) = (Arc::clone(&req), Arc::clone(&done), Arc::clone(&stop), Arc::clone(&commit_pinned));
+            std::thread::spawn(move || {
+                // SAFETY: plain call, this thread.
+                commit_pinned.store(cpus > 1 && unsafe { SetThreadAffinityMask(GetCurrentThread(), 1 << commit_cpu) } != 0, Ordering::SeqCst);
+                while !stop.load(Ordering::SeqCst) {
+                    let at = req.0.load(Ordering::SeqCst);
+                    if at == 0 {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    for _ in 0..req.2.load(Ordering::SeqCst) {
+                        std::hint::spin_loop();
+                    }
+                    done.0.store(now(), Ordering::SeqCst);
+                    // SAFETY: a page of the test's view.
+                    let made = !unsafe { VirtualAlloc(at as *const _, 4096, MEM_COMMIT, req.1.load(Ordering::SeqCst)) }.is_null();
+                    done.2.store(made, Ordering::SeqCst);
+                    done.1.store(now(), Ordering::SeqCst);
+                    req.0.store(0, Ordering::SeqCst);
+                }
+            })
+        };
+        let query = |at: usize| {
+            // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is valid; queries our memory.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            unsafe { VirtualQuery(at as *const _, &mut mbi, std::mem::size_of_val(&mbi)) };
+            (mbi.State, mbi.Protect)
+        };
+        let rwx = whv::WHvMapGpaRangeFlagRead | whv::WHvMapGpaRangeFlagWrite | whv::WHvMapGpaRangeFlagExecute;
+        // A fresh section, its views A (the guest's, mapped in WHP) and B:
+        // A mapped no-access when `closed` (then how), or the refusal.
+        let views = |closed: bool| -> std::result::Result<(windows_sys::Win32::Foundation::HANDLE, usize, usize, String), String> {
+            // SAFETY: an unnamed pagefile-backed section, closed by `unviews`.
+            let s = unsafe {
+                CreateFileMappingW(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_RESERVE, 0, LEN as u32, std::ptr::null())
+            };
+            assert!(!s.is_null());
+            // SAFETY: a view of the test's section.
+            let b = unsafe { MapViewOfFile(s, FILE_MAP_ALL_ACCESS, 0, 0, LEN) }.Value as usize;
+            assert_ne!(b, 0);
+            let mut how = String::new();
+            let a = if closed {
+                // SAFETY: a view of the test's section, mapped no-access.
+                let a = unsafe { MapViewOfFile3(s, GetCurrentProcess(), std::ptr::null(), 0, LEN, 0, PAGE_NOACCESS, std::ptr::null_mut(), 0) }.Value as usize;
+                if a != 0 {
+                    how = "MapViewOfFile3 PAGE_NOACCESS: mapped".into();
+                    a
+                } else {
+                    let e = std::io::Error::last_os_error();
+                    // SAFETY: as above, read-write.
+                    let a = unsafe { MapViewOfFile(s, FILE_MAP_ALL_ACCESS, 0, 0, LEN) }.Value as usize;
+                    assert_ne!(a, 0);
+                    let mut old = 0;
+                    // SAFETY: the test's view, reserved pages.
+                    let protected = unsafe { VirtualProtect(a as *const _, LEN, PAGE_NOACCESS, &mut old) } != 0;
+                    how = format!(
+                        "MapViewOfFile3 PAGE_NOACCESS refused ({e}); mapped read-write, VirtualProtect of the whole view no-access: {}",
+                        if protected { "done".to_string() } else { format!("refused ({})", std::io::Error::last_os_error()) }
+                    );
+                    if !protected {
+                        // SAFETY: the test's views and section.
+                        unsafe {
+                            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut _ });
+                            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut _ });
+                            windows_sys::Win32::Foundation::CloseHandle(s);
+                        }
+                        return Err(how);
+                    }
+                    a
+                }
+            } else {
+                // SAFETY: as above.
+                let a = unsafe { MapViewOfFile(s, FILE_MAP_ALL_ACCESS, 0, 0, LEN) }.Value as usize;
+                assert_ne!(a, 0);
+                a
+            };
+            // SAFETY: view A stays mapped while the VM has it; unmapped by `unviews`.
+            let hres = unsafe { whv::WHvMapGpaRange(part, a as *const _, SECTION_GPA, LEN as u64, rwx) };
+            if hres != 0 {
+                // SAFETY: the test's views and section.
+                unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut _ });
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut _ });
+                    windows_sys::Win32::Foundation::CloseHandle(s);
+                }
+                return Err(format!("{how}; WHvMapGpaRange of A {:#010x}", hres.cast_unsigned()));
+            }
+            Ok((s, a, b, how))
+        };
+        let unviews = |(s, a, b): (windows_sys::Win32::Foundation::HANDLE, usize, usize)| {
+            // SAFETY: the range mapped by `views`, then its views and section.
+            unsafe {
+                whv::WHvUnmapGpaRange(part, SECTION_GPA, LEN as u64);
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut _ });
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut _ });
+                windows_sys::Win32::Foundation::CloseHandle(s);
+            }
+        };
+        // How a trial ended.
+        #[derive(Debug)]
+        enum End {
+            /// The read completed: the byte, the exits before and after the
+            /// call's return, the read's time less the return's (ns; the
+            /// call's begin less the return's too), A's state and protection.
+            Given { value: u8, before: u32, after: u32, since_return: i64, call_ns: i64, a: (u32, u32) },
+            Held,
+            Failed(String),
+        }
+        // A trial: page `p`, the guest's read of A's page; `commit` (the
+        // address, the protection) made before the run (`stopped`) or by
+        // the committing thread after `k` exits.
+        let trial = |a: usize, p: usize, commit_at: usize, prot: PAGE_PROTECTION_FLAGS, stopped: bool| -> End {
+            let gpa = SECTION_GPA + (p * 4096) as u64;
+            let mut program = vec![0x8A, 0x04, 0x25];
+            program.extend_from_slice(&u32::try_from(gpa).unwrap().to_le_bytes());
+            program.extend_from_slice(&[0xE6, PORT as u8, 0xF4, 0xEB, 0xFD]);
+            put(m, PROGRAM, &program);
+            regs::set_rip(part, vp, PROGRAM).unwrap();
+            done.0.store(0, Ordering::SeqCst);
+            done.1.store(0, Ordering::SeqCst);
+            if stopped {
+                done.0.store(now(), Ordering::SeqCst);
+                // SAFETY: a page of the test's view.
+                let made = !unsafe { VirtualAlloc(commit_at as *const _, 4096, MEM_COMMIT, prot) }.is_null();
+                done.2.store(made, Ordering::SeqCst);
+                done.1.store(now(), Ordering::SeqCst);
+            }
+            let k = 1 + (p % 16) as u32;
+            let (mut before, mut after, mut asked) = (0u32, 0u32, stopped);
+            loop {
+                let ctx = match super::super::ffi::run_vp(part, vp) {
+                    Ok(c) => c,
+                    Err(e) => return End::Failed(format!("run failed, errno {}", e.errno())),
+                };
+                let returned = done.1.load(Ordering::SeqCst);
+                match ctx.ExitReason {
+                    whv::WHvRunVpExitReasonX64IoPortAccess => {
+                        let t = now();
+                        let q = query(a + p * 4096);
+                        // The call's begin and return once it has returned.
+                        while req.0.load(Ordering::SeqCst) != 0 {
+                            std::hint::spin_loop();
+                        }
+                        let (begun_at, returned_at) = (done.0.load(Ordering::SeqCst), done.1.load(Ordering::SeqCst));
+                        let ns = |x: u64, y: u64| i64::try_from(x).unwrap_or(i64::MAX) - i64::try_from(y).unwrap_or(i64::MAX);
+                        return End::Given {
+                            // SAFETY: the union arm matches the exit reason.
+                            value: (unsafe { ctx.Anonymous.IoPortAccess.Rax } & 0xff) as u8,
+                            before,
+                            after,
+                            since_return: if returned_at == 0 { i64::MIN } else { ns(t, returned_at) },
+                            call_ns: if returned_at == 0 || begun_at == 0 { 0 } else { ns(returned_at, begun_at) },
+                            a: q,
+                        };
+                    }
+                    whv::WHvRunVpExitReasonMemoryAccess => {
+                        // SAFETY: the union arm matches the exit reason.
+                        let at = unsafe { ctx.Anonymous.MemoryAccess.Gpa };
+                        if (at & !0xfff) != gpa {
+                            return End::Failed(format!("a memory exit at {at:#x}"));
+                        }
+                        if returned == 0 {
+                            before += 1;
+                        } else {
+                            after += 1;
+                            if after >= AFTER {
+                                // The committing thread's request taken.
+                                while req.0.load(Ordering::SeqCst) != 0 {
+                                    std::hint::spin_loop();
+                                }
+                                return End::Held;
+                            }
+                        }
+                        if !asked && before >= k {
+                            req.1.store(prot, Ordering::SeqCst);
+                            req.2.store(((p * 31) % 64 * 31) as u64, Ordering::SeqCst);
+                            req.0.store(commit_at, Ordering::SeqCst);
+                            asked = true;
+                        }
+                        if before > 1_000_000 {
+                            return End::Failed("a million exits and no commit".into());
+                        }
+                    }
+                    reason => return End::Failed(format!("exit reason {reason:#x} at RIP {:#x}", ctx.VpContext.Rip)),
+                }
+            }
+        };
+        // A case over the 512 pages of a fresh section: its given trials,
+        // the trials made, and the failures.
+        let case = |name: &str, closed: bool, through_b: bool, prot: PAGE_PROTECTION_FLAGS, stopped: bool| {
+            let (s, a, b, how) = match views(closed) {
+                Ok(v) => v,
+                Err(how) => {
+                    say(format!("{name}: not run: {how}"));
+                    return None;
+                }
+            };
+            let (mut given, mut held, mut failed, mut made) = (Vec::new(), 0, Vec::new(), 0);
+            for p in 0..PAGES {
+                if begun.elapsed() > BOUND {
+                    break;
+                }
+                made += 1;
+                let at = if through_b { b } else { a } + p * 4096;
+                let end = trial(a, p, at, prot, stopped);
+                // The committing thread done with the trial's request.
+                while req.0.load(Ordering::SeqCst) != 0 {
+                    std::hint::spin_loop();
+                }
+                match end {
+                    End::Given { value, before, after, since_return, call_ns, a: q } => given.push((p, value, before, after, since_return, call_ns, q)),
+                    End::Held => held += 1,
+                    End::Failed(e) => failed.push(format!("page {p}: {e}")),
+                }
+                if !done.2.load(Ordering::SeqCst) {
+                    failed.push(format!("page {p}: the commit refused"));
+                }
+            }
+            let shown: Vec<String> = given
+                .iter()
+                .take(16)
+                .map(|(p, value, before, after, since, call, q)| {
+                    format!(
+                        "page {p}: {value:#x}, {before} exits before the return and {after} after, read {} the call's return, the call {call} ns, A {:#x}/{:#x}",
+                        if *since == i64::MIN { "with no call made".to_string() } else if *since < 0 { format!("{} ns before", -since) } else { format!("{since} ns after") },
+                        q.0,
+                        q.1
+                    )
+                })
+                .collect();
+            say(format!(
+                "{name}{}: {} given of {made} trials, {held} held, {} failed {:?}; {shown:?}",
+                if how.is_empty() { String::new() } else { format!(" ({how})") },
+                given.len(),
+                failed.len(),
+                failed.iter().take(4).collect::<Vec<_>>()
+            ));
+            Some((s, a, b, given.len(), made, failed.len()))
+        };
+        let mut wrong = Vec::new();
+        say(format!(
+            "{cpus} CPUs; the vCPU's thread pinned to CPU 0: {vcpu_pinned}; the committing thread to CPU {commit_cpu}: {}",
+            commit_pinned.load(Ordering::SeqCst)
+        ));
+        if let Some((s, a, b, given, made, failed)) = case("stopped (no-access through A before the run)", false, false, PAGE_NOACCESS, true) {
+            unviews((s, a, b));
+            if given != 0 || made != PAGES || failed != 0 {
+                wrong.push(format!("stopped: {given} given of {made}, {failed} failed"));
+            }
+        }
+        if let Some((s, a, b, given, made, failed)) = case("B read-write (raced)", false, true, PAGE_READWRITE, false) {
+            unviews((s, a, b));
+            if given != made || made != PAGES || failed != 0 {
+                wrong.push(format!("B read-write: {given} given of {made}, {failed} failed"));
+            }
+        }
+        let (mut raced_given, mut raced_made) = (0, 0);
+        for r in 0..RACED_ROUNDS {
+            if let Some((s, a, b, given, made, _)) = case(&format!("raced round {r} (no-access through A)"), false, false, PAGE_NOACCESS, false) {
+                unviews((s, a, b));
+                raced_given += given;
+                raced_made += made;
+            }
+        }
+        say(format!("raced: {raced_given} given of {raced_made} trials"));
+        if let Some((s, a, b, _, _, _)) = case("V (A mapped no-access, read-write through B, raced)", true, true, PAGE_READWRITE, false) {
+            // Pages written through B and opened through A, read by the guest.
+            let mut opened = Vec::new();
+            for p in 0..16 {
+                let off = p * 4096;
+                // SAFETY: a committed page of view B (the case committed every page).
+                unsafe { ((b + off) as *mut u8).write_volatile(0x5A) };
+                let mut old = 0;
+                // SAFETY: the test's view.
+                let ok = unsafe { VirtualProtect((a + off) as *const _, 4096, PAGE_READWRITE, &mut old) } != 0;
+                let end = trial(a, p, b + off, PAGE_READWRITE, true);
+                opened.push(format!("{p}: opened {ok} (old {old:#x}), {end:?}"));
+            }
+            // A page never committed: the view mapped committed nothing.
+            let (s2, a2, b2, _) = views(true).map_or((std::ptr::null_mut(), 0, 0, String::new()), |v| v);
+            let never = if a2 == 0 { (0, 0) } else { query(b2 + 7 * 4096) };
+            say(format!("V: opened through A and read by the guest {opened:?}; in a fresh V section a page never committed reads through B {:#x}/{:#x}", never.0, never.1));
+            if a2 != 0 {
+                unviews((s2, a2, b2));
+            }
+            unviews((s, a, b));
+        }
+        stop.store(true, Ordering::SeqCst);
+        committer.join().unwrap();
+        say(format!("{:?} in all", begun.elapsed()));
+        drop(vcpu);
+        drop(vm);
+        // SAFETY: the test's memory, no VM left using it.
+        assert_eq!(unsafe { libc::munmap(m.cast(), MEM) }, 0);
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 

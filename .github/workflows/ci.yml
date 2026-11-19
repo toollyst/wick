@@ -2394,6 +2394,16 @@ jobs:
           # the guest's view closes (NEIGHBOURVIEW lines, a record).
           alone whp::vcpu::fpu_tests::test_a_guest_access_after_its_chunks_discard_faults_again
           alone whp::vcpu::fpu_tests::test_pages_beside_one_the_guest_exited_at_on_record
+          # Whether a page committed no-access through the guest's view is
+          # given to a guest accessing it while the commit is made, against
+          # two asserted controls (none given with the guest stopped, all
+          # given for a read-write commit through the alias), and variant
+          # V, the guest's view mapped no-access (COMMITRACE lines, a
+          # record, bounded at 4 minutes); and the same race in the
+          # product, a fill against the guest's first access (FILLRACE
+          # lines, a record). First run: CI.
+          alone whp::vcpu::fpu_tests::test_a_no_access_commit_raced_by_the_guests_access_on_record
+          alone whp::vcpu::fpu_tests::test_a_fill_raced_by_the_guests_first_access_on_record
           # SWAPSTRESS's chunk moved by the reclaim at a job's memory limit (its
           # live pages copied into a new section) under the guest's reads and
           # then its writes, 20 rounds each in a child held at the limit with
